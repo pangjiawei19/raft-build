@@ -1,3 +1,4 @@
+import { alignWithSource, pointAt } from "./markdownSourceAlignment";
 const CJK_URL_BOUNDARY_PUNCTUATION = "，。、；：！？）》」』】》〉”’（《「『【〈“‘";
 const ASCII_CLOSING_PUNCTUATION_PAIRS: Record<string, string> = {
   ")": "(",
@@ -128,13 +129,46 @@ function splitTextNodeForBareUrls(value: string): any[] {
   return nodes;
 }
 
-function transformChildren(parent: any) {
+// Give each split piece the source position of the text it came from, so
+// later plugins can still read the source (message refs check escapes).
+type PositionedPiece = {
+  type: string;
+  value?: string;
+  children?: Array<{ value: string }>;
+  position?: { start: ReturnType<typeof pointAt>; end: ReturnType<typeof pointAt> };
+};
+type ParsedText = { value: string; position?: { start?: { offset?: number }; end?: { offset?: number } } };
+
+function withSourcePositions<T extends PositionedPiece>(nodes: T[], original: ParsedText, source: string | undefined): T[] {
+  const start = original?.position?.start?.offset;
+  const end = original?.position?.end?.offset;
+  if (source === undefined || start === undefined || end === undefined) return nodes;
+  const { offsets } = alignWithSource(original.value, source.slice(start, end), start);
+  let cursor = 0;
+  for (const node of nodes) {
+    const length = (node.type === "text" ? node.value : node.children?.[0]?.value)?.length ?? 0;
+    if (node.type === "text") {
+      node.position = { start: pointAt(source, offsets[cursor]), end: pointAt(source, offsets[cursor + length]) };
+    }
+    cursor += length;
+  }
+  return nodes;
+}
+
+function transformChildren(parent: any, source?: string) {
   if (!Array.isArray(parent?.children)) return;
 
   const nextChildren: any[] = [];
   for (const child of parent.children) {
     if (child?.type === "text" && typeof child.value === "string") {
-      nextChildren.push(...splitTextNodeForBareUrls(child.value));
+      const split = splitTextNodeForBareUrls(child.value);
+      // Keep source positions: message refs read the source through them to
+      // tell `\<target>` from `<target>`. No URL: the parsed node as is.
+      if (split.length === 1 && split[0].type === "text" && split[0].value === child.value) {
+        nextChildren.push(child);
+      } else {
+        nextChildren.push(...withSourcePositions(split, child, source));
+      }
       continue;
     }
 
@@ -159,7 +193,7 @@ function transformChildren(parent: any) {
       child?.type !== "code" &&
       child?.type !== "html"
     ) {
-      transformChildren(child);
+      transformChildren(child, source);
     }
     nextChildren.push(child);
   }
@@ -168,7 +202,7 @@ function transformChildren(parent: any) {
 }
 
 export function remarkAutolinkBareUrls() {
-  return (tree: any) => {
-    transformChildren(tree);
+  return (tree: any, file?: { value?: unknown }) => {
+    transformChildren(tree, file?.value === undefined ? undefined : String(file.value));
   };
 }

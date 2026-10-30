@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
@@ -17,15 +16,15 @@ import { useServerStore } from "../src/store/serverStore";
 // EDITOR danger zone — client-secret rotation, marketplace lifecycle, and the
 // unsaved-app notice.
 //
-// The danger zone only mounts when the register/edit drawer is open. This
-// batch mounts the unsaved-app (`!editingClient`) branch by opening Register
-// app. The saved-app regenerate/offline confirm path still needs a loaded
-// client + Edit click; that is recorded as catalog-only, not wiring.
+// The danger zone mounts in the edit sheet of a saved app only: a new app's
+// form stops at what can be filled in now, and its Webhook section says that
+// it waits for the save. This batch mounts that unsaved-app
+// (`!editingClient`) branch by opening Register App. The saved-app
+// regenerate/offline confirm path still needs a loaded client + Edit click;
+// that is recorded as catalog-only, not wiring.
 
 const IDS = [
   "settings.connectedApps.editor.dangerStatusRestricted",
-  "settings.connectedApps.editor.dangerStatusAvailableAfterSave",
-  "settings.connectedApps.editor.saveBeforeLifecycle",
   "settings.connectedApps.editor.clientSecretTitle",
   "settings.connectedApps.editor.clientSecretDescription",
   "settings.connectedApps.editor.regenerateClientSecret",
@@ -104,13 +103,10 @@ test("mounted register-app danger zone is Chinese, not English residue", () => {
   );
 
   fireEvent.click(screen.getByRole("button", { name: zh["settings.connectedApps.registerApp"] }));
-  assert.ok(screen.getByText(zh["settings.connectedApps.editor.saveBeforeLifecycle"]));
-  assert.ok(screen.getAllByText(zh["settings.connectedApps.editor.dangerStatusAvailableAfterSave"]).length > 0);
-  assert.equal(
-    screen.queryByText("Save the app before lifecycle or credential actions become available."),
-    null,
-  );
-  assert.equal(screen.queryByText("Available after save"), null);
+  assert.ok(screen.getAllByText(zh["settings.connectedApps.editor.status.saveAppFirst"]).length > 0);
+  assert.ok(screen.queryByText("Save app first") === null);
+  assert.ok(screen.queryByTestId("connected-app-editor-section-danger") === null);
+  assert.ok(screen.queryByText(zh["settings.connectedApps.section.dangerZone"]) === null);
 });
 
 test("connected-apps editor confirm ids stay translated in the catalog", () => {

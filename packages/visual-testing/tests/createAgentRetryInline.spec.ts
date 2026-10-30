@@ -15,16 +15,11 @@ import { expect, test } from "@playwright/test";
  * Class and structure assertions cannot see this. Only line boxes can, which is
  * why this file exists and why it lives in the browser suite.
  *
- * KNOWN BOUNDARY, and it is a real one: this suite is LOCAL-ONLY. No CI job runs
- * it, so Hosted is NOT COVERED for these assertions. That is precisely how the
- * defect above survived — do not read a green run here as a Hosted guarantee.
+ * Visual browser CI now covers these assertions on selected staging pushes
+ * and daily runs. Ordinary PR checks still do not exercise this browser suite.
  */
 
-type Theme = "brutal" | "elegant";
-
-const CASE = (theme: Theme) =>
-  `/visual-testing.html?case=components.members.create-agent.claude-dialog` +
-  (theme === "elegant" ? "&theme=elegant" : "");
+const CASE = "/visual-testing.html?case=components.members.create-agent.claude-dialog";
 
 const catalog = (machineId: string) => ({
   context: "new_agent",
@@ -91,40 +86,38 @@ async function measure(page: import("@playwright/test").Page) {
   });
 }
 
-for (const theme of ["brutal", "elegant"] as Theme[]) {
-  test(`${theme}: the status sentence and its retry action occupy ONE line`, async ({ page }) => {
-    await primeRetryState(page);
-    await page.goto(CASE(theme));
-    await page.waitForSelector('[data-testid="runtime-model-source-status"]', { timeout: 10_000 });
-    await page.waitForTimeout(400);
+test(`the status sentence and its retry action occupy ONE line`, async ({ page }) => {
+  await primeRetryState(page);
+  await page.goto(CASE);
+  await page.waitForSelector('[data-testid="runtime-model-source-status"]', { timeout: 10_000 });
+  await page.waitForTimeout(400);
 
-    const m = await measure(page);
-    expect(m.text, `${theme}: the action must render beside the message`).toContain("Retry");
-    expect(
-      m.lineCount,
-      `${theme}: at the dialog's own width the message must fit one line, leaving room for the action — it read "${m.text}"`,
-    ).toBe(1);
-    expect(
-      m.sharesLastLine,
-      `${theme}: the action must sit ON that line, not below it`,
-    ).toBe(true);
-  });
+  const m = await measure(page);
+  expect(m.text, `the action must render beside the message`).toContain("Retry");
+  expect(
+    m.lineCount,
+    `at the dialog's own width the message must fit one line, leaving room for the action — it read "${m.text}"`,
+  ).toBe(1);
+  expect(
+    m.sharesLastLine,
+    `the action must sit ON that line, not below it`,
+  ).toBe(true);
+});
 
-  test(`${theme}: narrower than the dialog, the message wraps rather than overflowing — and the action is still not orphaned`, async ({ page }) => {
-    // Mahua's condition on the fix: shortening the copy must not be paid for with
-    // `nowrap`, which would trade a wrapped line for a clipped one. So the
-    // narrow case asserts the opposite property — text is ALLOWED to wrap here —
-    // and that the action still shares a row with words rather than standing
-    // alone, which is the thing that looked broken in the first place.
-    await page.setViewportSize({ width: 300, height: 844 });
-    await primeRetryState(page);
-    await page.goto(CASE(theme));
-    await page.waitForSelector('[data-testid="runtime-model-source-status"]', { timeout: 10_000 });
-    await page.waitForTimeout(400);
+test(`narrower than the dialog, the message wraps rather than overflowing — and the action is still not orphaned`, async ({ page }) => {
+  // Mahua's condition on the fix: shortening the copy must not be paid for with
+  // `nowrap`, which would trade a wrapped line for a clipped one. So the
+  // narrow case asserts the opposite property — text is ALLOWED to wrap here —
+  // and that the action still shares a row with words rather than standing
+  // alone, which is the thing that looked broken in the first place.
+  await page.setViewportSize({ width: 300, height: 844 });
+  await primeRetryState(page);
+  await page.goto(CASE);
+  await page.waitForSelector('[data-testid="runtime-model-source-status"]', { timeout: 10_000 });
+  await page.waitForTimeout(400);
 
-    const m = await measure(page);
-    expect(m.lineCount, `${theme}: the message must be free to wrap when it no longer fits`).toBeGreaterThan(1);
-    expect(m.overflow, `${theme}: wrapping, not horizontal overflow — a clipped message is worse than a wrapped one`).toBe(0);
-    expect(m.sharesLastLine, `${theme}: even wrapped, the action shares a line with text`).toBe(true);
-  });
-}
+  const m = await measure(page);
+  expect(m.lineCount, `the message must be free to wrap when it no longer fits`).toBeGreaterThan(1);
+  expect(m.overflow, `wrapping, not horizontal overflow — a clipped message is worse than a wrapped one`).toBe(0);
+  expect(m.sharesLastLine, `even wrapped, the action shares a line with text`).toBe(true);
+});

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import type { LocalReadSuppression } from "../src/store/messageStore.js";
+import type { LocalReadSuppression } from "../src/store/messageStore";
 
 class MemoryStorage {
   private readonly map = new Map<string, string>();
@@ -43,9 +42,9 @@ const {
   filterUnreadCountsByLocalReadSuppressions,
   markCurrentBrowserTabActiveForAutoRead,
   useMessageStore,
-} = await import("../src/store/messageStore.js");
-const { useServerStore } = await import("../src/store/serverStore.js");
-const { default: api } = await import("../src/api/client.js");
+} = await import("../src/store/messageStore");
+const { useServerStore } = await import("../src/store/serverStore");
+const { default: api } = await import("../src/api/client");
 
 const originalPost = api.post.bind(api);
 const originalGet = api.get.bind(api);
@@ -94,7 +93,7 @@ function restoreApi() {
   api.get = originalGet;
 }
 
-test("markUnread shows the sidebar unread badge before the network round trip settles", async () => {
+test("markUnread waits for the server before showing a sidebar unread badge", async () => {
   const postResponse = deferred<{ data: { unreadCount: number } }>();
   const unreadSnapshotResponse = deferred<{ data: { "channel-1": number } }>();
   const postCalls: string[] = [];
@@ -114,7 +113,7 @@ test("markUnread shows the sidebar unread badge before the network round trip se
 
     const markUnreadPromise = useMessageStore.getState().markUnread("channel-1");
 
-    assert.equal(useMessageStore.getState().unreadCounts["channel-1"], 1);
+    assert.equal(useMessageStore.getState().unreadCounts["channel-1"], undefined);
     await Promise.resolve();
     assert.deepEqual(postCalls, ["/channels/channel-1/unread"]);
 
@@ -171,7 +170,7 @@ test("markUnread waits for an in-flight read cursor sync before rewinding the cu
     assert.deepEqual(postCalls, ["/channels/channel-1/read"]);
 
     const markUnreadPromise = useMessageStore.getState().markUnread("channel-1");
-    assert.equal(useMessageStore.getState().unreadCounts["channel-1"], 1);
+    assert.equal(useMessageStore.getState().unreadCounts["channel-1"], undefined);
     await Promise.resolve();
     assert.deepEqual(postCalls, ["/channels/channel-1/read"]);
 
@@ -328,4 +327,57 @@ test("loadUnreadCounts keeps locally read mention markers suppressed while summa
     restoreApi();
     resetStores();
   }
+});
+
+
+test("manual unread receipt survives lagging RW summaries until its cursor version arrives", async () => {
+  resetStores();
+  api.post = (async () => ({ data: { unreadCount: 1, maxReadSeq: 20, readStateVersion: 7 } })) as typeof api.post;
+  let snapshot: unknown = { channels: {} };
+  api.get = (async () => ({ data: snapshot })) as typeof api.get;
+  try {
+    await useMessageStore.getState().markUnread("lagging-channel");
+    await useMessageStore.getState().loadUnreadCounts();
+    assert.equal(useMessageStore.getState().unreadCounts["lagging-channel"], 1, "omitted stale row cannot undo canonical receipt");
+    snapshot = { channels: { "lagging-channel": { unreadCount: 0, readState: { kind: "present", maxReadSeq: "30", readStateVersion: 6, latestActivity: null } } } };
+    await useMessageStore.getState().loadUnreadCounts();
+    assert.equal(useMessageStore.getState().unreadCounts["lagging-channel"], 1, "older summary version cannot clear badge");
+    snapshot = { channels: { "lagging-channel": { unreadCount: 1, readState: { kind: "present", maxReadSeq: "20", readStateVersion: 7, latestActivity: null } } } };
+    await useMessageStore.getState().loadUnreadCounts();
+    assert.equal(useMessageStore.getState().unreadCounts["lagging-channel"], 1);
+    snapshot = { channels: { "lagging-channel": { unreadCount: 0, readState: { kind: "present", maxReadSeq: "30", readStateVersion: 8, latestActivity: null } } } };
+    await useMessageStore.getState().loadUnreadCounts();
+    assert.equal(useMessageStore.getState().unreadCounts["lagging-channel"], undefined, "newer read can clear badge after catch-up");
+  } finally { restoreApi(); resetStores(); }
+});
+
+test("manual unread with no eligible message never invents a badge", async () => {
+  resetStores();
+  const response = deferred<{ data: { unreadCount: number } }>();
+  api.post = (() => response.promise) as typeof api.post;
+  api.get = (async () => ({ data: {} })) as typeof api.get;
+  try {
+    const pending = useMessageStore.getState().markUnread("own-only");
+    assert.equal(useMessageStore.getState().unreadCounts["own-only"], undefined);
+    response.resolve({ data: { unreadCount: 0 } });
+    await pending;
+    assert.equal(useMessageStore.getState().unreadCounts["own-only"], undefined);
+  } finally { restoreApi(); resetStores(); }
+});
+
+test("a delayed manual unread response cannot write into another server", async () => {
+  resetStores();
+  const response = deferred<{ data: { unreadCount: number; readStateVersion: number; maxReadSeq: number } }>();
+  api.post = (() => response.promise) as typeof api.post;
+  let refreshed = false;
+  api.get = (async () => { refreshed = true; return { data: {} }; }) as typeof api.get;
+  try {
+    const pending = useMessageStore.getState().markUnread("old-server-channel");
+    useServerStore.setState({ current: { ...useServerStore.getState().current!, id: "other-server" }, serverEpoch: 2 });
+    useMessageStore.setState({ unreadCounts: { "old-server-channel": 4 } });
+    response.resolve({ data: { unreadCount: 1, maxReadSeq: 20, readStateVersion: 7 } });
+    await pending;
+    assert.equal(useMessageStore.getState().unreadCounts["old-server-channel"], 4);
+    assert.equal(refreshed, false);
+  } finally { restoreApi(); resetStores(); }
 });

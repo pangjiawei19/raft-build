@@ -19,6 +19,29 @@ activity-sync.tsp -> OpenAPI HTTP operation description
 JSON Schema is never an input to either binding generator. OpenAPI is never an
 input to either binding generator.
 
+## Contract revision
+
+`revisions.json` maps every `activity-sync.tsp` digest to a contract revision.
+Any change to what goes over the wire (a field added, renamed or removed; a type,
+semantics or ordering change) takes the previous revision + 1. Even an added
+optional response field counts, because the Kotlin binding decodes strictly. A
+change that leaves the wire identical (comments, docs) keeps the revision and
+must state why in `compatible`; reviewers check that claim, since no tool can.
+`tools/contract-revision.mjs` (run by `contract.test.ts`) fails when the current
+source digest is not the ledger's last entry, and `contract.test.ts` also checks
+the ledger is append-only against the staging branch when git history for it is
+available. Reviewers of tsp PRs should still confirm the ledger only grew.
+
+`revision` is distinct from the older `version` / `contractVersion: 1` fields,
+which name the contract family and fixture format and are not bumped.
+
+Both bindings carry `ACTIVITY_SYNC_CONTRACT` and `ACTIVITY_SYNC_CONTRACT_REVISION`
+from the ledger; `manifest.json` pins `revision` and `revisionsSha256`. Planned
+next (task #3 follow-ups, not in place yet): the server sends
+`X-Raft-Contract: raft.activity-sync;revision=N` on the Activity endpoints, and a
+client enables the sync engine only when N equals the revision it was built with,
+falling back to `/channels/inbox` otherwise.
+
 ## What is executable here
 
 - TypeSpec 1.14.0 emits sealed JSON Schema and OpenAPI 3.1.

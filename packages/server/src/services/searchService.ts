@@ -1,11 +1,17 @@
 import { performance } from "node:perf_hooks";
-import { clearClockTimeout, setClockTimeout } from "@botiverse/raft-shared";
+import {
+  AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
+  AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+  clearClockTimeout,
+  setClockTimeout,
+} from "@botiverse/raft-shared";
 import { cut } from "jieba-wasm";
 import { sql, type SQL } from "drizzle-orm";
-import { executeSearchSql, isSearchQueryAbortedError } from "../db/index.js";
-import { addTraceEvent } from "../tracing/semanticTrace.js";
-import { messageSearchErrorTraceAttrs, messageSearchParamTraceAttrs } from "../tracing/messageSearchTrace.js";
-import { traceQuerySpan } from "../tracing/queryTrace.js";
+import { executeSearchSql, isSearchQueryAbortedError } from "../db/index";
+import { addTraceEvent } from "../tracing/semanticTrace";
+import { messageSearchErrorTraceAttrs, messageSearchParamTraceAttrs } from "../tracing/messageSearchTrace";
+import { traceQuerySpan } from "../tracing/queryTrace";
+import { evaluateFeatureFlag, SEARCH_SERVER_TIMELINE_WALK_FEATURE_FLAG_KEY } from "./featureFlagService";
 import type { AgentVisibleExternalMessageProvenance } from "@botiverse/raft-shared";
 
 export interface MessageSearchResult {
@@ -33,6 +39,17 @@ export interface MessageSearchResult {
 }
 
 export type MessageSearchSort = "relevance" | "recent";
+/**
+ * How a recent-sort text search finds its page. The walk reads messages newest
+ * first across every server (idx_messages_created_at) and checks visibility per
+ * row, so its cost is the global traffic it passes before LIMIT visible matches:
+ * a term that is neither rare nor dense, searched from a server with a small
+ * share of the traffic, walks ~160k rows (KBDevTeam user: 464k buffers, 5-6s
+ * cold; KBDevTeam agent: canceled). Text matches first costs the term's match
+ * set instead, bounded by the same corpus-wide estimate relevance admits; above
+ * it the term is dense enough that the walk finds matches quickly.
+ */
+export type MessageSearchRecentPlan = "walk" | "text_matches_first" | "server_timeline_walk";
 export type MessageSearchSenderType = "user" | "agent";
 
 export interface MessageSearchMentionTarget {
@@ -50,6 +67,88 @@ export interface MessageSearchMentionTarget {
  * Keep this value synchronized with manual/agent-knowledge/search.md.
  */
 export const MESSAGE_SEARCH_RELEVANCE_ESTIMATED_CANDIDATE_LIMIT = 10_000;
+/**
+ * Relevance search reads the full-text matches of every server first (the GIN
+ * index cannot be narrowed to one server) and only then keeps the visible ones,
+ * so it is also admitted only while PostgreSQL estimates at most this many
+ * matches across all servers for the text and the message-level filters
+ * (sender, sender type, dates, channel). A term absent from the search_vector
+ * statistics is always estimated at a fixed selectivity of at most 0.5% of all
+ * messages (80,918 of 16.1M rows on prod, 2026-09-29), whatever its real count.
+ * So an estimate is only rejected when it is also above
+ * MESSAGE_SEARCH_COMMON_TERM_CORPUS_FRACTION of all messages: that keeps rare
+ * terms admitted as the corpus grows, and only rejects terms the statistics
+ * know to be common.
+ * Keep both values synchronized with manual/agent-knowledge/search.md.
+ */
+export const MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT = 200_000;
+export const MESSAGE_SEARCH_COMMON_TERM_CORPUS_FRACTION = 0.01;
+/**
+ * Recent sort on a server with the timeline walk: collect the term's text
+ * matches first only while the planner expects at most this many (corpus-wide;
+ * the GIN match cannot be narrowed to one server). Above it, walk this server's
+ * timeline newest first instead (bounded by the row budget below). The
+ * relevance cap above is far too high for this: each collected match is a
+ * random heap read, and the walk stops at the page. Prod 2026-10-16 (agent
+ * search timeouts, 'deploy', 7 days, cold replica): collect-first 18.4 s (427k
+ * GIN matches, lossy bitmap, 36k pages read) vs this server's timeline walk
+ * 1.05 s (617 timeline rows). Without the timeline walk (flag off, or a channel
+ * filter) recent sort keeps the relevance cap: the other walk has no budget.
+ */
+export const MESSAGE_SEARCH_RECENT_COLLECT_FIRST_TEXT_MATCH_LIMIT = 2_000;
+/**
+ * Most timeline rows one server-timeline walk reads. A term common across
+ * Raft but rare on this server otherwise walks the whole range: 'invoice', 30
+ * days, the busiest server (prod replica 2026-10-16) read 46,921 timeline rows
+ * in 14.5 s for 3 matches, one step from the 15 s statement timeout. About
+ * 0.3 ms a row cold, so this budget is about 3 s. When it runs out before the
+ * page fills, the page is returned as incomplete with a cursor that continues
+ * below the last row read.
+ */
+export const MESSAGE_SEARCH_WALK_TIMELINE_ROW_BUDGET = 10_000;
+
+/**
+ * Opaque position in one server's timeline walk: (created_at, message_id) of a
+ * row, exclusive (a walk from it reads strictly older rows). Produced only by
+ * encodeMessageSearchWalkCursor; a client passes it back unchanged.
+ */
+export type MessageSearchWalkCursor = string & { readonly __brand: "MessageSearchWalkCursor" };
+
+interface MessageSearchWalkPosition {
+  /** UTC, microseconds: the exact stored created_at (a JS Date keeps only ms). */
+  createdAt: string;
+  messageId: string;
+}
+
+const WALK_CURSOR_CREATED_AT_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
+const WALK_CURSOR_MESSAGE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function encodeMessageSearchWalkCursor(position: MessageSearchWalkPosition): MessageSearchWalkCursor {
+  return Buffer.from(JSON.stringify({ t: position.createdAt, i: position.messageId }), "utf8")
+    .toString("base64url") as MessageSearchWalkCursor;
+}
+
+function decodeMessageSearchWalkCursor(cursor: MessageSearchWalkCursor): MessageSearchWalkPosition | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as { t?: unknown; i?: unknown };
+    if (typeof parsed.t !== "string" || !WALK_CURSOR_CREATED_AT_RE.test(parsed.t)) return null;
+    if (Number.isNaN(Date.parse(parsed.t))) return null;
+    if (typeof parsed.i !== "string" || !WALK_CURSOR_MESSAGE_ID_RE.test(parsed.i)) return null;
+    return { createdAt: parsed.t, messageId: parsed.i.toLowerCase() };
+  } catch {
+    return null;
+  }
+}
+
+/** Null for anything that is not a cursor this server produced. */
+export function parseMessageSearchWalkCursor(raw: unknown): MessageSearchWalkCursor | null {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 200) return null;
+  return decodeMessageSearchWalkCursor(raw as MessageSearchWalkCursor) ? raw as MessageSearchWalkCursor : null;
+}
+
+/** created_at as the cursor stores it: UTC with all six fractional digits. */
+const walkCreatedAtTextSql = (column: SQL) =>
+  sql`to_char(${column} AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')`;
 export const MESSAGE_SEARCH_BREADTH_PROBE_TIMEOUT_MS = 1_000;
 export const MESSAGE_SEARCH_QUERY_TOO_BROAD_CODE = "QUERY_TOO_BROAD" as const;
 export const MESSAGE_SEARCH_TIMEOUT_CODE = "SEARCH_TIMEOUT" as const;
@@ -117,6 +216,30 @@ export function classifyMessageSearchBreadth(estimatedCandidateRows: number): "w
     throw new Error("Invalid message search planner estimate");
   }
   return estimatedCandidateRows > MESSAGE_SEARCH_RELEVANCE_ESTIMATED_CANDIDATE_LIMIT ? "over_limit" : "within_limit";
+}
+
+/**
+ * Recent sort plan, on a server with the timeline walk, from the planner's
+ * corpus-wide text-match estimate: collect the matches first only for a
+ * bounded set, otherwise walk this server's timeline newest first.
+ */
+export function chooseMessageSearchRecentPlan(estimatedTextMatchRows: number): "text_matches_first" | "walk" {
+  if (!Number.isFinite(estimatedTextMatchRows) || estimatedTextMatchRows < 0) return "walk";
+  return estimatedTextMatchRows <= MESSAGE_SEARCH_RECENT_COLLECT_FIRST_TEXT_MATCH_LIMIT ? "text_matches_first" : "walk";
+}
+
+export function classifyMessageSearchTextMatchBreadth(
+  estimatedTextMatchRows: number,
+  corpusRows: number,
+): "within_limit" | "over_limit" {
+  if (!Number.isInteger(estimatedTextMatchRows) || estimatedTextMatchRows < 0 || !Number.isFinite(corpusRows)) {
+    throw new Error("Invalid message search planner estimate");
+  }
+  const limit = Math.max(
+    MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT,
+    Math.max(corpusRows, 0) * MESSAGE_SEARCH_COMMON_TERM_CORPUS_FRACTION,
+  );
+  return estimatedTextMatchRows > limit ? "over_limit" : "within_limit";
 }
 
 const INLINE_CODE_RE = /`([^`]+)`/g;
@@ -203,6 +326,8 @@ interface SearchRow extends Record<string, unknown> {
   channelArchivedAt: Date | string | null;
   content: string;
   createdAt: Date | string;
+  /** server_timeline_walk only: the row's exact walk key (see MessageSearchWalkPosition). */
+  walkCreatedAt?: string;
 }
 
 interface SearchBreadthProbeRow extends Record<string, unknown> {
@@ -211,9 +336,22 @@ interface SearchBreadthProbeRow extends Record<string, unknown> {
 
 type SearchServiceDeps = {
   executeSearchSql: typeof executeSearchSql;
+  /** Runtime switch for the server timeline walk (feature flag; absent = off). */
+  isServerTimelineWalkEnabled: (serverId: string) => Promise<boolean>;
+  /** Rows one server timeline walk may read (tests shrink it). */
+  walkTimelineRowBudget: number;
 };
 
-const defaultSearchServiceDeps: SearchServiceDeps = { executeSearchSql };
+async function isServerTimelineWalkEnabled(serverId: string): Promise<boolean> {
+  const evaluation = await evaluateFeatureFlag({ key: SEARCH_SERVER_TIMELINE_WALK_FEATURE_FLAG_KEY, serverId });
+  return evaluation.enabled;
+}
+
+const defaultSearchServiceDeps: SearchServiceDeps = {
+  executeSearchSql,
+  isServerTimelineWalkEnabled,
+  walkTimelineRowBudget: MESSAGE_SEARCH_WALK_TIMELINE_ROW_BUDGET,
+};
 let searchServiceDepsOverride: Partial<SearchServiceDeps> | null = null;
 
 function resolveSearchServiceDeps(): SearchServiceDeps {
@@ -308,22 +446,118 @@ interface SearchCandidateCtesParams {
   limit: number;
   offset: number;
   channelFilter: SQL;
+  channelScopeFilter: SQL;
+  /** The same channel scope as an array, for the GIN-driven text_matches set (see buildSearchFilters). */
+  textMatchChannelScopeFilter: SQL;
   senderFilter: SQL;
   senderTypeFilter: SQL;
   mentionTargetFilter: SQL;
   afterFilter: SQL;
   beforeFilter: SQL;
+  /**
+   * Recent sort with text only: "text_matches_first" collects the text matches
+   * first (as relevance does) and orders the visible ones by time; "walk" (the
+   * default) walks messages newest first until LIMIT visible matches;
+   * "server_timeline_walk" walks only this server's messages newest first
+   * (message_server_timeline), for a dense term with no channel filter.
+   */
+  recentPlan?: MessageSearchRecentPlan;
+  /** The searched server: bounds the server timeline walk. */
+  serverId?: string;
+  /** after/before on message_server_timeline.created_at (the walk's index range). */
+  timelineRangeFilter?: SQL;
+  /** The server timeline walk's window; see MessageSearchStatementParams.walkWindow. */
+  walkWindow?: MessageSearchWalkWindow;
+}
+
+/**
+ * The rows one server timeline walk may read: strictly older than `from` (the
+ * request's cursor) and no older than `through` (the row budget's last row,
+ * absent when fewer rows than the budget remain).
+ */
+export interface MessageSearchWalkWindow {
+  from?: MessageSearchWalkPosition;
+  through?: MessageSearchWalkPosition;
+  /** Rows the walk may read: the window size when `through` is set. */
+  budget?: number;
+}
+
+function walkWindowFilterSql(window: MessageSearchWalkWindow | undefined): SQL {
+  return sql`${window?.from
+    ? sql`AND (t.created_at, t.message_id) < (${window.from.createdAt}::timestamptz, ${window.from.messageId}::uuid)`
+    : sql``} ${window?.through
+    ? sql`AND (t.created_at, t.message_id) >= (${window.through.createdAt}::timestamptz, ${window.through.messageId}::uuid)`
+    : sql``}`;
 }
 
 /** @internal Exported so the production query-plan contract can be tested without a database. */
 export function buildSearchCandidateCtes(params: SearchCandidateCtesParams): SQL {
   const searchVectorFilter = params.tsQuery ? sql`AND m.search_vector @@ (${params.tsQuery})` : sql``;
-  const matchedCandidateRank = params.tsQuery ? sql`ts_rank_cd(mm.search_vector, (${params.tsQuery}))` : sql`0`;
+  // Recent sort ranks nothing, so either recent plan orders exactly like the
+  // walk (created_at, then id) and a page never depends on the plan chosen.
+  const matchedCandidateRank = params.tsQuery && params.sort === "relevance"
+    ? sql`ts_rank_cd(mm.search_vector, (${params.tsQuery}))`
+    : sql`0`;
   const matchedCandidateOrderBy = params.sort === "recent"
-    ? sql`mm.created_at DESC, ${matchedCandidateRank} DESC, mm.id DESC`
+    ? sql`mm.created_at DESC, mm.id DESC`
     : sql`${matchedCandidateRank} DESC, mm.created_at DESC, mm.id DESC`;
 
-  if (!params.tsQuery || params.sort === "recent") {
+  if (params.tsQuery && params.sort === "recent" && params.recentPlan === "server_timeline_walk") {
+    if (!params.serverId) throw new Error("server_timeline_walk needs the searched serverId");
+    // Newest first over this server's messages only (0310 timeline, verified
+    // 0 missing / 0 divergent before this plan was switched on), instead of
+    // every server's through idx_messages_created_at. Visibility and every
+    // filter still read the message itself (m.channel_id, not the timeline's
+    // copy), so a stale timeline row can only drop a message, never show one.
+    // The text match is written `(... @@ ...) IS TRUE` so it cannot become a
+    // GIN index condition: on a server with few visible channels the planner
+    // otherwise loops over them and runs BitmapAnd(channel index, GIN) per
+    // channel, rescanning the term's whole match set each time (prod
+    // 2026-10-03, apache-maka agent, 'means': 2,152 rescans, 27s) instead of
+    // walking the timeline. Same rows: IS TRUE only differs from @@ on NULL,
+    // which the WHERE clause drops either way.
+    return sql`
+      search_candidates AS (
+        SELECT
+          t.message_id AS "id",
+          t.created_at AS "createdAt",
+          0 AS "searchRank",
+          ${walkCreatedAtTextSql(sql`t.created_at`)} AS "walkCreatedAt"
+        FROM message_server_timeline t
+        JOIN messages m
+          ON m.id = t.message_id
+        JOIN visible_channels vc
+          ON vc.id = m.channel_id
+        WHERE t.server_id = ${params.serverId}
+          ${params.timelineRangeFilter ?? sql``}
+          ${walkWindowFilterSql(params.walkWindow)}
+          AND (
+            m.message_type = 'chat'
+            OR EXISTS (
+              SELECT 1
+              FROM agent_migration_receipt_channels receipt_surface
+              WHERE receipt_surface.channel_id = m.channel_id
+            )
+            OR EXISTS (
+              SELECT 1
+              FROM agent_private_surfaces private_surface
+              WHERE private_surface.channel_id = m.channel_id
+            )
+          )
+          ${params.channelFilter}
+          ${params.senderFilter}
+          ${params.senderTypeFilter}
+          ${params.mentionTargetFilter}
+          ${params.afterFilter}
+          ${params.beforeFilter}
+          AND (m.search_vector @@ (${params.tsQuery})) IS TRUE
+        ORDER BY t.created_at DESC, t.message_id DESC
+        LIMIT ${params.limit + 1}
+        OFFSET ${params.offset}
+      )`;
+  }
+
+  if (!params.tsQuery || (params.sort === "recent" && params.recentPlan !== "text_matches_first")) {
     return sql`
       search_candidates AS (
         SELECT
@@ -340,8 +574,14 @@ export function buildSearchCandidateCtes(params: SearchCandidateCtesParams): SQL
             FROM agent_migration_receipt_channels receipt_surface
             WHERE receipt_surface.channel_id = m.channel_id
           )
+          OR EXISTS (
+            SELECT 1
+            FROM agent_private_surfaces private_surface
+            WHERE private_surface.channel_id = m.channel_id
+          )
         )
           ${params.channelFilter}
+          ${params.channelScopeFilter}
           ${params.senderFilter}
           ${params.senderTypeFilter}
           ${params.mentionTargetFilter}
@@ -354,19 +594,41 @@ export function buildSearchCandidateCtes(params: SearchCandidateCtesParams): SQL
       )`;
   }
 
-  // Keep the MATERIALIZED set inside the same viewer scope used by the
-  // breadth probe. Ranking may be expensive, but inaccessible tenants must
-  // never contribute rows to that materialized workload.
+  // Relevance (and recent sort on a term with a bounded match set): collect
+  // the text matches first, then keep the visible ones.
+  // Joining visible_channels to messages instead leaves the join order to the
+  // planner, which misestimates the thread arms (every thread in the server
+  // joined to a filtered parent set reads as a few dozen rows) and then runs
+  // the GIN match once per visible channel: 23k loops, 29s for one Botiverse
+  // agent. Here the GIN match runs once, and the planner only picks how to join
+  // text_matches to visible_channels, which is cheap either way.
+  // text_matches holds only ids from every server (a GIN index cannot be
+  // narrowed to one), bounded by the breadth probe's corpus-wide estimate;
+  // content and ranking only ever read visible rows.
   return sql`
+    text_matches AS MATERIALIZED (
+      SELECT
+        m.id AS id,
+        m.channel_id AS channel_id
+      FROM messages m
+      WHERE m.search_vector @@ (${params.tsQuery})
+        ${params.textMatchChannelScopeFilter}
+        ${params.senderFilter}
+        ${params.senderTypeFilter}
+        ${params.afterFilter}
+        ${params.beforeFilter}
+    ),
     matched_messages AS MATERIALIZED (
       SELECT
         m.id AS id,
         m.channel_id AS channel_id,
         m.created_at AS created_at,
         m.search_vector AS search_vector
-      FROM visible_channels vc
+      FROM text_matches tm
+      JOIN visible_channels vc
+        ON vc.id = tm.channel_id
       JOIN messages m
-        ON m.channel_id = vc.id
+        ON m.id = tm.id
       WHERE (
         m.message_type = 'chat'
         OR EXISTS (
@@ -374,14 +636,14 @@ export function buildSearchCandidateCtes(params: SearchCandidateCtesParams): SQL
           FROM agent_migration_receipt_channels receipt_surface
           WHERE receipt_surface.channel_id = m.channel_id
         )
+        OR EXISTS (
+          SELECT 1
+          FROM agent_private_surfaces private_surface
+          WHERE private_surface.channel_id = m.channel_id
+        )
       )
         ${params.channelFilter}
-        ${params.senderFilter}
-        ${params.senderTypeFilter}
         ${params.mentionTargetFilter}
-        ${params.afterFilter}
-        ${params.beforeFilter}
-        ${searchVectorFilter}
     ),
     search_candidates AS (
       SELECT
@@ -405,6 +667,9 @@ export interface MessageSearchStatementParams {
   after?: Date;
   before?: Date;
   sort: MessageSearchSort;
+  recentPlan?: MessageSearchRecentPlan;
+  /** server_timeline_walk only: the window the walk may read. */
+  walkWindow?: MessageSearchWalkWindow;
   limit: number;
   offset: number;
 }
@@ -412,6 +677,39 @@ export interface MessageSearchStatementParams {
 function buildSearchFilters(params: MessageSearchStatementParams) {
   const channelFilter = params.channelId
     ? sql`AND (m.channel_id = ${params.channelId} OR vc.parent_channel_id = ${params.channelId})`
+    : sql``;
+  // The channel filter without visibility: the channel and its live threads,
+  // through idx_channels_thread_parent_channel. A superset of what
+  // channelFilter passes (both visibility builders only admit live threads),
+  // so messages can be narrowed to the filtered channel before visibility is
+  // joined instead of scanning every visible channel.
+  const channelScopeFilter = params.channelId
+    ? sql`AND m.channel_id IN (
+        SELECT ${params.channelId}::uuid
+        UNION ALL
+        SELECT scoped_thread.id
+        FROM channels scoped_thread
+        WHERE scoped_thread.parent_channel_id = ${params.channelId}
+          AND scoped_thread.type = 'thread'
+          AND scoped_thread.deleted_at IS NULL
+      )`
+    : sql``;
+  // The same scope as an array, computed once (an InitPlan) before the text
+  // match. As IN (subquery) the planner may instead run the GIN match once per
+  // scoped channel (BitmapAnd with the channel index, one GIN rescan per thread)
+  // whenever the term's estimate is small: 3,241 rescans, 4.8s for a 13k-match
+  // term on a channel with 3,240 threads. The walk keeps the IN form: there the
+  // scope is a per-row filter, which IN hashes and a parameter array does not.
+  const textMatchChannelScopeFilter = params.channelId
+    ? sql`AND m.channel_id = ANY(ARRAY(
+        SELECT ${params.channelId}::uuid
+        UNION ALL
+        SELECT scoped_thread.id
+        FROM channels scoped_thread
+        WHERE scoped_thread.parent_channel_id = ${params.channelId}
+          AND scoped_thread.type = 'thread'
+          AND scoped_thread.deleted_at IS NULL
+      ))`
     : sql``;
   const senderFilter = params.senderId
     ? sql`AND m.sender_id = ${params.senderId}`
@@ -435,7 +733,8 @@ function buildSearchFilters(params: MessageSearchStatementParams) {
   const beforeFilter = params.before
     ? sql`AND m.created_at <= ${params.before}`
     : sql``;
-  return { channelFilter, senderFilter, senderTypeFilter, mentionTargetFilter, afterFilter, beforeFilter };
+  const timelineRangeFilter = sql`${params.after ? sql`AND t.created_at >= ${params.after}` : sql``} ${params.before ? sql`AND t.created_at <= ${params.before}` : sql``}`;
+  return { channelFilter, channelScopeFilter, textMatchChannelScopeFilter, senderFilter, senderTypeFilter, mentionTargetFilter, afterFilter, beforeFilter, timelineRangeFilter };
 }
 
 /**
@@ -449,7 +748,7 @@ export function buildMessageSearchStatement(
   params: MessageSearchStatementParams,
   tsQuery: SQL | null,
 ): SQL {
-  const { channelFilter, senderFilter, senderTypeFilter, mentionTargetFilter, afterFilter, beforeFilter } = buildSearchFilters(params);
+  const { channelFilter, channelScopeFilter, textMatchChannelScopeFilter, senderFilter, senderTypeFilter, mentionTargetFilter, afterFilter, beforeFilter, timelineRangeFilter } = buildSearchFilters(params);
   const finalOrderBy = !tsQuery
     ? sql`sc."createdAt" DESC, sc."id" DESC`
     : params.sort === "recent"
@@ -458,9 +757,15 @@ export function buildMessageSearchStatement(
   const candidateCtes = buildSearchCandidateCtes({
     tsQuery,
     sort: params.sort,
+    recentPlan: params.recentPlan,
+    serverId: params.serverId,
+    timelineRangeFilter,
+    walkWindow: params.walkWindow,
     limit: params.limit,
     offset: params.offset,
     channelFilter,
+    channelScopeFilter,
+    textMatchChannelScopeFilter,
     senderFilter,
     senderTypeFilter,
     mentionTargetFilter,
@@ -512,7 +817,10 @@ export function buildMessageSearchStatement(
           c.type AS "channelType",
           c.archived_at AS "channelArchivedAt",
           m.content AS "content",
-          m.created_at AS "createdAt"
+          m.created_at AS "createdAt"${tsQuery && params.sort === "recent" && params.recentPlan === "server_timeline_walk"
+            ? sql`,
+          sc."walkCreatedAt" AS "walkCreatedAt"`
+            : sql``}
         FROM search_candidates sc
         JOIN messages m
           ON m.id = sc.id
@@ -537,6 +845,35 @@ export function buildMessageSearchStatement(
       `;
 }
 
+/**
+ * @internal The last row a server timeline walk may read: the budget's row,
+ * counted newest first from the cursor within the after/before range, and the
+ * row after it. Unless both exist, no more than the budget remain and the walk
+ * reads them all. Reads only idx_message_server_timeline_server_created
+ * (server_id, created_at, message_id), never messages.
+ */
+export function buildMessageSearchWalkFrontierSql(params: {
+  serverId: string;
+  after?: Date;
+  before?: Date;
+  from?: MessageSearchWalkPosition;
+  budget: number;
+}): SQL {
+  return sql`
+    SELECT
+      ${walkCreatedAtTextSql(sql`t.created_at`)} AS "createdAt",
+      t.message_id AS "messageId"
+    FROM message_server_timeline t
+    WHERE t.server_id = ${params.serverId}
+      ${params.after ? sql`AND t.created_at >= ${params.after}` : sql``}
+      ${params.before ? sql`AND t.created_at <= ${params.before}` : sql``}
+      ${walkWindowFilterSql({ from: params.from })}
+    ORDER BY t.created_at DESC, t.message_id DESC
+    OFFSET ${params.budget - 1}
+    LIMIT 2
+  `;
+}
+
 interface SearchBreadthProbeParams {
   visibleChannelsSql: SQL;
   tsQuery: SQL;
@@ -546,6 +883,33 @@ interface SearchBreadthProbeParams {
   mentionTargetFilter: SQL;
   afterFilter: SQL;
   beforeFilter: SQL;
+}
+
+interface SearchTextMatchProbeParams {
+  tsQuery: SQL;
+  channelScopeFilter: SQL;
+  senderFilter: SQL;
+  senderTypeFilter: SQL;
+  afterFilter: SQL;
+  beforeFilter: SQL;
+}
+
+/**
+ * @internal The estimate for the relevance statement's text_matches set: the
+ * same predicate over every server, planned but not executed.
+ */
+export function buildMessageSearchTextMatchProbeSql(params: SearchTextMatchProbeParams): SQL {
+  return sql`
+    EXPLAIN (FORMAT JSON)
+    SELECT m.id
+    FROM messages m
+    WHERE m.search_vector @@ (${params.tsQuery})
+      ${params.channelScopeFilter}
+      ${params.senderFilter}
+      ${params.senderTypeFilter}
+      ${params.afterFilter}
+      ${params.beforeFilter}
+  `;
 }
 
 /** @internal Exported so the planner-admission contract can be verified without production data. */
@@ -565,6 +929,11 @@ export function buildMessageSearchBreadthProbeSql(params: SearchBreadthProbePara
         SELECT 1
         FROM agent_migration_receipt_channels receipt_surface
         WHERE receipt_surface.channel_id = m.channel_id
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM agent_private_surfaces private_surface
+        WHERE private_surface.channel_id = m.channel_id
       )
     )
       ${params.channelFilter}
@@ -617,10 +986,21 @@ async function searchMessages(
     sort: MessageSearchSort;
     limit: number;
     offset: number;
+    /** Recent-sort text search only (routes reject it otherwise): continue a timeline walk. */
+    cursor?: MessageSearchWalkCursor;
     signal?: AbortSignal;
   },
   query: string,
-): Promise<{ results: MessageSearchResult[]; hasMore: boolean }> {
+  /**
+   * The same visible set, shaped for the recent walk: that plan checks
+   * visibility once per message it passes (newest first), so the set must be
+   * a per-channel primary-key lookup the planner can memoize, not a UNION the
+   * planner re-runs per row. Defaults to visibleChannelsSql.
+   */
+  walkVisibleChannelsSql: SQL = visibleChannelsSql,
+): Promise<MessageSearchPage> {
+  const walkFrom = membershipParams.cursor ? decodeMessageSearchWalkCursor(membershipParams.cursor) ?? undefined : undefined;
+  if (membershipParams.cursor && !walkFrom) throw new Error("Invalid message search cursor");
   const queryTokens = tokenizeSearchText(query);
   const searchText = queryTokens.join(" ");
   const hasSearchText = Boolean(searchText);
@@ -630,12 +1010,60 @@ async function searchMessages(
 
   const strictTsQuery = hasSearchText ? sql`plainto_tsquery('simple', ${searchText})` : null;
   const fallbackTsQuery = hasSearchText && queryTokens.length > 1 ? buildAnyTokenTsQuery(queryTokens) : null;
-  const { channelFilter, senderFilter, senderTypeFilter, mentionTargetFilter, afterFilter, beforeFilter } = buildSearchFilters(membershipParams);
+  const { channelFilter, channelScopeFilter, senderFilter, senderTypeFilter, mentionTargetFilter, afterFilter, beforeFilter } = buildSearchFilters(membershipParams);
 
   const deps = resolveSearchServiceDeps();
   const queryStart = performance.now();
   let rows: { rows: SearchRow[] };
   let fallbackUsed = false;
+  // Planner estimate of the text matches over every server (not executed),
+  // classified against the corpus-wide cap relevance admits.
+  const probeTextMatchBreadth = async (tsQuery: SQL, signal: AbortSignal): Promise<"within_limit" | "over_limit"> =>
+    (await probeTextMatchEstimate(tsQuery, signal)).relevanceVerdict;
+  const probeTextMatchEstimate = async (
+    tsQuery: SQL,
+    signal: AbortSignal,
+  ): Promise<{ relevanceVerdict: "within_limit" | "over_limit"; estimatedTextMatchRows: number }> => {
+    const textMatch = await traceQuerySpan({
+      queryName: "messages.search.text_match_breadth",
+      phase: "text_match_breadth_probe",
+      dbSystem: "postgresql",
+      attrs: {
+        search_text_present: true,
+        query_plan_shape: "fts_explain_estimate",
+        estimated_text_match_limit: MESSAGE_SEARCH_RELEVANCE_ESTIMATED_TEXT_MATCH_LIMIT,
+        probe_timeout_ms: MESSAGE_SEARCH_BREADTH_PROBE_TIMEOUT_MS,
+      },
+      successAttrs: (probe) => ({
+        estimated_text_match_rows: probe.estimatedTextMatchRows,
+        corpus_rows: probe.corpusRows,
+      }),
+    }, async () => {
+      const [explain, corpus] = await Promise.all([
+        deps.executeSearchSql<SearchBreadthProbeRow>(buildMessageSearchTextMatchProbeSql({
+          tsQuery,
+          channelScopeFilter,
+          senderFilter,
+          senderTypeFilter,
+          afterFilter,
+          beforeFilter,
+        }), { signal }),
+        deps.executeSearchSql<{ corpus_rows: unknown }>(
+          sql`SELECT reltuples::float8 AS corpus_rows FROM pg_class WHERE oid = 'messages'::regclass`,
+          { signal },
+        ),
+      ]);
+      if (explain.rows.length !== 1 || corpus.rows.length !== 1) throw new MessageSearchUnavailableError();
+      return {
+        estimatedTextMatchRows: readMessageSearchEstimatedCandidateRows(explain.rows[0]?.["QUERY PLAN"]),
+        corpusRows: Number(corpus.rows[0]?.corpus_rows),
+      };
+    });
+    return {
+      relevanceVerdict: classifyMessageSearchTextMatchBreadth(textMatch.estimatedTextMatchRows, textMatch.corpusRows),
+      estimatedTextMatchRows: textMatch.estimatedTextMatchRows,
+    };
+  };
   const probeSearchBreadth = async (tsQuery: SQL): Promise<"within_limit" | "over_limit"> => {
     const abort = createBreadthProbeAbort(membershipParams.signal);
     try {
@@ -645,6 +1073,7 @@ async function searchMessages(
         dbSystem: "postgresql",
         attrs: {
           ...messageSearchParamTraceAttrs({
+            queryTokenCount: queryTokens.length,
             query,
             channelId: membershipParams.channelId,
             senderId: membershipParams.senderId,
@@ -673,7 +1102,12 @@ async function searchMessages(
         beforeFilter,
       }), { signal: abort.signal }));
       if (result.rows.length !== 1) throw new MessageSearchUnavailableError();
-      return classifyMessageSearchBreadth(readMessageSearchEstimatedCandidateRows(result.rows[0]?.["QUERY PLAN"]));
+      if (classifyMessageSearchBreadth(readMessageSearchEstimatedCandidateRows(result.rows[0]?.["QUERY PLAN"])) === "over_limit") {
+        return "over_limit";
+      }
+      // The relevance statement reads the text matches of every server before
+      // visibility (see buildSearchCandidateCtes), so bound that set too.
+      return await probeTextMatchBreadth(tsQuery, abort.signal);
     } catch (error) {
       if (abort.didTimeout() && !membershipParams.signal?.aborted && isSearchQueryAbortedError(error)) {
         throw new MessageSearchTimeoutError();
@@ -685,6 +1119,57 @@ async function searchMessages(
       abort.cleanup();
     }
   };
+  // Recent sort never rejects. With the server timeline walk (flag on, no
+  // channel filter) a term within MESSAGE_SEARCH_RECENT_COLLECT_FIRST_TEXT_MATCH_LIMIT
+  // takes text matches first and a denser one walks the timeline under the row
+  // budget; without it the relevance cap decides, as the other walk has no
+  // budget. A failed probe walks. A cursor continues a timeline walk.
+  let recentPlanEstimatedTextMatchRows: number | undefined;
+  const chooseRecentPlan = async (tsQuery: SQL): Promise<MessageSearchRecentPlan> => {
+    if (walkFrom) return "server_timeline_walk";
+    const timelineWalkAvailable = !membershipParams.channelId
+      && await deps.isServerTimelineWalkEnabled(membershipParams.serverId).catch(() => false);
+    const abort = createBreadthProbeAbort(membershipParams.signal);
+    let estimate: Awaited<ReturnType<typeof probeTextMatchEstimate>>;
+    try {
+      estimate = await probeTextMatchEstimate(tsQuery, abort.signal);
+    } catch (error) {
+      if (membershipParams.signal?.aborted) throw error;
+      return timelineWalkAvailable ? "server_timeline_walk" : "walk";
+    } finally {
+      abort.cleanup();
+    }
+    recentPlanEstimatedTextMatchRows = estimate.estimatedTextMatchRows;
+    if (timelineWalkAvailable) {
+      return chooseMessageSearchRecentPlan(estimate.estimatedTextMatchRows) === "walk"
+        ? "server_timeline_walk"
+        : "text_matches_first";
+    }
+    return estimate.relevanceVerdict === "within_limit" ? "text_matches_first" : "walk";
+  };
+  // The last row the timeline walk may read (null: no more than the budget remain).
+  const loadWalkFrontier = async (): Promise<MessageSearchWalkPosition | null> => {
+    const frontier = await traceQuerySpan({
+      queryName: "messages.search.walk_frontier",
+      phase: "walk_budget_frontier",
+      dbSystem: "postgresql",
+      attrs: {
+        search_walk_budget_rows: deps.walkTimelineRowBudget,
+        search_walk_cursor_present: Boolean(walkFrom),
+      },
+      successAttrs: (result) => ({ row_count: result.rows.length }),
+    }, () => deps.executeSearchSql<{ createdAt: string; messageId: string }>(buildMessageSearchWalkFrontierSql({
+      serverId: membershipParams.serverId,
+      after: membershipParams.after,
+      before: membershipParams.before,
+      from: walkFrom,
+      budget: deps.walkTimelineRowBudget,
+    }), { signal: membershipParams.signal }));
+    const row = frontier.rows[0];
+    return row && frontier.rows.length > 1 ? { createdAt: row.createdAt, messageId: row.messageId } : null;
+  };
+  // The window of the last timeline walk run (undefined: another plan ran).
+  let lastWalkWindow: MessageSearchWalkWindow | undefined;
   const executeSearch = async (tsQuery: SQL | null, mode: "strict_all_terms" | "relaxed_any_term") => {
     const breadth = tsQuery && membershipParams.sort === "relevance"
       ? await probeSearchBreadth(tsQuery)
@@ -692,12 +1177,22 @@ async function searchMessages(
     if (breadth === "over_limit") {
       throw new MessageSearchQueryTooBroadError();
     }
+    const recentPlan: MessageSearchRecentPlan | undefined = tsQuery && membershipParams.sort === "recent"
+      ? await chooseRecentPlan(tsQuery)
+      : undefined;
+    let walkWindow: MessageSearchWalkWindow | undefined;
+    if (recentPlan === "server_timeline_walk") {
+      const through = await loadWalkFrontier();
+      walkWindow = { ...(walkFrom ? { from: walkFrom } : {}), ...(through ? { through } : {}), budget: deps.walkTimelineRowBudget };
+    }
+    lastWalkWindow = walkWindow;
     return traceQuerySpan({
       queryName: "messages.search",
       phase: "visibility_candidates_enrich",
       dbSystem: "postgresql",
       attrs: {
         ...messageSearchParamTraceAttrs({
+          queryTokenCount: queryTokens.length,
           query,
           channelId: membershipParams.channelId,
           senderId: membershipParams.senderId,
@@ -709,21 +1204,53 @@ async function searchMessages(
         }),
         search_text_present: hasSearchText,
         query_match_mode: mode,
+        ...(recentPlan
+          ? {
+            search_recent_plan: recentPlan === "server_timeline_walk"
+              ? "timeline_walk"
+              : recentPlan === "walk" ? "legacy_walk" : "collect_first",
+            ...(recentPlanEstimatedTextMatchRows === undefined
+              ? {}
+              : { recent_plan_estimated_text_match_rows: recentPlanEstimatedTextMatchRows }),
+          }
+          : {}),
+        ...(walkWindow
+          ? {
+            search_walk_budget_rows: deps.walkTimelineRowBudget,
+            search_walk_cursor_present: Boolean(walkWindow.from),
+          }
+          : {}),
         query_plan_shape: !tsQuery
           ? "page_first_single_statement"
-          : membershipParams.sort === "recent"
-            ? "fts_recent_page_first"
-            : "fts_materialized_matches_first",
+          : recentPlan === "server_timeline_walk"
+            ? "fts_recent_server_timeline"
+            : recentPlan === "walk"
+              ? "fts_recent_page_first"
+              : recentPlan === "text_matches_first"
+                ? "fts_recent_text_matches_first"
+                : "fts_text_matches_first",
       },
-      successAttrs: (result) => ({ row_count: result.rows.length }),
+      successAttrs: (result) => ({
+        row_count: result.rows.length,
+        ...(walkWindow
+          ? { search_walk_budget_exhausted: Boolean(walkWindow.through) && result.rows.length <= membershipParams.limit }
+          : {}),
+      }),
     }, () => deps.executeSearchSql<SearchRow>(
-      buildMessageSearchStatement(visibleChannelsSql, membershipParams, tsQuery),
+      buildMessageSearchStatement(
+        recentPlan === "walk" || recentPlan === "server_timeline_walk" ? walkVisibleChannelsSql : visibleChannelsSql,
+        { ...membershipParams, recentPlan, walkWindow },
+        tsQuery,
+      ),
       { signal: membershipParams.signal },
     ));
   };
   try {
     rows = await executeSearch(strictTsQuery, "strict_all_terms");
-    if (rows.rows.length === 0 && fallbackTsQuery && membershipParams.offset === 0) {
+    // An exhausted walk has not finished looking for all the terms, so it
+    // returns incomplete instead of falling back to any term.
+    const strictWalkIncomplete = Boolean(lastWalkWindow?.through) && rows.rows.length <= membershipParams.limit;
+    if (rows.rows.length === 0 && fallbackTsQuery && membershipParams.offset === 0 && !strictWalkIncomplete) {
       fallbackUsed = true;
       rows = await executeSearch(fallbackTsQuery, "relaxed_any_term");
     }
@@ -734,6 +1261,7 @@ async function searchMessages(
       : error;
     addTraceEvent("message_search.query.failed", {
       ...messageSearchParamTraceAttrs({
+        queryTokenCount: queryTokens.length,
         query,
         channelId: membershipParams.channelId,
         senderId: membershipParams.senderId,
@@ -759,11 +1287,24 @@ async function searchMessages(
   const overFetched = rows.rows.length > membershipParams.limit;
   const hasMore = !fallbackUsed && overFetched;
   const visibleRows = overFetched ? rows.rows.slice(0, membershipParams.limit) : rows.rows;
+  // A timeline walk whose budget row exists and whose page did not fill read
+  // its whole window: the matches below that row were never looked at.
+  const walkThrough = lastWalkWindow?.through;
+  const incomplete = Boolean(walkThrough) && !overFetched;
+  const lastVisibleRow = visibleRows[visibleRows.length - 1];
+  const nextWalkPosition: MessageSearchWalkPosition | undefined = !lastWalkWindow
+    ? undefined
+    : incomplete
+      ? walkThrough
+      : hasMore && lastVisibleRow?.walkCreatedAt
+        ? { createdAt: lastVisibleRow.walkCreatedAt, messageId: lastVisibleRow.id }
+        : undefined;
   if (visibleRows.some((row) => row.senderType === "external_projection" && !row.externalMessage)) {
     throw new Error("External projection search row is missing immutable author fact");
   }
   addTraceEvent("message_search.query.finished", {
     ...messageSearchParamTraceAttrs({
+      queryTokenCount: queryTokens.length,
       query,
       channelId: membershipParams.channelId,
       senderId: membershipParams.senderId,
@@ -784,11 +1325,20 @@ async function searchMessages(
     row_count: rows.rows.length,
     visible_row_count: visibleRows.length,
     has_more: hasMore,
+    ...(lastWalkWindow ? { search_walk_budget_exhausted: incomplete } : {}),
   });
 
   return {
     hasMore,
-    results: visibleRows.map((row) => ({
+    ...(incomplete && walkThrough
+      ? {
+        incomplete: true as const,
+        searchedThrough: new Date(walkThrough.createdAt).toISOString(),
+        searchedMessages: lastWalkWindow?.budget ?? 0,
+      }
+      : {}),
+    ...(nextWalkPosition ? { nextCursor: encodeMessageSearchWalkCursor(nextWalkPosition) } : {}),
+    results: visibleRows.map(({ walkCreatedAt: _walkCreatedAt, ...row }) => ({
       ...row,
       seq: normalizeSeq(row.seq),
       snippet: buildSnippet(row.content, queryTokens),
@@ -799,6 +1349,13 @@ async function searchMessages(
   };
 }
 
+/**
+ * Channels one human can search. A thread's parent channel comes from
+ * channels.parent_channel_id (0297: trigger-derived from the parent message,
+ * NULL when the thread has none), so resolving visibility never reads
+ * messages. The parent must be in this server: a thread whose parent message
+ * lives in another server's channel is not visible here.
+ */
 export function buildUserVisibleChannelsSql(params: {
   serverId: string;
   userId: string;
@@ -814,11 +1371,10 @@ export function buildUserVisibleChannelsSql(params: {
       visible_channels.id AS id,
       COALESCE(parent_channels.id, visible_channels.id) AS parent_channel_id
     FROM channels visible_channels
-    LEFT JOIN messages pm
-      ON visible_channels.type = 'thread'
-     AND pm.id = visible_channels.parent_message_id
     LEFT JOIN channels parent_channels
-      ON parent_channels.id = pm.channel_id
+      ON visible_channels.type = 'thread'
+     AND parent_channels.id = visible_channels.parent_channel_id
+     AND parent_channels.server_id = visible_channels.server_id
     JOIN server_members sm
       ON sm.server_id = visible_channels.server_id
      AND sm.user_id = ${params.userId}
@@ -829,6 +1385,8 @@ export function buildUserVisibleChannelsSql(params: {
       ON pch.channel_id = parent_channels.id
      AND pch.user_id = ${params.userId}
     WHERE visible_channels.server_id = ${params.serverId}
+      AND visible_channels.deleted_at IS NULL
+      AND parent_channels.deleted_at IS NULL
       AND ${explicitRootFilter ?? sql`(
         visible_channels.type = 'channel'
         OR (visible_channels.type IN ('private', 'dm') AND ch.user_id IS NOT NULL)
@@ -843,6 +1401,13 @@ export function buildUserVisibleChannelsSql(params: {
   `;
 }
 
+/**
+ * Channels one agent can search: public channels, its private/DM channels, and
+ * the live threads under each, found from the parent side through
+ * idx_channels_thread_parent_channel (parent_channel_id, id), so the cost
+ * follows the visible parent channels, not every thread in the server, and
+ * never reads messages.
+ */
 export function buildAgentVisibleChannelsSql(params: {
   serverId: string;
   agentId: string;
@@ -854,6 +1419,7 @@ export function buildAgentVisibleChannelsSql(params: {
     FROM channels public_channels
     WHERE public_channels.server_id = ${params.serverId}
       AND public_channels.type = 'channel'
+      AND public_channels.deleted_at IS NULL
 
     UNION ALL
 
@@ -866,38 +1432,102 @@ export function buildAgentVisibleChannelsSql(params: {
     WHERE ca.agent_id = ${params.agentId}
       AND member_channels.server_id = ${params.serverId}
       AND member_channels.type IN ('private', 'dm')
+      AND member_channels.deleted_at IS NULL
 
     UNION ALL
 
     SELECT
       tc.id AS id,
       pc.id AS parent_channel_id
-    FROM channels tc
-    JOIN messages pm
-      ON pm.id = tc.parent_message_id
-    JOIN channels pc
-      ON pc.id = pm.channel_id
-    WHERE tc.server_id = ${params.serverId}
-      AND tc.type = 'thread'
+    FROM channels pc
+    JOIN channels tc
+      ON tc.parent_channel_id = pc.id
+     AND tc.type = 'thread'
+     AND tc.deleted_at IS NULL
+    WHERE pc.server_id = ${params.serverId}
       AND pc.type = 'channel'
+      AND pc.deleted_at IS NULL
+      AND tc.server_id = ${params.serverId}
 
     UNION ALL
 
     SELECT
       tc.id AS id,
       pc.id AS parent_channel_id
-    FROM channels tc
-    JOIN messages pm
-      ON pm.id = tc.parent_message_id
+    FROM channel_agents pca
     JOIN channels pc
-      ON pc.id = pm.channel_id
-    JOIN channel_agents pca
-      ON pca.channel_id = pc.id
-     AND pca.agent_id = ${params.agentId}
-    WHERE tc.server_id = ${params.serverId}
-      AND tc.type = 'thread'
+      ON pc.id = pca.channel_id
+    JOIN channels tc
+      ON tc.parent_channel_id = pc.id
+     AND tc.type = 'thread'
+     AND tc.deleted_at IS NULL
+    WHERE pca.agent_id = ${params.agentId}
+      AND pc.server_id = ${params.serverId}
       AND pc.type IN ('private', 'dm')
+      AND pc.deleted_at IS NULL
+      AND tc.server_id = ${params.serverId}
   `;
+}
+
+/**
+ * The agent's visible channels (same set as buildAgentVisibleChannelsSql) as
+ * one join from the channel side, like buildUserVisibleChannelsSql: joined to
+ * messages, it resolves each message's channel by primary key. For the recent
+ * walk only; the UNION form stays the one to enumerate the whole set.
+ */
+export function buildAgentVisibleChannelsRowCheckSql(params: {
+  serverId: string;
+  agentId: string;
+}): SQL {
+  return sql`
+    SELECT
+      visible_channels.id AS id,
+      COALESCE(parent_channels.id, visible_channels.id) AS parent_channel_id
+    FROM channels visible_channels
+    LEFT JOIN channels parent_channels
+      ON visible_channels.type = 'thread'
+     AND parent_channels.id = visible_channels.parent_channel_id
+     AND parent_channels.server_id = visible_channels.server_id
+    LEFT JOIN channel_agents ca
+      ON ca.channel_id = visible_channels.id
+     AND ca.agent_id = ${params.agentId}
+    LEFT JOIN channel_agents pca
+      ON pca.channel_id = parent_channels.id
+     AND pca.agent_id = ${params.agentId}
+    WHERE visible_channels.server_id = ${params.serverId}
+      AND visible_channels.deleted_at IS NULL
+      AND parent_channels.deleted_at IS NULL
+      AND (
+        visible_channels.type = 'channel'
+        OR (visible_channels.type IN ('private', 'dm') AND ca.agent_id IS NOT NULL)
+        OR (
+          visible_channels.type = 'thread'
+          AND (
+            parent_channels.type = 'channel'
+            OR (parent_channels.type IN ('private', 'dm') AND pca.agent_id IS NOT NULL)
+          )
+        )
+      )
+  `;
+}
+
+export interface MessageSearchPage {
+  results: MessageSearchResult[];
+  hasMore: boolean;
+  /**
+   * The server timeline walk used up its row budget before the page filled:
+   * these are not all the matches. Continue with nextCursor.
+   */
+  incomplete?: true;
+  /**
+   * Server timeline walk only, when hasMore or incomplete: pass back as the
+   * cursor (offset 0) to continue strictly below what this page covered.
+   */
+  nextCursor?: MessageSearchWalkCursor;
+  /** incomplete only: the oldest message time the walk read (ISO). */
+  searchedThrough?: string;
+  /** incomplete only: how many messages the walk read (newest first, from the cursor). */
+  searchedMessages?: number;
 }
 
 export async function searchMessagesForUser(params: {
@@ -913,9 +1543,10 @@ export async function searchMessagesForUser(params: {
   sort?: MessageSearchSort;
   limit?: number;
   offset?: number;
+  cursor?: MessageSearchWalkCursor;
   signal?: AbortSignal;
   allowedRootChannelIds?: readonly string[];
-}): Promise<{ results: MessageSearchResult[]; hasMore: boolean }> {
+}): Promise<MessageSearchPage> {
   return searchMessages(
     buildUserVisibleChannelsSql({
       serverId: params.serverId,
@@ -931,8 +1562,12 @@ export async function searchMessagesForUser(params: {
       after: params.after,
       before: params.before,
       sort: params.sort ?? "relevance",
-      limit: Math.min(params.limit ?? 20, 50),
+      limit: Math.min(
+        params.limit ?? AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
+        AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+      ),
       offset: Math.max(params.offset ?? 0, 0),
+      cursor: params.cursor,
       signal: params.signal,
     },
     params.query,
@@ -952,8 +1587,9 @@ export async function searchMessagesForAgent(params: {
   sort?: MessageSearchSort;
   limit?: number;
   offset?: number;
+  cursor?: MessageSearchWalkCursor;
   signal?: AbortSignal;
-}): Promise<{ results: MessageSearchResult[]; hasMore: boolean }> {
+}): Promise<MessageSearchPage> {
   return searchMessages(
     buildAgentVisibleChannelsSql({
       serverId: params.serverId,
@@ -968,11 +1604,19 @@ export async function searchMessagesForAgent(params: {
       after: params.after,
       before: params.before,
       sort: params.sort ?? "relevance",
-      limit: Math.min(params.limit ?? 20, 50),
+      limit: Math.min(
+        params.limit ?? AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
+        AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+      ),
       offset: Math.max(params.offset ?? 0, 0),
+      cursor: params.cursor,
       signal: params.signal,
     },
     params.query,
+    buildAgentVisibleChannelsRowCheckSql({
+      serverId: params.serverId,
+      agentId: params.agentId,
+    }),
   );
 }
 

@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, screen } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -102,7 +101,7 @@ test("PaletteAuditPage renders zh-cn audit chrome", () => {
   renderWithIntl(<PaletteAuditPage />, { locale: "zh-cn" });
 
   assert.ok(screen.getByText("调色板审查"));
-  assert.ok(screen.getByText("真实界面中的 Brutal 调色板"));
+  assert.ok(screen.getByText("真实界面中的 Raft 调色板"));
   // solidTints renders once per ColorRow (one swatch scale per palette token).
   assert.ok(screen.getAllByText("纯色 + 淡化").length >= 1);
   assert.ok(screen.getByText("引用消息内容"));

@@ -1,21 +1,24 @@
 import { createHash, randomBytes } from "node:crypto";
 
 import {
+  currentDate,
   SLACK_BRIDGE_PROVISIONING_PROTOCOL_VERSION,
   type SlackBridgeChannelPair,
   type SlackBridgePreflight,
   type SlackBridgeProvisioningResponse,
   type SlackBridgeRawHealth,
 } from "@botiverse/raft-shared";
-import { and, desc, eq, gt, inArray, isNull, notInArray, or } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, ne, notInArray, or } from "drizzle-orm";
 
 import {
   getDb,
   type Database,
   type DatabaseExecutor,
   type DatabaseTransaction,
-} from "../db/index.js";
+} from "../db/index";
 import {
+  agents,
+  channelAgents,
   channelHumans,
   channels,
   externalActorProjections,
@@ -23,13 +26,14 @@ import {
   externalAppCredentials,
   externalAppIngressEndpoints,
   externalAppInstallGrantReceipts,
+  externalAppInstallServerGrants,
   externalAppInstalls,
   externalAppRegistrations,
   externalAppRegistrationSecrets,
   externalAppServerGrants,
-  externalAuthorPolicies,
   externalBindingAudienceSnapshots,
   externalChannelBindings,
+  externalDeliveryPartitions,
   externalHumanIdentityLinks,
   jointChannels,
   jointChannelServers,
@@ -45,24 +49,33 @@ import {
   oauthClients,
   oauthGrants,
   serverMembers,
+  servers,
   thirdPartyAgentEvents,
   users,
-} from "../db/schema.js";
+} from "../db/schema";
 import {
   type SlackBridgeProvisioningControlPlane,
   type SlackBridgeProvisioningRequestAuthority,
-} from "../routes/slackBridge.js";
-import { ExternalAppControlPlaneError } from "./externalAppControlPlaneService.js";
-import { effectiveUserSenderName } from "./effectiveSenderName.js";
+} from "../routes/slackBridge";
+import { ExternalAppControlPlaneError } from "./externalAppControlPlaneService";
 import {
+  applySlackInstallGrantScopeDrift,
+  classifySlackInstallGrantObservation,
   SLACK_BRIDGE_INSTALL_GRANT_FRESHNESS_MS,
+  slackBridgeGrantScopesSupportRuntime,
   slackBridgeInstallGrantHash,
   slackBridgeInstallGrantMatchesInstall,
-} from "./slackBridgeInstallGrantService.js";
+} from "./slackBridgeInstallGrantService";
 import {
+  SLACK_BRIDGE_AGENT_MENTION_BOT_SCOPES,
   SLACK_BRIDGE_ACTIVE_BOT_SCOPES,
   SLACK_BRIDGE_REQUIRED_BOT_SCOPES,
-} from "./slackBridgeProductionAppContract.js";
+} from "./slackBridgeProductionAppContract";
+import { slackPrivacyFreshUntil } from "./slackBindingPrivacyFreshnessService";
+import { projectSlackBindingLifecycle } from "./slackBindingLifecycleService";
+import { resolveExternalInstallServerGrantAuthority } from "./externalInstallServerGrantAuthority";
+import { effectiveAgentSenderName } from "./effectiveSenderName";
+import { filterChannelIdsVisibleToHuman } from "./channelService";
 
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -75,12 +88,15 @@ const PROVISIONING_PASSED_REASON = "provisioning_preflight_passed";
 const PROVISIONING_REPLACED_REASON = "provisioning_pair_replaced";
 const PROVISIONING_REMOVED_REASON = "provisioning_pair_removed";
 const PROVISIONING_UNBOUND_REASON = "manager_unbound_workspace";
+// Written by completeExternalOAuthAttempt when an active install is re-authorized.
+const PROVIDER_REAUTHORIZED_REASON = "provider_reauthorized_review_required";
 
 type Tx = DatabaseTransaction;
 type Install = typeof externalAppInstalls.$inferSelect;
 type Credential = typeof externalAppCredentials.$inferSelect;
 type Binding = typeof externalChannelBindings.$inferSelect;
 type InstallGrantReceipt = typeof externalAppInstallGrantReceipts.$inferSelect;
+type InstallServerGrant = typeof externalAppInstallServerGrants.$inferSelect;
 
 export interface SlackBridgeProvisioningSecretAuthority {
   encryptedSecretRef: string;
@@ -162,9 +178,63 @@ export interface SlackBridgeProvisioningInstallGrant {
   grantedScopes: readonly string[];
 }
 
+export interface SlackBridgeAgentMentionCandidate {
+  serverId: string;
+  agentId: string;
+  name: string;
+  displayName: string;
+  serverSlug: string;
+  serverName: string;
+}
+
+export interface SlackBridgeAgentMentionHandle {
+  agentId: string;
+  providerUsergroupId: string;
+  handle: string;
+}
+
+/**
+ * A principal that could not be reconciled this round, with Slack's error
+ * when one was observed. Agents carry `agentId`, humans `userId`.
+ */
+export type SlackBridgeAgentMentionReconcileFailure = (
+  | { agentId: string; userId?: never }
+  | { userId: string; agentId?: never }
+) & {
+  slackError: string | null;
+  // Transient failures (lease/transport/429/5xx) should not downgrade the
+  // persisted sync state or surface workspace-policy hints to the operator.
+  transient: boolean;
+};
+
+/** A Raft human in a Slack-paired channel, mentionable via a managed usergroup. */
+export interface SlackBridgeHumanMentionCandidate {
+  serverId: string;
+  userId: string;
+  name: string;
+  displayName: string;
+  serverSlug: string;
+  serverName: string;
+}
+
+export interface SlackBridgeHumanMentionHandle {
+  userId: string;
+  providerUsergroupId: string;
+  handle: string;
+}
+
+/**
+ * Agents and humans share one reconcile call (one usergroups.list, one handle
+ * namespace) and one request budget: Agents first, humans fill the rest.
+ */
+export const SLACK_BRIDGE_MENTION_HANDLE_RECONCILE_LIMIT = 200;
+
 export type SlackBridgeProvisioningProviderResult<T> =
   | { kind: "fact"; fact: T }
-  | { kind: "failed" }
+  // Slack's `error` payload field (e.g. "restricted_action", "name_taken")
+  // travels with deterministic failures so callers can persist and render
+  // actionable recovery hints instead of an opaque "failed".
+  | { kind: "failed"; slackError?: string }
   | { kind: "unverified" };
 
 export interface SlackBridgeProvisioningProvider {
@@ -183,6 +253,31 @@ export interface SlackBridgeProvisioningProvider {
     providerMemberIds: readonly string[];
     users: readonly SlackBridgeProvisioningProviderUser[];
   }>>;
+  reconcileAgentMentionHandles?(
+    input: SlackBridgeProvisioningProviderAuthority,
+    request: {
+      serverId: string;
+      candidates: readonly SlackBridgeAgentMentionCandidate[];
+      /**
+       * Omitted: human usergroups are left untouched (Agent-only reconcile).
+       * Present (even empty): human groups are reconciled to exactly this set.
+       */
+      humanCandidates?: readonly SlackBridgeHumanMentionCandidate[];
+      /**
+       * Cross-replica claim check, consulted before every usergroup write.
+       * Once it reports false the reconcile issues no further write and
+       * returns `unverified`. Omitted: the caller is the only writer.
+       */
+      isClaimHeld?(): Promise<boolean>;
+    },
+  ): Promise<SlackBridgeProvisioningProviderResult<{
+    handles: readonly SlackBridgeAgentMentionHandle[];
+    humanHandles?: readonly SlackBridgeHumanMentionHandle[];
+    // Principals (Agents and humans) that could not be reconciled this round,
+    // with Slack's error when one was observed. Empty when every candidate
+    // succeeded.
+    failures: readonly SlackBridgeAgentMentionReconcileFailure[];
+  }>>;
 }
 
 export interface SlackBridgeProvisioningControlPlaneDependencies {
@@ -190,7 +285,6 @@ export interface SlackBridgeProvisioningControlPlaneDependencies {
   bootstrap: SlackBridgeProvisioningBootstrapAuthority;
   provider: SlackBridgeProvisioningProvider;
   avatarMaterializer?: SlackBridgeAvatarMaterializer;
-  authorAvatarMaterializer?(policyId: string): Promise<unknown>;
 }
 
 export interface SlackBridgeAvatarMaterializer {
@@ -204,6 +298,7 @@ export interface SlackBridgeAvatarMaterializer {
 
 interface CurrentAuthority {
   grant: typeof externalAppServerGrants.$inferSelect | null;
+  installServerGrant: InstallServerGrant | null;
   install: Install | null;
   credential: Credential | null;
   installGrantReceipt: InstallGrantReceipt | null;
@@ -215,6 +310,12 @@ interface ProviderObservation {
   workspaceName: string | null;
   channels: SlackBridgeProvisioningProviderChannel[];
 }
+
+// Who a read projection is for. Managers see the full setup state; members
+// see it read-only, narrowed to the Raft channels they can view.
+type SlackBridgeProvisioningViewer =
+  | { kind: "manager" }
+  | { kind: "member"; userId: string };
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
@@ -230,6 +331,7 @@ function exactStrings(left: readonly string[], right: readonly string[]): boolea
   return a.length === b.length && a.every((value, index) => value === b[index]);
 }
 
+
 function validDate(value: Date): boolean {
   return value instanceof Date && Number.isFinite(value.getTime());
 }
@@ -241,6 +343,148 @@ function validHttps(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+export async function listSlackBridgeAgentMentionCandidates(
+  executor: DatabaseExecutor,
+  serverId: string,
+  bindings: readonly Binding[],
+): Promise<SlackBridgeAgentMentionCandidate[]> {
+  const channelIds = [...new Set(bindings.map((binding) => binding.channelId))];
+  if (channelIds.length === 0) return [];
+  const rows = await executor.select({
+    agentId: agents.id,
+    name: agents.name,
+    displayName: agents.displayName,
+    serverSlug: servers.slug,
+    serverName: servers.name,
+  }).from(channelAgents)
+    .innerJoin(agents, and(
+      eq(agents.id, channelAgents.agentId),
+      eq(agents.serverId, serverId),
+      isNull(agents.deletedAt),
+    ))
+    .innerJoin(servers, eq(servers.id, agents.serverId))
+    .where(inArray(channelAgents.channelId, channelIds));
+  return [...new Map(rows.map((row) => [row.agentId, {
+    serverId,
+    agentId: row.agentId,
+    name: row.name,
+    displayName: effectiveAgentSenderName(row),
+    serverSlug: row.serverSlug,
+    serverName: row.serverName,
+  }])).values()].sort((left, right) => left.agentId.localeCompare(right.agentId));
+}
+
+export type SlackBridgeMentionSyncState = NonNullable<
+  (typeof externalAppInstalls.$inferSelect)["agentMentionSync"]
+>;
+
+/**
+ * Persisted mention-usergroup sync state for one reconcile result; counts
+ * Agents and humans together. `null` for transport-level "unverified", which
+ * must not rewrite the stored state.
+ */
+export function slackBridgeMentionSyncState(input: {
+  reconciled: SlackBridgeProvisioningProviderResult<{
+    handles: readonly SlackBridgeAgentMentionHandle[];
+    humanHandles?: readonly SlackBridgeHumanMentionHandle[];
+    failures: readonly SlackBridgeAgentMentionReconcileFailure[];
+  }>;
+  candidates: readonly SlackBridgeAgentMentionCandidate[];
+  humanCandidates: readonly SlackBridgeHumanMentionCandidate[];
+  observedAt: Date;
+}): SlackBridgeMentionSyncState | null {
+  const { reconciled } = input;
+  const expected = input.candidates.length + input.humanCandidates.length;
+  const observedAt = input.observedAt.toISOString();
+  if (reconciled.kind === "unverified") return null;
+  if (reconciled.kind === "failed") {
+    return {
+      state: "degraded",
+      slackError: reconciled.slackError ?? null,
+      expected,
+      actual: 0,
+      observedAt,
+    };
+  }
+  const agentIds = new Set(reconciled.fact.handles.map((handle) => handle.agentId));
+  const userIds = new Set((reconciled.fact.humanHandles ?? []).map((handle) => handle.userId));
+  const actual = input.candidates.filter((candidate) => agentIds.has(candidate.agentId)).length
+    + input.humanCandidates.filter((candidate) => userIds.has(candidate.userId)).length;
+  if (actual === expected && reconciled.fact.failures.length === 0) {
+    return { state: "synced", slackError: null, expected, actual, observedAt };
+  }
+  return {
+    state: "degraded",
+    slackError: reconciled.fact.failures.find(
+      (failure) => !failure.transient && failure.slackError,
+    )?.slackError ?? null,
+    expected,
+    actual,
+    observedAt,
+  };
+}
+
+/**
+ * Raft humans who are members of the server's paired channels for this
+ * install, deterministic by user id and capped at `limit` (the caller passes
+ * the budget left after Agents). Retired accounts are excluded.
+ */
+export async function listSlackBridgeHumanMentionCandidates(
+  executor: DatabaseExecutor,
+  serverId: string,
+  bindings: readonly Binding[],
+  limit: number,
+): Promise<SlackBridgeHumanMentionCandidate[]> {
+  const channelIds = [...new Set(bindings.map((binding) => binding.channelId))];
+  if (channelIds.length === 0 || limit <= 0) return [];
+  const rows = await executor.selectDistinct({
+    userId: users.id,
+    name: users.name,
+    displayName: users.displayName,
+    serverSlug: servers.slug,
+    serverName: servers.name,
+  }).from(channelHumans)
+    .innerJoin(channels, and(
+      eq(channels.id, channelHumans.channelId),
+      eq(channels.serverId, serverId),
+    ))
+    .innerJoin(users, and(
+      eq(users.id, channelHumans.userId),
+      isNull(users.retiredAt),
+    ))
+    .innerJoin(servers, eq(servers.id, channels.serverId))
+    .where(inArray(channelHumans.channelId, channelIds))
+    .orderBy(users.id)
+    .limit(limit);
+  return rows.map((row) => ({
+    serverId,
+    userId: row.userId,
+    name: row.name,
+    displayName: row.displayName?.trim() || row.name,
+    serverSlug: row.serverSlug,
+    serverName: row.serverName,
+  }));
+}
+
+/** Agent + human candidates for one server/install within the shared budget. */
+export async function listSlackBridgeMentionCandidates(
+  executor: DatabaseExecutor,
+  serverId: string,
+  bindings: readonly Binding[],
+): Promise<{
+  candidates: SlackBridgeAgentMentionCandidate[];
+  humanCandidates: SlackBridgeHumanMentionCandidate[];
+}> {
+  const candidates = await listSlackBridgeAgentMentionCandidates(executor, serverId, bindings);
+  const humanCandidates = await listSlackBridgeHumanMentionCandidates(
+    executor,
+    serverId,
+    bindings,
+    SLACK_BRIDGE_MENTION_HANDLE_RECONCILE_LIMIT - candidates.length,
+  );
+  return { candidates, humanCandidates };
 }
 
 function requireManagerInput(input: SlackBridgeProvisioningRequestAuthority): void {
@@ -278,6 +522,31 @@ async function requireManager(
   }
 }
 
+// Reading the setup state needs server membership (Guests excluded); every
+// mutation stays behind requireManager. Members get the privacy-narrowed projection.
+async function requireReader(
+  executor: Database,
+  input: SlackBridgeProvisioningRequestAuthority,
+): Promise<SlackBridgeProvisioningViewer> {
+  requireManagerInput(input);
+  const [membership] = await executor.select({ role: serverMembers.role })
+    .from(serverMembers)
+    .where(and(
+      eq(serverMembers.serverId, input.serverId),
+      eq(serverMembers.userId, input.requestingUserId),
+    ))
+    .limit(1);
+  if (!membership || membership.role === "guest") {
+    throw new ExternalAppControlPlaneError(
+      "Slack Bridge provisioning operation is not authorized",
+      "external_app_not_authorized",
+    );
+  }
+  return membership.role === "owner" || membership.role === "admin"
+    ? { kind: "manager" }
+    : { kind: "member", userId: input.requestingUserId };
+}
+
 function assertBootstrap(bootstrap: SlackBridgeProvisioningBootstrapAuthority): void {
   if (
     !UUID_PATTERN.test(bootstrap.registrationId)
@@ -302,26 +571,117 @@ function assertBootstrap(bootstrap: SlackBridgeProvisioningBootstrapAuthority): 
   }
 }
 
+function registrationMatchesBootstrapIdentity(
+  registration: typeof externalAppRegistrations.$inferSelect,
+  bootstrap: SlackBridgeProvisioningBootstrapAuthority,
+): boolean {
+  return registration.id === bootstrap.registrationId
+    && registration.provider === "slack"
+    && registration.environment === bootstrap.environment
+    && registration.state === "active"
+    && registration.providerAppId === bootstrap.providerAppId
+    && registration.providerOAuthClientId === bootstrap.providerOAuthClientId
+    && registration.capabilityManifestVersion === bootstrap.capabilityManifestVersion
+    && exactStrings(registration.requiredCapabilities, bootstrap.requiredCapabilities);
+}
+
 function assertRegistration(
   registration: typeof externalAppRegistrations.$inferSelect,
   bootstrap: SlackBridgeProvisioningBootstrapAuthority,
 ): void {
   if (
-    registration.id !== bootstrap.registrationId
-    || registration.provider !== "slack"
-    || registration.environment !== bootstrap.environment
-    || registration.state !== "active"
-    || registration.providerAppId !== bootstrap.providerAppId
-    || registration.providerOAuthClientId !== bootstrap.providerOAuthClientId
-    || registration.capabilityManifestVersion !== bootstrap.capabilityManifestVersion
+    !registrationMatchesBootstrapIdentity(registration, bootstrap)
     || registration.capabilityManifestHash !== bootstrap.capabilityManifestHash
-    || !exactStrings(registration.requiredCapabilities, bootstrap.requiredCapabilities)
   ) {
     throw new ExternalAppControlPlaneError(
       "Slack Bridge registration conflicts with runtime authority",
       "external_app_install_conflict",
     );
   }
+}
+
+// The capability-manifest hash covers the code-owned scope list
+// (`slackBridgeProvisioningManifestHash`), so shipping a scope change (e.g.
+// usergroups:* for agent mentions) drifts every existing registration row.
+//
+// Why moving the recorded hash forward is safe: the manifest hash records
+// what the *code* expects the app definition to look like, not which scopes
+// any install actually holds — granted scopes live on `installed_scopes` and
+// can only grow through a fresh Slack OAuth (the provider will not mint
+// usergroups:* onto an existing token). `granted_capabilities` and the
+// manifest version are checked separately and must match, so this repair
+// only re-pins the content fingerprint; it never enlarges what a server
+// admin consented to in capability terms, and an install without the new
+// scopes simply keeps running with the old scope set (degrade contract).
+//
+// MUST run inside a transaction and MUST validate every active grant before
+// writing: a partial repair (registration moved, grants left behind) would
+// wedge the drift permanently because the registration hash already matches
+// on the next call. Callers pass `db` when not already in a transaction.
+async function reconcileRegistrationManifestDrift(input: {
+  db: Database;
+  executor: Database | Tx;
+  bootstrap: SlackBridgeProvisioningBootstrapAuthority;
+  registration: typeof externalAppRegistrations.$inferSelect;
+  now: Date;
+}): Promise<void> {
+  const { bootstrap, registration, now, db, executor } = input;
+  const run = async (tx: Database | Tx): Promise<void> => {
+    const previousManifestHash = registration.capabilityManifestHash;
+    // Validate before any write: a grant under an unrelated hash means we
+    // cannot prove what it authorized — conflict out with nothing changed.
+    const activeGrants = await tx.select({
+      id: externalAppServerGrants.id,
+      grantedManifestVersion: externalAppServerGrants.grantedManifestVersion,
+      grantedManifestHash: externalAppServerGrants.grantedManifestHash,
+    }).from(externalAppServerGrants).where(and(
+      eq(externalAppServerGrants.registrationId, registration.id),
+      eq(externalAppServerGrants.state, "active"),
+    )).for("update");
+    const unrepairable = activeGrants.filter((grant) =>
+      grant.grantedManifestVersion !== bootstrap.capabilityManifestVersion
+      || (grant.grantedManifestHash !== previousManifestHash
+        && grant.grantedManifestHash !== bootstrap.capabilityManifestHash));
+    if (unrepairable.length > 0) {
+      throw new ExternalAppControlPlaneError(
+        "Slack Bridge active grant manifest authority is ambiguous",
+        "external_app_install_conflict",
+      );
+    }
+    const [updated] = await tx.update(externalAppRegistrations)
+      .set({ capabilityManifestHash: bootstrap.capabilityManifestHash, updatedAt: now })
+      .where(and(
+        eq(externalAppRegistrations.id, registration.id),
+        eq(externalAppRegistrations.capabilityManifestHash, previousManifestHash),
+      ))
+      .returning({ id: externalAppRegistrations.id });
+    if (!updated) {
+      throw new ExternalAppControlPlaneError(
+        "Slack Bridge registration manifest changed during reconcile",
+        "external_app_install_conflict",
+      );
+    }
+    const driftedIds = activeGrants
+      .filter((grant) => grant.grantedManifestHash === previousManifestHash)
+      .map((grant) => grant.id);
+    if (driftedIds.length > 0) {
+      await tx.update(externalAppServerGrants)
+        .set({ grantedManifestHash: bootstrap.capabilityManifestHash, updatedAt: now })
+        .where(inArray(externalAppServerGrants.id, driftedIds));
+    }
+    console.warn("[Slock] Slack Bridge registration manifest drift reconciled", JSON.stringify({
+      registrationId: registration.id,
+      previousManifestHash,
+      capabilityManifestHash: bootstrap.capabilityManifestHash,
+      repairedGrantCount: driftedIds.length,
+    }));
+  };
+  if (executor === db) {
+    await db.transaction(async (tx) => run(tx as Tx));
+  } else {
+    await run(executor);
+  }
+  registration.capabilityManifestHash = bootstrap.capabilityManifestHash;
 }
 
 export type SlackBridgeOAuthIdentityAppType = "slock_builtin" | "third_party_global";
@@ -424,6 +784,18 @@ export async function reconcileSlackBridgeOAuthIdentityAppType(input: {
       identityMigrationConflict("Slack Bridge OAuth identity registration is missing or ambiguous");
     }
     const registration = registrations[0]!;
+    if (
+      registration.capabilityManifestHash !== input.bootstrap.capabilityManifestHash
+      && registrationMatchesBootstrapIdentity(registration, input.bootstrap)
+    ) {
+      await reconcileRegistrationManifestDrift({
+        db,
+        executor: tx,
+        bootstrap: input.bootstrap,
+        registration,
+        now: currentDate(),
+      });
+    }
     assertRegistration(registration, input.bootstrap);
 
     const clients = await tx.select().from(oauthClients)
@@ -590,6 +962,8 @@ export async function reconcileSlackBridgeOAuthIdentityAppType(input: {
 async function assertBootstrapRows(
   executor: Database | Tx,
   bootstrap: SlackBridgeProvisioningBootstrapAuthority,
+  now: Date,
+  db: Database,
 ): Promise<typeof externalAppRegistrations.$inferSelect | null> {
   const registrations = await executor.select().from(externalAppRegistrations)
     .where(eq(externalAppRegistrations.id, bootstrap.registrationId)).limit(2);
@@ -601,6 +975,12 @@ async function assertBootstrapRows(
     );
   }
   const registration = registrations[0]!;
+  if (
+    registration.capabilityManifestHash !== bootstrap.capabilityManifestHash
+    && registrationMatchesBootstrapIdentity(registration, bootstrap)
+  ) {
+    await reconcileRegistrationManifestDrift({ db, executor, bootstrap, registration, now });
+  }
   assertRegistration(registration, bootstrap);
   const clients = await executor.select().from(oauthClients)
     .where(eq(oauthClients.id, registration.oauthClientId)).limit(2);
@@ -675,10 +1055,24 @@ async function loadCurrentAuthority(
     );
   }
   const grant = grants[0] ?? null;
-  const installs = await db.select().from(externalAppInstalls).where(and(
-    eq(externalAppInstalls.serverId, serverId),
-    eq(externalAppInstalls.registrationId, bootstrap.registrationId),
-  )).orderBy(desc(externalAppInstalls.updatedAt)).limit(2);
+  const installServerGrants = await db.select().from(externalAppInstallServerGrants).where(and(
+    eq(externalAppInstallServerGrants.serverId, serverId),
+    eq(externalAppInstallServerGrants.registrationId, bootstrap.registrationId),
+    eq(externalAppInstallServerGrants.state, "active"),
+  )).orderBy(desc(externalAppInstallServerGrants.updatedAt)).limit(2);
+  if (installServerGrants.length > 1) {
+    throw new ExternalAppControlPlaneError(
+      "Slack Bridge server has multiple current workspace authorities",
+      "external_app_install_conflict",
+    );
+  }
+  const installServerGrant = installServerGrants[0] ?? null;
+  const installs = installServerGrant
+    ? await db.select().from(externalAppInstalls).where(and(
+      eq(externalAppInstalls.id, installServerGrant.installId),
+      eq(externalAppInstalls.registrationId, bootstrap.registrationId),
+    )).limit(2)
+    : [];
   if (installs.length > 1 && installs.filter((install) => install.state !== "revoked").length > 1) {
     throw new ExternalAppControlPlaneError(
       "Slack Bridge server has multiple current workspace installs",
@@ -712,6 +1106,7 @@ async function loadCurrentAuthority(
     : [];
   return {
     grant,
+    installServerGrant,
     install,
     credential: credentials[0] ?? null,
     installGrantReceipt: installGrantReceipts[0] ?? null,
@@ -740,12 +1135,16 @@ function currentGrant(
 function currentInstall(authority: CurrentAuthority): Install | null {
   const install = authority.install;
   const grant = authority.grant;
+  const installServerGrant = authority.installServerGrant;
   if (
     !install
     || !grant
+    || !installServerGrant
     || grant.state !== "active"
-    || install.serverGrantId !== grant.id
-    || install.grantEpoch !== grant.grantEpoch
+    || installServerGrant.serverGrantId !== grant.id
+    || installServerGrant.grantEpoch !== grant.grantEpoch
+    || installServerGrant.installId !== install.id
+    || installServerGrant.registrationId !== install.registrationId
   ) return null;
   return install;
 }
@@ -865,14 +1264,6 @@ async function observeInstallGrant(
   }
 }
 
-function installGrantMatchesAuthority(
-  authority: CurrentAuthority,
-  grant: SlackBridgeProvisioningInstallGrant,
-): boolean {
-  const install = currentInstall(authority);
-  return Boolean(install && slackBridgeInstallGrantMatchesInstall(install, grant));
-}
-
 export async function listSlackBridgeRaftConversationTargets(db: Database, serverId: string) {
   const ordinary = await db.select({ id: channels.id, name: channels.name, type: channels.type })
     .from(channels)
@@ -944,7 +1335,6 @@ async function currentConversationAuthorityStatus(
     providerAuthorityId: externalAppInstalls.providerAuthorityId,
   }).from(externalAppInstalls).where(and(
     eq(externalAppInstalls.id, binding.installId),
-    eq(externalAppInstalls.serverId, binding.serverId),
     eq(externalAppInstalls.registrationId, binding.registrationId),
     eq(externalAppInstalls.connectionEpoch, binding.connectionEpoch),
     eq(externalAppInstalls.state, "active"),
@@ -1042,7 +1432,7 @@ function preflightFor(input: {
       : "unverified";
   const endpoint = currentGrant(input.authority, input.bootstrap) ? "passed" : "failed";
   const scope = install?.state === "active"
-    ? exactStrings(install.installedScopes, SLACK_BRIDGE_REQUIRED_BOT_SCOPES)
+    ? slackBridgeGrantScopesSupportRuntime(install.installedScopes)
       ? "passed"
       : "failed"
     : "unverified";
@@ -1077,11 +1467,21 @@ function rawHealth(input: {
 }): SlackBridgeRawHealth {
   const install = input.authority.install;
   const credential = input.authority.credential;
-  const bindings = input.authority.bindings.map((binding) => ({
-    id: binding.id,
-    state: binding.state,
-    bindingEpoch: binding.bindingEpoch,
-  }));
+  const bindings = input.authority.bindings.map((binding) => {
+    const lifecycle = projectSlackBindingLifecycle({
+      installState: install?.state ?? "quarantined",
+      installStateReason: install?.stateReason ?? null,
+      bindingState: binding.state,
+      bindingStateReason: binding.stateReason,
+    });
+    return {
+      id: binding.id,
+      state: binding.state,
+      bindingEpoch: binding.bindingEpoch,
+      stateReason: lifecycle.reason,
+      recoveryAction: lifecycle.recoveryAction,
+    };
+  });
   const failingSurface: SlackBridgeRawHealth["failingSurface"] = !install || install.state !== "active"
     ? "install"
     : !credential || credential.state !== "active"
@@ -1099,7 +1499,7 @@ function rawHealth(input: {
     install: install ? {
       state: install.state,
       epochs: {
-        grant: String(install.grantEpoch),
+        grant: String(input.authority.installServerGrant?.grantEpoch ?? install.grantEpoch),
         connection: String(install.connectionEpoch),
         scope: String(install.scopeRevision),
         credential: String(install.credentialRevision),
@@ -1109,6 +1509,7 @@ function rawHealth(input: {
     bindings,
     audiences: [...input.audiences],
     lastVerifiedAt: install?.lastVerifiedAt?.toISOString() ?? null,
+    agentMentionSync: install?.agentMentionSync ?? null,
     failingSurface,
   };
 }
@@ -1117,7 +1518,6 @@ function stageFor(
   authority: CurrentAuthority,
   preflight: SlackBridgePreflight,
   now: Date,
-  managerHasOutboundConsent: boolean,
 ): SlackBridgeProvisioningResponse["snapshot"]["stage"] {
   const grant = authority.grant;
   const install = currentInstall(authority);
@@ -1127,7 +1527,6 @@ function stageFor(
   if (authority.bindings.some((binding) => binding.state === "active")) {
     return preflight.state === "passed"
       && currentInstallGrantReceipt(authority, now)
-      && managerHasOutboundConsent
       ? "health"
       : "enable";
   }
@@ -1139,120 +1538,29 @@ function stageFor(
   return "preflight";
 }
 
-async function managerHasCurrentOutboundConsent(input: {
-  db: Database;
-  bootstrap: SlackBridgeProvisioningBootstrapAuthority;
-  authority: CurrentAuthority;
-  request: SlackBridgeProvisioningRequestAuthority;
-}): Promise<boolean> {
-  const install = currentInstall(input.authority);
-  const activeBindings = input.authority.bindings.filter((binding) => binding.state === "active");
-  if (!install || activeBindings.length === 0) return true;
-  const policies = await input.db.select().from(externalAuthorPolicies).where(and(
-    eq(externalAuthorPolicies.serverId, input.request.serverId),
-    eq(externalAuthorPolicies.provider, "slack"),
-    eq(externalAuthorPolicies.appRegistrationId, input.bootstrap.registrationId),
-    eq(externalAuthorPolicies.installId, install.id),
-    inArray(externalAuthorPolicies.bindingId, activeBindings.map((binding) => binding.id)),
-    eq(externalAuthorPolicies.authorType, "user"),
-    eq(externalAuthorPolicies.authorId, input.request.requestingUserId),
-    eq(externalAuthorPolicies.state, "granted"),
-  ));
-  return activeBindings.every((binding) => policies.some((policy) =>
-    policy.bindingId === binding.id
-    && policy.bindingEpoch === binding.bindingEpoch
-    && policy.consentRevision === binding.bindingEpoch));
-}
-
-async function grantManagerCurrentOutboundConsent(input: {
-  tx: Tx;
-  bootstrap: SlackBridgeProvisioningBootstrapAuthority;
-  install: Install;
-  bindings: readonly Binding[];
-  request: SlackBridgeProvisioningRequestAuthority;
-}): Promise<void> {
-  const [manager] = await input.tx.select({ name: users.name, displayName: users.displayName })
-    .from(users)
-    .where(eq(users.id, input.request.requestingUserId))
-    .for("update")
-    .limit(1);
-  if (!manager) {
-    throw new ExternalAppControlPlaneError(
-      "Slack Bridge manager identity is unavailable",
-      "external_app_invalid_state",
-    );
-  }
-  const displayName = effectiveUserSenderName(manager);
-  for (const binding of input.bindings) {
-    const identity = and(
-      eq(externalAuthorPolicies.provider, "slack"),
-      eq(externalAuthorPolicies.installId, input.install.id),
-      eq(externalAuthorPolicies.bindingId, binding.id),
-      eq(externalAuthorPolicies.bindingEpoch, binding.bindingEpoch),
-      eq(externalAuthorPolicies.authorType, "user"),
-      eq(externalAuthorPolicies.authorId, input.request.requestingUserId),
-    );
-    const [existing] = await input.tx.select().from(externalAuthorPolicies)
-      .where(identity)
-      .for("update")
-      .limit(1);
-    if (
-      existing
-      && (
-        existing.serverId !== input.request.serverId
-        || existing.appRegistrationId !== input.bootstrap.registrationId
-        || existing.consentRevision > binding.bindingEpoch
-      )
-    ) {
-      throw new ExternalAppControlPlaneError(
-        "Slack Bridge manager consent conflicts with current binding authority",
-        "external_app_invalid_state",
-      );
-    }
-    const values = {
-      serverId: input.request.serverId,
-      provider: "slack",
-      appRegistrationId: input.bootstrap.registrationId,
-      installId: input.install.id,
-      bindingId: binding.id,
-      bindingEpoch: binding.bindingEpoch,
-      authorType: "user" as const,
-      authorId: input.request.requestingUserId,
-      displayName,
-      fallbackKind: "human" as const,
-      consentRevision: binding.bindingEpoch,
-      state: "granted" as const,
-      updatedAt: input.request.now,
-    };
-    if (existing) {
-      await input.tx.update(externalAuthorPolicies).set(values)
-        .where(eq(externalAuthorPolicies.id, existing.id));
-    } else {
-      await input.tx.insert(externalAuthorPolicies).values({
-        ...values,
-        avatarArtifactId: null,
-        createdAt: input.request.now,
-      }).onConflictDoUpdate({
-        target: [
-          externalAuthorPolicies.provider,
-          externalAuthorPolicies.installId,
-          externalAuthorPolicies.bindingId,
-          externalAuthorPolicies.bindingEpoch,
-          externalAuthorPolicies.authorType,
-          externalAuthorPolicies.authorId,
-        ],
-        set: values,
-      });
-    }
-  }
-}
-
-function providerChannelFallback(bindings: readonly Binding[]): SlackBridgeProvisioningProviderChannel[] {
+function providerChannelFallback(
+  bindings: readonly Pick<Binding, "providerConversationId" | "privacyClass">[],
+): SlackBridgeProvisioningProviderChannel[] {
   return bindings.map((binding) => ({
     id: binding.providerConversationId,
     name: `Slack channel ${binding.providerConversationId}`.slice(0, 200),
     privacyClass: binding.privacyClass,
   }));
+}
+
+export function projectSlackProviderChannelsForServer(input: {
+  observed: readonly SlackBridgeProvisioningProviderChannel[];
+  currentBindings: readonly Pick<Binding, "providerConversationId" | "privacyClass">[];
+  reservedByOtherServer: ReadonlySet<string>;
+}): SlackBridgeProvisioningProviderChannel[] {
+  const channels = new Map<string, SlackBridgeProvisioningProviderChannel>();
+  for (const channel of [
+    ...input.observed.filter((candidate) => !input.reservedByOtherServer.has(candidate.id)),
+    ...providerChannelFallback(input.currentBindings),
+  ]) {
+    if (!channels.has(channel.id)) channels.set(channel.id, channel);
+  }
+  return [...channels.values()];
 }
 
 async function responseFor(input: {
@@ -1261,7 +1569,9 @@ async function responseFor(input: {
   authority: CurrentAuthority;
   providerObservation: ProviderObservation;
   request: SlackBridgeProvisioningRequestAuthority;
+  viewer?: SlackBridgeProvisioningViewer;
 }): Promise<SlackBridgeProvisioningResponse> {
+  const viewer = input.viewer ?? { kind: "manager" };
   const raft = await listSlackBridgeRaftConversationTargets(input.db, input.request.serverId);
   const audiences = await audienceStatuses(
     input.db,
@@ -1275,26 +1585,56 @@ async function responseFor(input: {
     audiences,
     connection: input.providerObservation.status,
   });
-  const managerHasOutboundConsent = await managerHasCurrentOutboundConsent(input);
   const stage = stageFor(
     input.authority,
     preflight,
     input.request.now,
-    managerHasOutboundConsent,
   );
-  const providerChannels = new Map<string, SlackBridgeProvisioningProviderChannel>();
-  for (const channel of [
-    ...input.providerObservation.channels,
-    ...providerChannelFallback(input.authority.bindings),
-  ]) {
-    if (!providerChannels.has(channel.id)) providerChannels.set(channel.id, channel);
+  const reservedProviderConversationIds = new Set<string>();
+  if (input.authority.install) {
+    const reserved = await input.db.select({
+      providerConversationId: externalChannelBindings.providerConversationId,
+    }).from(externalChannelBindings).where(and(
+      eq(externalChannelBindings.installId, input.authority.install.id),
+      ne(externalChannelBindings.serverId, input.request.serverId),
+      inArray(externalChannelBindings.state, ["active", "paused", "quarantined"]),
+    ));
+    for (const binding of reserved) {
+      reservedProviderConversationIds.add(binding.providerConversationId);
+    }
   }
-  const pairs = input.authority.bindings.map((binding) => ({
+  // Stage, preflight and the failing surface stay whole-server aggregates so a
+  // member sees the same setup progress as a manager. Channel-level facts are
+  // narrowed: a member only learns about bindings whose Raft channel they can
+  // view, and only about the Slack channels those bindings name.
+  const visibleRaftChannelIds = viewer.kind === "member"
+    ? await filterChannelIdsVisibleToHuman(
+      input.request.serverId,
+      viewer.userId,
+      [...raft.map((channel) => channel.id), ...input.authority.bindings.map((binding) => binding.channelId)],
+      input.db,
+    )
+    : null;
+  const visibleBindings = visibleRaftChannelIds
+    ? input.authority.bindings.filter((binding) => visibleRaftChannelIds.has(binding.channelId))
+    : input.authority.bindings;
+  const providerChannels = projectSlackProviderChannelsForServer({
+    observed: input.providerObservation.channels,
+    currentBindings: input.authority.bindings,
+    reservedByOtherServer: reservedProviderConversationIds,
+  });
+  const pairs = visibleBindings.map((binding) => ({
     raftChannelId: binding.channelId,
     slackChannelId: binding.providerConversationId,
     bindingEpoch: binding.bindingEpoch,
   }));
-  const visibleRaft = new Map(raft.map((channel) => [channel.id, { id: channel.id, name: channel.name }]));
+  const pairedSlackChannelIds = new Set(pairs.map((pair) => pair.slackChannelId));
+  const visibleProviderChannels = visibleRaftChannelIds
+    ? providerChannels.filter((channel) => pairedSlackChannelIds.has(channel.id))
+    : providerChannels;
+  const visibleRaft = new Map(raft
+    .filter((channel) => !visibleRaftChannelIds || visibleRaftChannelIds.has(channel.id))
+    .map((channel) => [channel.id, { id: channel.id, name: channel.name }]));
   if (pairs.some((pair) => !visibleRaft.has(pair.raftChannelId))) {
     const boundRows = await input.db.select({ id: channels.id, name: channels.name })
       .from(channels)
@@ -1307,7 +1647,13 @@ async function responseFor(input: {
     connection: input.providerObservation.status,
     preflight,
   });
+  const visibleBindingIds = new Set(visibleBindings.map((binding) => binding.id));
   const grant = currentGrant(input.authority, input.bootstrap);
+  if (viewer.kind === "manager" && stage === "oauth" && !grant) {
+    // A manager at `oauth` must be able to start it; fail closed rather than
+    // render a consent step that cannot be completed.
+    throw new Error("Slack Bridge OAuth stage requires current server-grant authority");
+  }
   return {
     protocolVersion: SLACK_BRIDGE_PROVISIONING_PROTOCOL_VERSION,
     snapshot: {
@@ -1318,7 +1664,7 @@ async function responseFor(input: {
       raftChannels: [...visibleRaft.values()].slice(0, MAX_CHANNELS),
       slackChannels: stage === "connect"
         ? []
-        : [...providerChannels.values()].map(({ id, name, privacyClass, isMember }) => ({
+        : visibleProviderChannels.map(({ id, name, privacyClass, isMember }) => ({
           id,
           name,
           privacyClass,
@@ -1326,9 +1672,18 @@ async function responseFor(input: {
         })).slice(0, MAX_CHANNELS),
       channelPairs: stage === "connect" ? [] : pairs,
       preflight: stage === "connect" || stage === "oauth" || stage === "channels" ? null : preflight,
-      rawHealth: health,
+      rawHealth: visibleRaftChannelIds
+        ? {
+          ...health,
+          bindings: health.bindings.filter((binding) => visibleBindingIds.has(binding.id)),
+          audiences: health.audiences.filter((audience) => visibleBindingIds.has(audience.bindingId)),
+        }
+        : health,
     },
-    oauthAuthority: stage === "oauth" && grant ? {
+    // Past `connect` the same grant also authorizes an in-place
+    // re-authorization (new scopes) of the connected workspace. Only managers
+    // may start OAuth, so a member's projection never carries the authority.
+    oauthAuthority: viewer.kind === "manager" && stage !== "connect" && grant ? {
       registrationId: input.bootstrap.registrationId,
       serverGrantId: grant.id,
       grantEpoch: grant.grantEpoch,
@@ -1344,10 +1699,10 @@ async function recordConversationAuthority(input: {
   now: Date;
   authority: CurrentAuthority;
   binding: Binding;
-}): Promise<void> {
+}): Promise<"committed" | "fence_mismatch" | "authority_quarantined"> {
   const providerAuthority = activeProviderAuthority(input.authority, input.now);
   const install = currentInstall(input.authority);
-  if (!providerAuthority || !install) return;
+  if (!providerAuthority || !install) return "fence_mismatch";
 
   const privateBinding = input.binding.privacyClass === "private";
   const humanRows = privateBinding
@@ -1438,10 +1793,20 @@ async function recordConversationAuthority(input: {
       eq(externalChannelBindings.connectionEpoch, install.connectionEpoch),
       eq(externalChannelBindings.bindingEpoch, input.binding.bindingEpoch),
     )).for("update").limit(1);
-    if (!binding || binding.privacyClass !== input.binding.privacyClass) return false;
+    if (!binding || binding.privacyClass !== input.binding.privacyClass) return "fence_mismatch" as const;
+    const serverAuthority = await resolveExternalInstallServerGrantAuthority(tx, {
+      installId: binding.installId,
+      serverId: binding.serverId,
+      registrationId: binding.registrationId,
+    }, { lock: true });
+    if (!serverAuthority.current || binding.grantEpoch !== serverAuthority.grant.grantEpoch) {
+      return "authority_quarantined" as const;
+    }
 
     if (privateBinding) {
-      if (!binding.audienceRevision || binding.audienceRevision !== input.binding.audienceRevision) return false;
+      if (!binding.audienceRevision || binding.audienceRevision !== input.binding.audienceRevision) {
+        return "fence_mismatch" as const;
+      }
       const currentHumanRows = await tx.select({ userId: channelHumans.userId })
         .from(channelHumans)
         .innerJoin(serverMembers, and(
@@ -1450,7 +1815,7 @@ async function recordConversationAuthority(input: {
         ))
         .where(eq(channelHumans.channelId, binding.channelId));
       const currentUserIds = [...new Set(currentHumanRows.map((row) => row.userId))].sort();
-      if (!exactStrings(currentUserIds, userIds)) return false;
+      if (!exactStrings(currentUserIds, userIds)) return "fence_mismatch" as const;
     }
 
     const [latestSnapshot] = await tx.select({
@@ -1589,7 +1954,7 @@ async function recordConversationAuthority(input: {
         eq(externalChannelBindings.bindingEpoch, binding.bindingEpoch),
         eq(externalChannelBindings.audienceRevision, binding.audienceRevision!),
       )).returning({ id: externalChannelBindings.id });
-      if (!updated) return false;
+      if (!updated) return "fence_mismatch" as const;
     }
     await tx.insert(externalBindingAudienceSnapshots).values({
       bindingId: binding.id,
@@ -1604,11 +1969,13 @@ async function recordConversationAuthority(input: {
       expiresAt,
       createdAt: input.now,
     });
-    return true;
+    return "committed" as const;
   });
-  if (!committed || status !== "matched" || !input.avatarMaterializer) return;
+  if (committed !== "committed" || status !== "matched" || !input.avatarMaterializer) {
+    return committed;
+  }
   const avatarUsers = providerUsers.filter((user) => user.avatarLocator !== undefined);
-  if (avatarUsers.length === 0) return;
+  if (avatarUsers.length === 0) return "committed";
   const projections = await input.db.select({
     id: externalActorProjections.id,
     externalActorId: externalActorProjections.externalActorId,
@@ -1651,6 +2018,7 @@ async function recordConversationAuthority(input: {
       }
     },
   ));
+  return "committed";
 }
 
 export interface SlackPublicConversationAuthorityRefreshReceipt {
@@ -1696,7 +2064,6 @@ export async function refreshSlackPublicConversationAuthority(input: {
   const binding = bindings[0]!;
   const installs = await db.select().from(externalAppInstalls).where(and(
     eq(externalAppInstalls.id, binding.installId),
-    eq(externalAppInstalls.serverId, binding.serverId),
     eq(externalAppInstalls.registrationId, binding.registrationId),
   )).limit(2);
   if (installs.length !== 1) return unavailable("identity_mapping_unavailable");
@@ -1705,25 +2072,33 @@ export async function refreshSlackPublicConversationAuthority(input: {
     eq(externalAppRegistrations.id, binding.registrationId),
     eq(externalAppRegistrations.state, "active"),
   )).limit(2);
-  const grants = await db.select().from(externalAppServerGrants).where(and(
-    eq(externalAppServerGrants.id, install.serverGrantId),
-    eq(externalAppServerGrants.serverId, binding.serverId),
-    eq(externalAppServerGrants.registrationId, binding.registrationId),
-  )).limit(2);
+  const serverAuthority = await resolveExternalInstallServerGrantAuthority(db, {
+    installId: install.id,
+    serverId: binding.serverId,
+    registrationId: binding.registrationId,
+  });
   const credentials = await db.select().from(externalAppCredentials)
     .where(eq(externalAppCredentials.installId, install.id)).limit(2);
   const receipts = await db.select().from(externalAppInstallGrantReceipts).where(and(
     eq(externalAppInstallGrantReceipts.registrationId, binding.registrationId),
     eq(externalAppInstallGrantReceipts.installId, install.id),
   )).orderBy(desc(externalAppInstallGrantReceipts.receiptRevision)).limit(2);
-  if (registrations.length !== 1 || grants.length !== 1 || credentials.length !== 1) {
+  if (
+    registrations.length !== 1
+    || credentials.length !== 1
+  ) {
     return unavailable("identity_mapping_unavailable");
   }
-  if (!grantMatchesCurrentRegistration(grants[0]!, registrations[0]!)) {
+  if (
+    !serverAuthority.current
+    || binding.grantEpoch !== serverAuthority.grant.grantEpoch
+    || !grantMatchesCurrentRegistration(serverAuthority.grant, registrations[0]!)
+  ) {
     return unavailable("authority_quarantined");
   }
   const authority: CurrentAuthority = {
-    grant: grants[0]!,
+    grant: serverAuthority.grant,
+    installServerGrant: serverAuthority.association,
     install,
     credential: credentials[0]!,
     installGrantReceipt: receipts[0] ?? null,
@@ -1733,7 +2108,7 @@ export async function refreshSlackPublicConversationAuthority(input: {
     return unavailable("authority_quarantined");
   }
 
-  await recordConversationAuthority({
+  const recorded = await recordConversationAuthority({
     db,
     provider: input.provider,
     avatarMaterializer: input.avatarMaterializer,
@@ -1742,6 +2117,8 @@ export async function refreshSlackPublicConversationAuthority(input: {
     authority,
     binding,
   });
+  if (recorded === "authority_quarantined") return unavailable("authority_quarantined");
+  if (recorded !== "committed") return unavailable("identity_mapping_unavailable");
   const currentBindings = await db.select().from(externalChannelBindings).where(and(
     eq(externalChannelBindings.id, binding.id),
     eq(externalChannelBindings.serverId, binding.serverId),
@@ -1828,32 +2205,37 @@ export function createSlackBridgeProvisioningControlPlane(
   const load = async (
     request: SlackBridgeProvisioningRequestAuthority,
   ): Promise<SlackBridgeProvisioningResponse> => {
-    await requireManager(db, request);
-    const registration = await assertBootstrapRows(db, bootstrap);
+    const viewer = await requireReader(db, request);
+    const registration = await assertBootstrapRows(db, bootstrap, request.now, db);
     const authority = registration
       ? await loadCurrentAuthority(db, bootstrap, request.serverId)
       : {
         grant: null,
+        installServerGrant: null,
         install: null,
         credential: null,
         installGrantReceipt: null,
         bindings: [],
       };
+    // Members read the same live workspace observation as managers: stage,
+    // preflight and paired Slack channel names all depend on it, and a stored
+    // fallback would show a healthy bridge as unverified.
     const observation = registration
       ? await observeProvider(dependencies.provider, authority, request.now)
       : { status: "unverified" as const, workspaceName: null, channels: [] };
-    return responseFor({ db, bootstrap, authority, providerObservation: observation, request });
+    return responseFor({ db, bootstrap, authority, providerObservation: observation, request, viewer });
   };
 
   const loadWithoutProvider = async (
     request: SlackBridgeProvisioningRequestAuthority,
   ): Promise<SlackBridgeProvisioningResponse> => {
     await requireManager(db, request);
-    const registration = await assertBootstrapRows(db, bootstrap);
+    const registration = await assertBootstrapRows(db, bootstrap, request.now, db);
     const authority = registration
       ? await loadCurrentAuthority(db, bootstrap, request.serverId)
       : {
         grant: null,
+        installServerGrant: null,
         install: null,
         credential: null,
         installGrantReceipt: null,
@@ -1872,7 +2254,7 @@ export function createSlackBridgeProvisioningControlPlane(
     });
   };
 
-  return {
+  const controlPlane: SlackBridgeProvisioningControlPlane = {
     load,
 
     async connect(request) {
@@ -1911,7 +2293,7 @@ export function createSlackBridgeProvisioningControlPlane(
         }
         assertBootstrapClient(client, bootstrap);
 
-        let registration = await assertBootstrapRows(tx, bootstrap);
+        let registration = await assertBootstrapRows(tx, bootstrap, request.now, db);
         if (!registration) {
           [registration] = await tx.insert(externalAppRegistrations).values({
             id: bootstrap.registrationId,
@@ -1970,7 +2352,7 @@ export function createSlackBridgeProvisioningControlPlane(
             "external_app_install_conflict",
           );
         }
-        await assertBootstrapRows(tx, bootstrap);
+        await assertBootstrapRows(tx, bootstrap, request.now, db);
 
         await tx.insert(oauthClientInstalls).values({
           serverId: request.serverId,
@@ -2038,7 +2420,7 @@ export function createSlackBridgeProvisioningControlPlane(
 
     async saveChannelPairs(input) {
       requireManagerInput(input);
-      const registration = await assertBootstrapRows(db, bootstrap);
+      const registration = await assertBootstrapRows(db, bootstrap, input.now, db);
       if (!registration) {
         throw new ExternalAppControlPlaneError(
           "Slack Bridge connect must complete before channel selection",
@@ -2047,7 +2429,9 @@ export function createSlackBridgeProvisioningControlPlane(
       }
       const authority = await loadCurrentAuthority(db, bootstrap, input.serverId);
       const providerAuthority = activeProviderAuthority(authority, input.now);
-      if (!providerAuthority || !currentGrant(authority, bootstrap)) {
+      const serverGrant = currentGrant(authority, bootstrap);
+      const installServerGrant = authority.installServerGrant;
+      if (!providerAuthority || !serverGrant || !installServerGrant) {
         throw new ExternalAppControlPlaneError(
           "Slack Bridge OAuth authority is not active",
           "external_app_not_authorized",
@@ -2081,7 +2465,6 @@ export function createSlackBridgeProvisioningControlPlane(
         await requireManager(tx, input, true);
         const [install] = await tx.select().from(externalAppInstalls).where(and(
           eq(externalAppInstalls.id, providerAuthority.installId),
-          eq(externalAppInstalls.serverId, input.serverId),
           eq(externalAppInstalls.registrationId, bootstrap.registrationId),
           notInArray(externalAppInstalls.state, ["revoked"]),
           eq(externalAppInstalls.connectionEpoch, providerAuthority.connectionEpoch),
@@ -2092,6 +2475,44 @@ export function createSlackBridgeProvisioningControlPlane(
             "Slack Bridge install changed during channel selection",
             "external_app_not_authorized",
           );
+        }
+        const [lockedInstallServerGrant] = await tx.select()
+          .from(externalAppInstallServerGrants)
+          .where(and(
+            eq(externalAppInstallServerGrants.id, installServerGrant.id),
+            eq(externalAppInstallServerGrants.installId, install.id),
+            eq(externalAppInstallServerGrants.serverId, input.serverId),
+            eq(externalAppInstallServerGrants.registrationId, bootstrap.registrationId),
+            eq(externalAppInstallServerGrants.serverGrantId, serverGrant.id),
+            eq(externalAppInstallServerGrants.grantEpoch, serverGrant.grantEpoch),
+            eq(externalAppInstallServerGrants.state, "active"),
+          ))
+          .for("update")
+          .limit(1);
+        if (!lockedInstallServerGrant) {
+          throw new ExternalAppControlPlaneError(
+            "Slack Bridge server workspace authority changed during channel selection",
+            "external_app_not_authorized",
+          );
+        }
+        if (input.pairs.length > 0) {
+          const reservedProviderBindings = await tx.select({
+            serverId: externalChannelBindings.serverId,
+            providerConversationId: externalChannelBindings.providerConversationId,
+          }).from(externalChannelBindings).where(and(
+            eq(externalChannelBindings.installId, install.id),
+            inArray(
+              externalChannelBindings.providerConversationId,
+              input.pairs.map((pair) => pair.slackChannelId),
+            ),
+            inArray(externalChannelBindings.state, ["active", "paused", "quarantined"]),
+          )).for("update");
+          if (reservedProviderBindings.some((binding) => binding.serverId !== input.serverId)) {
+            throw new ExternalAppControlPlaneError(
+              "Slack Bridge channel is already assigned to another server",
+              "external_app_install_conflict",
+            );
+          }
         }
         const existing = await tx.select().from(externalChannelBindings).where(and(
           eq(externalChannelBindings.serverId, input.serverId),
@@ -2221,9 +2642,10 @@ export function createSlackBridgeProvisioningControlPlane(
               ? "private_channel"
               : "public_channel",
             privacyClass: providerChannel.privacyClass,
+            privacyFreshUntil: slackPrivacyFreshUntil(input.now),
             state: "paused",
             stateReason: PROVISIONING_PENDING_REASON,
-            grantEpoch: install.grantEpoch,
+            grantEpoch: lockedInstallServerGrant.grantEpoch,
             connectionEpoch: install.connectionEpoch,
             bindingEpoch: 1,
             audienceRevision: providerChannel.privacyClass === "private" ? 1 : null,
@@ -2241,7 +2663,7 @@ export function createSlackBridgeProvisioningControlPlane(
 
     async removeChannelPairs(input) {
       requireManagerInput(input);
-      const registration = await assertBootstrapRows(db, bootstrap);
+      const registration = await assertBootstrapRows(db, bootstrap, input.now, db);
       if (!registration) {
         throw new ExternalAppControlPlaneError(
           "Slack Bridge connect must complete before channel removal",
@@ -2306,7 +2728,7 @@ export function createSlackBridgeProvisioningControlPlane(
           "external_app_invalid_state",
         );
       }
-      const registration = await assertBootstrapRows(db, bootstrap);
+      const registration = await assertBootstrapRows(db, bootstrap, input.now, db);
       if (!registration) {
         throw new ExternalAppControlPlaneError(
           "Slack Bridge is not connected",
@@ -2326,31 +2748,42 @@ export function createSlackBridgeProvisioningControlPlane(
             "external_app_install_conflict",
           );
         }
-        const [install] = await tx.select().from(externalAppInstalls).where(and(
-          eq(externalAppInstalls.serverId, input.serverId),
-          eq(externalAppInstalls.registrationId, registration.id),
-          eq(externalAppInstalls.serverGrantId, grant.id),
-          eq(externalAppInstalls.grantEpoch, grant.grantEpoch),
-          notInArray(externalAppInstalls.state, ["revoked"]),
-          eq(externalAppInstalls.connectionEpoch, input.expectedConnectionEpoch),
-        )).for("update").limit(1);
-        if (!install) {
+        const [candidateInstallServerGrant] = await tx.select()
+          .from(externalAppInstallServerGrants)
+          .where(and(
+            eq(externalAppInstallServerGrants.serverId, input.serverId),
+            eq(externalAppInstallServerGrants.registrationId, registration.id),
+            eq(externalAppInstallServerGrants.serverGrantId, grant.id),
+            eq(externalAppInstallServerGrants.grantEpoch, grant.grantEpoch),
+            eq(externalAppInstallServerGrants.state, "active"),
+          ))
+          .limit(1);
+        const [install] = candidateInstallServerGrant
+          ? await tx.select().from(externalAppInstalls).where(and(
+              eq(externalAppInstalls.id, candidateInstallServerGrant.installId),
+              eq(externalAppInstalls.registrationId, registration.id),
+              notInArray(externalAppInstalls.state, ["revoked"]),
+              eq(externalAppInstalls.connectionEpoch, input.expectedConnectionEpoch),
+            )).for("update").limit(1)
+          : [];
+        const [installServerGrant] = install
+          ? await tx.select().from(externalAppInstallServerGrants).where(and(
+              eq(externalAppInstallServerGrants.id, candidateInstallServerGrant!.id),
+              eq(externalAppInstallServerGrants.installId, install.id),
+              eq(externalAppInstallServerGrants.serverId, input.serverId),
+              eq(externalAppInstallServerGrants.registrationId, registration.id),
+              eq(externalAppInstallServerGrants.serverGrantId, grant.id),
+              eq(externalAppInstallServerGrants.grantEpoch, grant.grantEpoch),
+              eq(externalAppInstallServerGrants.state, "active"),
+            )).for("update").limit(1)
+          : [];
+        if (!install || !installServerGrant) {
           throw new ExternalAppControlPlaneError(
             "Slack Bridge workspace changed before disconnect",
             "external_app_install_conflict",
           );
         }
 
-        await tx.update(externalAuthorPolicies).set({
-          state: "revoked",
-          updatedAt: input.now,
-        }).where(and(
-          eq(externalAuthorPolicies.serverId, input.serverId),
-          eq(externalAuthorPolicies.provider, "slack"),
-          eq(externalAuthorPolicies.appRegistrationId, registration.id),
-          eq(externalAuthorPolicies.installId, install.id),
-          eq(externalAuthorPolicies.state, "granted"),
-        ));
         await tx.update(externalHumanIdentityLinks).set({
           state: "revoked",
           revokedAt: input.now,
@@ -2386,46 +2819,72 @@ export function createSlackBridgeProvisioningControlPlane(
             );
           }
         }
-        const [credential] = await tx.select().from(externalAppCredentials)
-          .where(eq(externalAppCredentials.installId, install.id)).for("update").limit(1);
-        if (credential && credential.state !== "revoked") {
-          const [revokedCredential] = await tx.update(externalAppCredentials).set({
+        const [revokedInstallServerGrant] = await tx.update(externalAppInstallServerGrants).set({
+          state: "revoked",
+          revokedAt: input.now,
+          revokeReason: PROVISIONING_UNBOUND_REASON,
+          updatedAt: input.now,
+        }).where(and(
+          eq(externalAppInstallServerGrants.id, installServerGrant.id),
+          eq(externalAppInstallServerGrants.state, "active"),
+          eq(externalAppInstallServerGrants.grantEpoch, installServerGrant.grantEpoch),
+        )).returning({ id: externalAppInstallServerGrants.id });
+        if (!revokedInstallServerGrant) {
+          throw new ExternalAppControlPlaneError(
+            "Slack Bridge server workspace authority changed during disconnect",
+            "external_app_install_conflict",
+          );
+        }
+        const otherServerGrants = await tx.select({ id: externalAppInstallServerGrants.id })
+          .from(externalAppInstallServerGrants)
+          .where(and(
+            eq(externalAppInstallServerGrants.installId, install.id),
+            eq(externalAppInstallServerGrants.state, "active"),
+          ))
+          .for("update")
+          .limit(1);
+        if (otherServerGrants.length === 0) {
+          const [credential] = await tx.select().from(externalAppCredentials)
+            .where(eq(externalAppCredentials.installId, install.id)).for("update").limit(1);
+          if (credential && credential.state !== "revoked") {
+            const [revokedCredential] = await tx.update(externalAppCredentials).set({
+              state: "revoked",
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              revokedAt: input.now,
+              updatedAt: input.now,
+            }).where(and(
+              eq(externalAppCredentials.id, credential.id),
+              eq(externalAppCredentials.state, credential.state),
+              eq(externalAppCredentials.credentialRevision, credential.credentialRevision),
+            )).returning({ id: externalAppCredentials.id });
+            if (!revokedCredential) {
+              throw new ExternalAppControlPlaneError(
+                "Slack Bridge credential changed during disconnect",
+                "external_app_install_conflict",
+              );
+            }
+          }
+          const [revokedInstall] = await tx.update(externalAppInstalls).set({
             state: "revoked",
-            leaseOwner: null,
-            leaseExpiresAt: null,
-            revokedAt: input.now,
+            stateReason: PROVISIONING_UNBOUND_REASON,
+            connectionEpoch: install.connectionEpoch + 1,
+            disconnectedAt: input.now,
+            installGrantRenewalLeaseOwner: null,
+            installGrantRenewalLeaseExpiresAt: null,
+            installGrantRenewalNextAttemptAt: null,
             updatedAt: input.now,
           }).where(and(
-            eq(externalAppCredentials.id, credential.id),
-            eq(externalAppCredentials.state, credential.state),
-            eq(externalAppCredentials.credentialRevision, credential.credentialRevision),
-          )).returning({ id: externalAppCredentials.id });
-          if (!revokedCredential) {
+            eq(externalAppInstalls.id, install.id),
+            eq(externalAppInstalls.state, install.state),
+            eq(externalAppInstalls.connectionEpoch, install.connectionEpoch),
+          )).returning({ id: externalAppInstalls.id });
+          if (!revokedInstall) {
             throw new ExternalAppControlPlaneError(
-              "Slack Bridge credential changed during disconnect",
+              "Slack Bridge install changed during disconnect",
               "external_app_install_conflict",
             );
           }
-        }
-        const [revokedInstall] = await tx.update(externalAppInstalls).set({
-          state: "revoked",
-          stateReason: PROVISIONING_UNBOUND_REASON,
-          connectionEpoch: install.connectionEpoch + 1,
-          disconnectedAt: input.now,
-          installGrantRenewalLeaseOwner: null,
-          installGrantRenewalLeaseExpiresAt: null,
-          installGrantRenewalNextAttemptAt: null,
-          updatedAt: input.now,
-        }).where(and(
-          eq(externalAppInstalls.id, install.id),
-          eq(externalAppInstalls.state, install.state),
-          eq(externalAppInstalls.connectionEpoch, install.connectionEpoch),
-        )).returning({ id: externalAppInstalls.id });
-        if (!revokedInstall) {
-          throw new ExternalAppControlPlaneError(
-            "Slack Bridge install changed during disconnect",
-            "external_app_install_conflict",
-          );
         }
         const [revokedGrant] = await tx.update(externalAppServerGrants).set({
           state: "revoked",
@@ -2462,7 +2921,7 @@ export function createSlackBridgeProvisioningControlPlane(
 
     async runPreflight(request) {
       await requireManager(db, request);
-      const registration = await assertBootstrapRows(db, bootstrap);
+      const registration = await assertBootstrapRows(db, bootstrap, request.now, db);
       if (!registration) {
         throw new ExternalAppControlPlaneError(
           "Slack Bridge connect must complete before preflight",
@@ -2499,7 +2958,7 @@ export function createSlackBridgeProvisioningControlPlane(
 
     async enable(request) {
       await requireManager(db, request);
-      const registration = await assertBootstrapRows(db, bootstrap);
+      const registration = await assertBootstrapRows(db, bootstrap, request.now, db);
       if (!registration) {
         throw new ExternalAppControlPlaneError(
           "Slack Bridge connect must complete before enable",
@@ -2545,7 +3004,11 @@ export function createSlackBridgeProvisioningControlPlane(
         preflight.state !== "passed"
         || (!repairingActiveBindings && !activatingPausedBindings)
         || installGrantObservation.kind !== "fact"
-        || !installGrantMatchesAuthority(authority, installGrantObservation.fact)
+        || !currentInstall(authority)
+        || classifySlackInstallGrantObservation(
+          currentInstall(authority)!,
+          installGrantObservation.fact,
+        ) === "mismatch"
       ) {
         if (!repairingActiveBindings) {
           await markPreflightResult({ db, request, authority, passed: false });
@@ -2554,28 +3017,108 @@ export function createSlackBridgeProvisioningControlPlane(
         return responseFor({ db, bootstrap, authority, providerObservation: observation, request });
       }
       const install = currentInstall(authority)!;
+      const installServerGrant = authority.installServerGrant!;
       const credential = authority.credential!;
       const installGrant = installGrantObservation.fact;
       const observedGrantHash = slackBridgeInstallGrantHash(installGrant);
       const expectedBindings = new Map(authority.bindings.map((binding) => [binding.id, binding]));
+      if (SLACK_BRIDGE_AGENT_MENTION_BOT_SCOPES.every((scope) => (
+        install.installedScopes.includes(scope)
+      ))) {
+        const providerAuthority = activeProviderAuthority(authority, request.now);
+        if (!providerAuthority) {
+          throw new ExternalAppControlPlaneError(
+            "Slack Bridge provider authority changed before Agent mention reconciliation",
+            "external_app_invalid_state",
+          );
+        }
+        // Agent-mention usergroup sync is an additive capability: failures
+        // (Slack free plan without usergroups, admin-only usergroup policy,
+        // handle collision on all candidates) degrade to "agent temporarily
+        // not @-able from Slack" — they must never block channel binding,
+        // which would starve core message sync. The 5-minute lifecycle tick
+        // retries this reconciliation on its own schedule.
+        try {
+          const {
+            candidates: mentionCandidates,
+            humanCandidates: humanMentionCandidates,
+          } = await listSlackBridgeMentionCandidates(
+            db,
+            request.serverId,
+            authority.bindings,
+          );
+          if (!dependencies.provider.reconcileAgentMentionHandles) {
+            console.warn("[SlackBridge] Agent mention reconciliation unavailable", {
+              serverId: request.serverId,
+            });
+          } else {
+            const mentionReconciliation = await dependencies.provider.reconcileAgentMentionHandles(
+              providerAuthority,
+              {
+                serverId: request.serverId,
+                candidates: mentionCandidates,
+                humanCandidates: humanMentionCandidates,
+              },
+            );
+            const mentionSync = slackBridgeMentionSyncState({
+              reconciled: mentionReconciliation,
+              candidates: mentionCandidates,
+              humanCandidates: humanMentionCandidates,
+              observedAt: request.now,
+            });
+            if (mentionSync?.state === "degraded") {
+              console.warn("[SlackBridge] Agent mention reconciliation degraded", {
+                serverId: request.serverId,
+                kind: mentionReconciliation.kind,
+                slackError: mentionSync.slackError,
+                expected: mentionSync.expected,
+                actual: mentionSync.actual,
+                ...(mentionReconciliation.kind === "fact"
+                  ? { failures: mentionReconciliation.fact.failures }
+                  : {}),
+              });
+            }
+            if (mentionSync) {
+              await db.update(externalAppInstalls)
+                .set({ agentMentionSync: mentionSync, updatedAt: request.now })
+                .where(eq(externalAppInstalls.id, install.id));
+            }
+          }
+        } catch (error) {
+          console.warn("[SlackBridge] Agent mention reconciliation threw", {
+            serverId: request.serverId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       await db.transaction(async (tx) => {
         await requireManager(tx, request, true);
         const [lockedInstall] = await tx.select().from(externalAppInstalls).where(and(
           eq(externalAppInstalls.id, install.id),
-          eq(externalAppInstalls.serverId, request.serverId),
           eq(externalAppInstalls.registrationId, bootstrap.registrationId),
-          eq(externalAppInstalls.serverGrantId, install.serverGrantId),
-          eq(externalAppInstalls.grantEpoch, install.grantEpoch),
           eq(externalAppInstalls.connectionEpoch, install.connectionEpoch),
           eq(externalAppInstalls.credentialRevision, install.credentialRevision),
           eq(externalAppInstalls.state, "active"),
         )).for("update").limit(1);
+        const [lockedInstallServerGrant] = await tx.select()
+          .from(externalAppInstallServerGrants)
+          .where(and(
+            eq(externalAppInstallServerGrants.id, installServerGrant.id),
+            eq(externalAppInstallServerGrants.installId, install.id),
+            eq(externalAppInstallServerGrants.serverId, request.serverId),
+            eq(externalAppInstallServerGrants.registrationId, bootstrap.registrationId),
+            eq(externalAppInstallServerGrants.serverGrantId, installServerGrant.serverGrantId),
+            eq(externalAppInstallServerGrants.grantEpoch, installServerGrant.grantEpoch),
+            eq(externalAppInstallServerGrants.state, "active"),
+          ))
+          .for("update")
+          .limit(1);
         const [lockedGrant] = await tx.select().from(externalAppServerGrants).where(and(
-          eq(externalAppServerGrants.id, install.serverGrantId),
+          eq(externalAppServerGrants.id, installServerGrant.serverGrantId),
           eq(externalAppServerGrants.serverId, request.serverId),
           eq(externalAppServerGrants.registrationId, bootstrap.registrationId),
           eq(externalAppServerGrants.state, "active"),
-          eq(externalAppServerGrants.grantEpoch, install.grantEpoch),
+          eq(externalAppServerGrants.grantEpoch, installServerGrant.grantEpoch),
         )).for("update").limit(1);
         const [lockedCredential] = await tx.select().from(externalAppCredentials).where(and(
           eq(externalAppCredentials.id, credential.id),
@@ -2589,6 +3132,7 @@ export function createSlackBridgeProvisioningControlPlane(
         )).for("update").limit(1);
         if (
           !lockedInstall
+          || !lockedInstallServerGrant
           || !lockedGrant
           || !lockedCredential
           || lockedGrant.grantedManifestVersion !== bootstrap.capabilityManifestVersion
@@ -2628,13 +3172,47 @@ export function createSlackBridgeProvisioningControlPlane(
               || binding.bindingEpoch !== expected.bindingEpoch
               || binding.audienceRevision !== expected.audienceRevision
               || binding.connectionEpoch !== install.connectionEpoch
-              || binding.grantEpoch !== install.grantEpoch;
+              || binding.grantEpoch !== installServerGrant.grantEpoch;
           })
         ) {
           throw new ExternalAppControlPlaneError(
             "Slack Bridge preflight authority changed before enable",
             "external_app_invalid_state",
           );
+        }
+        // A scope set that drifted on the provider side (Slack app scopes
+        // changed without a Raft re-OAuth) is a stale install record, not a
+        // failed grant. Reconcile installed_scopes + scope_revision under the
+        // install row lock in this same transaction; bumping scope_revision
+        // invalidates receipts on every server sharing the install, and each
+        // writes a fresh one on its next renewal tick.
+        const grantClassification = classifySlackInstallGrantObservation(lockedInstall, installGrant);
+        if (grantClassification === "mismatch") {
+          throw new ExternalAppControlPlaneError(
+            "Slack Bridge install grant changed before enable",
+            "external_app_invalid_state",
+          );
+        }
+        let effectiveInstall = lockedInstall;
+        if (grantClassification === "scope_drift") {
+          const nextScopeRevision = await applySlackInstallGrantScopeDrift({
+            tx,
+            install: lockedInstall,
+            grant: installGrant,
+            now: request.now,
+            source: "enable",
+          });
+          if (nextScopeRevision === null) {
+            throw new ExternalAppControlPlaneError(
+              "Slack Bridge install authority changed before enable",
+              "external_app_invalid_state",
+            );
+          }
+          effectiveInstall = {
+            ...lockedInstall,
+            installedScopes: canonicalStrings(installGrant.grantedScopes),
+            scopeRevision: nextScopeRevision,
+          };
         }
         const receipts = await tx.select().from(externalAppInstallGrantReceipts).where(and(
           eq(externalAppInstallGrantReceipts.registrationId, bootstrap.registrationId),
@@ -2645,7 +3223,7 @@ export function createSlackBridgeProvisioningControlPlane(
           && latestReceipt.status === "valid"
           && latestReceipt.expiresAt > request.now
           && latestReceipt.connectionEpoch === lockedInstall.connectionEpoch
-          && latestReceipt.scopeRevision === lockedInstall.scopeRevision
+          && latestReceipt.scopeRevision === effectiveInstall.scopeRevision
           && latestReceipt.credentialRevision === lockedInstall.credentialRevision
           && latestReceipt.providerAppId === installGrant.providerAppId
           && latestReceipt.providerAuthorityId === installGrant.providerAuthorityId
@@ -2659,7 +3237,7 @@ export function createSlackBridgeProvisioningControlPlane(
             installId: lockedInstall.id,
             receiptRevision: (latestReceipt?.receiptRevision ?? 0) + 1,
             connectionEpoch: lockedInstall.connectionEpoch,
-            scopeRevision: lockedInstall.scopeRevision,
+            scopeRevision: effectiveInstall.scopeRevision,
             credentialRevision: lockedInstall.credentialRevision,
             providerAppId: installGrant.providerAppId,
             providerAuthorityId: installGrant.providerAuthorityId,
@@ -2677,7 +3255,7 @@ export function createSlackBridgeProvisioningControlPlane(
             createdAt: request.now,
           });
         }
-        if (lockedInstall.providerBotId === null) {
+        if (lockedInstall.providerBotId === null && grantClassification === "match") {
           await tx.update(externalAppInstalls).set({
             providerBotId: installGrant.providerBotId,
             lastVerifiedAt: request.now,
@@ -2697,7 +3275,29 @@ export function createSlackBridgeProvisioningControlPlane(
               "external_app_invalid_state",
             );
           }
+          await tx.update(externalChannelBindings).set({
+            privacyFreshUntil: slackPrivacyFreshUntil(request.now),
+            updatedAt: request.now,
+          }).where(and(
+            eq(externalChannelBindings.id, binding.id),
+            eq(externalChannelBindings.bindingEpoch, binding.bindingEpoch),
+            eq(externalChannelBindings.connectionEpoch, binding.connectionEpoch),
+          ));
         }
+        // Activation and delivery readiness are one durable transition. A
+        // worker may poll an active binding before its first message exists;
+        // the zero-position partition makes that state ordinary idleness.
+        await tx.insert(externalDeliveryPartitions).values(
+          currentBindings.map((binding) => ({
+            bindingId: binding.id,
+            bindingEpoch: binding.bindingEpoch,
+          })),
+        ).onConflictDoNothing({
+          target: [
+            externalDeliveryPartitions.bindingId,
+            externalDeliveryPartitions.bindingEpoch,
+          ],
+        });
         if (activatingPausedBindings) {
           for (const binding of currentBindings) {
             await tx.update(externalChannelBindings).set({
@@ -2712,38 +3312,35 @@ export function createSlackBridgeProvisioningControlPlane(
             ));
           }
         }
-        await grantManagerCurrentOutboundConsent({
-          tx,
-          bootstrap,
-          install: lockedInstall,
-          bindings: currentBindings,
-          request,
-        });
       });
-      if (dependencies.authorAvatarMaterializer) {
-        const policies = await db.select({ id: externalAuthorPolicies.id }).from(externalAuthorPolicies).where(and(
-          eq(externalAuthorPolicies.serverId, request.serverId),
-          eq(externalAuthorPolicies.provider, "slack"),
-          eq(externalAuthorPolicies.appRegistrationId, bootstrap.registrationId),
-          eq(externalAuthorPolicies.installId, install.id),
-          inArray(externalAuthorPolicies.bindingId, authority.bindings.map((binding) => binding.id)),
-          eq(externalAuthorPolicies.authorType, "user"),
-          eq(externalAuthorPolicies.authorId, request.requestingUserId),
-          eq(externalAuthorPolicies.state, "granted"),
-        ));
-        for (const policy of policies) {
-          try {
-            await dependencies.authorAvatarMaterializer(policy.id);
-          } catch {
-            // Consent and audience authority remain valid when a profile image
-            // cannot be materialized; the frozen emoji fallback stays active.
-          }
-        }
-      }
       authority = await loadCurrentAuthority(db, bootstrap, request.serverId);
       return responseFor({ db, bootstrap, authority, providerObservation: observation, request });
     },
+
+    // A fresh OAuth exchange on an already-connected workspace pauses every
+    // binding at the new connection epoch (`provider_reauthorized_review_required`).
+    // The manager who just re-authorized has reviewed the connection, so
+    // re-confirm the same pairs and run them through the ordinary
+    // channel-pairs → preflight → enable path. Every check still applies; a
+    // pair that fails preflight stays paused. Slack stops retrying a rejected
+    // event within minutes, so this runs in the OAuth callback rather than
+    // waiting for a separate manual step.
+    async resumeAfterReauthorization(request) {
+      requireManagerInput(request);
+      const authority = await loadCurrentAuthority(db, bootstrap, request.serverId);
+      if (authority.install?.state !== "active") return null;
+      const reauthorized = authority.bindings.some((binding) =>
+        binding.state === "paused" && binding.stateReason === PROVIDER_REAUTHORIZED_REASON);
+      if (!reauthorized) return null;
+      const pairs = authority.bindings
+        .filter((binding) => binding.state === "active" || binding.state === "paused" || binding.state === "quarantined")
+        .map((binding) => ({ raftChannelId: binding.channelId, slackChannelId: binding.providerConversationId }));
+      await controlPlane.saveChannelPairs({ ...request, pairs });
+      await controlPlane.runPreflight(request);
+      return controlPlane.enable(request);
+    },
   };
+  return controlPlane;
 }
 
 export function slackBridgeProvisioningManifestHash(input: {

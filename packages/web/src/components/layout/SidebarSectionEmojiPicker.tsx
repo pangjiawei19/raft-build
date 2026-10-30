@@ -1,8 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { Button, Popover, PopoverTrigger, PopoverContent } from "@botiverse/raft-ui";
+import Tooltip from "../ui/Tooltip";
+import { useOptionalAppTheme } from "../../hooks/useAppTheme";
+import { useCallback, useEffect, useState } from "react";
 import type { ComponentType } from "react";
 import type { PickerProps } from "emoji-picker-react";
 import { SmilePlus, X } from "lucide-react";
 import { useIntl } from "react-intl";
+
+const PICKER_PREVIEW_CONFIG: PickerProps["previewConfig"] = { showPreview: false };
 
 export default function SidebarSectionEmojiPicker({
   value,
@@ -14,7 +19,11 @@ export default function SidebarSectionEmojiPicker({
   const { formatMessage } = useIntl();
   const [open, setOpen] = useState(false);
   const [EmojiPicker, setEmojiPicker] = useState<ComponentType<PickerProps> | null>(null);
-  const rootRef = useRef<HTMLDivElement | null>(null);
+  const appTheme = useOptionalAppTheme();
+  const handleEmojiClick = useCallback<NonNullable<PickerProps["onEmojiClick"]>>((emojiData) => {
+    onChange(emojiData.emoji);
+    setOpen(false);
+  }, [onChange]);
 
   useEffect(() => {
     if (!open || EmojiPicker) return;
@@ -36,45 +45,28 @@ export default function SidebarSectionEmojiPicker({
     };
   }, [EmojiPicker, open]);
 
-  useEffect(() => {
-    if (!open) return;
-    const handlePointerDown = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    document.addEventListener("pointerdown", handlePointerDown);
-    return () => document.removeEventListener("pointerdown", handlePointerDown);
-  }, [open]);
-
   return (
-    <div
-      ref={rootRef}
-      className="relative shrink-0 self-stretch"
-      onKeyDown={(event) => {
-        if (event.key !== "Escape" || !open) return;
-        event.stopPropagation();
-        setOpen(false);
-      }}
-    >
-      <button
-        type="button"
-        aria-label={value
-          ? formatMessage({ id: "layout.sidebar.changeSectionEmojiAria" }, { emoji: value })
-          : formatMessage({ id: "layout.sidebar.chooseSectionEmoji" })}
-        aria-haspopup="dialog"
-        aria-expanded={open}
-        title={formatMessage({ id: value ? "layout.sidebar.changeEmoji" : "layout.sidebar.chooseEmoji" })}
-        onClick={() => setOpen((current) => !current)}
-        className={`flex h-full min-h-10 w-11 items-center justify-center border-r-2 border-black bg-white p-0 text-xl focus:outline-none ${
-          value ? "text-black" : "text-black/40"
-        }`}
-      >
-        {value || <SmilePlus size={18} aria-hidden />}
-      </button>
+    <Popover open={open} onOpenChange={setOpen}>
+      <Tooltip content={formatMessage({ id: value ? "layout.sidebar.changeEmoji" : "layout.sidebar.chooseEmoji" })}>
+        <PopoverTrigger
+          render={(
+            <Button type="button" variant="ghost" size="icon-sm"
+              aria-label={value
+                ? formatMessage({ id: "layout.sidebar.changeSectionEmojiAria" }, { emoji: value })
+                : formatMessage({ id: "layout.sidebar.chooseSectionEmoji" })}
+              className="text-xl"
+            >
+              {value || <SmilePlus size={18} aria-hidden className="text-foreground-muted" />}
+            </Button>
+          )}
+        />
+      </Tooltip>
       {open && (
-        <div
+        <PopoverContent
+          align="start"
           role="dialog"
           aria-label={formatMessage({ id: "layout.sidebar.chooseSectionEmoji" })}
-          className="absolute left-0 top-[calc(100%+8px)] z-[70] border-2 border-black bg-white shadow-brutal"
+          className="z-[70] p-0"
         >
           {value && (
             <button
@@ -83,7 +75,7 @@ export default function SidebarSectionEmojiPicker({
                 onChange("");
                 setOpen(false);
               }}
-              className="flex h-9 w-full items-center justify-center gap-2 border-b-2 border-black bg-white px-3 text-xs font-bold hover:bg-soft-signal/30"
+              className="flex h-9 w-full items-center justify-center gap-2 border-b border-line-hairline bg-layer-popover px-3 font-sans text-callout font-medium text-foreground outline-none transition-colors hover:bg-brand-soft focus-visible:bg-brand-soft"
             >
               <X size={14} aria-hidden />
               {formatMessage({ id: "layout.sidebar.noEmoji" })}
@@ -93,20 +85,18 @@ export default function SidebarSectionEmojiPicker({
             <EmojiPicker
               width="min(340px, calc(100vw - 48px))"
               height={360}
+              theme={(appTheme?.resolvedMode === "dark" ? "dark" : "light") as PickerProps["theme"]}
               lazyLoadEmojis
-              previewConfig={{ showPreview: false }}
-              onEmojiClick={(emojiData) => {
-                onChange(emojiData.emoji);
-                setOpen(false);
-              }}
+              previewConfig={PICKER_PREVIEW_CONFIG}
+              onEmojiClick={handleEmojiClick}
             />
           ) : (
-            <div role="status" className="flex h-24 w-[min(340px,calc(100vw-48px))] items-center justify-center text-sm text-black/60">
+            <div role="status" className="flex h-24 w-[min(340px,calc(100vw-48px))] items-center justify-center font-sans text-callout text-foreground-hint">
               {formatMessage({ id: "layout.sidebar.loadingEmoji" })}
             </div>
           )}
-        </div>
+        </PopoverContent>
       )}
-    </div>
+    </Popover>
   );
 }

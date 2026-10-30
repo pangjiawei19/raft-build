@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { afterEach, test as nodeTest } from "node:test";
+import { test as nodeTest } from "vitest";
 import "./helpers/domSetup";
 import { useState } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { getCreatableRuntimeOptions, TOPBAR_OVERFLOW_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { getCreatableRuntimeOptions } from "@botiverse/raft-shared";
 import api from "../src/api/client";
 import ChannelMembers from "../src/components/agent/ChannelMembers";
 import type { Agent } from "../src/store/agentStore";
@@ -17,7 +17,6 @@ import type { Server, ServerMember } from "../src/store/serverStore";
 import { useServerStore } from "../src/store/serverStore";
 import {
   resetServerFeatureFlagsForTests,
-  setServerFeatureFlagForTests,
 } from "../src/store/serverFeatureFlags";
 import { TestIntlProvider } from "./helpers/intl";
 
@@ -45,7 +44,7 @@ import { TestIntlProvider } from "./helpers/intl";
 // interleave under the vitest shim.
 type TestFn = () => void | Promise<void>;
 const test = (name: string, fn: TestFn) =>
-  nodeTest(name, { concurrency: false }, fn);
+  nodeTest(name,  fn);
 
 Element.prototype.scrollIntoView ??= () => {};
 
@@ -163,7 +162,6 @@ function seedStores(role: Server["role"], options: { addChannelMembers?: boolean
     agents: [makeAgent({ id: "agent-scout", name: "runtime-scout", displayName: "Runtime Scout" })],
     agentActivities: {},
   } as never);
-  setServerFeatureFlagForTests("server-1", TOPBAR_OVERFLOW_FEATURE_FLAG_KEY, true);
   useMachineStore.setState({
     machines: [{
       id: "machine-1",
@@ -240,7 +238,7 @@ test("A: the create entry sits at the candidate-list bottom and opens the dialog
 
   const list = screen.getByTestId("add-member-candidate-list");
   const entry = within(list).getByTestId("add-member-create-agent-entry");
-  assert.ok(within(entry).getByText("Create a New Agent"));
+  assert.ok(within(entry).getByText("Create Agent"));
   assert.ok(
     within(entry).getByText("Joins #product-design automatically after creation"),
     "the entry must state its auto-join consequence on the row itself",
@@ -251,6 +249,13 @@ test("A: the create entry sits at the candidate-list bottom and opens the dialog
     list.lastElementChild === entry,
     "the entry is the list's persistent bottom row, after all candidates",
   );
+  // Task #99: "persistent" means pinned, not merely last. The candidates live
+  // in an inner scroll region; the entry must sit OUTSIDE it so a long list
+  // never hides it below the fold.
+  const scrollRegion = within(list).getByTestId("add-member-candidate-scroll");
+  assert.ok(scrollRegion.classList.contains("overflow-y-auto"));
+  assert.ok(!scrollRegion.contains(entry), "the create entry must not be inside the scrolling candidate region");
+  assert.ok(entry.classList.contains("shrink-0"));
 
   fireEvent.click(entry);
   await waitFor(() => {
@@ -261,11 +266,11 @@ test("A: the create entry sits at the candidate-list bottom and opens the dialog
   });
   const contextStrip = screen.getByTestId("create-agent-channel-context");
   assert.match(contextStrip.textContent ?? "", /#product-design/);
-  // The strip carries the entry's promise; the frozen mock renders it as a
-  // cyan, black-bordered band — a grey caption was rejected as the weakest
-  // possible carrier (Duoyu, PR #7372 design review).
-  assert.match(contextStrip.className, /bg-brutal-cyan/);
-  assert.match(contextStrip.className, /border-2/);
+  // The strip carries the entry's promise as a cyan band — a grey caption was
+  // rejected as the weakest possible carrier (Duoyu, PR #7372 design review).
+  // Raft DS: an info wash is cyan-soft and, being a highlight, has no ink edge.
+  assert.match(contextStrip.className, /bg-info-soft/);
+  assert.doesNotMatch(contextStrip.className, /border-2/);
 });
 
 test("A2: with search hits, the generic row does not smuggle the search text into the dialog", async () => {
@@ -275,14 +280,61 @@ test("A2: with search hits, the generic row does not smuggle the search text int
   // "runtime" matches the seeded Runtime Scout — the row stays generic.
   fireEvent.change(screen.getByPlaceholderText("Name"), { target: { value: "runtime" } });
   const entry = screen.getByTestId("add-member-create-agent-entry");
-  assert.ok(within(entry).getByText("Create a New Agent"), "row label must stay generic on a hit");
+  assert.ok(within(entry).getByText("Create Agent"), "row label must stay generic on a hit");
 
   fireEvent.click(entry);
   await waitFor(() => {
     const nameInput = document.getElementById("create-agent-name") as HTMLInputElement | null;
     assert.ok(nameInput, "the create dialog must open");
-    assert.equal(nameInput.value, "", "an unpromised name must not be prefilled");
+    // The dialog's own suggested name is fine; the search text is not.
+    assert.notEqual(nameInput.value, "runtime", "an unpromised name must not be prefilled from the search");
+    assert.match(nameInput.value, /^[a-z]+-[a-z]+$/, "a fresh create starts with a suggested name");
   });
+});
+
+test("A3: the channel-settings Create Agent keeps select popovers inside its dialog layer", async () => {
+  seedStores("owner");
+  useMachineStore.setState((state) => ({
+    machines: [
+      ...state.machines,
+      {
+        ...state.machines[0]!,
+        id: "machine-2",
+        name: "Linux",
+        hostname: "linux.local",
+      },
+    ],
+  }));
+  renderAddView(makePrefetched());
+
+  fireEvent.click(screen.getByTestId("add-member-create-agent-entry"));
+  const contextStrip = await screen.findByTestId("create-agent-channel-context");
+  const createForm = contextStrip.closest("form");
+  assert.ok(createForm, "the shared Create Agent form must be mounted");
+
+  const computerTrigger = within(createForm).getAllByRole("combobox")
+    .find((trigger) => trigger.textContent?.includes("Mac"));
+  assert.ok(computerTrigger, "the Computer select must use the shared Create Agent control");
+  fireEvent.click(computerTrigger);
+
+  const listbox = await screen.findByRole("listbox");
+  assert.ok(
+    createForm.contains(listbox),
+    "the select popup must share the dialog's portal owner instead of landing behind it",
+  );
+  const linuxOption = within(listbox).getByRole("option", { name: "Linux (linux.local)" });
+  fireEvent.pointerDown(linuxOption, { pointerType: "mouse" });
+  fireEvent.click(linuxOption);
+  await waitFor(() => assert.match(computerTrigger.textContent ?? "", /Linux/));
+
+  const runtimeTrigger = within(createForm).getAllByRole("combobox")[1];
+  assert.ok(runtimeTrigger, "the Runtime select must use the shared Create Agent control");
+  fireEvent.click(runtimeTrigger);
+  const runtimeListbox = await screen.findByRole("listbox");
+  assert.ok(
+    createForm.contains(runtimeListbox),
+    "runtime-backed selects must share the dialog's portal owner too",
+  );
 });
 
 test("B: a no-hit search steps the entry up and strips the leading @ from the suggested name", async () => {
@@ -298,7 +350,7 @@ test("B: a no-hit search steps the entry up and strips the leading @ from the su
     within(entry).getByText("Create Agent “deploy-bot”"),
     "the typed text becomes the suggested name with the display-@ removed",
   );
-  assert.match(entry.className, /bg-soft-signal/, "the no-hit state promotes the entry visually");
+  assert.match(entry.className, /bg-brand-soft/, "the no-hit state promotes the entry visually");
 
   fireEvent.click(entry);
   await waitFor(() => {
@@ -318,7 +370,7 @@ test("C: without createAgents the entry is visible but disabled, with the reason
     "the enabled entry must not render without the createAgents capability",
   );
   const disabled = screen.getByTestId("add-member-create-agent-entry-disabled");
-  assert.ok(within(disabled).getByText("Create a New Agent"));
+  assert.ok(within(disabled).getByText("Create Agent"));
   assert.match(
     disabled.textContent ?? "",
     /needs an owner or admin/,

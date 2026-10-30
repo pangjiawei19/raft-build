@@ -1,3 +1,4 @@
+import type { ServerId } from "./brandedIds";
 // Operation cards (B-mode) — agents prepare a privileged action and post it
 // inline as a chat message; a human admin clicks the action button to commit
 // it under their own identity. The card is the entire body of the system
@@ -15,8 +16,9 @@
 // approval surface.
 
 import { z } from "zod";
+import { lazySchema } from "./lazySchema";
 
-const uuidSchema = z.uuid();
+const uuidSchema = lazySchema("uuidSchema", () => z.uuid());
 
 /**
  * `idOrHandleSchema` — schema for fields that accept either a Slock UUID
@@ -37,21 +39,21 @@ const uuidSchema = z.uuid();
  * Validation only checks "non-empty string"; type-specific resolution and
  * not-found errors live in the server's prepare step.
  */
-const idOrHandleSchema = z.string().min(1).max(120);
+const idOrHandleSchema = lazySchema("idOrHandleSchema", () => z.string().min(1).max(120));
 
 export const APPROVAL_RUNTIMES = ["claude", "codex", "kimi", "kimi-sdk", "gemini", "opencode"] as const;
 export type ActionCardAgentRuntime = (typeof APPROVAL_RUNTIMES)[number];
 
-const draftHintSchema = z
+const draftHintSchema = lazySchema("draftHintSchema", () => z
   .string()
   .trim()
   .max(2_000)
   .optional()
   .describe(
     "Why the agent prepared this for you. Shows below the form on the card; not the action itself.",
-  );
+  ));
 
-export const channelCreateOperationSchema = z.object({
+export const channelCreateOperationSchema = lazySchema("channelCreateOperationSchema", () => z.object({
   type: z.literal("channel:create"),
   name: z.string().trim().min(1).max(80),
   visibility: z.enum(["public", "private"]).default("public"),
@@ -69,9 +71,9 @@ export const channelCreateOperationSchema = z.object({
    */
   initialAgents: z.array(idOrHandleSchema).max(64).optional(),
   draftHint: draftHintSchema,
-});
+}));
 
-export const agentCreateOperationSchema = z.object({
+export const agentCreateOperationSchema = lazySchema("agentCreateOperationSchema", () => z.object({
   type: z.literal("agent:create"),
   name: z.string().trim().min(1).max(60),
   description: z.string().trim().max(500).optional(),
@@ -82,12 +84,28 @@ export const agentCreateOperationSchema = z.object({
    * the dialog when available; `requiredComputer` prevents silent fallback to
    * any other computer.
    *
-   * Runtime / model / reasoning effort remain human-picked technical fields.
+   * Runtime / model / reasoning effort remain human-picked technical fields,
+   * except for a hosted agent's model below.
    */
   suggestedComputer: idOrHandleSchema.optional(),
   requiredComputer: idOrHandleSchema.optional(),
+  /**
+   * Where the agent runs. `antiproton` preselects "Hosted by Raft
+   * (Antiproton)" (no computer); absent or `computer` keeps the computer
+   * picker. Prepare refuses `antiproton` when hosting is off for the server.
+   * The human can still change it in the dialog.
+   */
+  hosting: z.enum(["computer", "antiproton"]).optional()
+    .describe('Where the new agent runs: "antiproton" proposes a cloud agent (one that runs in Raft\'s cloud, not on a Computer); omit it or use "computer" for a Computer the human picks. The human can change it.'),
+  /**
+   * Hosted model id, only with `hosting: "antiproton"`. Prepare checks it
+   * against the provider's current list; absent means the provider default.
+   * The human can still change it in the dialog.
+   */
+  model: z.string().trim().min(1).max(200).optional()
+    .describe('Cloud agent model id, only with hosting: "antiproton"; omit for the default. An id the cloud runtime does not offer is refused, and the refusal lists the offered ids.'),
   draftHint: draftHintSchema,
-});
+}));
 
 /**
  * `channel:add_member` — agent prepares a list of humans and/or agents to add
@@ -114,7 +132,7 @@ export const agentCreateOperationSchema = z.object({
  * field names mirror `channelCreateOperationSchema.initialHumans` /
  * `initialAgents` for symmetry.
  */
-export const channelAddMemberOperationSchema = z.object({
+export const channelAddMemberOperationSchema = lazySchema("channelAddMemberOperationSchema", () => z.object({
   type: z.literal("channel:add_member"),
   /**
    * Target channel. Handle (`#general` or bare `general`) or UUID.
@@ -127,9 +145,9 @@ export const channelAddMemberOperationSchema = z.object({
   /** Same resolution rule as `channelCreateOperationSchema.initialAgents`. */
   agents: z.array(idOrHandleSchema).max(64).optional(),
   draftHint: draftHintSchema,
-});
+}));
 
-export const integrationApproveAgentLoginOperationSchema = z.object({
+export const integrationApproveAgentLoginOperationSchema = lazySchema("integrationApproveAgentLoginOperationSchema", () => z.object({
   type: z.literal("integration:approve_agent_login"),
   requestId: uuidSchema,
   agentId: uuidSchema,
@@ -139,12 +157,15 @@ export const integrationApproveAgentLoginOperationSchema = z.object({
   clientName: z.string().trim().min(1).max(120),
   scopes: z.array(z.string().trim().min(1).max(120)).max(64),
   draftHint: draftHintSchema,
-});
+}));
 
-export const integrationInstallMarketplaceAppOperationSchema = z.object({
+export const integrationInstallMarketplaceAppOperationSchema = lazySchema("integrationInstallMarketplaceAppOperationSchema", () => z.object({
   type: z.literal("integration:install_marketplace_app"),
   clientId: uuidSchema,
   clientKey: z.string().trim().min(1).max(120),
+  setupUrl: z.string().max(2000).optional(),
+  setupDescription: z.string().max(1000).optional(),
+  setupRevision: z.number().int().positive().optional(),
   /**
    * Canonical inert display projection. The raw publisher-controlled name
    * must never enter an action-card carrier.
@@ -156,18 +177,20 @@ export const integrationInstallMarketplaceAppOperationSchema = z.object({
   agentName: z.string().trim().min(1).max(120),
   scopes: z.array(z.string().trim().min(1).max(120)).max(64),
   draftHint: draftHintSchema,
-});
+}));
 
-const integrationAppDraftFieldsSchema = z.object({
+const integrationAppDraftFieldsSchema = lazySchema("integrationAppDraftFieldsSchema", () => z.object({
   name: z.string().trim().min(1).max(120).optional(),
   description: z.string().trim().max(1_000).optional(),
   category: z.string().trim().min(1).max(120).optional(),
   homepageUrl: z.string().trim().max(2_000).optional(),
   returnUrl: z.string().trim().max(2_000).optional(),
   agentManifestUrl: z.string().trim().max(2_000).optional(),
-});
+  setupUrl: z.string().trim().max(2_000).optional(),
+  setupDescription: z.string().trim().max(500).optional(),
+}));
 
-export const integrationRegisterAppOperationSchema = integrationAppDraftFieldsSchema.extend({
+export const integrationRegisterAppOperationSchema = lazySchema("integrationRegisterAppOperationSchema", () => integrationAppDraftFieldsSchema.extend({
   type: z.literal("integration:register_app"),
   name: z.string().trim().min(1).max(120),
   clientKey: z.string().trim().min(1).max(120).optional(),
@@ -175,24 +198,24 @@ export const integrationRegisterAppOperationSchema = integrationAppDraftFieldsSc
   scopes: z.array(z.string().trim().min(1).max(120)).max(64).default([]),
   unsafeDemoUrlOverride: z.boolean().optional(),
   draftHint: draftHintSchema,
-});
+}));
 
-export const integrationUpdateAppRegistrationOperationSchema = integrationAppDraftFieldsSchema.extend({
+export const integrationUpdateAppRegistrationOperationSchema = lazySchema("integrationUpdateAppRegistrationOperationSchema", () => integrationAppDraftFieldsSchema.extend({
   type: z.literal("integration:update_app_registration"),
   clientKey: z.string().trim().min(1).max(120),
   scopes: z.array(z.string().trim().min(1).max(120)).max(64).optional(),
   unsafeDemoUrlOverride: z.boolean().optional(),
   draftHint: draftHintSchema,
-});
+}));
 
-export const integrationRecoverAppOwnerOperationSchema = z.object({
+export const integrationRecoverAppOwnerOperationSchema = lazySchema("integrationRecoverAppOwnerOperationSchema", () => z.object({
   type: z.literal("integration:recover_app_owner"),
   clientKey: z.string().trim().min(1).max(120),
   targetAgent: z.string().trim().min(1).max(120),
   draftHint: draftHintSchema,
-});
+}));
 
-export const actionCardActionSchema = z.discriminatedUnion("type", [
+export const actionCardActionSchema = lazySchema("actionCardActionSchema", () => z.discriminatedUnion("type", [
   channelCreateOperationSchema,
   agentCreateOperationSchema,
   channelAddMemberOperationSchema,
@@ -201,7 +224,7 @@ export const actionCardActionSchema = z.discriminatedUnion("type", [
   integrationRegisterAppOperationSchema,
   integrationUpdateAppRegistrationOperationSchema,
   integrationRecoverAppOwnerOperationSchema,
-]);
+]));
 
 export type ActionCardAction = z.infer<typeof actionCardActionSchema>;
 export type ActionCardActionType = ActionCardAction["type"];
@@ -398,6 +421,12 @@ export function validateActionCardAction(action: ActionCardAction): string | nul
     if (action.suggestedComputer && action.requiredComputer) {
       return "agent:create must include only one of suggestedComputer or requiredComputer";
     }
+    if (action.hosting === "antiproton" && (action.suggestedComputer || action.requiredComputer)) {
+      return 'agent:create with hosting: "antiproton" makes a cloud agent, which does not run on a Computer; leave out suggestedComputer and requiredComputer';
+    }
+    if (action.model !== undefined && action.hosting !== "antiproton") {
+      return 'agent:create model is only for a cloud agent (hosting: "antiproton")';
+    }
   }
   if (action.type === "channel:add_member") {
     const total = (action.humans?.length ?? 0) + (action.agents?.length ?? 0);
@@ -411,6 +440,8 @@ export function validateActionCardAction(action: ActionCardAction): string | nul
       || action.homepageUrl !== undefined
       || action.returnUrl !== undefined
       || action.agentManifestUrl !== undefined
+      || action.setupUrl !== undefined
+      || action.setupDescription !== undefined
       || action.scopes !== undefined;
     if (!hasMetadataPatch) {
       return "integration:update_app_registration must include at least one field to update";
@@ -421,10 +452,9 @@ export function validateActionCardAction(action: ActionCardAction): string | nul
 
 // ── Card state on the carrier message ───────────────────────────────────────
 //
-// State lives on `messages.action_metadata` (jsonb) — no separate table. The
-// state machine is intentionally tiny:
-//
-//   prepared → executed   (admin clicked the action button, action succeeded)
+// State lives on `messages.action_metadata` (jsonb) and is mirrored by the
+// durable action_cards row. Conversion adds an authority-aware lifecycle:
+//   prepared → frozen → reconfirm_required → prepared/ready → executed
 //   prepared → failed     (admin clicked, action failed; card shows error and
 //                          stays "prepared" so click can be retried —
 //                          `failed` is a UI hint, the canonical state stays
@@ -433,10 +463,19 @@ export function validateActionCardAction(action: ActionCardAction): string | nul
 // The action is idempotent at the server level: a click while state is
 // already `executed` is rejected.
 
-export type ActionCardState = "prepared" | "executed";
+export type ActionCardState = "prepared" | "executed" | "frozen" | "reconfirm_required";
 
 export interface ActionCardMetadata {
   kind: "action-card";
+  /**
+   * The card's target server, fixed at prepare time (the preparing agent's
+   * server). Execution always acts on this server and the confirmer's
+   * permissions are checked there, whichever joint projection they view it
+   * from. Read paths overwrite it from `action_cards.server_id`.
+   */
+  sourceServerId?: ServerId | null;
+  /** Display name of `sourceServerId` at prepare time ("Acts on <name>"). */
+  targetServerName?: string | null;
   /** Frozen at prepare time. */
   action: ActionCardAction;
   /** Safe fallback presentation for older clients. */
@@ -448,6 +487,12 @@ export interface ActionCardMetadata {
   executedByUserName?: string | null;
   /** Resource produced by the execute step (e.g. created channel id). */
   result?: ActionCardResult | null;
+  /** Persisted optimistic credential. Conversion retires the old value. */
+  confirmationVersion?: number;
+  /** Durable conversion identity; present only after this card was frozen. */
+  conversionJobId?: string;
+  conversionEpoch?: string;
+  reconfirmedAt?: string;
 }
 
 export type ActionCardResult =
@@ -487,6 +532,7 @@ export type ActionCardResult =
       agentId: string;
       agentName: string;
       scopes: string[];
+      setupUrl?: string;
     }
   | {
       kind: "integration-app-registration";
@@ -497,6 +543,8 @@ export type ActionCardResult =
       returnUrl: string | null;
       homepageUrl: string | null;
       agentManifestUrl: string | null;
+      setupUrl?: string | null;
+      setupDescription?: string | null;
       scopes: string[];
       unsafeDemoUrlOverride?: boolean;
     }
@@ -513,9 +561,23 @@ export type ActionCardResult =
 export interface ExecuteActionRequestBody {
   /** Optimistic-concurrency guard against double-execute. */
   expectedState?: ActionCardState;
+  expectedConfirmationVersion?: number;
 }
 
 // Body shape for POST /api/actions/:messageId/mark-executed (dialog flow)
 export interface MarkActionExecutedRequestBody {
   result: ActionCardResult;
+  expectedConfirmationVersion?: number;
+}
+
+export interface ActionCardRegularWriterContext {
+  messageId: string;
+  confirmationVersion: number;
+}
+
+/** A shared history copy never grants authority to execute in another workspace. */
+export function isActionCardReadOnlyInServer(sourceServerId: ServerId | null | undefined, viewerServerId: string | undefined): boolean {
+  // Undefined is the additive-protocol fallback for an older server. Current
+  // servers explicitly send null if the canonical card owner is unavailable.
+  return sourceServerId !== undefined && (sourceServerId === null || sourceServerId !== viewerServerId);
 }

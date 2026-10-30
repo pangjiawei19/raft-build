@@ -4,14 +4,20 @@ import { expect, test } from "@playwright/test";
  * Key/value rows are shared by RuntimeConfigFields (env vars) and AgentMcpTab
  * (credential headers).  The real Agent Details runtime editor gives us the
  * former consumer with persisted rows; measure the actual text-bearing inputs
- * in both themes so a button/input stopgap cannot hide a typography regression.
+ * so a button/input stopgap cannot hide a typography regression. They are
+ * inputs, so they read the DS input type (TextField: 16/24, weight 400).
  */
-type Theme = "brutal" | "elegant";
+type Mode = "light" | "dark";
 type Metrics = { fontSize: string; fontWeight: string; lineHeight: string };
 
-const CASE = (theme: Theme) =>
+/** DS TextField: input text is 16/24, at the body weight. */
+const RAFT_FIELD: Metrics = { fontSize: "16px", fontWeight: "400", lineHeight: "24px" };
+
+// The visual host reads its mode from `?theme=dark` and renders light
+// otherwise (requestedMode in packages/web/visual-testing/VisualTestingCases.tsx).
+const CASE = (mode: Mode) =>
   `/visual-testing.html?case=screens.members.agent-detail.runtime-connection` +
-  (theme === "elegant" ? "&theme=elegant" : "");
+  (mode === "dark" ? "&theme=dark" : "");
 
 async function primeConnections(page: import("@playwright/test").Page) {
   await page.route("**/provider-connections", async (route) => {
@@ -26,11 +32,10 @@ async function primeConnections(page: import("@playwright/test").Page) {
   });
 }
 
-async function openRows(page: import("@playwright/test").Page, theme: Theme) {
+async function openRows(page: import("@playwright/test").Page, mode: Mode) {
   await primeConnections(page);
-  await page.goto(CASE(theme));
-  await page.waitForSelector('[title="Edit runtime config"]', { timeout: 10_000 });
-  await page.click('[title="Edit runtime config"]');
+  await page.goto(CASE(mode));
+  await page.getByRole("button", { name: "Edit runtime config" }).click({ timeout: 10_000 });
   // Agent Details uses an inline editor surface (not an ARIA dialog).  Readiness
   // is the editor's real combobox, matching the existing provider-connection
   // metrics spec; waiting for role=dialog makes the tooth fail before measuring.
@@ -43,43 +48,40 @@ async function openRows(page: import("@playwright/test").Page, theme: Theme) {
   await page.waitForTimeout(300);
 }
 
-for (const theme of ["brutal", "elegant"] as Theme[]) {
-  test(`${theme}: shared key/value inputs obey field metrics`, async ({ page }) => {
-    await openRows(page, theme);
-    const result = await page.evaluate(() => {
-      const root = document.querySelector("[data-theme]") ?? document.documentElement;
-      const token = getComputedStyle(root);
-      const px = (v: string) => `${parseFloat(v.trim())}px`;
-      const tokens = {
-        fontSize: px(token.getPropertyValue("--field-font-size")),
-        fontWeight: token.getPropertyValue("--field-font-weight").trim(),
-        lineHeight: px(token.getPropertyValue("--field-line-height")),
-      };
-      const rows = [...document.querySelectorAll('[data-slot="field"]')]
-        .flatMap((field) => [...field.querySelectorAll("input")])
-        .filter((input) => input.getAttribute("aria-label")?.toLowerCase().includes("environment"));
-      return { tokens, metrics: rows.map((el) => { const s = getComputedStyle(el); return { fontSize: s.fontSize, fontWeight: s.fontWeight, lineHeight: s.lineHeight } as Metrics; }) };
-    });
-    expect(result.metrics.length, `${theme}: env-var key/value consumer must render rows`).toBeGreaterThan(0);
-    expect(result.tokens.fontSize).toMatch(/^\d+(\.\d+)?px$/);
-    for (const metric of result.metrics) expect(metric).toEqual(result.tokens);
+test("shared key/value inputs obey the field metrics", async ({ page }) => {
+  await openRows(page, "light");
+  const result = await page.evaluate(() => {
+    const token = getComputedStyle(document.documentElement);
+    const px = (v: string) => `${parseFloat(v.trim())}px`;
+    const tokens = {
+      fontSize: px(token.getPropertyValue("--field-font-size")),
+      fontWeight: token.getPropertyValue("--field-font-weight").trim(),
+      lineHeight: px(token.getPropertyValue("--field-line-height")),
+    };
+    const rows = [...document.querySelectorAll('[data-slot="field"]')]
+      .flatMap((field) => [...field.querySelectorAll("input")])
+      .filter((input) => input.getAttribute("aria-label")?.toLowerCase().includes("environment"));
+    return { tokens, metrics: rows.map((el) => { const s = getComputedStyle(el); return { fontSize: s.fontSize, fontWeight: s.fontWeight, lineHeight: s.lineHeight } as Metrics; }) };
   });
-}
+  expect(result.metrics.length, "env-var key/value consumer must render rows").toBeGreaterThan(0);
+  expect(result.tokens, "the field axis resolves to the DS input type").toEqual(RAFT_FIELD);
+  for (const metric of result.metrics) expect(metric).toEqual(result.tokens);
+});
 
 /**
  * The typography test above stays GREEN when the colour override comes back —
  * it only measures the inputs, and the override was never on an input. That is
  * the gap @Dozy found on PR #7010: the fix had no tooth of its own.
  *
- * A literal is invisible to a single-theme measurement, so this reads the SAME
- * two elements under both themes and requires them to disagree. `text-black/60`
+ * A literal is invisible to a single-mode measurement, so this reads the SAME
+ * two elements in light and dark and requires them to disagree. `text-black/60`
  * on the add button, or `text-black/40` on the `=` separator, renders one colour
- * everywhere — which is precisely what "cannot follow the theme" means, and
+ * in both modes — which is precisely what "cannot follow the mode" means, and
  * precisely what this then catches.
  */
-test("add button and separator follow the theme rather than a literal", async ({ page }) => {
-  const read = async (theme: Theme) => {
-    await openRows(page, theme);
+test("add button and separator follow the mode rather than a literal", async ({ page }) => {
+  const read = async (mode: Mode) => {
+    await openRows(page, mode);
     return page.evaluate(() => {
       const addButton = [...document.querySelectorAll("button")]
         .find((el) => /add variable/i.test(el.textContent ?? ""));
@@ -92,21 +94,21 @@ test("add button and separator follow the theme rather than a literal", async ({
     });
   };
 
-  const brutal = await read("brutal");
-  const elegant = await read("elegant");
+  const light = await read("light");
+  const dark = await read("dark");
 
   // Preconditions: a missing element would make the inequality below vacuous.
-  expect(brutal.addButton, "the add-variable button must render under brutal").not.toBeNull();
-  expect(brutal.separator, "the `=` separator must render under brutal").not.toBeNull();
-  expect(elegant.addButton, "the add-variable button must render under elegant").not.toBeNull();
-  expect(elegant.separator, "the `=` separator must render under elegant").not.toBeNull();
+  expect(light.addButton, "the add-variable button must render in light").not.toBeNull();
+  expect(light.separator, "the `=` separator must render in light").not.toBeNull();
+  expect(dark.addButton, "the add-variable button must render in dark").not.toBeNull();
+  expect(dark.separator, "the `=` separator must render in dark").not.toBeNull();
 
   expect(
-    elegant.addButton,
-    `the add-variable button must change with the theme — got ${brutal.addButton} under both, which is what a hardcoded text-black/60 looks like`,
-  ).not.toBe(brutal.addButton);
+    dark.addButton,
+    `the add-variable button must change with the mode — got ${light.addButton} in both, which is what a hardcoded text-black/60 looks like`,
+  ).not.toBe(light.addButton);
   expect(
-    elegant.separator,
-    `the "=" separator must change with the theme — got ${brutal.separator} under both, which is what a hardcoded text-black/40 looks like`,
-  ).not.toBe(brutal.separator);
+    dark.separator,
+    `the "=" separator must change with the mode — got ${light.separator} in both, which is what a hardcoded text-black/40 looks like`,
+  ).not.toBe(light.separator);
 });

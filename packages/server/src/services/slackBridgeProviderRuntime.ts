@@ -8,30 +8,35 @@ import {
 } from "@botiverse/raft-shared";
 import { and, eq, gt, isNull, lte, or } from "drizzle-orm";
 
-import { getDb, type Database, type DatabaseTransaction } from "../db/index.js";
+import { getDb, type Database, type DatabaseTransaction } from "../db/index";
 import {
   externalAppCredentials,
   externalAppInstalls,
   externalChannelBindings,
   externalMessageLinks,
-} from "../db/schema.js";
-import type { SlackAudienceCredentialResolver } from "./slackAudienceRefreshService.js";
-import type { SlackBridgeCredentialCipher } from "./slackBridgeEnvSecrets.js";
-import type { ExternalAttachmentAuthority } from "./externalAttachmentProviderAdapter.js";
+} from "../db/schema";
+import type { SlackAudienceCredentialResolver } from "./slackAudienceRefreshService";
+import type { SlackBridgeCredentialCipher } from "./slackBridgeEnvSecrets";
+import type { ExternalAttachmentAuthority } from "./externalAttachmentProviderAdapter";
 import {
   SlackInboundAttachmentError,
   type SlackInboundAttachmentTransport,
-} from "./slackInboundAttachmentAdapter.js";
+} from "./slackInboundAttachmentAdapter";
 import {
   SlackOutboundAttachmentError,
   type SlackOutboundAttachmentTransport,
-} from "./slackOutboundAttachmentAdapter.js";
+} from "./slackOutboundAttachmentAdapter";
 import type {
+  SlackBridgeAgentMentionCandidate,
+  SlackBridgeAgentMentionHandle,
+  SlackBridgeAgentMentionReconcileFailure,
+  SlackBridgeHumanMentionCandidate,
+  SlackBridgeHumanMentionHandle,
   SlackBridgeProvisioningProvider,
   SlackBridgeProvisioningProviderAuthority,
   SlackBridgeProvisioningProviderResult,
   SlackBridgeProvisioningProviderUser,
-} from "./slackBridgeProvisioningControlPlane.js";
+} from "./slackBridgeProvisioningControlPlane";
 import {
   SLACK_BRIDGE_CREDENTIAL_LEASE_SCHEMA,
   type SlackBridgeCredentialHandle,
@@ -41,7 +46,22 @@ import {
   type SlackWebApiRequest,
   type SlackWebApiTransport,
   type SlackWebApiTransportResult,
-} from "./slackProviderAdapter.js";
+} from "./slackProviderAdapter";
+import {
+  findAnyCurrentExternalInstallServerGrantAuthority,
+  resolveExternalInstallServerGrantAuthority,
+} from "./externalInstallServerGrantAuthority";
+import {
+  parseSlackAgentUsergroupMarker,
+  parseSlackHumanUsergroupMarker,
+  RAFT_AGENT_USERGROUP_MARKER_PREFIX,
+  RAFT_HUMAN_USERGROUP_MARKER_PREFIX,
+  SLACK_USERGROUP_NAMING_EXHAUSTED_ERROR,
+  slackAgentHandleCandidates,
+  slackAgentUsergroupMarker,
+  slackHumanHandleCandidates,
+  slackHumanUsergroupMarker,
+} from "./slackMentionTokens";
 
 const DEFAULT_CREDENTIAL_LEASE_TTL_MS = 60_000;
 const DEFAULT_FETCH_TIMEOUT_MS = 15_000;
@@ -68,6 +88,7 @@ const SLACK_QUERY_METHODS = new Set([
   "conversations.history",
   "conversations.replies",
   "reactions.get",
+  "usergroups.list",
   "users.info",
 ]);
 
@@ -106,6 +127,18 @@ export interface SlackBridgeAudienceProviderRuntime {
 
 export interface SlackBridgeProviderRuntime extends SlackBridgeAudienceProviderRuntime {
   provisioningProvider: SlackBridgeProvisioningProvider;
+  resolveUsers(
+    authority: SlackBridgeProvisioningProviderAuthority,
+    providerUserIds: readonly string[],
+  ): Promise<SlackBridgeProvisioningProviderResult<{ users: readonly SlackBridgeProvisioningProviderUser[] }>>;
+  resolveAgentMentionHandles(
+    authority: SlackBridgeProvisioningProviderAuthority,
+    input: { serverId: string; providerUsergroupIds: readonly string[] },
+  ): Promise<SlackBridgeProvisioningProviderResult<{
+    handles: readonly SlackBridgeAgentMentionHandle[];
+    /** Managed human usergroups (`raft-user:` marker) among the requested ids. */
+    humanHandles?: readonly SlackBridgeHumanMentionHandle[];
+  }>>;
 }
 
 export interface SlackBridgeProviderRuntimeDependencies {
@@ -143,8 +176,157 @@ export function slackProfileAvatarLocator(profile: Record<string, unknown>): str
   return locator;
 }
 
+function slackProvisioningUser(value: unknown, expectedProviderUserId: string): SlackBridgeProvisioningProviderUser | null {
+  if (!record(value) || value.id !== expectedProviderUserId) return null;
+  const profile = record(value.profile) ? value.profile : {};
+  const displayName = nonEmpty(profile.display_name, 512)
+    ? profile.display_name
+    : nonEmpty(profile.real_name, 512)
+      ? profile.real_name
+      : nonEmpty(value.name, 512)
+        ? value.name
+        : expectedProviderUserId;
+  const handle = nonEmpty(value.name, 512) ? value.name : null;
+  const actorKind = value.is_bot === true || value.is_app_user === true
+    ? "remote" as const
+    : value.is_restricted === true || value.is_ultra_restricted === true
+      ? "guest" as const
+      : "human" as const;
+  return {
+    id: expectedProviderUserId,
+    displayName,
+    handle,
+    actorKind,
+    avatarLocator: slackProfileAvatarLocator(profile),
+  };
+}
+
 function record(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+type SlackAgentUsergroup = {
+  id: string;
+  name: string;
+  handle: string;
+  description: string;
+  disabled: boolean;
+};
+
+function parseSlackAgentUsergroup(value: unknown): SlackAgentUsergroup | null {
+  if (!record(value)) return null;
+  if (
+    !nonEmpty(value.id, 160)
+    || !nonEmpty(value.name, 80)
+    || !nonEmpty(value.handle, 80)
+  ) return null;
+  return {
+    id: value.id,
+    name: value.name,
+    handle: value.handle,
+    description: typeof value.description === "string" ? value.description : "",
+    disabled: value.date_delete !== undefined && Number(value.date_delete) > 0,
+  };
+}
+
+/**
+ * Slack refuses a usergroup write whose handle or name is taken or invalid
+ * (e.g. a handle equal to an existing Slack username). Those refusals move
+ * the principal to its next candidate; any other failure (rate limit,
+ * permission, transport) does not.
+ */
+export function slackUsergroupNamingConflict(
+  slackError: string | undefined,
+): "handle" | "name" | null {
+  if (!slackError) return null;
+  const naming = /(?:already_exists|_taken|^invalid_(?:name|handle))/u.test(slackError);
+  if (!naming) return null;
+  return slackError.includes("handle") ? "handle" : "name";
+}
+
+/** One Raft principal (Agent or human) that should own a managed Slack usergroup. */
+type SlackMentionPrincipal = {
+  kind: "agent" | "user";
+  id: string;
+  marker: string;
+  handleCandidates: readonly string[];
+  nameCandidates: readonly string[];
+};
+
+/** Usergroup names tell Slack users which entries are Raft Agents. */
+const SLACK_AGENT_USERGROUP_NAME_LABEL = " (agent)";
+const SLACK_USERGROUP_NAME_LIMIT = 80;
+
+function slackUsergroupNameWithSuffix(
+  baseValue: string,
+  suffixValue: string,
+  label: string,
+): string {
+  const base = Array.from(baseValue.trim());
+  const suffix = Array.from(suffixValue.trim()).slice(0, 32);
+  if (base.length === 0 || suffix.length === 0) return "";
+  const separator = " · ";
+  const available = Math.max(
+    1,
+    SLACK_USERGROUP_NAME_LIMIT - separator.length - suffix.length - label.length,
+  );
+  return `${base.slice(0, available).join("")}${label}${separator}${suffix.join("")}`
+    .slice(0, SLACK_USERGROUP_NAME_LIMIT);
+}
+
+function slackUsergroupNameCandidates(input: {
+  displayName: string;
+  serverName: string;
+  serverSlug: string;
+  id: string;
+  label: string;
+}): string[] {
+  // Slack autocomplete shows usergroup *names* workspace-wide; carrying the
+  // Raft server name in the name makes principals from other servers on a
+  // shared Slack workspace self-evident ("Huarong (agent) · botiverse"). Agent
+  // names keep the " (agent)" label in every variant so Slack users can tell
+  // Agents from humans. The handle stays the bare Raft handle either way.
+  const bare = Array.from(input.displayName.trim())
+    .slice(0, SLACK_USERGROUP_NAME_LIMIT - input.label.length)
+    .join("");
+  return [...new Set([
+    slackUsergroupNameWithSuffix(input.displayName, input.serverName, input.label),
+    slackUsergroupNameWithSuffix(input.displayName, input.serverSlug, input.label),
+    slackUsergroupNameWithSuffix(input.displayName, input.id.slice(0, 8), input.label),
+    bare ? `${bare}${input.label}` : "",
+  ].filter(Boolean))];
+}
+
+function slackAgentMentionPrincipal(candidate: SlackBridgeAgentMentionCandidate): SlackMentionPrincipal {
+  return {
+    kind: "agent",
+    id: candidate.agentId,
+    marker: slackAgentUsergroupMarker(candidate.serverId, candidate.agentId),
+    handleCandidates: slackAgentHandleCandidates(candidate),
+    nameCandidates: slackUsergroupNameCandidates({
+      displayName: candidate.displayName,
+      serverName: candidate.serverName,
+      serverSlug: candidate.serverSlug,
+      id: candidate.agentId,
+      label: SLACK_AGENT_USERGROUP_NAME_LABEL,
+    }),
+  };
+}
+
+function slackHumanMentionPrincipal(candidate: SlackBridgeHumanMentionCandidate): SlackMentionPrincipal {
+  return {
+    kind: "user",
+    id: candidate.userId,
+    marker: slackHumanUsergroupMarker(candidate.serverId, candidate.userId),
+    handleCandidates: slackHumanHandleCandidates(candidate),
+    nameCandidates: slackUsergroupNameCandidates({
+      displayName: candidate.displayName,
+      serverName: candidate.serverName,
+      serverSlug: candidate.serverSlug,
+      id: candidate.userId,
+      label: "",
+    }),
+  };
 }
 
 function jsonObject(value: unknown): SlackJsonObject {
@@ -282,6 +464,7 @@ export function createSlackBridgeProviderRuntime(
     const fields = {
       serverId: externalAppInstalls.serverId,
       installId: externalAppInstalls.id,
+      registrationId: externalAppInstalls.registrationId,
       installState: externalAppInstalls.state,
       providerAppId: externalAppInstalls.providerAppId,
       providerTeamId: externalAppInstalls.providerTeamId,
@@ -309,7 +492,12 @@ export function createSlackBridgeProviderRuntime(
       or(isNull(externalAppCredentials.leaseExpiresAt), lte(externalAppCredentials.leaseExpiresAt, requestedAt)),
     );
     if (request.binding) {
-      return tx.select(fields).from(externalAppCredentials)
+      return tx.select({
+        ...fields,
+        bindingServerId: externalChannelBindings.serverId,
+        bindingRegistrationId: externalChannelBindings.registrationId,
+        bindingGrantEpoch: externalChannelBindings.grantEpoch,
+      }).from(externalAppCredentials)
         .innerJoin(externalAppInstalls, eq(externalAppInstalls.id, externalAppCredentials.installId))
         .innerJoin(externalChannelBindings, and(
           eq(externalChannelBindings.id, request.binding.bindingId),
@@ -358,6 +546,31 @@ export function createSlackBridgeProviderRuntime(
         || !nonEmpty(current.providerTeamId)
         || !nonEmpty(current.botUserId)
       ) return null;
+      if (request.binding) {
+        if (
+          !("bindingServerId" in current)
+          || typeof current.bindingServerId !== "string"
+          || !("bindingRegistrationId" in current)
+          || typeof current.bindingRegistrationId !== "string"
+          || !("bindingGrantEpoch" in current)
+          || typeof current.bindingGrantEpoch !== "number"
+          || current.bindingRegistrationId !== current.registrationId
+        ) return null;
+        const serverAuthority = await resolveExternalInstallServerGrantAuthority(tx, {
+          installId: current.installId,
+          serverId: current.bindingServerId,
+          registrationId: current.bindingRegistrationId,
+        }, { lock: true });
+        if (!serverAuthority.current || current.bindingGrantEpoch !== serverAuthority.grant.grantEpoch) {
+          return null;
+        }
+      } else {
+        const serverAuthority = await findAnyCurrentExternalInstallServerGrantAuthority(tx, {
+          installId: current.installId,
+          registrationId: current.registrationId,
+        }, { lock: true });
+        if (!serverAuthority) return null;
+      }
       const claimed = await tx.update(externalAppCredentials).set({
         leaseOwner: leaseId,
         leaseExpiresAt,
@@ -1143,10 +1356,102 @@ export function createSlackBridgeProviderRuntime(
     if (result.kind !== "response") return { kind: "unverified" };
     const responseBody = result.body as Record<string, unknown>;
     if (result.status === 429 || result.status >= 500) return { kind: "unverified" };
-    if (responseBody.ok !== true) return { kind: "failed" };
+    if (responseBody.ok !== true) {
+      const slackError = typeof responseBody.error === "string"
+        ? responseBody.error.slice(0, 160)
+        : undefined;
+      console.warn("[SlackBridge] provisioning call failed", {
+        method,
+        status: result.status,
+        slackError,
+      });
+      return { kind: "failed", slackError };
+    }
     return {
       kind: "fact",
       fact: { body: responseBody, headers: result.headers },
+    };
+  };
+
+  const resolveUsers: SlackBridgeProviderRuntime["resolveUsers"] = async (authority, providerUserIds) => {
+    if (
+      stopped
+      || !validDate(authority.now)
+      || providerUserIds.length === 0
+      || providerUserIds.length > 50
+      || new Set(providerUserIds).size !== providerUserIds.length
+      || providerUserIds.some((providerUserId) => !nonEmpty(providerUserId, 160))
+    ) return { kind: "unverified" };
+    const users: SlackBridgeProvisioningProviderUser[] = [];
+    for (const providerUserId of providerUserIds) {
+      const response = await provisioningCall(authority, "users.info", { user: providerUserId });
+      if (response.kind !== "fact") return response;
+      const user = slackProvisioningUser(response.fact.user, providerUserId);
+      if (!user) return { kind: "failed" };
+      users.push(user);
+    }
+    return { kind: "fact", fact: { users } };
+  };
+
+  const resolveAgentMentionHandles: SlackBridgeProviderRuntime["resolveAgentMentionHandles"] = async (
+    authority,
+    input,
+  ) => {
+    if (
+      stopped
+      || !validDate(authority.now)
+      || !nonEmpty(input.serverId, 160)
+      || input.providerUsergroupIds.length === 0
+      || input.providerUsergroupIds.length > 50
+      || new Set(input.providerUsergroupIds).size !== input.providerUsergroupIds.length
+      || input.providerUsergroupIds.some((id) => !/^S[A-Z0-9]{2,}$/u.test(id))
+    ) return { kind: "unverified" };
+    const listed = await provisioningCall(authority, "usergroups.list", {
+      include_count: false,
+      include_disabled: true,
+    });
+    if (listed.kind !== "fact") return listed;
+    if (!Array.isArray(listed.fact.usergroups)) return { kind: "unverified" };
+    const requested = new Set(input.providerUsergroupIds);
+    const handles: SlackBridgeAgentMentionHandle[] = [];
+    const humanHandles: SlackBridgeHumanMentionHandle[] = [];
+    for (const raw of listed.fact.usergroups) {
+      const group = parseSlackAgentUsergroup(raw);
+      if (!group) return { kind: "unverified" };
+      if (!requested.has(group.id) || group.disabled) continue;
+      const marker = parseSlackAgentUsergroupMarker(group.description);
+      if (marker && marker.serverId === input.serverId) {
+        handles.push({
+          agentId: marker.agentId,
+          providerUsergroupId: group.id,
+          handle: group.handle.toLocaleLowerCase("en-US"),
+        });
+        continue;
+      }
+      const humanMarker = parseSlackHumanUsergroupMarker(group.description);
+      if (humanMarker && humanMarker.serverId === input.serverId) {
+        humanHandles.push({
+          userId: humanMarker.userId,
+          providerUsergroupId: group.id,
+          handle: group.handle.toLocaleLowerCase("en-US"),
+        });
+      }
+    }
+    const providerUsergroupIds = [...handles, ...humanHandles]
+      .map((handle) => handle.providerUsergroupId);
+    if (new Set(providerUsergroupIds).size !== providerUsergroupIds.length) {
+      return { kind: "failed" };
+    }
+    const byProviderUsergroupId = (
+      left: { providerUsergroupId: string },
+      right: { providerUsergroupId: string },
+    ) => left.providerUsergroupId.localeCompare(right.providerUsergroupId);
+    return {
+      kind: "fact",
+      fact: {
+        handles: handles.sort(byProviderUsergroupId),
+        humanHandles: humanHandles.sort(byProviderUsergroupId),
+      },
     };
   };
 
@@ -1297,31 +1602,265 @@ export function createSlackBridgeProviderRuntime(
       for (const providerUserId of observableMemberIds) {
         const response = await provisioningCall(authority, "users.info", { user: providerUserId });
         if (response.kind !== "fact") return response;
-        if (!record(response.fact.user) || response.fact.user.id !== providerUserId) {
-          return { kind: "failed" };
-        }
-        const profile = record(response.fact.user.profile) ? response.fact.user.profile : {};
-        const displayName = nonEmpty(profile.display_name, 512)
-          ? profile.display_name
-          : nonEmpty(profile.real_name, 512)
-            ? profile.real_name
-            : nonEmpty(response.fact.user.name, 512)
-              ? response.fact.user.name
-              : providerUserId;
-        const handle = nonEmpty(response.fact.user.name, 512) ? response.fact.user.name : null;
-        const actorKind = response.fact.user.is_bot === true || response.fact.user.is_app_user === true
-          ? "remote" as const
-          : response.fact.user.is_restricted === true || response.fact.user.is_ultra_restricted === true
-            ? "guest" as const
-            : "human" as const;
-        const avatarLocator = slackProfileAvatarLocator(profile);
-        users.push({ id: providerUserId, displayName, handle, actorKind, avatarLocator });
+        const user = slackProvisioningUser(response.fact.user, providerUserId);
+        if (!user) return { kind: "failed" };
+        users.push(user);
       }
       return {
         kind: "fact",
         fact: {
           providerMemberIds: [...providerMemberIds].sort(),
           users,
+        },
+      };
+    },
+
+    async reconcileAgentMentionHandles(authority, request) {
+      const humanCandidates = request.humanCandidates;
+      if (
+        stopped
+        || !validDate(authority.now)
+        || !nonEmpty(request.serverId, 160)
+        || request.candidates.length + (humanCandidates?.length ?? 0) > 200
+        || request.candidates.some((candidate) => (
+          candidate.serverId !== request.serverId
+          || !nonEmpty(candidate.agentId, 160)
+          || !nonEmpty(candidate.name, 160)
+          || !nonEmpty(candidate.displayName, 512)
+          || !nonEmpty(candidate.serverSlug, 160)
+          || !nonEmpty(candidate.serverName, 512)
+        ))
+        || new Set(request.candidates.map((candidate) => candidate.agentId)).size
+          !== request.candidates.length
+        || (humanCandidates ?? []).some((candidate) => (
+          candidate.serverId !== request.serverId
+          || !nonEmpty(candidate.userId, 160)
+          || !nonEmpty(candidate.name, 160)
+          || !nonEmpty(candidate.displayName, 512)
+          || !nonEmpty(candidate.serverSlug, 160)
+          || !nonEmpty(candidate.serverName, 512)
+        ))
+        || new Set((humanCandidates ?? []).map((candidate) => candidate.userId)).size
+          !== (humanCandidates?.length ?? 0)
+      ) return { kind: "unverified" };
+
+      const listed = await provisioningCall(authority, "usergroups.list", {
+        include_count: false,
+        include_disabled: true,
+      });
+      if (listed.kind !== "fact") return { kind: listed.kind, slackError: listed.kind === "failed" ? listed.slackError : undefined };
+      if (!Array.isArray(listed.fact.usergroups)) return { kind: "unverified" };
+      const groups: SlackAgentUsergroup[] = [];
+      for (const raw of listed.fact.usergroups) {
+        const group = parseSlackAgentUsergroup(raw);
+        if (!group) return { kind: "unverified" };
+        groups.push(group);
+      }
+
+      // Only groups carrying this server's marker for a kind being reconciled
+      // are managed here: an Agent-only request (no `humanCandidates`) never
+      // touches human groups, and foreign/plain groups are never touched.
+      const managedPrefixes = [
+        `${RAFT_AGENT_USERGROUP_MARKER_PREFIX}${request.serverId}:`,
+        ...(humanCandidates ? [`${RAFT_HUMAN_USERGROUP_MARKER_PREFIX}${request.serverId}:`] : []),
+      ];
+      // Two replicas racing a create can leave two groups with the same
+      // exact marker (same server, same principal). Keep one — enabled
+      // first, then the lowest id — and disable the rest below, so the race
+      // heals on the next pass instead of failing every pass. Groups are
+      // matched by their full marker only, never by name or handle.
+      const managedByMarker = new Map<string, SlackAgentUsergroup>();
+      const duplicateManaged: SlackAgentUsergroup[] = [];
+      for (const group of groups) {
+        if (!managedPrefixes.some((prefix) => group.description.startsWith(prefix))) continue;
+        const kept = managedByMarker.get(group.description);
+        if (!kept) {
+          managedByMarker.set(group.description, group);
+          continue;
+        }
+        const preferNew = kept.disabled !== group.disabled
+          ? kept.disabled
+          : group.id < kept.id;
+        duplicateManaged.push(preferNew ? kept : group);
+        if (preferNew) managedByMarker.set(group.description, group);
+      }
+      // Checked before every write: a holder whose claim lapsed (renewal
+      // refused, or its last confirmed window elapsed) sends nothing more and
+      // reports `unverified`, which never rewrites the persisted state.
+      const claimLost = async () => request.isClaimHeld !== undefined && !(await request.isClaimHeld());
+      // Agents first, then humans: an Agent keeps first claim on a handle.
+      const principals: SlackMentionPrincipal[] = [
+        ...[...request.candidates]
+          .sort((left, right) => left.agentId.localeCompare(right.agentId))
+          .map(slackAgentMentionPrincipal),
+        ...[...(humanCandidates ?? [])]
+          .sort((left, right) => left.userId.localeCompare(right.userId))
+          .map(slackHumanMentionPrincipal),
+      ];
+      const desiredMarkers = new Set(principals.map((principal) => principal.marker));
+      const occupied = new Set(groups.map((group) => group.handle.toLocaleLowerCase("en-US")));
+      const occupiedNames = new Set(groups.map((group) => group.name.toLocaleLowerCase("en-US")));
+      const handles: SlackBridgeAgentMentionHandle[] = [];
+      const humanHandles: SlackBridgeHumanMentionHandle[] = [];
+      const failures: SlackBridgeAgentMentionReconcileFailure[] = [];
+      const recordFailure = (
+        principal: SlackMentionPrincipal,
+        slackError: string | null,
+        transient: boolean,
+      ) => {
+        failures.push(principal.kind === "agent"
+          ? { agentId: principal.id, slackError, transient }
+          : { userId: principal.id, slackError, transient });
+      };
+
+      for (const principal of principals) {
+        // Per-principal isolation: a collision on every handle/name candidate
+        // or a provider error for one principal must not starve the rest —
+        // reconcile continues so remaining principals still get groups and the
+        // disable pass still runs. The failure (with Slack's error) is
+        // reported to the caller; the next tick retries.
+        const marker = principal.marker;
+        let group = managedByMarker.get(marker) ?? null;
+        if (group) {
+          occupied.delete(group.handle.toLocaleLowerCase("en-US"));
+          occupiedNames.delete(group.name.toLocaleLowerCase("en-US"));
+          if (group.disabled) {
+            let enabled: SlackBridgeProvisioningProviderResult<Record<string, unknown>>;
+            if (await claimLost()) return { kind: "unverified" };
+            try {
+              enabled = await provisioningCall(authority, "usergroups.enable", {
+                usergroup: group.id,
+              });
+            } catch {
+              recordFailure(principal, null, true);
+              continue;
+            }
+            if (enabled.kind !== "fact") {
+              recordFailure(
+                principal,
+                enabled.kind === "failed" ? enabled.slackError ?? null : null,
+                enabled.kind === "unverified",
+              );
+              continue;
+            }
+          }
+        }
+        // A group already holding one of this principal's candidates keeps it.
+        // Re-claiming an earlier candidate every tick re-sends a write Slack
+        // refuses (e.g. the handle is a Slack username, which usergroups.list
+        // never shows), so the reconcile would never converge and every tick
+        // would spend a rate-limited write on it.
+        const keptHandle = group && principal.handleCandidates.includes(group.handle)
+          ? group.handle
+          : null;
+        const keptName = group && principal.nameCandidates.includes(group.name)
+          ? group.name
+          : null;
+        let reconciled: { group: SlackAgentUsergroup; handle: string; name: string } | null = null;
+        for (;;) {
+          const handle = keptHandle && !occupied.has(keptHandle)
+            ? keptHandle
+            : principal.handleCandidates
+              .find((value) => value.length > 0 && !occupied.has(value)) ?? null;
+          const name = !handle
+            ? null
+            : keptName && !occupiedNames.has(keptName.toLocaleLowerCase("en-US"))
+              ? keptName
+              : principal.nameCandidates
+                .find((value) => !occupiedNames.has(value.toLocaleLowerCase("en-US"))) ?? null;
+          if (!handle || !name) {
+            // Every candidate is occupied or was refused as taken/invalid.
+            recordFailure(principal, SLACK_USERGROUP_NAMING_EXHAUSTED_ERROR, false);
+            break;
+          }
+          let write: SlackBridgeProvisioningProviderResult<Record<string, unknown>> | null = null;
+          const needsWrite = !group
+            || group.name !== name || group.handle !== handle || group.description !== marker;
+          if (needsWrite && await claimLost()) return { kind: "unverified" };
+          try {
+            if (!group) {
+              write = await provisioningCall(authority, "usergroups.create", {
+                name,
+                handle,
+                description: marker,
+              });
+            } else if (
+              group.name !== name || group.handle !== handle || group.description !== marker
+            ) {
+              write = await provisioningCall(authority, "usergroups.update", {
+                usergroup: group.id,
+                name,
+                handle,
+                description: marker,
+              });
+            }
+          } catch {
+            recordFailure(principal, null, true);
+            break;
+          }
+          if (!write) {
+            reconciled = { group: group!, handle, name };
+            break;
+          }
+          if (write.kind !== "fact") {
+            // A taken/invalid handle is retired for this tick (later
+            // principals skip it too) and the next candidate is tried. Slack
+            // reports some handle clashes (e.g. with a Slack username) as name
+            // errors, so a name conflict retires both the handle and the name.
+            // Any other failure (permission, plan, rate limit) does not cycle.
+            const conflict = write.kind === "failed"
+              ? slackUsergroupNamingConflict(write.slackError)
+              : null;
+            if (!conflict) {
+              recordFailure(
+                principal,
+                write.kind === "failed" ? write.slackError ?? null : null,
+                write.kind === "unverified",
+              );
+              break;
+            }
+            occupied.add(handle);
+            if (conflict === "name") occupiedNames.add(name.toLocaleLowerCase("en-US"));
+            continue;
+          }
+          const observed = parseSlackAgentUsergroup(write.fact.usergroup);
+          if (!observed || observed.description !== marker || observed.handle !== handle) {
+            recordFailure(principal, null, false);
+            break;
+          }
+          reconciled = { group: observed, handle, name };
+          break;
+        }
+        if (!reconciled) continue;
+        const { handle, name } = reconciled;
+        group = reconciled.group;
+        occupied.add(handle);
+        occupiedNames.add(name.toLocaleLowerCase("en-US"));
+        if (principal.kind === "agent") {
+          handles.push({ agentId: principal.id, providerUsergroupId: group.id, handle });
+        } else {
+          humanHandles.push({ userId: principal.id, providerUsergroupId: group.id, handle });
+        }
+      }
+
+      const retired = [
+        ...[...managedByMarker].filter(([marker]) => !desiredMarkers.has(marker)).map(([, group]) => group),
+        ...duplicateManaged,
+      ];
+      for (const group of retired) {
+        if (group.disabled) continue;
+        if (await claimLost()) return { kind: "unverified" };
+        const disabled = await provisioningCall(authority, "usergroups.disable", {
+          usergroup: group.id,
+        });
+        if (disabled.kind !== "fact") return { kind: disabled.kind, slackError: disabled.kind === "failed" ? disabled.slackError : undefined };
+      }
+      return {
+        kind: "fact",
+        fact: {
+          handles,
+          ...(humanCandidates ? { humanHandles } : {}),
+          failures,
         },
       };
     },
@@ -1334,6 +1873,8 @@ export function createSlackBridgeProviderRuntime(
     createOutboundAttachmentTransport,
     quarantineSink,
     releaseCredential,
+    resolveUsers,
+    resolveAgentMentionHandles,
     provisioningProvider,
     async stop() {
       if (stopped) return;

@@ -1,18 +1,19 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import type { Agent } from "../src/store/agentStore.js";
-import type { Channel } from "../src/store/channelStore.js";
+import type { Agent } from "../src/store/agentStore";
+import type { Channel } from "../src/store/channelStore";
 import {
   applyStatusActivityEvent,
   appendLiveAgentActivityItem,
   buildMessageActivityItem,
   buildStatusActivityItem,
   LIVE_AGENT_ACTIVITY_VISIBLE_MS,
+  LIVE_AGENT_IDLE_GRACE_MS,
+  nextLiveAgentActivityExpiry,
   pruneExpiredLiveAgentActivityItems,
-} from "../src/utils/liveAgentActivity.js";
+} from "../src/utils/liveAgentActivity";
 import type {
   LiveAgentActivityItem,
-} from "../src/utils/liveAgentActivity.js";
+} from "../src/utils/liveAgentActivity";
 
 function agent(overrides: Partial<Agent> & Pick<Agent, "id" | "name">): Agent {
   return {
@@ -121,7 +122,7 @@ test("buildStatusActivityItem only keeps active work status events", () => {
   assert.equal(thinking?.activity, "thinking");
 });
 
-test("appendLiveAgentActivityItem dedupes adjacent equivalent events and keeps newest first", () => {
+test("appendLiveAgentActivityItem keeps one row per agent, in the order they started", () => {
   const first = {
     id: "a",
     kind: "activity" as const,
@@ -132,13 +133,39 @@ test("appendLiveAgentActivityItem dedupes adjacent equivalent events and keeps n
     context: null,
     activity: "working" as const,
     createdAt: 1000,
+    startedAt: 1000,
+    idleSince: null,
   };
   const duplicate = { ...first, id: "b", createdAt: 1500 };
   const next = { ...first, id: "c", text: "Thinking…", activity: "thinking" as const };
 
+  const other = { ...first, id: "d", agentId: "agent-2", createdAt: 1200, startedAt: 1200 };
+
   assert.deepEqual(appendLiveAgentActivityItem([], first), [first]);
-  assert.deepEqual(appendLiveAgentActivityItem([first], duplicate), [first]);
-  assert.deepEqual(appendLiveAgentActivityItem([first], next).map((item) => item.id), ["c", "a"]);
+  assert.deepEqual(appendLiveAgentActivityItem([first], duplicate), [first], "an equivalent event within 2s changes nothing");
+  const updated = appendLiveAgentActivityItem([first, other], next);
+  assert.deepEqual(updated.map((item) => item.id), ["c", "d"], "a new event updates the agent's row where it is");
+  assert.equal(updated[0].startedAt, 1000, "and keeps when it started");
+  assert.deepEqual(appendLiveAgentActivityItem([other], first).map((item) => item.agentId), ["agent-2", "agent-1"], "a newcomer joins the end");
+});
+
+test("applyStatusActivityEvent lists each working agent once however many events it sends", () => {
+  // Regression: the store used to keep a 20-event ticker history, so the
+  // top bar counted 20 "agents" and its faces, keyed by agent, piled up.
+  const agents = [agent({ id: "agent-1", name: "runner" }), agent({ id: "agent-2", name: "writer" })];
+  let items: LiveAgentActivityItem[] = [];
+  for (let i = 0; i < 30; i += 1) {
+    items = applyStatusActivityEvent(items, {
+      agentId: i % 3 === 0 ? "agent-2" : "agent-1",
+      activity: "working",
+      detail: `Step ${i}`,
+      timestamp: 10_000 + i * 3_000,
+    }, agents);
+    // Neither the set nor the order changes while both keep working: agent-2
+    // started first and stays first, however busy agent-1 is.
+    if (i >= 1) assert.deepEqual(items.map((item) => item.agentId), ["agent-2", "agent-1"], `after event ${i}`);
+  }
+  assert.equal(new Set(items.map((item) => item.id)).size, items.length);
 });
 
 test("applyStatusActivityEvent clears an agent's live work when it settles", () => {
@@ -163,7 +190,35 @@ test("applyStatusActivityEvent clears an agent's live work when it settles", () 
     timestamp: 10_002,
   }, agents);
 
-  assert.deepEqual(next.map((item) => item.agentId), ["agent-2"]);
+  // It stays, in its place, for the idle grace, then leaves.
+  assert.deepEqual(next.map((item) => [item.agentId, item.idleSince]), [["agent-1", 10_002], ["agent-2", null]]);
+  assert.deepEqual(pruneExpiredLiveAgentActivityItems(next, 10_002 + LIVE_AGENT_IDLE_GRACE_MS - 1).map((item) => item.agentId), ["agent-1", "agent-2"]);
+  assert.deepEqual(pruneExpiredLiveAgentActivityItems(next, 10_002 + LIVE_AGENT_IDLE_GRACE_MS).map((item) => item.agentId), ["agent-2"]);
+});
+
+test("an agent that picks up again within the idle grace keeps its place; after it, it rejoins at the end", () => {
+  // Agents go idle between tool calls. Without the grace their faces dropped
+  // out of the stack and came back, many times a minute.
+  const agents = [agent({ id: "agent-1", name: "runner" }), agent({ id: "agent-2", name: "writer" })];
+  let items = applyStatusActivityEvent([], { agentId: "agent-1", activity: "working", detail: "Edit", timestamp: 1_000 }, agents);
+  items = applyStatusActivityEvent(items, { agentId: "agent-2", activity: "working", detail: "Test", timestamp: 1_100 }, agents);
+  items = applyStatusActivityEvent(items, { agentId: "agent-1", activity: "online", timestamp: 2_000 }, agents);
+  const resumed = applyStatusActivityEvent(items, { agentId: "agent-1", activity: "thinking", timestamp: 2_000 + LIVE_AGENT_IDLE_GRACE_MS - 1 }, agents);
+  assert.deepEqual(resumed.map((item) => [item.agentId, item.idleSince, item.startedAt]), [["agent-1", null, 1_000], ["agent-2", null, 1_100]]);
+
+  const afterGrace = 2_000 + LIVE_AGENT_IDLE_GRACE_MS;
+  const rejoined = applyStatusActivityEvent(items, { agentId: "agent-1", activity: "thinking", timestamp: afterGrace }, agents);
+  assert.deepEqual(rejoined.map((item) => [item.agentId, item.startedAt]), [["agent-2", 1_100], ["agent-1", afterGrace]]);
+});
+
+test("nextLiveAgentActivityExpiry is the earliest moment a row leaves on its own", () => {
+  const agents = [agent({ id: "agent-1", name: "runner" }), agent({ id: "agent-2", name: "writer" })];
+  assert.equal(nextLiveAgentActivityExpiry([]), null);
+  let items = applyStatusActivityEvent([], { agentId: "agent-1", activity: "working", detail: "Edit", timestamp: 1_000 }, agents);
+  items = applyStatusActivityEvent(items, { agentId: "agent-2", activity: "working", detail: "Test", timestamp: 1_100 }, agents);
+  assert.equal(nextLiveAgentActivityExpiry(items), 1_000 + LIVE_AGENT_ACTIVITY_VISIBLE_MS, "the safety window of the quietest working agent");
+  items = applyStatusActivityEvent(items, { agentId: "agent-2", activity: "online", timestamp: 3_000 }, agents);
+  assert.equal(nextLiveAgentActivityExpiry(items), 3_000 + LIVE_AGENT_IDLE_GRACE_MS, "an idle agent's grace ends first");
 });
 
 test("applyStatusActivityEvent treats heartbeat as refresh-only", () => {
@@ -228,7 +283,7 @@ test("applyStatusActivityEvent treats probe response as refresh-only", () => {
   }, agents), []);
 });
 
-test("refresh-only terminal snapshot clears the existing live-work row", () => {
+test("refresh-only terminal snapshot settles the existing live-work row", () => {
   const agents = [
     agent({ id: "agent-1", name: "runner" }),
     agent({ id: "agent-2", name: "writer" }),
@@ -254,7 +309,8 @@ test("refresh-only terminal snapshot clears the existing live-work row", () => {
     isRefreshOnly: true,
   }, agents);
 
-  assert.deepEqual(refreshed, [unrelated]);
+  assert.deepEqual(refreshed.map((item) => [item.agentId, item.idleSince]), [["agent-1", 2_000], ["agent-2", null]], "settled, in its place, for the grace");
+  assert.deepEqual(pruneExpiredLiveAgentActivityItems(refreshed, 2_000 + LIVE_AGENT_IDLE_GRACE_MS), [unrelated]);
 });
 
 test("refresh-only work snapshot updates the existing row without appending or reordering", () => {
@@ -323,6 +379,8 @@ test("pruneExpiredLiveAgentActivityItems drops status activity after the visible
     context: null,
     activity: "working" as const,
     createdAt: 10_000,
+    startedAt: 10_000,
+    idleSince: null,
   };
   const expired = { ...active, id: "expired", createdAt: 10_000 - LIVE_AGENT_ACTIVITY_VISIBLE_MS };
 

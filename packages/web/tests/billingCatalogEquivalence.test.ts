@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 import { en as enMessages } from "../src/i18n/messages/en";
 import { zhCn as zhMessages } from "../src/i18n/messages/zh-cn";
@@ -33,6 +32,9 @@ export const EXPECTED_MIGRATED_IDS: readonly string[] = [
   "billing.canceling",
   "billing.capacity",
   "billing.channels",
+  "billing.checkoutPromotionHint",
+  "billing.checkoutPromotionReview",
+  "billing.checkoutPromotionUnavailable",
   "billing.checkoutSummary",
   "billing.currentPlan",
   "billing.everythingInFree",
@@ -246,6 +248,10 @@ const GENUINELY_NEW = new Set([
   "billing.confirmAndUpdateSeats",
   "billing.opening2",
   "billing.updating2",
+  // #9896: the Agent migration plan row is a new benefit, not migrated copy, so
+  // the legacy catalog never had it. Plan wiring and both locales are pinned in
+  // tests/billingPlanPresentation.i18n.test.ts.
+  "billing.agentMigration",
 ]);
 
 test("the genuinely-new ids are new for a REASON, not because I retranslated", () => {
@@ -333,6 +339,7 @@ test("no migrated billing string is left calling the legacy lookup", () => {
   // original mechanism had and the easiest one to recreate by habit.
   for (const rel of [
     "../src/components/settings/SettingsPanel.tsx",
+    "../src/components/settings/PlanSectionContent.tsx",
     "../src/components/settings/SettingsSegmentedControls.tsx",
   ]) {
     const src = readFileSync(resolve(import.meta.dirname, rel), "utf8");
@@ -374,27 +381,33 @@ test("zh values that intentionally match English are product terms, not misses",
 // sequence and fails; a deleted call shortens it and fails.
 // ---------------------------------------------------------------------------
 const EXPECTED_CALLSITE_IDS: Record<string, readonly string[]> = {
+  // PlanSectionContent was split out of SettingsPanel (between PlanSection and
+  // the Danger Zone), so its ids moved to their own entry; together the two
+  // entries are the same ordered sequence as before the split.
   "SettingsPanel.tsx": [
     "billing.planBilling", "billing.managePlan", "billing.gracePeriodExpired",
-    "billing.planDowngraded", "billing.theGracePeriodHasEndedExcessAgentsHaveBeenSt", "billing.onlyServerOwnersCanChangeBilling",
-    "billing.paidPlansAreNotAvailableYet", "billing.unlimited", "billing.unlimited",
-    "billing.upgradeToPro", "billing.managePlan", "billing.yearly",
-    "billing.monthly", "billing.unlimited", "billing.reactivateThisProSubscriptionBeforeTheCurren",
-    "billing.reactivateSubscription", "billing.reactivating", "billing.updating",
-    "billing.failedToStartCheckout", "billing.failedToOpenBillingPortal", "billing.seatUpdateIsPendingStripePaymentConfirmation",
-    "billing.seatQuantitiesAreAlreadyUpToDate", "billing.subscriptionReactivatedYourCurrentProSeatCap", "billing.failedToUpdateSeats",
-    "billing.subscriptionCancellationScheduledForTheEndOf", "billing.failedToCancelSubscription", "billing.currentPlan",
-    "billing.finalTrialPeriod", "billing.included", "billing.notIncluded",
-    "billing.seat", "billing.humans", "billing.agents",
-    "billing.humans", "billing.agents", "billing.messageHistory",
-    "billing.unlimited", "billing.fileUploads", "billing.openStripeBillingPortal",
-    "billing.opening", "billing.billingPortal", "billing.cancelTheWholeProSubscriptionAtPeriodEnd",
-    "billing.cancelSubscription2", "billing.seeAllFeaturesAndComparePlans", "billing.howOftenDoYouWantToBeBilled",
-    "billing.billingInterval", "billing.opening", "billing.upgradeToPro",
-    "billing.checkoutSummary", "billing.subscriptionSummary", "billing.addedCapacity",
-    "billing.cancelSubscription", "billing.cancelTheWholeProSubscriptionAtTheEndOfTheCu", "billing.cancelSubscription2",
-    "billing.canceling", "billing.capacity", "billing.billing",
+    "billing.planDowngraded", "billing.theGracePeriodHasEndedExcessAgentsHaveBeenSt", "billing.billing",
     "billing.onlyServerOwnersAndAdminsCanViewBilling",
+  ],
+  "PlanSectionContent.tsx": [
+    "billing.onlyServerOwnersCanChangeBilling", "billing.paidPlansAreNotAvailableYet", "billing.unlimited",
+    "billing.unlimited", "billing.upgradeToPro", "billing.managePlan",
+    "billing.yearly", "billing.monthly", "billing.unlimited",
+    "billing.reactivateThisProSubscriptionBeforeTheCurren", "billing.reactivateSubscription", "billing.reactivating",
+    "billing.updating", "billing.failedToStartCheckout", "billing.failedToOpenBillingPortal",
+    "billing.seatUpdateIsPendingStripePaymentConfirmation", "billing.seatQuantitiesAreAlreadyUpToDate", "billing.subscriptionReactivatedYourCurrentProSeatCap",
+    "billing.failedToUpdateSeats", "billing.subscriptionCancellationScheduledForTheEndOf", "billing.failedToCancelSubscription",
+    "billing.currentPlan", "billing.finalTrialPeriod", "billing.included",
+    "billing.notIncluded", "billing.seat", "billing.seat",
+    "billing.humans", "billing.agents", "billing.humans",
+    "billing.agents", "billing.messageHistory", "billing.unlimited",
+    "billing.fileUploads", "billing.openStripeBillingPortal", "billing.opening",
+    "billing.billingPortal", "billing.cancelTheWholeProSubscriptionAtPeriodEnd", "billing.cancelSubscription2",
+    "billing.seeAllFeaturesAndComparePlans", "billing.howOftenDoYouWantToBeBilled", "billing.billingInterval",
+    "billing.opening", "billing.upgradeToPro", "billing.checkoutSummary",
+    "billing.subscriptionSummary", "billing.addedCapacity", "billing.cancelSubscription",
+    "billing.cancelTheWholeProSubscriptionAtTheEndOfTheCu", "billing.cancelSubscription2", "billing.canceling",
+    "billing.capacity",
   ],
   "SettingsSegmentedControls.tsx": [
     "billing.monthly", "billing.yearly", "billing.billingInterval",

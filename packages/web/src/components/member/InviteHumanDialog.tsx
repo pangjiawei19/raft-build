@@ -1,10 +1,13 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
-import { Check, Copy, Link2, Mail, Plus, Trash2 } from "lucide-react";
+import { Check, Copy, Link2, Mail, Plus } from "lucide-react";
 import {
   Button,
   Field,
   Input,
+  SegmentedControl,
+  SegmentedControlItem,
+  SegmentedControlLabel,
   Select,
   SelectContent,
   SelectIcon,
@@ -14,7 +17,7 @@ import {
   SelectList,
   SelectTrigger,
   SelectValue,
-} from "raft-ui";
+} from "@botiverse/raft-ui";
 import type { ServerRole } from "@botiverse/raft-shared";
 import { SERVER_GUEST_FEATURE_FLAG_KEY, formatBillingCapacityLimitMessage, getBillingCapacityLimitState, getBillingUsage, validateEmailAddress } from "@botiverse/raft-shared";
 import { useServerStore } from "../../store/serverStore";
@@ -22,8 +25,15 @@ import { useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
 import api from "../../api/client";
+import { shareableWebOrigin } from "../../utils/desktopShell";
 import DialogCard from "../ui/DialogCard";
+import Tooltip from "../ui/Tooltip";
 import Banner from "../ui/Banner";
+import TextLink from "../ui/TextLink";
+import { InviteeRow } from "./InviteeRow";
+
+// DS TextField label: 13/18 600 ink-2, always visible, sentence case.
+const FIELD_LABEL_CLASS = "mb-1.5 block text-footnote font-semibold text-foreground-muted";
 
 /**
  * The roles an invite can grant. Derived from the shared `ServerRole` union
@@ -32,14 +42,14 @@ import Banner from "../ui/Banner";
  * import, so this is the closest thing to one source of truth. If `ServerRole`
  * ever loses either member, this stops compiling instead of drifting quietly.
  */
-type InvitableRole = Extract<ServerRole, "member" | "guest">;
+export type InvitableRole = Extract<ServerRole, "member" | "guest">;
 
 /**
  * `id` is a stable React key that survives removal of an earlier row. Index
  * keys would reuse a removed row's identity and carry the wrong text into the
  * wrong box.
  */
-interface Invitee {
+export interface Invitee {
   id: string;
   email: string;
   role: InvitableRole;
@@ -48,22 +58,32 @@ interface Invitee {
 interface JoinLinkRecord {
   id: string;
   token: string;
+  maxUses?: number | null;
+  expiresAt?: string | null;
+  useCount?: number | null;
 }
 
 function isBillingGateError(error: string) {
   return error.includes("seat limit") || error.includes("limit reached") || error.includes("requires the Pro plan");
 }
 
+export type InviteePatch = Partial<Omit<Invitee, "id">>;
+
 export default function InviteHumanDialog({
   onClose,
 }: {
   onClose: () => void;
 }) {
-  const { formatMessage } = useIntl();
+  const intl = useIntl();
+  const { formatMessage } = intl;
   const server = useServerStore((s) => s.current);
   const billing = useServerStore((s) => s.billing);
   const loadBilling = useServerStore((s) => s.loadBilling);
   const nav = useAppNavigate();
+  const openBillingSettings = useCallback(() => {
+    onClose();
+    nav.toSettings("billing");
+  }, [nav, onClose]);
   /**
    * One row per person, each carrying its OWN role.
    *
@@ -80,6 +100,20 @@ export default function InviteHumanDialog({
   const inviteeFieldId = useId();
   const [joinLink, setJoinLink] = useState<JoinLinkRecord | null>(null);
   const [linkLoading, setLinkLoading] = useState(false);
+  // Optional link limits (Phase 1). The selectors are an edit DRAFT, kept
+  // separate from the active link. Each is a "keep current" choice so changing
+  // ONE never silently drops the other. "keep" resolves against `linkLimits` —
+  // a STABLE snapshot of the current link's limits that only updates on a
+  // successful (re)generate, NOT when the link is transiently cleared. That is
+  // what lets a retry after a failed create resend the SAME chosen limits
+  // instead of falling back to unlimited/never.
+  const [maxUsesChoice, setMaxUsesChoice] = useState<string>("unlimited");
+  const [expiryChoice, setExpiryChoice] = useState<string>("never");
+  const [linkLimits, setLinkLimits] = useState<{ maxUses: number | null; expiresAt: string | null }>(
+    { maxUses: null, expiresAt: null },
+  );
+  const [regenerating, setRegenerating] = useState(false);
+  const [inviteTab, setInviteTab] = useState<"email" | "link">("email");
   const [copied, setCopied] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
@@ -99,15 +133,53 @@ export default function InviteHumanDialog({
     ],
     [formatMessage],
   );
+  // Link-limit options as rUI Select items (same primitive as the role selector
+  // above; these two use the default button-scale chrome, see the row below).
+  // The "keep current" entry only appears once the loaded link already carries
+  // that limit.
+  const maxUsesItems = useMemo(
+    () => [
+      ...(linkLimits.maxUses != null
+        ? [{ value: "keep", label: formatMessage({ id: "member.invite.keepCurrent" }) }]
+        : []),
+      { value: "unlimited", label: formatMessage({ id: "member.invite.unlimited" }) },
+      { value: "1", label: "1" },
+      { value: "5", label: "5" },
+      { value: "10", label: "10" },
+      { value: "25", label: "25" },
+    ],
+    [formatMessage, linkLimits.maxUses],
+  );
+  const expiryItems = useMemo(
+    () => [
+      ...(linkLimits.expiresAt != null
+        ? [{ value: "keep", label: formatMessage({ id: "member.invite.keepCurrent" }) }]
+        : []),
+      { value: "never", label: formatMessage({ id: "member.invite.never" }) },
+      { value: "1", label: formatMessage({ id: "member.invite.days" }, { count: 1 }) },
+      { value: "7", label: formatMessage({ id: "member.invite.days" }, { count: 7 }) },
+      { value: "30", label: formatMessage({ id: "member.invite.days" }, { count: 30 }) },
+    ],
+    [formatMessage, linkLimits.expiresAt],
+  );
   const joinUrl = useMemo(() => {
     if (!joinLink) return "";
-    return `${window.location.origin}/join/${joinLink.token}`;
+    // Build from the shareable web origin, not window.location.origin: in the
+    // desktop shell the latter is `app://raft`, which yields an unopenable
+    // invite link. On Web this is the page origin (unchanged).
+    return `${shareableWebOrigin()}/join/${joinLink.token}`;
   }, [joinLink]);
   const humanCount = billing?.usage.humans ?? 0;
   const humanCapacity = billing?.capacity ?? { maxHumans: -1, maxAgents: -1, maxUniversalSeats: -1 };
   const humanUsageState = billing?.usage ?? getBillingUsage(humanCount, 0);
   const humanCapacityLimitState = getBillingCapacityLimitState(humanCapacity, humanUsageState, "human");
   const humanSeatLimitReached = billing != null && humanCapacityLimitState.reached;
+  // Guest invitations consume no paid human seat. Only block the email path
+  // when a non-empty target actually requests a seat-consuming role; blank
+  // rows are ignored by submission and must not block a Guest-only batch.
+  const emailInviteSeatLimitReached = humanSeatLimitReached && invitees.some(
+    (invitee) => invitee.email.trim() !== "" && invitee.role !== "guest",
+  );
   const humanSeatLimitMessage = humanSeatLimitReached
     ? formatBillingCapacityLimitMessage(
       "human",
@@ -121,6 +193,19 @@ export default function InviteHumanDialog({
     void loadBilling();
   }, [loadBilling]);
 
+  // Adopt a link as the active one AND (re)seed the edit draft + the stable
+  // `linkLimits` snapshot from it. Called only on load, a successful generate,
+  // and revoke — never on the transient clear inside regenerateLink, so a
+  // failed create leaves the draft intact for retry.
+  const adoptLink = useCallback((link: JoinLinkRecord | null) => {
+    setJoinLink(link);
+    const maxUses = link?.maxUses ?? null;
+    const expiresAt = link?.expiresAt ?? null;
+    setLinkLimits({ maxUses, expiresAt });
+    setMaxUsesChoice(maxUses != null ? "keep" : "unlimited");
+    setExpiryChoice(expiresAt != null ? "keep" : "never");
+  }, []);
+
   useEffect(() => {
     if (!server) return;
     let cancelled = false;
@@ -131,14 +216,14 @@ export default function InviteHumanDialog({
         const { data: links } = await api.get(`/servers/${server.id}/join-links`);
         const existing = Array.isArray(links) ? links[0] as JoinLinkRecord | undefined : undefined;
         if (existing) {
-          if (!cancelled) setJoinLink(existing);
+          if (!cancelled) adoptLink(existing);
           return;
         }
         const { data } = await api.post(`/servers/${server.id}/join-links`, {
           maxUses: null,
           expiresAt: null,
         });
-        if (!cancelled) setJoinLink(data.link);
+        if (!cancelled) adoptLink(data.link);
       } catch (err: unknown) {
         const axiosErr = err as { response?: { data?: { error?: string } } };
         if (!cancelled) {
@@ -153,43 +238,113 @@ export default function InviteHumanDialog({
     return () => {
       cancelled = true;
     };
-  }, [server, humanSeatLimitReached, formatMessage]);
+  }, [server, humanSeatLimitReached, formatMessage, adoptLink]);
 
-  const updateInvitee = (id: string, patch: Partial<Omit<Invitee, "id">>) => {
+  const updateInvitee = useCallback((id: string, patch: InviteePatch) => {
     setInvitees((prev) => prev.map((invitee) => invitee.id === id ? { ...invitee, ...patch } : invitee));
-  };
+  }, []);
 
-  const addInvitee = () => {
+  const addInvitee = useCallback(() => {
     setInvitees((prev) => [...prev, { id: `invitee-${nextInviteeId.current++}`, email: "", role: "member" }]);
-  };
+  }, []);
 
   // The last row is protected by NOT rendering its remove control (below), so
   // there is deliberately no second length check here. A redundant guard in
   // this setter would be unreachable, and unreachable code that looks like a
   // guard implies the path is live.
-  const removeInvitee = (id: string) => {
+  const removeInvitee = useCallback((id: string) => {
     setInvitees((prev) => prev.filter((invitee) => invitee.id !== id));
-  };
+  }, []);
 
-  const handleCopy = async () => {
+  const handleCopy = useCallback(async () => {
     if (!joinUrl) return;
     await navigator.clipboard.writeText(joinUrl);
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1500);
+  }, [joinUrl]);
+
+  const handleInviteTabChange = useCallback((val: "email" | "link" | null) => {
+    if (val) setInviteTab(val);
+  }, []);
+
+  const handleMaxUsesChange = useCallback((value: string | null) => {
+    if (value != null) setMaxUsesChoice(value);
+  }, []);
+
+  const handleExpiryChange = useCallback((value: string | null) => {
+    if (value != null) setExpiryChoice(value);
+  }, []);
+
+  // Regenerate the shareable link with the chosen usage cap / expiry. Revokes
+  // the current link (so its token stops working) and creates a fresh one.
+  const regenerateLink = useCallback(async () => {
+    if (!server || regenerating) return;
+    setRegenerating(true);
+    setError("");
+    // Resolve target limits BEFORE deleting, honouring "keep" = the current
+    // link's value, so editing one control never loosens the untouched one.
+    const maxUses = maxUsesChoice === "keep" ? linkLimits.maxUses
+      : maxUsesChoice === "unlimited" ? null
+      : Number(maxUsesChoice);
+    const expiresAt = expiryChoice === "keep" ? linkLimits.expiresAt
+      : expiryChoice === "never" ? null
+      : new Date(Date.now() + Number(expiryChoice) * 24 * 60 * 60 * 1000).toISOString();
+    try {
+      if (joinLink) {
+        await api.delete(`/servers/${server.id}/join-links/${joinLink.id}`);
+        // Hide the now-revoked token, but DON'T reseed the draft — if the
+        // create below fails, the retry must resend `maxUses`/`expiresAt`.
+        setJoinLink(null);
+      }
+      const { data } = await api.post(`/servers/${server.id}/join-links`, {
+        maxUses,
+        expiresAt,
+      });
+      adoptLink(data.link);
+      setCopied(false);
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: string } } };
+      setError(axiosErr.response?.data?.error || formatMessage({ id: "member.invite.failedPrepareLink" }));
+    } finally {
+      setRegenerating(false);
+    }
+  }, [server, regenerating, maxUsesChoice, linkLimits, expiryChoice, joinLink, adoptLink, formatMessage]);
+
+  const handleRegenerateClick = useCallback(() => {
+    void regenerateLink();
+  }, [regenerateLink]);
+
+  // Revoke the current link entirely: its token stops working and no
+  // replacement is created (the "Update link" button can make a fresh one).
+  const revokeLink = async () => {
+    if (!server || !joinLink || regenerating) return;
+    setRegenerating(true);
+    setError("");
+    try {
+      await api.delete(`/servers/${server.id}/join-links/${joinLink.id}`);
+      // No replacement: clear the link AND the draft (there is nothing to keep).
+      adoptLink(null);
+      setCopied(false);
+    } catch (err: unknown) {
+      const axiosErr = err as { response?: { data?: { error?: string } } };
+      setError(axiosErr.response?.data?.error || formatMessage({ id: "member.invite.failedPrepareLink" }));
+    } finally {
+      setRegenerating(false);
+    }
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!server) return;
-    if (humanSeatLimitReached) {
-      setError(humanSeatLimitMessage);
-      return;
-    }
     const targets = invitees
       .map((invitee) => ({ email: invitee.email.trim(), role: invitee.role }))
       .filter((invitee) => invitee.email !== "");
     if (targets.length === 0) {
       setError(formatMessage({ id: "member.invite.enterEmailOrCopyLink" }));
+      return;
+    }
+    if (emailInviteSeatLimitReached) {
+      setError(humanSeatLimitMessage);
       return;
     }
     setError("");
@@ -223,122 +378,75 @@ export default function InviteHumanDialog({
   return (
     <DialogCard title={formatMessage({ id: "member.invite.title" })} onClose={onClose} maxWidthClass="max-w-lg">
         <form onSubmit={handleSubmit} className="space-y-4">
-          {error && !humanSeatLimitReached && (
-            <Banner intent="warning" className="font-bold">
+          {error && !emailInviteSeatLimitReached && (
+            <Banner intent="warning">
               {error}
               {isBillingGateError(error) && (
                 <>
                   {" "}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onClose();
-                      nav.toSettings("billing");
-                    }}
-                    className="font-bold text-black underline"
+                  <TextLink
+                    variant="primary"
+                    onClick={openBillingSettings}
                   >
                     {formatMessage({ id: "member.invite.viewBilling" })}
-                  </button>
+                  </TextLink>
                 </>
               )}
             </Banner>
           )}
 
-          {humanSeatLimitReached && (
-            <Banner intent="warning" className="font-bold">
+          {emailInviteSeatLimitReached && (
+            <Banner intent="warning">
               {humanSeatLimitMessage}{" "}
-              <button
-                type="button"
-                onClick={() => {
-                  onClose();
-                  nav.toSettings("billing");
-                }}
-                className="font-bold text-black underline"
+              <TextLink
+                variant="primary"
+                onClick={openBillingSettings}
               >
                 {formatMessage({ id: "member.invite.viewBilling" })}
-              </button>
+              </TextLink>
             </Banner>
           )}
 
+          {/* Stopgap until per-agent access control (task #121): any member can
+              DM and direct every agent in the server, so say so before inviting. */}
+          <Banner intent="info" withIcon data-testid="invite-agent-reach-hint">
+            {formatMessage({ id: "member.invite.agentReachHint" })}
+          </Banner>
+
+          {/* Invite method tabs (Phase 3): email vs shareable link. */}
+          <SegmentedControl<"email" | "link">
+            value={inviteTab}
+            onValueChange={handleInviteTabChange}
+            // Full width, so the two methods share the track equally.
+            className="w-full *:flex-1"
+            data-testid="invite-method-tabs"
+          >
+            <SegmentedControlItem value="email" data-testid="invite-tab-email">
+              <SegmentedControlLabel>{formatMessage({ id: "member.invite.tabEmail" })}</SegmentedControlLabel>
+            </SegmentedControlItem>
+            <SegmentedControlItem value="link" data-testid="invite-tab-link">
+              <SegmentedControlLabel>{formatMessage({ id: "member.invite.tabLink" })}</SegmentedControlLabel>
+            </SegmentedControlItem>
+          </SegmentedControl>
+
+          {inviteTab === "email" && (
           <div>
-            <label className="mb-1 block text-sm font-bold text-foreground-strong uppercase tracking-wide">
+            <label className={FIELD_LABEL_CLASS}>
               {formatMessage({ id: "member.invite.byEmail" })}
             </label>
             <div className="space-y-2">
               {invitees.map((invitee, index) => (
-                <div key={invitee.id} className="flex items-center gap-2">
-                  {/*
-                    * Each control gets its OWN `Field className="contents"`.
-                    *
-                    * Base UI's Field context hands every Input beneath it the
-                    * same control id and the same `aria-labelledby`, so a list
-                    * of rows would collapse into one id and every box would
-                    * announce the group's label. An inherited `aria-labelledby`
-                    * also outranks `aria-label`, so labelling them directly
-                    * does not help while they share a context. `contents` adds
-                    * no layout. (Found by @Dozy on PR #7010.)
-                    */}
-                  <Field className="contents">
-                    <Input
-                      id={`${inviteeFieldId}-email-${invitee.id}`}
-                      type="email"
-                      aria-label={formatMessage({ id: "member.invite.emailLabel" })}
-                      value={invitee.email}
-                      onChange={(event) => updateInvitee(invitee.id, { email: event.target.value })}
-                      className="min-w-0 flex-1"
-                      placeholder="name@company.com"
-                    />
-                  </Field>
-                  {canOfferGuest && (
-                    <Select
-                      // `chrome="field"` opts into rUI's field metric axis, so
-                      // the trigger takes the same height and typography as the
-                      // Input beside it. Its default chrome borrows the Button
-                      // size scale (32px / 14px) because the trigger is built on
-                      // Button — which is why the row read as two different
-                      // kinds of control. Hand-setting a height would have
-                      // matched only the number, not the type scale.
-                      chrome="field"
-                      value={invitee.role}
-                      onValueChange={(value) => {
-                        if (value != null) updateInvitee(invitee.id, { role: value as InvitableRole });
-                      }}
-                      items={roleItems}
-                    >
-                      <SelectTrigger
-                        id={`${inviteeFieldId}-role-${invitee.id}`}
-                        className="w-28 shrink-0"
-                        aria-label={formatMessage({ id: "member.invite.roleLabel" })}
-                      >
-                        <SelectValue />
-                        <SelectIcon />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectList>
-                          {roleItems.map((item) => (
-                            <SelectItem key={item.value} value={item.value}>
-                              <SelectItemText>{item.label}</SelectItemText>
-                              <SelectItemIndicator />
-                            </SelectItem>
-                          ))}
-                        </SelectList>
-                      </SelectContent>
-                    </Select>
-                  )}
-                  {/* Hidden, not disabled, at one row: removing the last row
-                      leaves no way back to a usable form. */}
-                  {invitees.length > 1 && (
-                    <Button
-                      type="button"
-                      size="icon-xs"
-                      variant="default"
-                      onClick={() => removeInvitee(invitee.id)}
-                      aria-label={formatMessage({ id: "member.invite.removeInvitee" }, { index: index + 1 })}
-                    >
-                      <Trash2 size={14} />
-                    </Button>
-                  )}
-                </div>
+                <InviteeRow
+                  key={invitee.id}
+                  invitee={invitee}
+                  index={index}
+                  fieldIdPrefix={inviteeFieldId}
+                  canOfferGuest={canOfferGuest}
+                  canRemove={invitees.length > 1}
+                  roleItems={roleItems}
+                  onUpdate={updateInvitee}
+                  onRemove={removeInvitee}
+                />
               ))}
             </div>
             <div className="mt-2">
@@ -346,28 +454,24 @@ export default function InviteHumanDialog({
                   themed treatment, and a literal here could not follow the
                   theme (@cindyz, PR #7010). */}
               <Button type="button" size="sm" variant="ghost" onClick={addInvitee}>
-                <Plus size={14} />
+                <Plus size={16} aria-hidden="true" />
                 {formatMessage({ id: "member.invite.addInvitee" })}
               </Button>
             </div>
           </div>
 
-          <div className="flex items-center gap-3 text-[11px] font-bold uppercase tracking-widest text-black/40">
-            <div className="h-px flex-1 bg-black/20" />
-            <span>{formatMessage({ id: "member.invite.or" })}</span>
-            <div className="h-px flex-1 bg-black/20" />
-          </div>
+          )}
 
+          {inviteTab === "link" && (
           <div>
-            <label className="mb-1 block text-sm font-bold text-foreground-strong uppercase tracking-wide">
+            <label className={FIELD_LABEL_CLASS}>
               {formatMessage({ id: "member.invite.linkLabel" })}
             </label>
             <div className="flex items-center gap-2">
-              {/* readOnly Input rather than a bordered div: `border-2
-                  border-black` was a literal, so this box kept its heavy brutal
-                  edge under the elegant theme while everything around it went
-                  soft (@cindyz). The Input follows the theme and picks up the
-                  same field metrics as the rows above. */}
+              {/* readOnly Input rather than a bordered div: a literal
+                  `border-2 border-black` kept a heavy edge while everything
+                  around it went soft (@cindyz). The Input picks up the same
+                  field metrics as the rows above. */}
               <Field className="contents">
                 <Input
                   readOnly
@@ -375,48 +479,158 @@ export default function InviteHumanDialog({
                   value={linkLoading
                     ? formatMessage({ id: "member.invite.preparingLink" })
                     : joinUrl || formatMessage({ id: "member.invite.linkUnavailable" })}
-                  className="min-w-0 flex-1 truncate font-mono text-xs"
+                  className="min-w-0 flex-1 truncate font-mono text-mono-code"
                 />
               </Field>
+              <Tooltip content={formatMessage({ id: "member.invite.copyLinkTitle" })}>
               <Button
                 type="button"
                 onClick={handleCopy}
-                disabled={!joinUrl || linkLoading}
-                size="icon-md"
-                variant="default"
+                disabled={!joinUrl || linkLoading || regenerating}
+                size="icon-lg"
+                variant="outline"
                 className="shrink-0"
-                title={formatMessage({ id: "member.invite.copyLinkTitle" })}
                 aria-label={formatMessage({ id: "member.invite.copyLinkTitle" })}
+                data-slot="button"
               >
-                {copied ? <Check size={14} /> : <Copy size={14} />}
+                {copied ? <Check size={20} aria-hidden="true" /> : <Copy size={20} aria-hidden="true" />}
               </Button>
+              </Tooltip>
             </div>
-            <div className="mt-1 flex items-center gap-1 text-xs text-foreground-muted">
-              <Link2 size={12} />
+            {/* Optional link limits (Phase 1). Purely additive: leaving the
+                defaults keeps the unlimited, non-expiring link. */}
+            {/* Link-limit controls sit beside a `size="sm"` Button (h-8), not
+                beside an Input, so they use the Select's DEFAULT chrome (the
+                Button size scale) rather than `chrome="field"` — field metrics
+                made them tower over both the labels and the button (task #98).
+                Labels never wrap or clip; each label+control pair stays together. */}
+            <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-2">
+              <label htmlFor={`${inviteeFieldId}-max-uses`} className="flex items-center gap-1.5">
+                <span className="whitespace-nowrap text-footnote font-semibold text-foreground-muted">
+                  {formatMessage({ id: "member.invite.maxUsesLabel" })}
+                </span>
+                <Select
+                  value={maxUsesChoice}
+                  onValueChange={handleMaxUsesChange}
+                  items={maxUsesItems}
+                >
+                  <SelectTrigger
+                    id={`${inviteeFieldId}-max-uses`}
+                    className="w-32 shrink-0"
+                    aria-label={formatMessage({ id: "member.invite.maxUsesLabel" })}
+                  >
+                    <SelectValue />
+                    <SelectIcon />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectList>
+                      {maxUsesItems.map((item) => (
+                        <SelectItem key={item.value} value={item.value}>
+                          <SelectItemText>{item.label}</SelectItemText>
+                          <SelectItemIndicator />
+                        </SelectItem>
+                      ))}
+                    </SelectList>
+                  </SelectContent>
+                </Select>
+              </label>
+              <label htmlFor={`${inviteeFieldId}-expiry`} className="flex items-center gap-1.5">
+                <span className="whitespace-nowrap text-footnote font-semibold text-foreground-muted">
+                  {formatMessage({ id: "member.invite.expiresLabel" })}
+                </span>
+                <Select
+                  value={expiryChoice}
+                  onValueChange={handleExpiryChange}
+                  items={expiryItems}
+                >
+                  <SelectTrigger
+                    id={`${inviteeFieldId}-expiry`}
+                    className="w-32 shrink-0"
+                    aria-label={formatMessage({ id: "member.invite.expiresLabel" })}
+                  >
+                    <SelectValue />
+                    <SelectIcon />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectList>
+                      {expiryItems.map((item) => (
+                        <SelectItem key={item.value} value={item.value}>
+                          <SelectItemText>{item.label}</SelectItemText>
+                          <SelectItemIndicator />
+                        </SelectItem>
+                      ))}
+                    </SelectList>
+                  </SelectContent>
+                </Select>
+              </label>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={handleRegenerateClick}
+                disabled={regenerating || linkLoading || !server}
+              >
+                {formatMessage({ id: "member.invite.applyLinkOptions" })}
+              </Button>
+              {joinLink && (
+                <button
+                  type="button"
+                  onClick={() => void revokeLink()}
+                  disabled={regenerating}
+                  data-testid="invite-link-revoke"
+                  className="rounded-[2px] text-footnote font-semibold text-danger-strong underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus disabled:cursor-not-allowed disabled:text-foreground-disabled disabled:no-underline"
+                >
+                  {formatMessage({ id: "member.invite.revokeLink" })}
+                </button>
+              )}
+            </div>
+            {joinLink && (
+              <p className="mt-1.5 text-caption text-foreground-hint">
+                {formatMessage({ id: "member.invite.updateReplacesHint" })}
+              </p>
+            )}
+            {joinLink && (joinLink.maxUses != null || joinLink.expiresAt != null) && (
+              <div className="mt-1.5 text-caption text-foreground-hint" data-testid="invite-link-status">
+                {joinLink.maxUses != null && formatMessage(
+                  { id: "member.invite.usedOf" },
+                  { used: joinLink.useCount ?? 0, max: joinLink.maxUses },
+                )}
+                {joinLink.maxUses != null && joinLink.expiresAt != null && " · "}
+                {joinLink.expiresAt != null && formatMessage(
+                  { id: "member.invite.expiresOn" },
+                  { date: intl.formatDate(joinLink.expiresAt) },
+                )}
+              </div>
+            )}
+            <div className="mt-1.5 flex items-center gap-1.5 text-caption text-foreground-hint">
+              <Link2 size={14} aria-hidden="true" />
               {humanSeatLimitReached
                 ? formatMessage({ id: "member.invite.seatLimitHint" })
                 : formatMessage({ id: "member.invite.sendLinkHint" })}
             </div>
           </div>
+          )}
 
-          <div className="flex justify-end gap-3">
-            <button
+          <div className="flex flex-wrap justify-end gap-2 pt-1">
+            <Button size="lg"
+              variant="ghost"
               type="button"
               onClick={onClose}
-              className="btn-brutal bg-white px-4 py-2 text-sm"
             >
               {formatMessage({ id: "common.confirm.cancel" })}
-            </button>
-            <button
-              type="submit"
-              disabled={sending || humanSeatLimitReached}
-              className="btn-brutal bg-brutal-pink px-4 py-2 text-sm flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <Mail size={14} />
-              {sending
-                ? formatMessage({ id: "member.invite.sending" })
-                : formatMessage({ id: "member.invite.sendInvites" })}
-            </button>
+            </Button>
+            {inviteTab === "email" && (
+              <Button size="lg"
+                variant="accent"
+                type="submit"
+                disabled={sending || emailInviteSeatLimitReached}
+              >
+                <Mail size={18} aria-hidden="true" />
+                {sending
+                  ? formatMessage({ id: "member.invite.sending" })
+                  : formatMessage({ id: "member.invite.sendInvites" })}
+              </Button>
+            )}
           </div>
         </form>
     </DialogCard>

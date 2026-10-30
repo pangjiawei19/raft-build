@@ -1,8 +1,9 @@
+import { CheckoutPromotionUnavailableError, normalizeCheckoutPromotionCode, resolveCheckoutPromotion } from "./checkoutPromotion";
 import Stripe from "stripe";
 import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { and, eq, isNull, lt } from "drizzle-orm";
-import { getDb } from "../db/index.js";
-import { subscriptions, servers, webhookEvents } from "../db/schema.js";
+import { getDb } from "../db/index";
+import { subscriptions, servers, webhookEvents } from "../db/schema";
 import type { Server as SocketIOServer } from "socket.io";
 import {
   PRO_AGENT_SEAT_BLOCK_SIZE,
@@ -18,9 +19,9 @@ import {
   type BillingPriceSummary,
   type ServerPlan,
 } from "@botiverse/raft-shared";
-import { getServerBillingEntitlement, getServerBillingUsage } from "./planService.js";
-import { getWebFrameAncestorOrigins } from "../config/appUrl.js";
-import { addTraceEvent, traceAttrs } from "../tracing/semanticTrace.js";
+import { getServerBillingEntitlement, getServerBillingUsage } from "./planService";
+import { getWebFrameAncestorOrigins } from "../config/appUrl";
+import { addTraceEvent, traceAttrs } from "../tracing/semanticTrace";
 
 // ── Socket.io reference for broadcasting plan changes ──
 
@@ -127,7 +128,7 @@ export async function getBillingSummary(serverId: string) {
   });
   const db = getDb();
   await refreshSubscriptionForServer(serverId);
-  const { getFileUploadQuotaSummary } = await import("./fileUploadQuotaService.js");
+  const { getFileUploadQuotaSummary } = await import("./fileUploadQuotaService");
   const [server] = await db
     .select({ plan: servers.plan })
     .from(servers)
@@ -203,6 +204,7 @@ export function validateRedirectUrl(url: string): boolean {
 // ── Checkout ──
 
 export interface BillingCheckoutRequest {
+  promotionCode?: unknown;
   targetPlan?: unknown;
   billingTraceId?: unknown;
   billingInterval?: unknown;
@@ -368,6 +370,13 @@ export async function createCheckoutSession(
   });
   try {
     if (!isStripeBillingFlagEnabled()) throw new Error("Billing is not configured (STRIPE_BILLING_ENABLED must be true)");
+    // Reject the retired input instead of silently sending a full-price checkout.
+    // Empty legacy fields remain equivalent to not providing a code.
+    if ("referralCode" in request && request.referralCode != null
+      && (typeof request.referralCode !== "string" || request.referralCode.trim() !== "")) {
+      throw new Error("Promotion codes must be entered on Stripe Checkout.");
+    }
+    const code = normalizeCheckoutPromotionCode(request.promotionCode);
     const stripe = getStripe();
     const contract = buildCheckoutContract(request, userId, serverId);
     traceBillingEvent("billing.checkout.contract_built", {
@@ -383,30 +392,44 @@ export async function createCheckoutSession(
       provisioned_agent_seats: Number(contract.metadata.provisionedAgentSeats),
     });
     const existing = await getSubscription(serverId);
-    const session = await stripe.checkout.sessions.create({
+    const promotionId = code ? await resolveCheckoutPromotion(stripe, code, {
+      customerId: existing?.stripeCustomerId ?? null,
+      priceId: contract.lineItems[0].price!,
+      interval: contract.metadata.billingInterval === "annual" ? "year" : "month",
+      secretKey: process.env.STRIPE_SECRET_KEY ?? "",
+    }) : null;
+    const params: Stripe.Checkout.SessionCreateParams = {
       mode: "subscription",
       success_url: successUrl,
       cancel_url: cancelUrl,
       client_reference_id: serverId,
       customer: existing?.stripeCustomerId,
-      allow_promotion_codes: true,
+      ...(promotionId ? { discounts: [{ promotion_code: promotionId }] } : { allow_promotion_codes: true }),
       line_items: contract.lineItems,
       metadata: contract.metadata,
       subscription_data: contract.subscriptionData,
-    });
+    };
+    let session: Stripe.Checkout.Session;
+    try {
+      session = await stripe.checkout.sessions.create(params, code ? { timeout: 15_000, maxNetworkRetries: 0 } : undefined);
+    } catch (error) {
+      if (code) throw new CheckoutPromotionUnavailableError();
+      throw error;
+    }
 
     if (!session.url) {
       traceBillingEvent("billing.checkout.session.missing_url", {
         server_id: serverId,
         billing_trace_id: contract.metadata.billingTraceId ?? null,
       });
+      if (code) throw new CheckoutPromotionUnavailableError();
       throw new Error("Stripe Checkout did not return a URL");
     }
     traceBillingEvent("billing.checkout.session.created", {
       server_id: serverId,
       billing_trace_id: contract.metadata.billingTraceId ?? null,
       existing_customer_present: Boolean(existing?.stripeCustomerId),
-      promotion_codes_enabled: true,
+      promotion_codes_enabled: !promotionId,
       stripe_session_url_present: Boolean(session.url),
       line_item_count: contract.lineItems.length,
     });
@@ -1836,6 +1859,29 @@ async function syncStripeSubscriptionProjection(
       updatedAt: now,
     })
     .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)));
+
+  // Contract v0.3 §18.8: a plan change can move a joint over (or back within)
+  // its free-server cap. Observe it now instead of waiting for the hourly
+  // sweep. Best effort: the sweep is the backstop if this fails.
+  try {
+    const { reconcileJointsForServer } = await import("./jointChannelLimitService");
+    await reconcileJointsForServer(serverId, new Date(now));
+  } catch (err) {
+    console.error(`[Billing] Joint over-limit reconcile failed for server ${serverId}:`, err instanceof Error ? err.message : err);
+  }
+
+  // The hosting provider's spend limit follows the plan. Best effort: its sync
+  // sweep re-checks every server with a hosted agent each minute.
+  if (srv.plan !== nextPlan) {
+    try {
+      const { markHostedRuntimePlanChanged } = await import("./hostedRuntimeServerPlanSync");
+      const { kickHostedRuntimePlanSync } = await import("./agentRuntimeProvisionService");
+      await markHostedRuntimePlanChanged(serverId);
+      kickHostedRuntimePlanSync();
+    } catch (err) {
+      console.error(`[Billing] Hosted runtime plan kick failed for server ${serverId}:`, err instanceof Error ? err.message : err);
+    }
+  }
 
   if (shouldBroadcast) {
     console.log(`[Billing] Synced Stripe subscription ${stripeSub.id} for server ${serverId}: ${projection.plan}/${status}`);

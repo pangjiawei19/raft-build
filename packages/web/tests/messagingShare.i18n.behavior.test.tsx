@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { createIntl } from "react-intl";
 import "./helpers/domSetup";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -14,6 +13,14 @@ const en = enMessages as Record<string, string>;
 const zh = zhMessages as Record<string, string>;
 const DATA_IMAGE =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+Av5NAAAAAElFTkSuQmCC";
+// What a validated capture hands the preview (task #1302), at the default 2x.
+const IMAGE = {
+  dataUrl: DATA_IMAGE,
+  blob: new Blob([Uint8Array.from(atob(DATA_IMAGE.split(",")[1]), (c) => c.charCodeAt(0))], { type: "image/png" }),
+  width: 1,
+  height: 1,
+  pixelRatio: 2,
+};
 
 afterEach(() => cleanup());
 
@@ -47,7 +54,7 @@ test("SelectShareLightbox renders its real preview actions in zh-cn", () => {
   render(
     <TestIntlProvider locale="zh-cn">
       <SelectShareLightbox
-        dataUrl={DATA_IMAGE}
+        image={IMAGE}
         onClose={() => undefined}
         onShareToX={async () => undefined}
       />

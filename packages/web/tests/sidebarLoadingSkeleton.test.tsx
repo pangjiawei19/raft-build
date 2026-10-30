@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import api from "../src/api/client";
@@ -14,7 +13,6 @@ import { useChannelStore } from "../src/store/channelStore";
 import { useMachineStore } from "../src/store/machineStore";
 import { useMessageStore } from "../src/store/messageStore";
 import { useServerStore } from "../src/store/serverStore";
-import { useWorkspaceGridNavigationStore } from "../src/components/workspace/workspaceGridNavigationStore";
 
 const originalApiGet = api.get;
 
@@ -28,7 +26,6 @@ afterEach(() => {
   useMachineStore.setState({ machines: [], loading: true });
   useServerStore.setState({ current: null, servers: [], members: [] });
   useAuthStore.setState({ user: null, loading: false, initialized: true });
-  useWorkspaceGridNavigationStore.setState({ active: false, enabled: false, railMode: null });
 });
 
 function installApiStub() {

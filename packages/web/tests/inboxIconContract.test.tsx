@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import api from "../src/api/client";
@@ -88,7 +87,7 @@ function seedOwner() {
   } as never);
 }
 
-test("activity panel header uses the Activity icon", () => {
+test("activity panel header names the page without an icon tile", () => {
   setDesktopViewport();
   seedOwner();
   useInboxStore.setState({
@@ -109,13 +108,12 @@ test("activity panel header uses the Activity icon", () => {
     </MemoryRouter>,
   );
 
+  // Raft DS › Panel: a page head names the page; the yellow location tile is
+  // a channel's, and the Activity glyph lives on the rail and sidebar entry
+  // (pinned below), so the head carries no icon tile at all.
   const header = screen.getByTestId("inbox-header");
-  const headerIcon = header.querySelector("svg.lucide-activity");
-  assert.ok(headerIcon, "Activity panel header must use the Activity icon");
-  assert.equal(header.querySelector("svg.lucide-message-square-text"), null);
-  // Test-owned footprint. Do not import the production `size={18}` literal.
-  assert.equal(headerIcon.getAttribute("width"), "18", "Activity header icon must be 18×18");
-  assert.equal(headerIcon.getAttribute("height"), "18", "Activity header icon must be 18×18");
+  assert.ok(header.querySelector('[data-slot="panel-header-icon"]') === null, "no icon tile in the Activity head");
+  assert.ok(header.querySelector("svg.lucide-message-square-text") === null);
 });
 
 test("mobile sidebar Activity entry uses the Activity icon", () => {
@@ -134,9 +132,10 @@ test("mobile sidebar Activity entry uses the Activity icon", () => {
   const sidebarIcon = sidebarEntry.querySelector("svg.lucide-activity");
   assert.ok(sidebarIcon, "sidebar Activity entry must use the Activity icon");
   assert.equal(sidebarEntry.querySelector("svg.lucide-message-square-text"), null);
-  // Test-owned footprint. Do not import the production `size={14}` literal.
-  assert.equal(sidebarIcon.getAttribute("width"), "14", "sidebar Activity icon must be 14×14");
-  assert.equal(sidebarIcon.getAttribute("height"), "14", "sidebar Activity icon must be 14×14");
+  // Test-owned footprint. Do not import the production `size={20}` literal.
+  // Raft Design System › ListRow entry (`.rf-row--entry`): a 20px icon.
+  assert.equal(sidebarIcon.getAttribute("width"), "20", "sidebar Activity icon must be 20×20");
+  assert.equal(sidebarIcon.getAttribute("height"), "20", "sidebar Activity icon must be 20×20");
 });
 
 test("activity panel loading state renders the skeleton, not loading copy", () => {

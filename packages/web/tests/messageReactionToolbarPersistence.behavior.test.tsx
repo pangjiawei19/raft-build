@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
-import test, { afterEach, beforeEach } from "node:test";
 import { useState } from "react";
 import { MemoryRouter } from "react-router-dom";
 import { cleanup, fireEvent, render as rtlRender } from "@testing-library/react";
+import { MessageItem as RaftMessageItem } from "@botiverse/raft-ui";
 import { TestIntlProvider } from "./helpers/intl";
 const render: typeof rtlRender = (ui, options) => rtlRender(ui, { wrapper: TestIntlProvider, ...options });
 import "./helpers/domSetup";
@@ -49,7 +49,7 @@ function ToolbarHarness({ canReact = true }: { canReact?: boolean }) {
   const [reactionActive, setReactionActive] = useState(false);
 
   return (
-    <div className="group/message">
+    <RaftMessageItem data-testid="toolbar-row">
       <MessageHoverToolbar
         isSaved={false}
         reactionActive={reactionActive}
@@ -58,7 +58,7 @@ function ToolbarHarness({ canReact = true }: { canReact?: boolean }) {
         onReactionClick={() => setReactionActive((active) => !active)}
         onToggleSave={() => {}}
       />
-    </div>
+    </RaftMessageItem>
   );
 }
 
@@ -146,16 +146,29 @@ test("opening the reaction picker pins the message toolbar visible outside row h
   const { container } = render(<ToolbarHarness />);
   const toolbar = container.querySelector<HTMLElement>("[data-message-affordance='toolbar']");
   const reactionButton = container.querySelector<HTMLButtonElement>("[data-message-affordance='reaction']");
+  const row = container.querySelector<HTMLElement>("[data-testid='toolbar-row']");
   assert.ok(toolbar);
   assert.ok(reactionButton);
+  assert.ok(row);
   assert.equal(toolbar.classList.contains("hidden"), false, "resting toolbar stays mounted for stable hover clicks");
-  assert.equal(toolbar.classList.contains("pointer-events-none"), false);
-  assert.equal(toolbar.classList.contains("opacity-0"), true);
+  // raft-ui 0.5.35 (#386): the opacity is variable-driven (`--mi-toolbar-opacity`,
+  // set by the row on hover/focus-within/open popup) instead of the
+  // `opacity-0` / `group-hover:opacity-100` classes.
+  // The row shows it for any open popup inside it, so no local override fights
+  // that variable.
+  assert.equal(toolbar.classList.contains("opacity-(--mi-toolbar-opacity,0)"), true);
+  assert.equal(row.classList.contains("has-data-popup-open:[--mi-toolbar-opacity:1]"), true);
+  assert.equal([...toolbar.classList].some((name) => name.includes("opacity-100")), false);
+  assert.equal(reactionButton.hasAttribute("data-popup-open"), false);
 
   fireEvent.click(reactionButton);
 
   assert.equal(reactionButton.getAttribute("aria-expanded"), "true");
-  assert.equal(toolbar.classList.contains("opacity-100"), true);
+  assert.equal(
+    reactionButton.hasAttribute("data-popup-open"),
+    true,
+    "the open picker marks its button, which pins the toolbar visible outside row hover",
+  );
   assert.equal(toolbar.classList.contains("flex"), true);
 });
 
@@ -193,7 +206,7 @@ test("opening the reaction picker keeps the message row's outer frame active", a
   const { row } = await renderMessage();
   const reactionButton = row.querySelector<HTMLButtonElement>("[data-message-affordance='reaction']");
   assert.ok(reactionButton);
-  assert.equal(row.classList.contains("border-transparent"), true, "resting row keeps its transparent border");
+  assert.equal(row.hasAttribute("data-popup-open"), false, "resting row is not in its active state");
 
   const originalCustomEvent = globalThis.CustomEvent;
   globalThis.CustomEvent = window.CustomEvent;
@@ -205,10 +218,15 @@ test("opening the reaction picker keeps the message row's outer frame active", a
 
   assert.ok(document.querySelector("[data-message-affordance='reaction-picker']"));
   assert.equal(
-    row.classList.contains("border-black"),
+    row.getAttribute("data-popup-open") !== null || row.className.includes("ring-info"),
     true,
     "the message frame must stay active while the pointer can move through the portaled picker",
   );
-  assert.equal(row.classList.contains("border-transparent"), false);
-  assert.equal(row.classList.contains("bg-white"), true);
+  // Active = rui's data-popup-open state (row tint + toolbar kept visible).
+  // The row draws no frame of its own (task #694): the active state is the
+  // pressed fill, never a border or ring.
+  assert.equal(row.getAttribute("data-popup-open") !== null, true);
+  assert.match(row.className, /(?:^| )data-popup-open:bg-fill-pressed(?: |$)/);
+  const frameTokens = row.className.split(/\s+/).filter((token) => /(?:^|:)(?:border|ring)(?:-|$)/.test(token));
+  assert.deepEqual(frameTokens, [], "the message row draws no border or ring frame");
 });

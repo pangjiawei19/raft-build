@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useIntl } from "react-intl";
 import {
   EllipsisVertical,
-  ExternalLink,
+  Maximize2,
+  Minimize2,
   MapPin,
   MessageCircleOff,
   MessageCirclePlus,
@@ -13,13 +14,13 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
-} from "raft-ui";
-import { useThreadStore } from "../../store/threadStore";
-import Button from "../ui/Button";
+  PanelAction,
+} from "@botiverse/raft-ui";
+import { isThreadFollowed, useThreadStore } from "../../store/threadStore";
+import Tooltip from "../ui/Tooltip";
 
 /**
- * Thread topbar vertical-ellipsis action menu (task #187, gated by
- * `topbar_overflow_v0`).
+ * Thread topbar vertical-ellipsis action menu.
  *
  * A Thread only has a few immediate commands, so a full settings drawer is
  * too heavy. Raft UI's DropdownMenu supplies the correct command-menu
@@ -36,8 +37,12 @@ export interface ThreadOverflowMenuProps {
   parentMessageId: string | null;
   viewInChannelLabel: string;
   onViewInChannel: () => void;
-  onOpenInNewTab?: () => void;
   onSearch: () => void;
+  restoreChannelLabel?: string;
+  hideChannelLabel?: string;
+  canToggleChannel?: () => boolean;
+  channelCollapsed?: boolean;
+  onToggleChannel?: () => void;
 }
 
 export default function ThreadOverflowMenu({
@@ -45,19 +50,21 @@ export default function ThreadOverflowMenu({
   parentMessageId,
   viewInChannelLabel,
   onViewInChannel,
-  onOpenInNewTab,
   onSearch,
+  restoreChannelLabel,
+  hideChannelLabel,
+  canToggleChannel,
+  channelCollapsed = false,
+  onToggleChannel,
 }: ThreadOverflowMenuProps) {
   const { formatMessage } = useIntl();
+  const [splitAvailable, setSplitAvailable] = useState(true);
   const [followBusy, setFollowBusy] = useState(false);
-  const followed = useThreadStore((state) =>
-    parentMessageId
-      ? state.followedThreads.some((thread) => thread.parentMessageId === parentMessageId)
-      : false);
+  const followed = useThreadStore((state) => (parentMessageId ? isThreadFollowed(state, parentMessageId) : false));
   const followThread = useThreadStore((state) => state.followThread);
   const unfollowThread = useThreadStore((state) => state.unfollowThread);
 
-  const handleFollowAction = () => {
+  const handleFollowAction = useCallback(() => {
     if (followBusy) return;
     const action = followed
       ? threadChannelId ? unfollowThread(threadChannelId) : null
@@ -68,21 +75,24 @@ export default function ThreadOverflowMenu({
     // menu. They are intentionally not modelled as a preference Switch.
     setFollowBusy(true);
     void action.catch(() => {}).finally(() => setFollowBusy(false));
-  };
+  }, [followBusy, followed, threadChannelId, parentMessageId, unfollowThread, followThread]);
+  const handleOpenChange = useCallback((open: boolean) => {
+    if (open) setSplitAvailable(canToggleChannel?.() ?? true);
+  }, [canToggleChannel]);
   return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        render={(
-          <Button
-            shape="icon"
-            title={formatMessage({ id: "message.threadPanel.overflow.open" })}
-            aria-label={formatMessage({ id: "message.threadPanel.overflow.open" })}
-            data-testid="thread-overflow-trigger"
-          >
-            <EllipsisVertical size={14} />
-          </Button>
-        )}
-      />
+    <DropdownMenu onOpenChange={handleOpenChange}>
+      <Tooltip content={formatMessage({ id: "message.threadPanel.overflow.open" })}>
+        <DropdownMenuTrigger
+          render={(
+            <PanelAction
+              aria-label={formatMessage({ id: "message.threadPanel.overflow.open" })}
+              data-testid="thread-overflow-trigger"
+            >
+              <EllipsisVertical />
+            </PanelAction>
+          )}
+        />
+      </Tooltip>
       <DropdownMenuContent
         side="bottom"
         align="end"
@@ -90,19 +100,16 @@ export default function ThreadOverflowMenu({
         aria-label={formatMessage({ id: "message.threadPanel.overflow.open" })}
         data-testid="thread-overflow-menu"
       >
+        {onToggleChannel && splitAvailable && (
+          <DropdownMenuItem onClick={onToggleChannel} data-testid="thread-overflow-maximize">
+            {channelCollapsed ? <Minimize2 /> : <Maximize2 />}
+            {channelCollapsed ? restoreChannelLabel ?? formatMessage({ id: "message.threadPanel.overflow.showChannel" }) : hideChannelLabel ?? formatMessage({ id: "message.threadPanel.overflow.hideChannel" })}
+          </DropdownMenuItem>
+        )}
         <DropdownMenuItem onClick={onSearch} data-testid="thread-overflow-search">
           <Search />
           {formatMessage({ id: "message.threadPanel.searchInThread" })}
         </DropdownMenuItem>
-        {parentMessageId && onOpenInNewTab && (
-          <DropdownMenuItem
-            onClick={onOpenInNewTab}
-            data-testid="thread-overflow-open-new-tab"
-          >
-            <ExternalLink />
-            {formatMessage({ id: "message.threadPanel.openInNewTab" })}
-          </DropdownMenuItem>
-        )}
         {parentMessageId && (
           <DropdownMenuItem
             onClick={onViewInChannel}

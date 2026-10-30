@@ -1,22 +1,28 @@
-import { lazy, Suspense, useCallback, useMemo, useState } from "react";
-import type { ReactNode } from "react";
-import { useIntl } from "react-intl";
-import { ArrowLeft, Users, Plus, X, Search } from "lucide-react";
-import {
+import { Badge,
+  Button,
+  Card,
+  CheckboxIndicator,
+  DialogSurface,
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+  PanelAction,
+  PanelHeader,
   SidebarList,
   SidebarSection,
   SidebarSectionChevron,
   SidebarSectionCount,
   SidebarSectionDisclosure,
   SidebarSectionHeader,
-  SidebarSectionTitle,
-} from "raft-ui";
+  SidebarSectionTitle, Spinner } from "@botiverse/raft-ui";
+import CloseButton from "../ui/CloseButton";
+import { lazy, Suspense, useCallback, useMemo, useState } from "react";
+import type { ReactNode } from "react";
+import { useIntl } from "react-intl";
+import { ArrowLeft, Users, Plus, X, Search, AlertTriangle } from "lucide-react";
 import { useAgentDisplayState, useAgentStore } from "../../store/agentStore";
 import type { AgentActivity } from "@botiverse/raft-shared";
-import {
-  CHANNEL_MANAGER_ROLE_ACTIONS_FEATURE_FLAG_KEY,
-  TOPBAR_OVERFLOW_FEATURE_FLAG_KEY,
-} from "@botiverse/raft-shared";
+import { CHANNEL_MANAGER_ROLE_ACTIONS_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import type { Agent } from "../../store/agentStore";
 import { useChannelStore } from "../../store/channelStore";
 import { useServerStore } from "../../store/serverStore";
@@ -28,14 +34,14 @@ import { useServerPermissions } from "../../hooks/useServerPermissions";
 import { useAuthStore } from "../../store/authStore";
 import AvatarSlot from "../ui/AvatarSlot";
 import Banner from "../ui/Banner";
+import EmptyState from "../ui/EmptyState";
+import { trackAgentCreateOpened } from "../../analytics/journey";
 import CreateAgentDialog from "./CreateAgentDialog";
-import CheckMarker from "../ui/CheckMarker";
 import SectionEyebrow from "../ui/SectionEyebrow";
 import FormField from "../ui/FormField";
 import AgentActivityDot from "./AgentActivityDot";
 import {
   ChannelMemberListShell,
-  ChannelMemberHoverActions,
   ChannelMemberRoleAndActions,
   ChannelMemberRow,
   ChannelMemberSectionHeader,
@@ -43,16 +49,16 @@ import {
 import { useChannelMemberRemoval } from "../channel/useChannelMemberRemoval";
 import Modal from "../Modal";
 import ConfirmDialog from "../ConfirmDialog";
-import Button from "../ui/Button";
-import Spinner from "../ui/Spinner";
+import Tooltip from "../ui/Tooltip";
 import type { ProfilePanelTarget } from "../profile/ProfilePanel";
 import { primeHumanProfileFromChannelMember, setCachedAgentProfile } from "../profile/profileFallbackCache";
-import { isLocalProjectionMember } from "../../utils/channelLocalMembership";
+import { isLocalProjectionMember, memberServerBadgeLabels } from "../../utils/channelLocalMembership";
+import type { ServerBadgeMember } from "../../utils/channelLocalMembership";
 import { usePeopleSuggestionSearch } from "../../hooks/usePeopleSuggestionSearch";
 import type { PeopleSuggestionCandidate } from "../../utils/peopleSuggestionSearch";
 import { canUseChannelMemberAction } from "../../utils/channelMemberPermissions";
-import { formatActivityText } from "../../utils/activity";
-import LegacyChannelMembers from "./LegacyChannelMembers";
+import { formatAgentDisplayStateText } from "../../utils/activity";
+import { MemberRoleActions } from "./MemberRoleActions";
 
 const ProfilePanel = lazy(() => import("../profile/ProfilePanel"));
 
@@ -64,27 +70,40 @@ export function agentStatusFallbackActivity(status: Agent["status"]): AgentActiv
 }
 
 export function AgentActivityInfo({ agentId, fallbackStatus }: { agentId: string; fallbackStatus: Agent["status"] }) {
-  const { formatMessage } = useIntl();
+  const intl = useIntl();
   const displayState = useAgentDisplayState(agentId, { status: fallbackStatus });
-  const activityText = formatActivityText(
-    formatMessage,
-    displayState.activity,
-    displayState.activityDetail,
-    displayState.activityDetailKind,
-  );
+  const activityText = formatAgentDisplayStateText(intl, displayState);
   return (
-    <div className="text-xs text-black/50 font-mono truncate">
+    <div className="truncate text-caption text-foreground-hint">
       {activityText}
     </div>
   );
 }
 
 // Shared by the modal/panel member list and the members page, which shows
-// the same remote-server badge on joint-channel rows.
+// the same remote-server badge on joint-channel rows. The RUI Badge recipe
+// owns the chip shape (22px cyan-soft = external); the server label is data,
+// so it reads in Space Mono like every other machine label.
 export function JointPeerBadge({ label }: { label: string }) {
   return (
-    <span className="inline-block max-w-full truncate border border-black bg-brutal-cyan/25 px-1 font-mono text-[10px] font-bold leading-4 text-black">
+    <Badge
+      appearance="soft"
+      variant="information"
+      className="inline-flex max-w-full items-center justify-center truncate text-center font-mono text-mono-meta font-normal"
+    >
       {label}
+    </Badge>
+  );
+}
+
+/** One JointPeerBadge per server, in roster order (viewed server first). */
+export function JointServerBadges({ labels }: { labels: readonly string[] }) {
+  if (labels.length === 0) return null;
+  return (
+    // Keeps #9527's layout: the name gets at least half the row and the
+    // badges never push it to nothing.
+    <span className="flex max-w-1/2 shrink-0 items-center gap-1 overflow-hidden">
+      {labels.map((label, index) => <JointPeerBadge key={`${index}:${label}`} label={label} />)}
     </span>
   );
 }
@@ -119,9 +138,8 @@ function MemberPageSection({
       defaultOpen
       data-testid={`member-page-section-${kind}-group`}
     >
-      <SidebarSectionHeader>
+      <SidebarSectionHeader className="w-full!">
         <SidebarSectionDisclosure
-          className="!normal-case"
           data-testid={`member-page-section-${kind}-toggle`}
         >
           <SidebarSectionChevron />
@@ -155,16 +173,17 @@ function AddMemberCandidateBody({
   return (
     <span className="min-w-0 flex-1 text-left">
       <span className="flex min-w-0 items-center gap-1.5">
-        <span className="truncate text-sm font-medium text-black">{name}</span>
+        <span className="truncate text-callout font-semibold">{name}</span>
         {trailing}
       </span>
       {normalizedDescription ? (
-        <span
-          className="block truncate text-xs font-normal text-black/60"
-          title={normalizedDescription}
-        >
-          {normalizedDescription}
-        </span>
+        <Tooltip content={normalizedDescription}>
+          <span
+            className="block truncate text-caption text-foreground-hint"
+          >
+            {normalizedDescription}
+          </span>
+        </Tooltip>
       ) : null}
     </span>
   );
@@ -174,6 +193,23 @@ function AddMemberCandidateBody({
  *  a `kind:id` prefix never collides with the id itself. */
 function candidateKey(kind: "agent" | "human", id: string): string {
   return `${kind}:${id}`;
+}
+
+/** External (Slack) participant handle in its @ protocol form. */
+function handleLabel(handle: string): string {
+  return `@${handle}`;
+}
+
+/** Add-flow candidate option (DS selectable row): transparent until hovered;
+ *  the name inherits the row ink so the disabled state reaches it. */
+const CANDIDATE_ROW_CLASS = "flex w-full items-center gap-2 rounded-control px-3 py-2 text-left text-foreground transition-colors [@media(max-height:600px)]:py-1";
+
+/** Multi-select candidate: a failed row keeps its orange-soft problem wash
+ *  (the overlay presses on top of it); disabled while a batch is in flight. */
+function candidateToggleRowClass(failed: boolean): string {
+  return `${CANDIDATE_ROW_CLASS} disabled:cursor-not-allowed disabled:text-foreground-disabled ${
+    failed ? "bg-warning-soft enabled:hover:press-overlay" : "enabled:hover:bg-fill-pressed"
+  }`;
 }
 
 type ChannelMembersProps = {
@@ -201,7 +237,7 @@ type ChannelMembersProps = {
   };
 };
 
-function GatedChannelMembers({
+export default function ChannelMembers({
   channelId,
   open,
   onOpenChange,
@@ -241,7 +277,6 @@ function GatedChannelMembers({
     roleChangeFailed,
   } = prefetchedMembers ?? localMembers;
   const openProfile = useProfileStore((s) => s.openProfile);
-  const topbarOverflowEnabled = useServerFeatureFlag(TOPBAR_OVERFLOW_FEATURE_FLAG_KEY).enabled;
   const channelManagerRoleActionsEnabled = useServerFeatureFlag(
     CHANNEL_MANAGER_ROLE_ACTIONS_FEATURE_FLAG_KEY,
   ).enabled;
@@ -249,11 +284,21 @@ function GatedChannelMembers({
   const isPanel = presentation === "panel";
   const isPage = presentation === "page";
   const showPanel = open ?? internalShowPanel;
-  const setShowPanel = (next: boolean) => {
+  const setShowPanel = useCallback((next: boolean) => {
     if (onOpenChange) onOpenChange(next);
     else setInternalShowPanel(next);
-  };
+  }, [onOpenChange]);
   const [showAddSection, setShowAddSection] = useState(initialView === "add");
+  // The add picker lists agents from the roster store. Ask for it when the
+  // picker opens instead of relying on boot timing: the connect snapshot (or its
+  // bounded fallback) may not have landed yet, and an empty roster would offer to
+  // create an agent that already exists. loadAgents dedupes in-flight calls.
+  // (A picker opened directly via initialView="add" is covered by its opener.)
+  const loadAgents = useAgentStore((s) => s.loadAgents);
+  const openAddSection = useCallback(() => {
+    setShowAddSection(true);
+    void loadAgents();
+  }, [loadAgents]);
   const [memberSearch, setMemberSearch] = useState("");
   // Members page (page mode) live roster filter — separate from the add
   // flow's candidate search (`memberSearch`).
@@ -278,7 +323,7 @@ function GatedChannelMembers({
     removeHuman,
     channelName: currentChannel?.name,
   });
-  // task #187 multi-select add flow (flag-gated): selection is staged and
+  // task #187 multi-select add flow: selection is staged and
   // only committed on confirm; failed rows stay selected + highlighted so
   // the confirm button doubles as retry.
   const [selectedKeys, setSelectedKeys] = useState<Set<string>>(() => new Set());
@@ -299,10 +344,12 @@ function GatedChannelMembers({
   const isArchived = !!currentChannel?.archivedAt;
   const isLocalMember = (serverId?: string) =>
     !currentChannel?.serverId || !serverId || serverId === currentChannel.serverId;
-  const jointPeerLabel = (serverId?: string, serverName?: string | null, serverSlug?: string | null) =>
-    currentChannel?.type === "joint" && !isLocalMember(serverId)
-      ? serverName || serverSlug || null
-      : null;
+  // Joint rosters badge every server a non-local member participates through
+  // (RFC 075 phase 1): a person on both sides shows both servers.
+  const jointServerLabels = (member: ServerBadgeMember) =>
+    currentChannel?.type === "joint"
+      ? memberServerBadgeLabels(member, currentChannel.serverId)
+      : [];
   const totalParticipants = channelAgents.length + channelHumans.length + channelExternalMembers.length;
   const { capabilities } = useServerPermissions();
   const canAddChannelMembers = canUseChannelMemberAction({
@@ -370,20 +417,21 @@ function GatedChannelMembers({
     return map;
   }, [agents, serverMembers]);
 
-  const resetAddFlow = () => {
+  const resetAddFlow = useCallback(() => {
     setShowAddSection(false);
     setMemberSearch("");
     setSelectedKeys(new Set());
     setFailedKeys(new Set());
     setAddError(null);
     setAdding(false);
-  };
-  const closePanel = () => {
+  }, []);
+  const closePanel = useCallback(() => {
     resetAddFlow();
     setRoleError(null);
     if (isPanel || isPage) onRequestClose?.();
     else setShowPanel(false);
-  };
+  }, [resetAddFlow, isPanel, isPage, onRequestClose, setShowPanel]);
+
 
   const toggleCandidate = (key: string) => {
     setSelectedKeys((prev) => {
@@ -403,7 +451,7 @@ function GatedChannelMembers({
     setAddError(null);
   };
 
-  const handleConfirmAdd = async () => {
+  const handleConfirmAdd = useCallback(async () => {
     if (adding || selectedKeys.size === 0) return;
     setAdding(true);
     setAddError(null);
@@ -439,7 +487,7 @@ function GatedChannelMembers({
     } finally {
       setAdding(false);
     }
-  };
+  }, [adding, selectedKeys, addMembers, resetAddFlow, pendingJoinAgent]);
 
   const showAddEntry = !membersLoading && canAddChannelMembers;
 
@@ -447,56 +495,24 @@ function GatedChannelMembers({
     targetType: "user" | "agent",
     member: ChannelHuman | ChannelAgent,
     removeAction?: () => void,
-  ) => {
-    const serverRole = member.serverRole ?? ("role" in member ? member.role : "member");
-    const effectiveRole = member.effectiveChannelRole
-      ?? (serverRole === "owner" || serverRole === "admin" || member.channelRole === "admin" ? "admin" : "member");
-    const protectedServerAdmin = serverRole === "owner" || serverRole === "admin";
-    const canExplainProtectedDemote = !isArchived
-      && !isAllChannel
-      && currentChannel?.channelCapabilities?.changeChannelMemberRoles === true
-      && member.id !== currentUserId
-      && protectedServerAdmin
-      && effectiveRole !== "member";
-    const canChangeRole = !isArchived && !isAllChannel && member.canChangeChannelRole;
-    const showRoleAction = channelManagerRoleActionsEnabled
-      && (canChangeRole || canExplainProtectedDemote);
-    if (!showRoleAction && !removeAction) return null;
-    const nextRole = effectiveRole === "member" ? "admin" : "member";
-    const key = `${targetType}:${member.id}`;
-    return (
-      <ChannelMemberHoverActions
-        roleAction={showRoleAction ? {
-          label: formatMessage({
-            id: nextRole === "admin"
-              ? "agent.channelMembers.makeAdminShort"
-              : "agent.channelMembers.removeAdminShort",
-          }),
-          ariaLabel: formatMessage({
-            id: nextRole === "admin"
-              ? "agent.channelMembers.makeAdmin"
-              : "agent.channelMembers.removeAdmin",
-          }, { name: member.name }),
-          disabled: roleChangingKey === key,
-          onClick: () => {
-            if (canExplainProtectedDemote) {
-              setProtectedDemoteTarget(member.displayName || member.name);
-              return;
-            }
-            setRoleError(null);
-            setRoleChangingKey(key);
-            void changeMemberRole(targetType, member.id, nextRole)
-              .catch(() => setRoleError(formatMessage({ id: "agent.channelMembers.updateRoleFailed" })))
-              .finally(() => setRoleChangingKey((current) => current === key ? null : current));
-          },
-        } : undefined}
-        removeAction={removeAction ? {
-          label: formatMessage({ id: "agent.channelMembers.removeName" }, { name: member.name }),
-          onClick: removeAction,
-        } : undefined}
-      />
-    );
-  };
+  ) => (
+    <MemberRoleActions
+      targetType={targetType}
+      member={member}
+      removeAction={removeAction}
+      isArchived={isArchived}
+      isAllChannel={isAllChannel}
+      roleCapabilitiesEnabled={currentChannel?.channelCapabilities?.changeChannelMemberRoles === true}
+      currentUserId={currentUserId}
+      roleActionsEnabled={channelManagerRoleActionsEnabled}
+      roleChangingKey={roleChangingKey}
+      changeMemberRole={changeMemberRole}
+      formatMessage={formatMessage}
+      onProtectedDemote={setProtectedDemoteTarget}
+      onRoleError={setRoleError}
+      onRoleChanging={setRoleChangingKey}
+    />
+  );
 
   /* Per-member row renderers, single-sourced between the modal/panel
      member list and the members page (page mode): the page makes the
@@ -504,7 +520,7 @@ function GatedChannelMembers({
      trailing slot; modal/panel keep the avatar-click affordance. */
   const renderAgentRow = (agent: ChannelAgent, pageMode: boolean) => {
     const canRemoveAgent = isLocalMember(agent.serverId);
-    const peerLabel = jointPeerLabel(agent.serverId, agent.serverName, agent.serverSlug);
+    const serverLabels = jointServerLabels(agent);
     const openAgentProfile = () => {
       setCachedAgentProfile(currentServerId, agent);
       if (isPage) {
@@ -531,8 +547,8 @@ function GatedChannelMembers({
         agentFallbackActivity={agentStatusFallbackActivity(agent.status)}
         name={(
           <span className="flex min-w-0 items-center gap-1.5">
-            <span className="truncate">{agent.displayName || agent.name}</span>
-            {peerLabel && <JointPeerBadge label={peerLabel} />}
+            <span className="min-w-0 truncate">{agent.displayName || agent.name}</span>
+            <JointServerBadges labels={serverLabels} />
           </span>
         )}
         secondary={<AgentActivityInfo agentId={agent.id} fallbackStatus={agent.status} />}
@@ -545,7 +561,7 @@ function GatedChannelMembers({
 
   const renderHumanRow = (human: ChannelHuman, pageMode: boolean) => {
     const canRemoveHuman = isLocalMember(human.serverId);
-    const peerLabel = jointPeerLabel(human.serverId, human.serverName, human.serverSlug);
+    const serverLabels = jointServerLabels(human);
     const openHumanProfile = () => {
       if (currentChannel?.serverId) {
         primeHumanProfileFromChannelMember(currentChannel.serverId, human);
@@ -573,8 +589,8 @@ function GatedChannelMembers({
         gravatarHash={human.gravatarHash}
         name={(
           <span className="flex min-w-0 items-center gap-1.5">
-            <span className="truncate">{human.displayName || human.name}</span>
-            {peerLabel && <JointPeerBadge label={peerLabel} />}
+            <span className="min-w-0 truncate">{human.displayName || human.name}</span>
+            <JointServerBadges labels={serverLabels} />
           </span>
         )}
         secondary={human.description ? <div className="truncate">{human.description}</div> : undefined}
@@ -593,12 +609,14 @@ function GatedChannelMembers({
       name={(
         <span className="flex min-w-0 items-center gap-1.5">
           <span className="truncate">{member.displayName}</span>
-          <span className="border border-black bg-brutal-lavender px-1 font-mono text-[10px] font-bold uppercase leading-4 text-black">
+          <Badge appearance="outline" className="shrink-0">
             {formatMessage({ id: "settings.slackBridge.providerBadge" })}
-          </span>
+          </Badge>
         </span>
       )}
-      secondary={member.handles[0] ? `@${member.handles[0]}` : undefined}
+      secondary={member.handles[0]
+        ? <span className="font-mono text-mono-meta">{handleLabel(member.handles[0])}</span>
+        : undefined}
     />
   );
 
@@ -613,7 +631,7 @@ function GatedChannelMembers({
   // the row's own label promises it. A generic「创建一个新 Agent」row must not
   // smuggle the search text into the dialog (Duoyu, PR #7372 design review).
   const createEntryPromoted = createAgentPrefillName.length > 0 && !hasFilteredResults;
-  const joinCreatedAgent = async (agent: { id: string; name: string }) => {
+  const joinCreatedAgent = useCallback(async (agent: { id: string; name: string }) => {
     setRetryingJoin(true);
     try {
       // Same atomic batch facade as「添加所选」(handleConfirmAdd) — ONE
@@ -639,17 +657,58 @@ function GatedChannelMembers({
     } finally {
       setRetryingJoin(false);
     }
-  };
+  }, [addMembers]);
+
+  const handleRetryJoin = useCallback(() => {
+    if (pendingJoinAgent) void joinCreatedAgent(pendingJoinAgent);
+  }, [joinCreatedAgent, pendingJoinAgent]);
+
+  const handleMemberSearchChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setMemberSearch(e.target.value);
+  }, []);
+
+  const handleConfirmAddClick = useCallback(() => {
+    void handleConfirmAdd();
+  }, [handleConfirmAdd]);
+
+  const handleBackOrReset = useCallback(() => {
+    if (showAddSection) resetAddFlow();
+    else onBack?.();
+  }, [showAddSection, resetAddFlow, onBack]);
+
+  const handleRosterQueryChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    setRosterQuery(e.target.value);
+  }, []);
+
+  const handleOpenPanel = useCallback(() => {
+    setShowPanel(true);
+  }, [setShowPanel]);
+
+  const handleClearProtectedDemote = useCallback(() => {
+    setProtectedDemoteTarget(null);
+  }, []);
+
+  const handleCreatedAgent = useCallback((agent: { id: string; name: string }) => {
+    void joinCreatedAgent(agent);
+  }, [joinCreatedAgent]);
+
+  const handleCloseCreateAgent = useCallback(() => {
+    setShowCreateAgent(false);
+  }, []);
 
   const addCandidateRows = (multiSelect: boolean, fillAvailableHeight = false) => (
-    <div
-      className={`border-2 border-black bg-white shadow-brutal-sm overflow-y-auto ${fillAvailableHeight ? "min-h-0 flex-1" : "max-h-72"}`}
+    <Card
+      // Column: the candidates scroll in the inner region; the create-agent
+      // entry is a pinned footer OUTSIDE that region (task #99) so it is always
+      // in view instead of only after scrolling to the end of a long list.
+      className={`overflow-y-auto ${fillAvailableHeight ? "min-h-0 flex-1" : "max-h-72"}`}
       data-testid={multiSelect ? "add-member-candidate-list" : undefined}
     >
+    <div className="min-h-0 flex-1 overflow-y-auto p-1" data-testid={multiSelect ? "add-member-candidate-scroll" : undefined}>
       {/* Available agents */}
       {filteredAgents.length > 0 && (
         <>
-          <SectionEyebrow as="div" uppercase={false} className="px-3 py-1.5 bg-white/50">
+          <SectionEyebrow as="div" className="px-3 pb-1 pt-2">
             {formatMessage({ id: "agent.channelMembers.agents" })}
           </SectionEyebrow>
           {filteredAgents.map((agent) => {
@@ -659,7 +718,7 @@ function GatedChannelMembers({
                 <button
                   key={agent.id}
                   onClick={() => { void addAgent(agent.id).catch(() => {}); }}
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-black transition-colors hover:bg-soft-signal [@media(max-height:600px)]:py-1"
+                  className={`${CANDIDATE_ROW_CLASS} hover:bg-fill-pressed`}
                 >
                   <AvatarSlot
                     context="compact-list"
@@ -682,10 +741,11 @@ function GatedChannelMembers({
                 onClick={() => toggleCandidate(key)}
                 disabled={adding}
                 aria-pressed={selectedKeys.has(key)}
-                className={`flex w-full items-center gap-2 px-3 py-2 text-left text-black transition-colors hover:bg-soft-signal disabled:cursor-not-allowed disabled:opacity-60 [@media(max-height:600px)]:py-1 ${failedKeys.has(key) ? "bg-brutal-red/15" : ""}`}
+                aria-describedby={failedKeys.has(key) ? `add-member-failed-${key}` : undefined}
+                className={candidateToggleRowClass(failedKeys.has(key))}
                 data-testid={`add-candidate-agent-${agent.id}`}
               >
-                <CheckMarker checked={selectedKeys.has(key)} disabled={adding} />
+                <CheckboxIndicator checked={selectedKeys.has(key)} disabled={adding} />
                 <AvatarSlot
                   context="compact-list"
                   type="agent"
@@ -697,6 +757,11 @@ function GatedChannelMembers({
                   name={agent.displayName || agent.name}
                   description={agent.description}
                 />
+                {failedKeys.has(key) ? (
+                  <span id={`add-member-failed-${key}`} className="sr-only">
+                    {formatMessage({ id: "agent.channelMembers.addFailed" })}
+                  </span>
+                ) : null}
               </button>
             );
           })}
@@ -706,7 +771,7 @@ function GatedChannelMembers({
       {/* Available humans */}
       {filteredHumans.length > 0 && (
         <>
-          <SectionEyebrow as="div" uppercase={false} className="px-3 py-1.5 bg-white/50">
+          <SectionEyebrow as="div" className="px-3 pb-1 pt-2">
             {formatMessage({ id: "agent.channelMembers.humans" })}
           </SectionEyebrow>
           {filteredHumans.map((human) => {
@@ -716,7 +781,7 @@ function GatedChannelMembers({
                 <button
                   key={human.userId}
                   onClick={() => { void addHuman(human.userId).catch(() => {}); }}
-                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-black transition-colors hover:bg-soft-signal [@media(max-height:600px)]:py-1"
+                  className={`${CANDIDATE_ROW_CLASS} hover:bg-fill-pressed`}
                 >
                   <AvatarSlot
                     context="compact-list"
@@ -739,10 +804,11 @@ function GatedChannelMembers({
                 onClick={() => toggleCandidate(key)}
                 disabled={adding}
                 aria-pressed={selectedKeys.has(key)}
-                className={`flex w-full items-center gap-2 px-3 py-2 text-left text-black transition-colors hover:bg-soft-signal disabled:cursor-not-allowed disabled:opacity-60 [@media(max-height:600px)]:py-1 ${failedKeys.has(key) ? "bg-brutal-red/15" : ""}`}
+                aria-describedby={failedKeys.has(key) ? `add-member-failed-${key}` : undefined}
+                className={candidateToggleRowClass(failedKeys.has(key))}
                 data-testid={`add-candidate-human-${human.userId}`}
               >
-                <CheckMarker checked={selectedKeys.has(key)} disabled={adding} />
+                <CheckboxIndicator checked={selectedKeys.has(key)} disabled={adding} />
                 <AvatarSlot
                   context="compact-list"
                   type="human"
@@ -754,6 +820,11 @@ function GatedChannelMembers({
                   name={human.displayName || human.name}
                   description={human.description}
                 />
+                {failedKeys.has(key) ? (
+                  <span id={`add-member-failed-${key}`} className="sr-only">
+                    {formatMessage({ id: "agent.channelMembers.addFailed" })}
+                  </span>
+                ) : null}
               </button>
             );
           })}
@@ -761,19 +832,21 @@ function GatedChannelMembers({
       )}
 
       {!hasAvailable && (
-        <div className="px-3 py-4 text-sm text-black/50 font-mono text-center">
+        <div className="px-3 py-4 text-center text-callout text-foreground-hint">
           {formatMessage({ id: "agent.channelMembers.allMembersAdded" })}
         </div>
       )}
 
       {hasAvailable && !hasFilteredResults && (
-        <div className="px-3 py-4 text-sm text-black/50 font-mono text-center">
+        <div className="px-3 py-4 text-center text-callout text-foreground-hint">
           {formatMessage({ id: "agent.channelMembers.noMatches" }, { query: memberSearch.trim() })}
         </div>
       )}
 
+    </div>
       {/* Create-a-new-Agent entry (task #584, design task #1139): persistent
-          bottom row in the candidate list. When the search has no hit the
+          bottom row — pinned below the scrolling candidates (task #99), not the
+          last scrolled row. When the search has no hit the
           typed text becomes the suggested name and the row steps up to the
           primary next action; without create permission the row stays VISIBLE
           but disabled with the reason — hiding it here would recreate the
@@ -782,42 +855,45 @@ function GatedChannelMembers({
         capabilities.createAgents ? (
           <button
             type="button"
-            onClick={() => setShowCreateAgent(true)}
+            onClick={() => {
+              trackAgentCreateOpened("channel_members");
+              setShowCreateAgent(true);
+            }}
             disabled={adding}
             data-testid="add-member-create-agent-entry"
-            className={`flex w-full items-center gap-2.5 border-t-2 border-black px-3 py-2.5 text-left ${
-              createEntryPromoted ? "bg-soft-signal" : "bg-white hover:bg-black/5"
+            className={`flex w-full shrink-0 items-center gap-2.5 border-t border-line-seam px-4 py-2.5 text-left text-foreground transition-colors disabled:cursor-not-allowed disabled:text-foreground-disabled ${
+              createEntryPromoted ? "bg-brand-soft enabled:hover:press-overlay" : "bg-layer-card enabled:hover:bg-fill-pressed"
             }`}
           >
-            <span className="flex size-6 shrink-0 items-center justify-center border-2 border-dashed border-black bg-white">
-              <Plus size={14} />
+            <span className="flex size-6 shrink-0 items-center justify-center rounded-sticker border-[1.5px] border-dashed border-foreground-hint text-foreground-hint">
+              <Plus size={14} aria-hidden="true" />
             </span>
             <span className="flex min-w-0 flex-col">
-              <span className="truncate text-sm font-bold">
+              <span className="truncate text-callout font-semibold">
                 {createEntryPromoted
                   ? formatMessage({ id: "channel.addMembers.createAgentNamed" }, { name: createAgentPrefillName })
                   : formatMessage({ id: "channel.addMembers.createAgent" })}
               </span>
-              <span className="truncate text-xs text-black/50">
+              <span className="truncate text-caption text-foreground-hint">
                 {formatMessage({ id: "channel.addMembers.createAgentAutoJoin" }, { channel: `#${currentChannel?.name ?? ""}` })}
               </span>
             </span>
           </button>
         ) : (
-          <div className="border-t-2 border-black px-3 py-2.5" data-testid="add-member-create-agent-entry-disabled">
-            <div className="flex items-center gap-2.5 opacity-50">
-              <span className="flex size-6 shrink-0 items-center justify-center border-2 border-dashed border-black bg-white">
-                <Plus size={14} />
+          <div className="shrink-0 border-t border-line-seam px-4 py-2.5" data-testid="add-member-create-agent-entry-disabled">
+            <div className="flex items-center gap-2.5 text-foreground-disabled">
+              <span className="flex size-6 shrink-0 items-center justify-center rounded-sticker border-[1.5px] border-dashed border-foreground-disabled">
+                <Plus size={14} aria-hidden="true" />
               </span>
-              <span className="text-sm font-bold">{formatMessage({ id: "channel.addMembers.createAgent" })}</span>
+              <span className="text-callout font-semibold">{formatMessage({ id: "channel.addMembers.createAgent" })}</span>
             </div>
-            <p className="mt-1.5 text-xs text-black/50">
+            <p className="mt-1.5 text-caption text-foreground-hint">
               {formatMessage({ id: "channel.addMembers.createAgentNoPermission" })}
             </p>
           </div>
         )
       )}
-    </div>
+    </Card>
   );
 
   const memberListView = (
@@ -826,18 +902,18 @@ function GatedChannelMembers({
           inner-scrolling box); modal mode keeps the framed shell. */}
       <ChannelMemberListShell framed={!isPanel}>
         {(roleError || roleChangeFailed) && (
-          <Banner intent="warning" className="m-3 font-bold" data-testid="channel-member-role-error">
+          <Banner intent="warning" className="m-3" data-testid="channel-member-role-error">
             {roleError || formatMessage({ id: "agent.channelMembers.updateRoleFailed" })}
           </Banner>
         )}
         {membersLoading && (
           <div
-            className="flex items-center justify-center gap-2 px-3 py-4 font-mono text-sm text-black/50"
+            className="flex items-center justify-center gap-2 px-3 py-4 text-callout text-foreground-hint"
             data-testid="channel-members-loading"
           >
             <Spinner
               size="sm"
-              label={formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
+              aria-label={formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
             />
             {formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
           </div>
@@ -869,26 +945,12 @@ function GatedChannelMembers({
         )}
 
         {!membersLoading && totalParticipants === 0 && (
-          <div className="px-3 py-4 text-sm text-black/50 font-mono text-center">
+          <div className="px-3 py-4 text-center text-callout text-foreground-hint">
             {formatMessage({ id: "agent.channelMembers.noMembers" })}
           </div>
         )}
       </ChannelMemberListShell>
 
-      {/* Add entry — flag off keeps the legacy bottom button; flag on
-          moves it to the modal header (top 「＋ 添加」). */}
-      {!topbarOverflowEnabled && showAddEntry && (
-        <div className="mt-4">
-          <button
-            onClick={() => setShowAddSection(true)}
-            disabled={!hasAvailable}
-            className="btn-brutal flex w-full items-center justify-center gap-1.5 bg-brutal-pink px-3 py-1.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            <Plus size={14} />
-            {formatMessage({ id: "agent.channelMembers.addMember" })}
-          </button>
-        </div>
-      )}
     </>
   );
 
@@ -898,7 +960,7 @@ function GatedChannelMembers({
       data-testid="add-member-view"
     >
       {addError && (
-        <Banner intent="warning" className="mb-3 font-bold" data-testid="add-member-error">
+        <Banner intent="warning" className="mb-3" data-testid="add-member-error">
           {formatMessage({
             id: addError === "none"
               ? "channel.addMembers.noneAdded"
@@ -911,25 +973,26 @@ function GatedChannelMembers({
           that clears this — however the join completes (banner retry, the
           staged「添加所选」, or a socket refresh), the banner goes away. */}
       {pendingJoinAgent && !channelAgents.some((agent) => agent.id === pendingJoinAgent.id) && (
-        <Banner intent="warning" className="mb-3" data-testid="add-member-create-agent-join-failed">
-          <div className="text-sm font-bold">
-            {formatMessage(
-              { id: "channel.addMembers.createAgentJoinFailedTitle" },
-              { name: pendingJoinAgent.name, channel: `#${currentChannel?.name ?? ""}` },
-            )}
-          </div>
-          <div className="mt-0.5 text-xs">
-            {formatMessage({ id: "channel.addMembers.createAgentJoinFailedBody" })}
-          </div>
-          <button
-            type="button"
-            onClick={() => { void joinCreatedAgent(pendingJoinAgent); }}
-            disabled={retryingJoin || adding}
-            className="btn-brutal-sm mt-2 inline-flex items-center gap-1.5 bg-white px-2 py-1 text-xs font-bold disabled:cursor-not-allowed disabled:opacity-50"
-            data-testid="add-member-create-agent-retry-join"
-          >
-            {formatMessage({ id: "channel.addMembers.retryJoin" })}
-          </button>
+        <Banner
+          intent="warning"
+          className="mb-3"
+          data-testid="add-member-create-agent-join-failed"
+          title={formatMessage(
+            { id: "channel.addMembers.createAgentJoinFailedTitle" },
+            { name: pendingJoinAgent.name, channel: `#${currentChannel?.name ?? ""}` },
+          )}
+          actions={(
+            <Button size="sm" variant="outline"
+              type="button"
+              onClick={handleRetryJoin}
+              disabled={retryingJoin || adding}
+              data-testid="add-member-create-agent-retry-join"
+            >
+              {formatMessage({ id: "channel.addMembers.retryJoin" })}
+            </Button>
+          )}
+        >
+          {formatMessage({ id: "channel.addMembers.createAgentJoinFailedBody" })}
         </Banner>
       )}
 
@@ -938,47 +1001,54 @@ function GatedChannelMembers({
         <div className="mb-3 flex flex-wrap gap-1.5" data-testid="add-member-selected-chips">
           {[...selectedKeys].map((key) => {
             const kind = key.startsWith("agent:") ? "agent" : "human";
-            const tone = failedKeys.has(key)
-              ? "bg-brutal-red/25"
-              : kind === "agent"
-                ? "bg-brutal-cyan"
-                : "bg-brutal-lavender";
+            const failedNow = failedKeys.has(key);
+            const memberName = candidateNameByKey.get(key) ?? key;
             return (
-              <span
+              <Badge
                 key={key}
-                className={`inline-flex items-center gap-1 border-2 border-black px-1.5 py-0.5 text-xs font-bold ${tone}`}
+                appearance="soft"
+                variant={failedNow ? "warning" : "default"}
+                className="pr-0.5"
                 data-member-kind={kind}
+                data-member-status={failedNow ? "failed" : "selected"}
                 data-testid={`add-member-selected-chip-${key}`}
               >
-                <span className="max-w-32 truncate">{candidateNameByKey.get(key) ?? key}</span>
+                <span className="max-w-32 truncate">{memberName}</span>
+                {failedNow ? (
+                  <span className="inline-flex shrink-0 items-center gap-0.5" data-member-failure="true">
+                    <AlertTriangle size={12} aria-hidden="true" />
+                    <span>{formatMessage({ id: "agent.channelMembers.addFailed" })}</span>
+                  </span>
+                ) : null}
                 <button
                   type="button"
                   onClick={() => toggleCandidate(key)}
                   disabled={adding}
-                  className="shrink-0"
-                  aria-label={formatMessage({ id: "agent.channelMembers.deselectName" }, { name: candidateNameByKey.get(key) ?? key })}
+                  className="inline-flex size-[18px] shrink-0 items-center justify-center rounded-sticker text-foreground-hint transition-colors hover:bg-fill-pressed hover:text-foreground disabled:cursor-not-allowed disabled:text-foreground-disabled disabled:hover:bg-transparent"
+                  aria-label={formatMessage({ id: "agent.channelMembers.deselectName" }, { name: memberName })}
                 >
-                  <X size={12} />
+                  <X size={14} />
                 </button>
-              </span>
+              </Badge>
             );
           })}
         </div>
       )}
 
       {hasAvailable && (
-        <FormField label={formatMessage({ id: "agent.channelMembers.search" })} labelStyle="plain" className="mb-3">
-          <div className="relative">
-            <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-black/40" />
-            <input
+        <FormField label={formatMessage({ id: "agent.channelMembers.search" })} className="mb-3">
+          <InputGroup>
+            <InputGroupAddon align="inline-start">
+              <Search aria-hidden="true" />
+            </InputGroupAddon>
+            <InputGroupInput
               type="text"
               value={memberSearch}
-              onChange={(e) => setMemberSearch(e.target.value)}
-              className="input-brutal input-member-search w-full pl-9"
+              onChange={handleMemberSearchChange}
               placeholder={formatMessage({ id: "agent.channelMembers.namePlaceholder" })}
               autoFocus
             />
-          </div>
+          </InputGroup>
         </FormField>
       )}
 
@@ -987,23 +1057,24 @@ function GatedChannelMembers({
       {/* Confirm — staged atomic commit; N=0 disabled; a rejected batch keeps
           every selected row available for correction/retry. */}
       <div className={`mt-4 ${isPage ? "shrink-0" : ""}`}>
-        <button
+        <Button size="lg"
           type="button"
-          onClick={() => void handleConfirmAdd()}
+          onClick={handleConfirmAddClick}
           disabled={adding || selectedKeys.size === 0}
-          className="btn-brutal flex w-full items-center justify-center gap-1.5 bg-brutal-pink px-3 py-1.5 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed"
+          variant="primary"
+          className="w-full"
           data-testid="add-member-confirm"
         >
           <Plus size={14} />
           {adding
             ? formatMessage({ id: "agent.channelMembers.adding" })
             : formatMessage({ id: "agent.channelMembers.confirmAdd" }, { count: selectedKeys.size })}
-        </button>
+        </Button>
       </div>
     </div>
   );
 
-  const showInModalAddView = topbarOverflowEnabled && showAddSection && canAddChannelMembers;
+  const showInModalAddView = showAddSection && canAddChannelMembers;
 
   // Shared header + view body: the Modal shell (legacy) and the overflow
   // drawer panel (task #187) render identical content — only the close
@@ -1012,17 +1083,17 @@ function GatedChannelMembers({
     <div className="mb-4 flex items-center justify-between">
       <div className="flex min-w-0 items-center gap-2">
         {showInModalAddView && (
-          <button
-            onClick={resetAddFlow}
-            className="btn-brutal-sm bg-white p-1"
-            title={formatMessage({ id: "agent.channelMembers.backToMembers" })}
-            aria-label={formatMessage({ id: "agent.channelMembers.backToMembers" })}
-            data-testid="add-member-back"
-          >
-            <ArrowLeft size={16} />
-          </button>
+          <Tooltip content={formatMessage({ id: "agent.channelMembers.backToMembers" })}>
+            <Button size="icon-sm" variant="ghost"
+              onClick={resetAddFlow}
+              aria-label={formatMessage({ id: "agent.channelMembers.backToMembers" })}
+              data-testid="add-member-back"
+            >
+              <ArrowLeft size={16} />
+            </Button>
+          </Tooltip>
         )}
-        <h2 className="truncate text-lg font-bold">
+        <h2 className="truncate text-headline">
           {showInModalAddView
             ? formatMessage({ id: "agent.channelMembers.addMember" })
             : isPanel
@@ -1034,7 +1105,7 @@ function GatedChannelMembers({
                 : formatMessage({ id: "agent.channelMembers.membersCount" }, { count: totalParticipants })}
         </h2>
         {isPanel && !showInModalAddView && (
-          <span className="shrink-0 font-mono text-xs font-normal text-black/55">
+          <span className="shrink-0 text-caption text-foreground-hint">
             {membersLoading
               ? formatMessage({ id: "message.chatPanel.overflow.membersLoading" })
               : formatMessage(
@@ -1045,26 +1116,25 @@ function GatedChannelMembers({
         )}
       </div>
       <div className="flex shrink-0 items-center gap-1.5">
-        {topbarOverflowEnabled && !showInModalAddView && showAddEntry && (
-          <button
-            onClick={() => setShowAddSection(true)}
-            disabled={!hasAvailable}
-            className="btn-brutal-sm bg-white p-1 disabled:opacity-50 disabled:cursor-not-allowed"
-            title={formatMessage({ id: "agent.channelMembers.addMember" })}
-            aria-label={formatMessage({ id: "agent.channelMembers.addMember" })}
-            data-testid="add-member-open"
-          >
-            <Plus size={16} />
-          </button>
+        {!showInModalAddView && showAddEntry && (
+          <Tooltip content={formatMessage({ id: "agent.channelMembers.addMember" })}>
+            <Button size="icon-sm" variant="ghost"
+              onClick={openAddSection}
+              disabled={!hasAvailable}
+              aria-label={formatMessage({ id: "agent.channelMembers.addMember" })}
+              data-testid="add-member-open"
+            >
+              <Plus size={16} />
+            </Button>
+          </Tooltip>
         )}
         {!isPanel && (
-          <button
+          <CloseButton
             onClick={closePanel}
-            className="btn-brutal-sm bg-white p-1"
             aria-label={formatMessage({ id: "message.channelSettings.close" })}
           >
             <X size={20} />
-          </button>
+          </CloseButton>
         )}
       </div>
     </div>
@@ -1077,7 +1147,7 @@ function GatedChannelMembers({
     : isPanel
       ? (
         <div
-          className="max-h-[280px] overflow-y-auto border-y border-black/10"
+          className="max-h-[280px] overflow-y-auto border-y border-line-hairline"
           data-testid="channel-members-scroll"
         >
           {memberListView}
@@ -1086,7 +1156,7 @@ function GatedChannelMembers({
       : memberListView;
 
   /* ── Members page (page mode, task #187): the overflow drawer's
-     second-level view. One full-height column — yellow header (‹ back
+     second-level view. One full-height column — paper panel header (‹ back
      to the drawer root), persistent roster search, humans-first
      sections with counts + role tags, bottom-pinned ＋ add entry; the
      staged add flow renders in place as the drawer-internal third level,
@@ -1099,44 +1169,45 @@ function GatedChannelMembers({
   const visibleExternalMembers = channelExternalMembers.filter((member) =>
     memberMatches(normalizedRosterQuery, member.handles.join(" "), member.displayName));
 
+  // raft-ui PanelHeader owns the edges: on a phone the Back mirrors the last
+  // action, 3px from the edge, as on every other head.
   const pageHeader = (
-    <div className="flex h-panel-header shrink-0 items-center gap-2 border-b-2 border-black bg-soft-signal px-4">
+    <PanelHeader>
       {/* In the add view the back button is the add flow's own ‹ back
           (resetAddFlow), keeping the add-member-back contract the modal
           and panel headers use; otherwise it returns to the drawer root. */}
-      <Button
-        type="button"
-        shape="icon"
-        onClick={() => (showAddSection ? resetAddFlow() : onBack?.())}
+      <PanelAction
+        onClick={handleBackOrReset}
         aria-label={formatMessage({
           id: showAddSection ? "agent.channelMembers.backToMembers" : "channel.membersPage.back",
         })}
         data-testid={showAddSection ? "add-member-back" : "member-page-back"}
       >
-        <ArrowLeft size={16} />
-      </Button>
-      <h2 className="truncate text-base font-bold">
+        <ArrowLeft />
+      </PanelAction>
+      <h2 className="truncate text-headline">
         {showAddSection
           ? formatMessage({ id: "agent.channelMembers.addMember" })
           : formatMessage({ id: "message.chatPanel.overflow.members" })}
       </h2>
       {!showAddSection && !membersLoading && (
-        <span
-          className="shrink-0 rounded-full bg-black px-2 py-0.5 font-mono text-xs text-brutal-cream"
+        <Badge
+          appearance="outline"
+          className="shrink-0"
           data-testid="member-page-count"
         >
           {totalParticipants}
-        </span>
+        </Badge>
       )}
       {!showAddSection && membersLoading && (
         <Spinner
           size="sm"
-          label={formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
+          aria-label={formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
           data-testid="member-page-count-loading"
         />
       )}
       <div className="flex-1" />
-    </div>
+    </PanelHeader>
   );
 
   const pageListView = (
@@ -1144,7 +1215,7 @@ function GatedChannelMembers({
       {(roleError || roleChangeFailed) && (
         <Banner
           intent="warning"
-          className="m-3 shrink-0 font-bold"
+          className="m-3 shrink-0"
           data-testid="channel-member-role-error"
         >
           {roleError || formatMessage({ id: "agent.channelMembers.updateRoleFailed" })}
@@ -1152,34 +1223,53 @@ function GatedChannelMembers({
       )}
 
       {/* Persistent search — filters both sections live. */}
-      <div className="shrink-0 border-b border-black/10 px-4 py-3">
-        <div className="relative">
-          <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-black/40" />
-          <input
+      <div className="shrink-0 border-b border-line-hairline px-4 py-3">
+        <InputGroup>
+          <InputGroupAddon align="inline-start">
+            <Search aria-hidden="true" />
+          </InputGroupAddon>
+          <InputGroupInput
             type="text"
             value={rosterQuery}
-            onChange={(e) => setRosterQuery(e.target.value)}
+            onChange={handleRosterQueryChange}
             disabled={membersLoading}
-            className="input-brutal input-member-search w-full pl-9"
             placeholder={formatMessage({ id: "channel.membersPage.searchPlaceholder" })}
             data-testid="member-page-search"
           />
-        </div>
+        </InputGroup>
       </div>
 
       {/* Humans first (design master member-page), then agents. Each category
           uses Raft UI's disclosure primitive, starts expanded, and keeps its
-          live filtered count in the trigger. */}
-      <div className="min-h-0 flex-1 overflow-y-auto">
+          live filtered count in the trigger.
+
+          The RUI sidebar section header bleeds by `--sidebar-row-inset-x`
+          (6px each side) to escape its sidebar gutter; this page has no such
+          gutter, so that bleed grew the header to calc(100% + 12px) and made
+          the column scroll sideways. Zeroing the inset drops the negative
+          margins, and w-full! replaces the 100%+12px width with one that fits
+          the container - the chevron, label and count keep their exact
+          positions, and the scrollbar disappears at its cause, not hidden.
+
+          TEMPORARY (Artea, 2026-09-17): this page borrows RUI's sidebar
+          section family for its groups, and that reuse is what leaks sidebar
+          geometry into member rows. Two removals are tracked:
+          - rui #284 derives the bleed width from the same variable instead of
+            the hard-coded 12px; once the pinned raft-ui carries it, drop
+            w-full! and keep only the inset declaration;
+          - a generic rui Collapsible (commissioned in #proj-rui) will replace
+            this SidebarSection reuse entirely, at which point both the inset
+            declaration and this bridge are removed. */}
+      <div className="min-h-0 flex-1 overflow-y-auto [--sidebar-row-inset-x:0px]">
         {membersLoading && (
           <div
-            className="flex min-h-32 items-center justify-center gap-2 px-3 py-4 font-mono text-sm text-black/50"
+            className="flex min-h-32 items-center justify-center gap-2 px-3 py-4 text-callout text-foreground-hint"
             aria-live="polite"
             data-testid="member-page-loading"
           >
             <Spinner
               size="sm"
-              label={formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
+              aria-label={formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
             />
             {formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
           </div>
@@ -1216,18 +1306,20 @@ function GatedChannelMembers({
         )}
 
         {!membersLoading && totalParticipants === 0 && (
-          <div className="px-3 py-4 text-center font-mono text-sm text-black/50">
-            {formatMessage({ id: "agent.channelMembers.noMembers" })}
-          </div>
+          <EmptyState
+            icon={<Users size={36} aria-hidden="true" />}
+            title={formatMessage({ id: "agent.channelMembers.noMembers" })}
+          />
         )}
         {!membersLoading
           && totalParticipants > 0
           && visibleHumans.length === 0
           && visibleAgents.length === 0
           && visibleExternalMembers.length === 0 && (
-          <div className="px-3 py-4 text-center font-mono text-sm text-black/50">
-            {formatMessage({ id: "agent.channelMembers.noMatches" }, { query: rosterQuery.trim() })}
-          </div>
+          <EmptyState
+            icon={<Search size={36} aria-hidden="true" />}
+            title={formatMessage({ id: "agent.channelMembers.noMatches" }, { query: rosterQuery.trim() })}
+          />
         )}
       </div>
 
@@ -1235,17 +1327,20 @@ function GatedChannelMembers({
           add flow (drawer-internal third level, no Modal). Hidden while a
           remove confirm is staged so the bottom bar never stacks. */}
       {!removeTarget && showAddEntry && (
-        <div className="shrink-0 border-t-2 border-black p-3">
-          <button
+        <div className="shrink-0 border-t border-line-seam p-3">
+          <Button
+            size="lg"
+            variant="outline"
             type="button"
-            onClick={() => setShowAddSection(true)}
+            onClick={openAddSection}
             disabled={!hasAvailable}
-            className="btn-brutal flex w-full items-center justify-center gap-1.5 bg-white px-3 py-2 text-sm font-bold disabled:opacity-50 disabled:cursor-not-allowed"
+            className="w-full"
             data-testid="member-page-add"
           >
             <Plus size={14} />
             {formatMessage({ id: "agent.channelMembers.addMember" })}
-          </button>
+          </Button>
+
         </div>
       )}
     </>
@@ -1255,33 +1350,36 @@ function GatedChannelMembers({
     <>
       {/* Member count button in header */}
       {!isPanel && !isPage && !hideTrigger && (
-        <Button
-          onClick={() => setShowPanel(true)}
-          shape="iconText"
-          className="min-w-7 gap-1 px-1.5"
-          title={formatMessage({ id: "agent.channelMembers.viewParticipants" })}
-        >
-          <Users size={14} className="shrink-0" />
-          {membersLoading ? (
-            <Spinner
-              size="xs"
-              label={formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
-            />
-          ) : (
-            <span className="min-w-[1ch] text-center font-mono text-[11px] font-bold leading-none tabular-nums">
-              {totalParticipants > 99 ? "99+" : totalParticipants}
-            </span>
-          )}
-        </Button>
+        <Tooltip content={formatMessage({ id: "agent.channelMembers.viewParticipants" })}>
+          <Button
+            onClick={handleOpenPanel}
+            size="sm"
+            className="min-w-7 gap-1 px-1.5"
+            aria-label={formatMessage({ id: "agent.channelMembers.viewParticipants" })}
+            data-testid="channel-members-open"
+          >
+            <Users size={14} className="shrink-0" />
+            {membersLoading ? (
+              <Spinner
+                size="xs"
+                aria-label={formatMessage({ id: "message.chatPanel.overflow.membersLoading" })}
+              />
+            ) : (
+              <span data-testid="channel-members-count" className="min-w-[1ch] text-center font-mono text-mono-meta font-bold tabular-nums">
+                {totalParticipants > 99 ? "99+" : totalParticipants}
+              </span>
+            )}
+          </Button>
+        </Tooltip>
       )}
 
       {/* Members modal panel */}
       {!isPanel && !isPage && showPanel && (
         <Modal onClose={closePanel}>
-          <div className="w-full max-w-sm card-brutal p-6">
+          <DialogSurface className="w-full max-w-sm p-5">
             {panelHeader}
             {panelBody}
-          </div>
+          </DialogSurface>
         </Modal>
       )}
 
@@ -1302,7 +1400,7 @@ function GatedChannelMembers({
               search query, disclosures and scroll position are the actual
               "previous page" the Back control must restore. */}
           <div
-            className={`${selectedProfile ? "hidden" : "flex"} min-h-0 flex-1 flex-col bg-white`}
+            className={`${selectedProfile ? "hidden" : "flex"} min-h-0 flex-1 flex-col bg-layer-canvas text-foreground`}
             data-testid="member-page"
           >
             {pageHeader}
@@ -1315,7 +1413,7 @@ function GatedChannelMembers({
           {selectedProfile && (
             <Suspense
               fallback={(
-                <div className="flex min-h-0 flex-1 items-center justify-center bg-white text-sm font-display text-black/40">
+                <div className="flex min-h-0 flex-1 items-center justify-center bg-layer-canvas text-callout text-foreground-hint">
                   {formatMessage({ id: "common.loading" })}
                 </div>
               )}
@@ -1333,42 +1431,6 @@ function GatedChannelMembers({
         </>
       )}
 
-      {/* Add Member modal (stacked on top of Members modal) — legacy
-          single-click flow, flag off only. */}
-      {!isPage && !topbarOverflowEnabled && showAddSection && canAddChannelMembers && (
-        <Modal onClose={() => setShowAddSection(false)} layer={1}>
-          <div className="w-full max-w-sm card-brutal p-6">
-            <div className="mb-4 flex items-center justify-between">
-              <h2 className="text-lg font-bold">{formatMessage({ id: "agent.channelMembers.addMember" })}</h2>
-              <button
-                onClick={() => { setShowAddSection(false); setMemberSearch(""); }}
-                className="btn-brutal-sm bg-white p-1"
-              >
-                <X size={20} />
-              </button>
-            </div>
-
-            {hasAvailable && (
-              <FormField label={formatMessage({ id: "agent.channelMembers.search" })} labelStyle="plain" className="mb-3">
-                <div className="relative">
-                  <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-black/40" />
-                  <input
-                    type="text"
-                    value={memberSearch}
-                    onChange={(e) => setMemberSearch(e.target.value)}
-                    className="input-brutal input-member-search w-full pl-9"
-                    placeholder={formatMessage({ id: "agent.channelMembers.namePlaceholder" })}
-                    autoFocus
-                  />
-                </div>
-              </FormField>
-            )}
-
-            {addCandidateRows(false)}
-          </div>
-        </Modal>
-      )}
-
       {/* One shared dialog across modal, panel, desktop Drawer, and the
           full-screen mobile Drawer. */}
       {removeConfirmDialog}
@@ -1380,11 +1442,11 @@ function GatedChannelMembers({
             { name: protectedDemoteTarget },
           )}
           confirmLabel={formatMessage({ id: "common.ok" })}
-          confirmColor="bg-white"
+          confirmVariant="outline"
           hideCancel
           closeOnConfirm={false}
-          onConfirm={() => setProtectedDemoteTarget(null)}
-          onClose={() => setProtectedDemoteTarget(null)}
+          onConfirm={handleClearProtectedDemote}
+          onClose={handleClearProtectedDemote}
           layer={1}
           chromeLocale="active"
         />
@@ -1409,23 +1471,10 @@ function GatedChannelMembers({
           ].join(" ") || undefined : undefined}
           stayOnCreate
           autoJoinChannelName={currentChannel?.name}
-          onCreated={(agent) => { void joinCreatedAgent(agent); }}
-          onClose={() => setShowCreateAgent(false)}
+          onCreated={handleCreatedAgent}
+          onClose={handleCloseCreateAgent}
         />
       )}
     </>
   );
-}
-
-export default function ChannelMembers(props: ChannelMembersProps) {
-  const topbarOverflowEnabled = useServerFeatureFlag(
-    TOPBAR_OVERFLOW_FEATURE_FLAG_KEY,
-  ).enabled;
-
-  if (!topbarOverflowEnabled) {
-    if (props.presentation && props.presentation !== "modal") return null;
-    return <LegacyChannelMembers channelId={props.channelId} />;
-  }
-
-  return <GatedChannelMembers {...props} />;
 }

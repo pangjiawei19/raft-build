@@ -1,7 +1,9 @@
 /**
  * Canonical key/value row — small label above value.
  *
- * Replaces the inline `<div><div className="text-xs text-black/50 mb-1">Foo</div><span className="text-sm text-black font-mono">bar</span></div>` pattern that appears 30+ times across detail panels (HumanDetailPanel, AgentDetailPanel, MachineDetailPanel) and the SettingsPanel body.
+ * Replaces the hand-rolled "small grey label above a value" pattern that
+ * appeared 30+ times across detail panels (HumanDetailPanel, AgentDetailPanel,
+ * MachineDetailPanel) and the SettingsPanel body.
  *
  * Background: stdrc 2026-05-12 #wg-theme:a987f888 asked for strong-signal
  * primitives to be lifted in one PR. KeyValueRow is the second of the three.
@@ -17,10 +19,9 @@
  * - `className`       — additional classes on the outer wrapper
  * - `valueClassName`  — additional classes on the value cell
  *
- * Typography defaults match the canonical detail-panel KV convention: label
- * is `text-xs text-black/50 mb-1`, value is `text-sm text-black`. Pass
- * `mono` for fields like email / dates / IDs that are conventionally rendered
- * in monospace.
+ * Typography follows Raft Design System › PropertyList: the label (dt) is
+ * 13/18 500 ink-3, the value (dd) is 14/20 ink. Pass `mono` for fields like
+ * email / dates / IDs — what machines write is Space Mono 12/16.
  *
  * If your row needs an inline-editable value (with Save/Cancel and per-row
  * loading state), this primitive is not the right fit — it intentionally
@@ -50,15 +51,14 @@ export default function KeyValueRow({
   valueClassName,
 }: KeyValueRowProps) {
   const wrapperCls = className ? className : undefined;
-  const valueClsParts = ["text-sm text-black"];
-  if (mono) valueClsParts.push("font-mono");
+  const valueClsParts = [mono ? "font-mono text-mono-meta text-foreground" : "text-callout text-foreground"];
   if (breakAll) valueClsParts.push("break-all");
   if (valueClassName) valueClsParts.push(valueClassName);
   const valueCls = valueClsParts.join(" ");
   return (
     <div className={wrapperCls}>
       <div className="mb-1 flex items-center gap-2">
-        <div className="text-xs text-black/50">{label}</div>
+        <div className="text-footnote font-medium text-foreground-hint">{label}</div>
         {action ? <div className="shrink-0">{action}</div> : null}
       </div>
       <div className={valueCls}>{value}</div>

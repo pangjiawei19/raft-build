@@ -1,5 +1,8 @@
 import { useIntl } from "react-intl";
+import { Card } from "@botiverse/raft-ui";
 import { mobileDownloadUrl } from "../utils/mobileDownloadUrl";
+import { desktopDownloadUrl } from "../utils/desktopDownload";
+import { useDesktopDownloadView } from "../components/settings/DesktopDownloadOptions";
 
 /**
  * Public "pick your platform" page for the mobile download entry.
@@ -36,32 +39,45 @@ export function isTouchCapableMac(nav: { userAgent?: string; maxTouchPoints?: nu
   return /Macintosh|Mac OS X/i.test(ua) && (nav.maxTouchPoints ?? 0) > 1;
 }
 
+// DS Button (rf-btn) drawn on a link: 44 tall, 1.5px edge, 15/20 bold, the
+// pressed overlay on hover/press. The recommended desktop build is this
+// page's one pink action; the two phone platforms are the paper button.
+const LINK_BUTTON_BASE =
+  "flex h-11 w-full items-center justify-center rounded-control border-[1.5px] px-4 text-center text-subhead font-bold no-underline outline-none focus-visible:shadow-focus";
+const LINK_BUTTON_CLASS =
+  `${LINK_BUTTON_BASE} border-line-strong bg-layer-card text-foreground hover:press-overlay active:press-overlay`;
+const PRIMARY_LINK_BUTTON_CLASS =
+  `${LINK_BUTTON_BASE} border-sticker-ink bg-attention text-sticker-ink hover:press-overlay-sticker active:press-overlay-sticker`;
+
 export default function MobileDownloadChooserPage() {
   const { formatMessage } = useIntl();
   const likelyIPad = typeof navigator === "undefined" ? false : isTouchCapableMac(navigator);
+  const desktop = useDesktopDownloadView();
 
   return (
-    <div className="flex min-h-dvh items-center justify-center bg-brutal-cream px-6 py-10 font-display">
-      <div className="card-brutal w-full max-w-sm space-y-4 p-6" data-testid="mobile-download-chooser">
-        <h1 className="text-lg font-bold text-black">
+    <div className="flex min-h-dvh items-center justify-center bg-layer-sidebar px-4 py-10 font-display text-foreground">
+      <Card className="w-full max-w-sm space-y-4 p-6" data-testid="mobile-download-chooser">
+        <h1 className="text-headline">
           {formatMessage({ id: "mobileDownload.chooser.title" })}
         </h1>
-        <p className="text-sm text-black/60">
+        <p className="text-callout text-foreground-muted">
           {formatMessage({ id: "mobileDownload.chooser.description" })}
         </p>
         {/* An iPad cannot be identified server-side, so when the browser tells us
             what the UA could not, say so — otherwise the reader has to know that
             "iPad counts as iOS here", which is our implementation detail. */}
         {likelyIPad ? (
-          <p className="text-xs text-black/50" data-testid="mobile-download-chooser-ipad-hint">
+          <p className="text-caption text-foreground-hint" data-testid="mobile-download-chooser-ipad-hint">
             {formatMessage({ id: "mobileDownload.chooser.ipadHint" })}
           </p>
         ) : null}
         <div className="flex flex-col gap-2">
           {/* Leaves Raft (302 → testflight.apple.com), so new tab; Android is a
               download and stays put. Same asymmetry as the Settings section. */}
+          {/* Same paper button for both: neither platform is recommended. They
+              stay real links (downloads), drawn as the DS ink-line button. */}
           <a
-            className="btn-brutal-sm bg-white px-3 py-2 text-center text-sm font-bold"
+            className={LINK_BUTTON_CLASS}
             href={mobileDownloadUrl("ios")}
             target="_blank"
             rel="noopener noreferrer"
@@ -70,14 +86,57 @@ export default function MobileDownloadChooserPage() {
             {formatMessage({ id: "settings.mobileApp.ios" })}
           </a>
           <a
-            className="btn-brutal-sm bg-white px-3 py-2 text-center text-sm font-bold"
+            className={LINK_BUTTON_CLASS}
             href={mobileDownloadUrl("android")}
             data-testid="mobile-download-chooser-android"
           >
             {formatMessage({ id: "settings.mobileApp.android" })}
           </a>
         </div>
-      </div>
+        {/* Desktop (task #714 put the desktop beta on this page: the newsletter
+            links here for desktop readers too). Same rule as Settings → About:
+            this device's platform first when it is a computer, every platform
+            listed. Each goes through /api/desktop-download, which resolves the
+            Latest release's own update feed, so a download here and an in-app
+            update never disagree. Downloads, so same tab. */}
+        <div className="space-y-2 border-t border-line-hairline pt-4" data-testid="desktop-download-chooser">
+          <h2 className="text-footnote font-bold text-foreground">{formatMessage({ id: "settings.desktopApp.sectionLabel" })}</h2>
+          {desktop.recommended ? (
+            <a
+              className={PRIMARY_LINK_BUTTON_CLASS}
+              href={desktopDownloadUrl(desktop.recommended.target)}
+              data-testid="desktop-download-chooser-recommended"
+              data-target={desktop.recommended.target}
+            >
+              {formatMessage({ id: desktop.recommended.labelId })}
+            </a>
+          ) : desktop.windowsSoon ? (
+            <p className="text-caption text-foreground-hint" data-testid="desktop-download-chooser-windows-soon">
+              {formatMessage({ id: "settings.desktopApp.windowsSoon" })}
+            </p>
+          ) : null}
+          {desktop.recommended?.intelHint ? (
+            <p className="text-caption text-foreground-hint" data-testid="desktop-download-chooser-intel-hint">
+              {formatMessage({ id: "settings.desktopApp.intelHint" })}
+            </p>
+          ) : null}
+          <ul className="flex flex-wrap gap-x-4 gap-y-2 text-footnote">
+            {desktop.options.map((option) => (
+              <li key={option.target}>
+                {option.available ? (
+                  <a className="font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px]" href={desktopDownloadUrl(option.target)} data-testid={`desktop-download-chooser-${option.target}`}>
+                    {formatMessage({ id: option.labelId })}
+                  </a>
+                ) : (
+                  <span className="text-foreground-hint" data-testid={`desktop-download-chooser-${option.target}`}>
+                    {formatMessage({ id: "settings.desktopApp.option.unavailable" }, { platform: formatMessage({ id: option.labelId }) })}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </Card>
     </div>
   );
 }

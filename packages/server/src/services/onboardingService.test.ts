@@ -1,6 +1,6 @@
-import { afterEach, test } from "vitest";
 import assert from "node:assert/strict";
 import {
+  buildOwnerOpenerV2Messages,
   ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
   ONBOARDING_DAY2_RECAP_TITLE,
   ONBOARDING_DAY2_RECAP_VERSION,
@@ -15,7 +15,7 @@ import {
   triggerNewAgentAllChannelGreeting,
   triggerNewMemberOnboarding,
   triggerOwnerOnboardingOnAgentActivation,
-} from "./onboardingService.js";
+} from "./onboardingService";
 
 const OPENER_V2_ON = {
   key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY,
@@ -96,6 +96,9 @@ function makeDeps(overrides: Record<string, unknown> = {}): any {
     updateMemberOnboardingPreferences: async () => null,
     getUser: async () => null,
     createSchedule: async (input: any) => input,
+    getHostedOnboardingAgentState: async () => null,
+    claimOwnerOpener: async () => new Date("2026-10-14T00:00:00Z"),
+    releaseOwnerOpenerClaim: async () => {},
     ...overrides,
   };
 }
@@ -576,6 +579,114 @@ test("a dropped ledger wake does not count as briefed, so the next activation re
 
   assert.equal(fired, false);
   assert.deepEqual(marked, [], "a briefing that was dropped must not burn the one-shot sent flag");
+});
+
+// Hosted Cindy (antiproton_cindy): an external agent is never "started", so the
+// running check would block her forever. She counts as able to receive once the
+// provider accepted her and her workspace import landed; then the owner's facts go
+// once, ahead of the opener, since no machine:online will ever re-send them.
+for (const [state, expectOpener] of [["ready", true], ["pending", false], ["failed", false], [null, false]] as const) {
+  test(`hosted Cindy (inactive, external) is briefed only when her hosted state is ready: ${state}`, async () => {
+    const delivered: string[] = [];
+    const marked: string[] = [];
+    __setOnboardingServiceDepsForTests(makeDeps({
+      getServer: async () => makeServer(),
+      getMemberOnboardingPreferences: async () => ({ onboardingDmSentAt: null, onboardingOwnerOpenerV2MessageIds: [], onboardingOwnerOpenerV2Topics: [] }),
+      getAgent: async () => makeAgent({ id: "agent-1", name: "cindy", status: "inactive", runtime: "external", model: "external" }),
+      getUser: async () => ({ id: "owner-1", name: "Owner", signupSurveyCompletedAt: new Date(), signupRole: "founder" }),
+      listChannels: async () => [
+        { id: "channel-all", name: "all", type: "channel" },
+        { id: "owner-channel", name: "onboarding-owner", type: "channel" },
+      ],
+      evaluateFeatureFlag: async () => OPENER_V2_ON,
+      broadcastAndDeliver: async () => ({ id: "message-1" }),
+      getOrCreateThread: async () => ({ id: "team-mode-thread" }),
+      createOwnerOpenerArtifactAttachment: async () => ({ id: "team-mode-attachment", filename: "team-mode.html" }),
+      getHostedOnboardingAgentState: async () => state,
+      updateMemberOnboardingPreferences: async (_serverId: string, userId: string) => {
+        marked.push(userId);
+      },
+    }) as any);
+    const agentOrchestrator = {
+      async deliverMessage(_agentId: string, message: { message_id: string }) {
+        delivered.push(message.message_id);
+        return { status: "queued", reason: "external_inbox" };
+      },
+      pushReminderUpsert: async () => false,
+    } as any;
+
+    const fired = await triggerOwnerOnboardingOnAgentActivation(makeIo(), agentOrchestrator, "server-1", "agent-1");
+
+    assert.equal(fired, expectOpener);
+    if (expectOpener) {
+      assert.deepEqual(delivered, ["onboarding-owner-facts-server-1", "opener-v2-ledger-server-1"], "owner facts once, before the opener ledger");
+      assert.deepEqual(marked, ["owner-1"]);
+    } else {
+      assert.deepEqual(delivered, []);
+      assert.deepEqual(marked, []);
+    }
+  });
+}
+
+function hostedCindyDeps(overrides: Record<string, unknown>) {
+  return makeDeps({
+    getServer: async () => makeServer(),
+    getMemberOnboardingPreferences: async () => ({ onboardingDmSentAt: null, onboardingOwnerOpenerV2MessageIds: [], onboardingOwnerOpenerV2Topics: [] }),
+    getAgent: async () => makeAgent({ id: "agent-1", name: "cindy", status: "inactive", runtime: "external", model: "external" }),
+    getUser: async () => ({ id: "owner-1", name: "Owner", signupSurveyCompletedAt: new Date(), signupRole: "founder" }),
+    listChannels: async () => [
+      { id: "channel-all", name: "all", type: "channel" },
+      { id: "owner-channel", name: "onboarding-owner", type: "channel" },
+    ],
+    broadcastAndDeliver: async () => ({ id: "message-1" }),
+    getOrCreateThread: async () => ({ id: "team-mode-thread" }),
+    createOwnerOpenerArtifactAttachment: async () => ({ id: "team-mode-attachment", filename: "team-mode.html" }),
+    getHostedOnboardingAgentState: async () => "ready",
+    ...overrides,
+  });
+}
+
+function recordingOrchestrator(delivered: string[], status: "queued" | "dropped" = "queued") {
+  return {
+    async deliverMessage(_agentId: string, message: { message_id: string }) {
+      delivered.push(message.message_id);
+      return status === "queued" ? { status, reason: "external_inbox" } : { status, reason: "agent_unavailable" };
+    },
+    pushReminderUpsert: async () => false,
+  } as any;
+}
+
+test("hosted Cindy takes the opener-v2 path even where the server has opener v2 off", async () => {
+  const delivered: string[] = [];
+  __setOnboardingServiceDepsForTests(hostedCindyDeps({
+    evaluateFeatureFlag: async () => ({ key: ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY, enabled: false, reason: "missing_flag" }),
+  }) as any);
+  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), recordingOrchestrator(delivered), "server-1", "agent-1"), true);
+  assert.deepEqual(delivered, ["onboarding-owner-facts-server-1", "opener-v2-ledger-server-1"]);
+});
+
+test("a trigger that loses the opener claim briefs and posts nothing", async () => {
+  const delivered: string[] = [];
+  const posted: unknown[] = [];
+  __setOnboardingServiceDepsForTests(hostedCindyDeps({
+    claimOwnerOpener: async () => null,
+    broadcastAndDeliver: async (_io: unknown, _orch: unknown, message: unknown) => { posted.push(message); return { id: "m" }; },
+  }) as any);
+  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), recordingOrchestrator(delivered), "server-1", "agent-1"), false);
+  assert.deepEqual(delivered, [], "no owner facts outside the claim");
+  assert.deepEqual(posted, []);
+});
+
+test("a dropped opener releases the claim so a later trigger retries", async () => {
+  const released: string[] = [];
+  const marked: string[] = [];
+  __setOnboardingServiceDepsForTests(hostedCindyDeps({
+    releaseOwnerOpenerClaim: async (_serverId: string, userId: string) => { released.push(userId); },
+    updateMemberOnboardingPreferences: async (_serverId: string, userId: string) => { marked.push(userId); },
+  }) as any);
+  assert.equal(await triggerOwnerOnboardingOnAgentActivation(makeIo(), recordingOrchestrator([], "dropped"), "server-1", "agent-1"), false);
+  assert.deepEqual(released, ["owner-1"]);
+  assert.deepEqual(marked, []);
 });
 
 // The survey is answered one screen AFTER Cindy is created. If the briefing went out
@@ -1406,4 +1517,13 @@ test("triggerCrossChannelHint fires during active wizard step and suppresses aft
   __setOnboardingServiceDepsForTests(makeHintDeps("create-agent", new Date("2026-07-07T02:00:00.000Z")) as any);
   const firedAgain = await triggerCrossChannelHint(makeIo(), {} as any, "server-1", "owner-1", "channel-general");
   assert.equal(firedAgain, false);
+});
+
+test("hosted Cindy's opener does not offer to look at a computer she does not have", () => {
+  const computer = buildOwnerOpenerV2Messages("Ada");
+  const hosted = buildOwnerOpenerV2Messages("Ada", { hosted: true });
+  assert.equal(hosted.length, computer.length);
+  assert.match(computer.at(-1)!.content, /on this computer/);
+  assert.doesNotMatch(hosted.map((message) => message.content).join("\n"), /computer/i);
+  assert.equal(hosted.at(-1)!.topic, computer.at(-1)!.topic, "same topic, so her ledger is unchanged");
 });

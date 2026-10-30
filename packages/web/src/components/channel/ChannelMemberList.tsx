@@ -1,10 +1,25 @@
-import type { ReactNode } from "react";
+import { useCallback } from "react";
+import type { MouseEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
+import { Badge, Button, Card } from "@botiverse/raft-ui";
 import type { AgentActivity, ServerRole } from "@botiverse/raft-shared";
-import { X } from "lucide-react";
+import { UserMinus, X } from "lucide-react";
 import AvatarSlot from "../ui/AvatarSlot";
 import SectionEyebrow from "../ui/SectionEyebrow";
+import Tooltip from "../ui/Tooltip";
 import AgentActivityDot from "../agent/AgentActivityDot";
+
+// DS ListRow for a member: 35px identity, the name 15/20 600, the role or
+// handle 12/16 ink-3; rows press like content rows and are separated by a
+// hairline that starts where the text starts (16 + 35 + 12 = 63px).
+const MEMBER_ROW_CLASS = [
+  "group relative flex min-h-16 items-center gap-3 px-4 py-2.5 transition-colors md:min-h-14",
+  "hover:bg-fill-pressed [@media(max-height:600px)]:min-h-0 [@media(max-height:600px)]:py-1.5",
+  "[[data-member-row]+&]:before:pointer-events-none [[data-member-row]+&]:before:absolute [[data-member-row]+&]:before:top-0 [[data-member-row]+&]:before:right-0 [[data-member-row]+&]:before:left-[63px] [[data-member-row]+&]:before:border-t [[data-member-row]+&]:before:border-line-hairline",
+  "[li+li>&]:before:pointer-events-none [li+li>&]:before:absolute [li+li>&]:before:top-0 [li+li>&]:before:right-0 [li+li>&]:before:left-[63px] [li+li>&]:before:border-t [li+li>&]:before:border-line-hairline",
+].join(" ");
+const MEMBER_ROW_TITLE_CLASS = "truncate text-subhead font-semibold text-foreground";
+const MEMBER_ROW_SUB_CLASS = "truncate text-caption text-foreground-hint";
 
 export function ChannelMemberListShell({
   children,
@@ -19,23 +34,22 @@ export function ChannelMemberListShell({
   framed?: boolean;
   "data-testid"?: string;
 }) {
-  return (
-    <div
-      className={
-        framed
-          ? `max-h-72 overflow-y-auto border-2 border-black bg-white shadow-brutal-sm ${className}`
-          : className
-      }
-      data-testid={dataTestId}
-    >
+  return framed ? (
+    <Card className={`max-h-72 overflow-y-auto ${className}`} data-testid={dataTestId}>
+      {children}
+    </Card>
+  ) : (
+    <div className={className} data-testid={dataTestId}>
       {children}
     </div>
   );
 }
 
+/** DS list section title (`rf-section`): 13/18 700 ink-3 above its rows,
+ *  no band behind it. */
 export function ChannelMemberSectionHeader({ children }: { children: ReactNode }) {
   return (
-    <SectionEyebrow as="div" uppercase={false} className="bg-white/50 px-3 py-1.5">
+    <SectionEyebrow as="div" className="px-4 pt-4 pb-1.5">
       {children}
     </SectionEyebrow>
   );
@@ -49,15 +63,12 @@ function ChannelMemberActivityBadge({
   fallbackActivity?: AgentActivity;
 }) {
   return (
-    <span data-channel-member-avatar-badge-shell="true" className="absolute bottom-0 right-0 block size-0">
-      <AgentActivityDot
-        agentId={agentId}
-        fallbackActivity={fallbackActivity}
-        size="md"
-        pulse
-        className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
-      />
-    </span>
+    <AgentActivityDot
+      agentId={agentId}
+      fallbackActivity={fallbackActivity}
+      size="md"
+      data-channel-member-avatar-badge-shell="true"
+    />
   );
 }
 
@@ -68,15 +79,19 @@ export function MemberRoleTag({ role }: { role: ServerRole }) {
   const { formatMessage } = useIntl();
   if (role === "member") return null;
   const isGuest = role === "guest";
+  // Admin is a neutral label (DS `rf-tag`); a guest comes from outside the
+  // workspace, so it reads as the cyan-soft external chip.
   return (
-    <span
+    <Badge
       data-testid={isGuest ? "member-page-role-channel-guest" : "member-page-role-channel-admin"}
-      className={`shrink-0 border-[1.5px] border-black px-1.5 py-0.5 font-mono text-[10px] leading-3 ${isGuest ? "bg-brutal-cyan" : "bg-brutal-lavender"}`}
+      appearance={isGuest ? "soft" : "outline"}
+      variant={isGuest ? "information" : undefined}
+      className="shrink-0"
     >
       {formatMessage({ id: isGuest
         ? "channel.membersPage.role.channelGuest"
         : "channel.membersPage.role.channelAdmin" })}
-    </span>
+    </Badge>
   );
 }
 
@@ -136,7 +151,7 @@ export function ChannelMemberRow({
 }) {
   const avatar = (
     <AvatarSlot
-      context="members-row"
+      context="list-row"
       type={type}
       agentAvatarUrl={agentAvatarUrl}
       humanAvatarUrl={humanAvatarUrl}
@@ -144,22 +159,25 @@ export function ChannelMemberRow({
       badge={type === "agent" && agentId ? (
         <ChannelMemberActivityBadge agentId={agentId} fallbackActivity={agentFallbackActivity} />
       ) : undefined}
-      className={onAvatarClick || onRowClick ? "transition-colors hover:brightness-90" : undefined}
     />
+  );
+
+  const text = (
+    <div className="min-w-0 flex-1">
+      <div className={MEMBER_ROW_TITLE_CLASS}>
+        {name}
+      </div>
+      {secondary ? (
+        <div className={MEMBER_ROW_SUB_CLASS}>
+          {secondary}
+        </div>
+      ) : null}
+    </div>
   );
 
   const body = (
     <>
-      <div className="min-w-0 flex-1">
-        <div className={`truncate text-sm text-black ${type === "human" ? "font-bold" : "font-medium"}`}>
-          {name}
-        </div>
-        {secondary ? (
-          <div className="truncate text-xs text-black/50">
-            {secondary}
-          </div>
-        ) : null}
-      </div>
+      {text}
       {trailing}
     </>
   );
@@ -169,23 +187,14 @@ export function ChannelMemberRow({
     // trailing slot (role tag, remove button) renders as a sibling so
     // interactive controls never nest inside a button.
     return (
-      <div className="group flex items-start gap-2 px-3 py-2 transition-colors [@media(max-height:600px)]:py-1 hover:bg-soft-signal/30">
+      <div className={MEMBER_ROW_CLASS} data-member-row="">
         <button
           type="button"
           onClick={onRowClick}
-          className="flex min-w-0 flex-1 items-start gap-2 text-left"
+          className="flex min-w-0 flex-1 items-center gap-3 rounded-control text-left outline-none focus-visible:shadow-focus"
         >
-          <span className="relative mt-1 shrink-0">{avatar}</span>
-          <div className="min-w-0 flex-1">
-            <div className={`truncate text-sm text-black ${type === "human" ? "font-bold" : "font-medium"}`}>
-              {name}
-            </div>
-            {secondary ? (
-              <div className="truncate text-xs text-black/50">
-                {secondary}
-              </div>
-            ) : null}
-          </div>
+          <span className="relative shrink-0">{avatar}</span>
+          {text}
         </button>
         {trailing}
       </div>
@@ -193,17 +202,17 @@ export function ChannelMemberRow({
   }
 
   return (
-    <div className="group flex items-start gap-2 px-3 py-2 transition-colors [@media(max-height:600px)]:py-1 hover:bg-soft-signal/30">
+    <div className={MEMBER_ROW_CLASS} data-member-row="">
       {onAvatarClick ? (
         <button
           type="button"
           onClick={onAvatarClick}
-          className="relative mt-1 shrink-0"
+          className="relative shrink-0 rounded-sticker outline-none focus-visible:shadow-focus"
         >
           {avatar}
         </button>
       ) : (
-        <span className="relative mt-1 shrink-0">{avatar}</span>
+        <span className="relative shrink-0">{avatar}</span>
       )}
       {body}
     </div>
@@ -215,6 +224,7 @@ export function ChannelMemberRemoveButton({
   onClick,
   revealOnRowHover = true,
   visibleLabel,
+  icon,
 }: {
   label: string;
   onClick: () => void;
@@ -223,20 +233,22 @@ export function ChannelMemberRemoveButton({
    *  control appears (Artea 2026-08-05: reveal jitter). Mobile always
    *  shows it (no hover). */
   revealOnRowHover?: boolean;
-  /** Member-management rows use a full text button alongside their role
-   *  action. Other compact lists keep the existing icon affordance. */
+  /** Member-management rows render icon-only with a suitable icon (Artea,
+   *  2026-09-17); other compact lists keep the bare icon affordance. */
   visibleLabel?: string;
+  icon?: ReactNode;
 }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`${revealOnRowHover ? "flex md:invisible md:group-hover:visible md:group-focus-within:visible" : "flex"} ${visibleLabel ? "btn-brutal-sm h-7 whitespace-nowrap bg-brutal-red/20 px-2 text-xs hover:bg-brutal-red/60" : "mt-1 size-6 border border-black bg-brutal-red/20 hover:bg-brutal-red/60"} shrink-0 items-center justify-center text-black transition-colors`}
-      title={label}
-      aria-label={label}
-    >
-      {visibleLabel ?? <X size={12} />}
-    </button>
+    <Tooltip content={label}>
+      <button
+        type="button"
+        onClick={onClick}
+        className={`${revealOnRowHover ? "flex md:invisible md:group-hover:visible md:group-focus-within:visible" : "flex"} ${visibleLabel ? "h-8 px-2.5 text-footnote font-bold" : "size-8"} shrink-0 items-center justify-center rounded-control text-foreground-muted outline-none transition-colors hover:bg-fill-pressed hover:text-foreground active:bg-fill-pressed focus-visible:shadow-focus`}
+        aria-label={label}
+      >
+        {visibleLabel ?? icon ?? <X size={16} aria-hidden="true" />}
+      </button>
+    </Tooltip>
   );
 }
 
@@ -255,32 +267,36 @@ export function ChannelMemberHoverActions({
     onClick: () => void;
   };
 }) {
-  const { formatMessage } = useIntl();
+  const onRoleAction = roleAction?.onClick;
+  const handleRoleActionClick = useCallback((event: MouseEvent) => {
+    event.stopPropagation();
+    onRoleAction?.();
+  }, [onRoleAction]);
+
   if (!roleAction && !removeAction) return null;
 
   return (
     <span className="flex items-center gap-2" data-testid="channel-member-hover-actions">
       {roleAction && (
-        <button
+        <Button
           type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            roleAction.onClick();
-          }}
+          onClick={handleRoleActionClick}
           disabled={roleAction.disabled}
-          className="btn-brutal-sm h-7 whitespace-nowrap bg-white px-2 text-xs disabled:opacity-50"
+          size="sm"
+          variant="outline"
+          className="whitespace-nowrap"
           data-testid="channel-member-role-action"
           aria-label={roleAction.ariaLabel}
         >
           {roleAction.label}
-        </button>
+        </Button>
       )}
       {removeAction && (
         <ChannelMemberRemoveButton
           label={removeAction.label}
           onClick={removeAction.onClick}
           revealOnRowHover={false}
-          visibleLabel={formatMessage({ id: "agent.channelMembers.removeAction" })}
+          icon={<UserMinus size={16} aria-hidden />}
         />
       )}
     </span>

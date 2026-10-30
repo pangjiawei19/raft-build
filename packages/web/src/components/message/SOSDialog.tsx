@@ -1,11 +1,24 @@
-import { useState, useRef, useEffect } from "react";
+import { Textarea, Button } from "@botiverse/raft-ui";
+import { useCallback, useState, useRef, useEffect } from "react";
+import type { ChangeEvent } from "react";
 import { useIntl } from "react-intl";
 import DialogCard from "../ui/DialogCard";
 import Banner from "../ui/Banner";
-import Button from "../ui/Button";
 import api from "../../api/client";
 
 type Phase = "confirm" | "stopped" | "resuming";
+
+interface ResumeAllResponse {
+  results?: Array<{ agentId: string; ok: boolean; reason?: string }>;
+}
+
+/** Agents the resume did not reach: still starting (try again shortly) or failed. */
+interface ResumeShortfall {
+  starting: number;
+  failed: number;
+  /** A retry names only these, so agents that already got the guidance are not sent it again. */
+  agentIds: string[];
+}
 
 export default function SOSDialog({
   channelId,
@@ -21,6 +34,7 @@ export default function SOSDialog({
   const [stopping, setStopping] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [guidance, setGuidance] = useState("");
+  const [resumeShortfall, setResumeShortfall] = useState<ResumeShortfall | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -29,7 +43,7 @@ export default function SOSDialog({
     }
   }, [phase]);
 
-  const handleStop = async () => {
+  const handleStop = useCallback(async () => {
     setStopping(true);
     try {
       await api.post(`/channels/${channelId}/stop-all-agents`);
@@ -39,19 +53,35 @@ export default function SOSDialog({
     } finally {
       setStopping(false);
     }
-  };
+  }, [channelId]);
 
-  const handleResume = async () => {
+  const handleResume = useCallback(async () => {
     if (!guidance.trim()) return;
     setResuming(true);
     try {
       const prompt = `[SOS] The user has emergency-stopped all agents in #${channelName} because they were going off-track. Here is the user's correction and new guidance:\n\n${guidance.trim()}\n\nRead this carefully, acknowledge the correction, and adjust your approach accordingly. Use check_messages and read_history to understand the current state before taking any action.`;
-      await api.post(`/channels/${channelId}/resume-all-agents`, { prompt });
-      onClose();
+      const { data } = await api.post<ResumeAllResponse>(
+        `/channels/${channelId}/resume-all-agents`,
+        resumeShortfall ? { prompt, agentIds: resumeShortfall.agentIds } : { prompt },
+      );
+      // The server reports each agent; one it could not start did not get the
+      // guidance, so keep the dialog open (with the text) instead of closing.
+      const missed = (data?.results ?? []).filter((result) => !result.ok);
+      if (missed.length === 0) {
+        onClose();
+        return;
+      }
+      const starting = missed.filter((result) => result.reason === "start_in_flight").length;
+      setResumeShortfall({ starting, failed: missed.length - starting, agentIds: missed.map((result) => result.agentId) });
+      setResuming(false);
     } catch {
       setResuming(false);
     }
-  };
+  }, [channelId, channelName, guidance, onClose, resumeShortfall]);
+
+  const handleGuidanceChange = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => {
+    setGuidance(event.target.value);
+  }, []);
 
   return (
     <DialogCard
@@ -64,7 +94,7 @@ export default function SOSDialog({
 
         {phase === "confirm" && (
           <>
-            <p className="mb-5 text-sm leading-relaxed text-black/75" data-slot="sos-dialog-content">
+            <p className="mb-5 text-subhead text-foreground-muted" data-slot="sos-dialog-content">
               {formatMessage({ id: "message.sos.confirmWarning" }, { channel: channelName })}
             </p>
 
@@ -72,17 +102,16 @@ export default function SOSDialog({
             <div className="flex justify-end gap-3">
               <Button
                 onClick={onClose}
-                size="sm"
-                tone="white"
+                size="lg"
+                variant="ghost"
               >
                 {formatMessage({ id: "common.confirm.cancel" })}
               </Button>
               <Button
                 onClick={handleStop}
                 disabled={stopping}
-                size="sm"
-                tone="orange"
-                className="disabled:cursor-not-allowed disabled:opacity-50"
+                size="lg"
+                variant="warning"
               >
                 {stopping
                   ? formatMessage({ id: "message.sos.stopping" })
@@ -97,23 +126,37 @@ export default function SOSDialog({
             <Banner intent="success" density="sm" className="mb-3 font-bold">
               {formatMessage({ id: "message.sos.allStopped" })}
             </Banner>
-            <p className="mb-2 text-sm">
+            <p className="mb-2 text-subhead text-foreground-muted">
               {formatMessage({ id: "message.sos.guidanceHint" })}
             </p>
-            <textarea
+            {resumeShortfall && (
+              <Banner intent="warning" density="sm" className="mb-3" data-slot="sos-resume-shortfall">
+                {resumeShortfall.starting > 0 && (
+                  <div>
+                    {formatMessage({ id: "message.sos.resumeStillStarting" }, { count: resumeShortfall.starting })}
+                  </div>
+                )}
+                {resumeShortfall.failed > 0 && (
+                  <div>
+                    {formatMessage({ id: "message.sos.resumeFailed" }, { count: resumeShortfall.failed })}
+                  </div>
+                )}
+              </Banner>
+            )}
+            <Textarea
               ref={textareaRef}
               value={guidance}
-              onChange={(e) => setGuidance(e.target.value)}
+              onChange={handleGuidanceChange}
               placeholder={formatMessage({ id: "message.sos.guidancePlaceholder" })}
-              className="input-brutal mb-4 w-full resize-none p-3 text-sm"
+              className="mb-4 w-full resize-none"
               rows={4}
               disabled={resuming}
             />
             <div className="flex justify-end gap-3">
               <Button
                 onClick={onClose}
-                size="sm"
-                tone="white"
+                size="lg"
+                variant="ghost"
                 disabled={resuming}
               >
                 {formatMessage({ id: "message.sos.keepStopped" })}
@@ -121,9 +164,8 @@ export default function SOSDialog({
               <Button
                 onClick={handleResume}
                 disabled={!guidance.trim() || resuming}
-                size="sm"
-                tone="lime"
-                className="disabled:cursor-not-allowed disabled:opacity-50"
+                size="lg"
+                variant="primary"
               >
                 {resuming
                   ? formatMessage({ id: "message.sos.resuming" })

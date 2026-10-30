@@ -1,51 +1,30 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
 import {
   agentApiContract,
   type AgentApiRouteKey,
-} from "./agentApiContract.js";
-import { asChannelId, asMessageId, type ChannelId, type MessageId } from "./brandedIds.js";
+} from "./agentApiContract";
+import { asChannelId, asMessageId, type ChannelId, type MessageId } from "./brandedIds";
 import {
   createAgentApiClient,
   type AgentApiClient,
-} from "./agentApiClient.js";
+} from "./agentApiClient";
 import type {
   AgentApiRawTransport,
   AgentApiRawTransportRequest,
-} from "./agentApiRawClient.js";
+} from "./agentApiRawClient";
 
-const migrationResponse = {
-  migration: {
-    id: "migration-1",
-    agentId: "agent-1",
-    sourceMachineId: "machine-a",
-    targetMachineId: "machine-b",
-    state: "prep",
-    manifestPath: null,
-    manifestSha256: null,
-    arrivalReportPath: null,
-    arrivalReportSha256: null,
-    abortReason: null,
-    failureReason: null,
-    prepDeadlineAt: "2026-06-29T04:10:00.000Z",
-    transferDeadlineAt: "2026-06-29T05:00:00.000Z",
-    arrivalDeadlineAt: "2026-06-29T05:10:00.000Z",
-    readyAt: null,
-    flippedAt: null,
-    arrivedAt: null,
-    completedAt: null,
-    abortedAt: null,
-    revision: 1,
-    createdAt: "2026-06-29T04:00:00.000Z",
-    updatedAt: "2026-06-29T04:00:00.000Z",
-  },
-};
-
+const raftbenchRunId = "00000000-0000-4000-8000-000000000001";
+const raftbenchCoverage = { from: "2026-10-17T00:00:00Z", to: "2026-10-18T00:00:00Z", fetchedMessages: 0, exhausted: true, stopReason: "window_end", notRead: ["Tool outcomes not read"] };
+const raftbenchContext = { runId: raftbenchRunId, revision: 1, sourceText: "Coverage: no synthetic source messages", sources: [], coverage: raftbenchCoverage, nextCursor: null };
+const raftbenchReport = { runId: raftbenchRunId, revision: 1, status: "complete", patterns: [], gaps: [] };
+const raftbenchReceipt = { runId: raftbenchRunId, revision: 1, status: "complete", receiptId: "00000000-0000-4000-8000-000000000002", coverage: raftbenchCoverage };
 const sdkFixtures: Record<AgentApiRouteKey, {
   input: unknown[];
   response: unknown;
 }> = {
+  raftbenchContext: { input: [{ runId: raftbenchRunId }], response: raftbenchContext },
+  raftbenchSubmit: { input: [raftbenchReport], response: raftbenchReceipt },
   feedbackLocatorIngest: {
     input: [{
       artifact_kind: "raft-feedback-locator-v0",
@@ -116,54 +95,6 @@ const sdkFixtures: Record<AgentApiRouteKey, {
         title: "Spin up a preview environment",
         firstScreen: "# Spin up a preview environment",
       }],
-    },
-  },
-  wikiManifestGet: {
-    input: [],
-    response: {
-      configured: true,
-      wikiSpaceId: "11111111-1111-4111-8111-111111111111",
-      etag: null,
-      manifest: null,
-    },
-  },
-  wikiArtifactRead: {
-    input: [{
-      artifactId: "22222222-2222-4222-8222-222222222222",
-    }],
-    response: {
-      configured: true,
-      wikiSpaceId: "11111111-1111-4111-8111-111111111111",
-      etag: "\"manifest-v1\"",
-      artifact: {
-        id: "22222222-2222-4222-8222-222222222222",
-        artifactType: "page",
-        slug: "architecture",
-        title: "Architecture",
-        summary: "Summary",
-        currentUnderstanding: "Current understanding",
-        status: "current",
-        confidence: "high",
-        sourcePolicy: "cached_summary",
-        sourceRefs: [],
-        revision: {
-          id: "33333333-3333-4333-8333-333333333333",
-          key: "servers/server/wiki/revisions/artifact/revision.md",
-          sha256: "a".repeat(64),
-          bytes: 15,
-        },
-        updatedAt: "2026-07-26T00:00:00.000Z",
-      },
-      markdown: "# Architecture\n",
-    },
-  },
-  wikiManifestPublish: {
-    input: [{ expectedEtag: null, manifest: {}, revisionBodies: [] }],
-    response: {
-      configured: true,
-      wikiSpaceId: "11111111-1111-4111-8111-111111111111",
-      etag: "\"manifest-v1\"",
-      manifest: {},
     },
   },
   managedMcpTools: {
@@ -246,6 +177,22 @@ const sdkFixtures: Record<AgentApiRouteKey, {
     input: [{ target: "#engineering" }],
     response: { id: "chan-1", name: "engineering", type: "channel", archivedAt: null, archivedByUserId: null, archivedByAgentId: null },
   },
+  channelCreate: {
+    input: [{ name: "design", visibility: "private", description: "Design reviews" }],
+    response: { id: "chan-2", name: "design", type: "private", description: "Design reviews" },
+  },
+  channelUpdate: {
+    input: [{ channelId: asChannelId("chan-2") }, { description: "Design reviews" }],
+    response: { id: "chan-2", name: "design", type: "private", description: "Design reviews" },
+  },
+  channelMemberAdd: {
+    input: [{ channelId: asChannelId("chan-2") }, { agent: "Kirby" }],
+    response: { ok: true, alreadyMember: false, channelId: "chan-2", member: { type: "agent", id: "agent-2", name: "Kirby" } },
+  },
+  channelMemberRemove: {
+    input: [{ channelId: asChannelId("chan-2") }, { agent: "Kirby" }],
+    response: { ok: true, wasMember: true, channelId: "chan-2", member: { type: "agent", id: "agent-2", name: "Kirby" } },
+  },
   channelMembers: {
     input: [{ channel: "#wg-raft-cli" }],
     response: {
@@ -264,6 +211,83 @@ const sdkFixtures: Record<AgentApiRouteKey, {
     input: [{ thread: "#wg-raft-cli:abcd1234" }],
     response: { ok: true },
   },
+  threadList: {
+    input: [],
+    response: {
+      threads: [{
+        target: "#wg-raft-cli:abcd1234",
+        threadChannelId: "11111111-2222-4333-8444-555555555555",
+        parentChannelRef: "#wg-raft-cli",
+        parentMessageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+        parentMessageShortId: "abcd1234",
+        followedAt: "2026-09-10T12:00:00.000Z",
+        reason: "mentioned",
+        doneAt: null,
+      }],
+    },
+  },
+  assistantOwnerInbox: {
+    input: [{ filter: "unread", limit: "20" }],
+    response: {
+      owner: { userId: "33333333-3333-4333-8333-333333333333" },
+      filter: "unread",
+      items: [{
+        kind: "thread",
+        channelId: "44444444-4444-4444-8444-444444444444",
+        channelName: "proj-runtime",
+        channelType: "channel",
+        parentChannelId: "55555555-5555-4555-8555-555555555555",
+        parentMessageId: "22222222-2222-4222-8222-222222222222",
+        unread: 2,
+        hasMention: true,
+        latestAt: "2026-09-10T12:00:00.000Z",
+        latestSenderName: "richard",
+        latestPreview: "ship it",
+        firstUnreadMessageId: "66666666-6666-4666-8666-666666666666",
+      }],
+      hasMore: false,
+      nextOffset: null,
+    },
+  },
+  assistantOwnerMessages: {
+    input: [{ channelId: "55555555-5555-4555-8555-555555555555", limit: "50" }],
+    response: {
+      owner: { userId: "33333333-3333-4333-8333-333333333333" },
+      channelId: "55555555-5555-4555-8555-555555555555",
+      messages: [],
+      hasMore: false,
+      hasOlder: false,
+      hasNewer: false,
+    },
+  },
+  inboxList: {
+    input: [{ view: "unread" }],
+    response: {
+      view: "unread",
+      items: [{
+        target: "dm:@richard",
+        kind: "dm",
+        unread: 3,
+        mentions: 0,
+        lastReadSeq: 1199,
+        activitySeq: 1203,
+        latestSenderName: "richard",
+        latestAt: "2026-09-10T12:00:00.000Z",
+      }],
+      hasMore: false,
+      nextBeforeSeq: null,
+      totals: { conversations: 1, dms: 1, mentions: 0 },
+    },
+  },
+  agentContext: {
+    input: [],
+    response: {
+      agent: { id: "agent-1", name: "alice", displayName: "Alice", description: "Reviewer", runtime: "external", external: true },
+      server: { id: "server-1", slug: "acme", name: "Acme" },
+      credential: { capabilities: ["read", "send"] },
+      prompt: { audience: "self-hosted-runner", text: "# Raft CLI operating guide" },
+    },
+  },
   serverInfo: {
     input: [],
     response: {
@@ -275,7 +299,17 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       agents: [],
       humans: [],
     },
+  },  userChannels: {
+    input: [{ name: "HaoHao" }, { offset: "0", limit: "50" }],
+    response: {
+      user: { name: "xxchan", role: "owner" },
+      kind: "human",
+      memberships: [],
+      uncheckedCount: 1,
+      page: { total: 1, offset: 0, limit: 50 },
+    },
   },
+
   serverUpdate: {
     input: [{ name: "Renamed Server", hideHumansFromMembers: true }],
     response: {
@@ -283,6 +317,25 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       name: "Renamed Server",
       hideHumansFromMembers: true,
       avatarUrl: null,
+    },
+  },
+  serverLabs: {
+    input: [],
+    response: { serverId: "server-1", accessEnabled: true, version: 3, canManageAccess: false, canManageEnrollments: true, labs: [{ labKey: "agent-panel-v2", name: "Agent panel v2", description: "The new Agent panel", state: "open", enrolled: false, effective: false, updatedAt: null }] },
+  },
+  serverLabsAccess: {
+    input: [{ enabled: true, expectedVersion: 3 }],
+    response: { applied: true, auditEventId: "audit-1", serverId: "server-1", accessEnabled: true, version: 4, canManageAccess: false, canManageEnrollments: true, labs: [{ labKey: "agent-panel-v2", name: "Agent panel v2", description: "The new Agent panel", state: "open", enrolled: true, effective: true, updatedAt: "2026-10-11T09:30:00.000Z" }] },
+  },
+  serverLabEnrollment: {
+    input: [{ labKey: "agent-panel-v2" }, { enabled: true, expectedVersion: 3 }],
+    response: { applied: true, auditEventId: "audit-1", serverId: "server-1", accessEnabled: true, version: 4, canManageAccess: false, canManageEnrollments: true, labs: [{ labKey: "agent-panel-v2", name: "Agent panel v2", description: "The new Agent panel", state: "open", enrolled: true, effective: true, updatedAt: "2026-10-11T09:30:00.000Z" }] },
+  },
+  senderMentionDeliveries: {
+    input: [{ messageId: "11111111-1111-4111-8111-111111111111" }],
+    response: {
+      messageId: "11111111-1111-4111-8111-111111111111",
+      deliveries: [{ targetHandle: "@Noel", outcome: "lost", reasonCategory: "quota" }],
     },
   },
   mentionActionsPending: {
@@ -333,11 +386,7 @@ const sdkFixtures: Record<AgentApiRouteKey, {
     response: { ok: true },
   },
   taskAssign: {
-    input: [
-      { channel: "#wg-raft-cli", task_number: 25, assignee: "@akko" },
-      { channel: "#wg-raft-cli", task_number: 25, assignee: null },
-      { channel: "#wg-raft-cli", task_number: 25, assignee: "@akko", expected_revision: 3 },
-    ],
+    input: [{ channel: "#wg-raft-cli", task_number: 25, assignee: "@akko" }],
     response: { ok: true, revision: 4, assignee: "@akko" },
   },
   taskUpdateStatus: {
@@ -409,47 +458,6 @@ const sdkFixtures: Record<AgentApiRouteKey, {
     response: {
       task: { taskNumber: 24, title: "Current title", description: null, revision: 2 },
       events: [],
-    },
-  },
-  migrationBegin: {
-    input: [{ targetMachineId: "machine-b" }],
-    response: migrationResponse,
-  },
-  migrationStatus: {
-    input: [],
-    response: migrationResponse,
-  },
-  migrationReady: {
-    input: [{ manifestPath: "MIGRATION-MANIFEST.json", manifestSha256: "sha256:manifest" }],
-    response: {
-      migration: {
-        ...migrationResponse.migration,
-        state: "ready",
-        manifestPath: "MIGRATION-MANIFEST.json",
-        manifestSha256: "sha256:manifest",
-        readyAt: "2026-06-29T04:02:00.000Z",
-        revision: 2,
-        updatedAt: "2026-06-29T04:02:00.000Z",
-      },
-    },
-  },
-  migrationArrived: {
-    input: [{ reportPath: "MIGRATION-ARRIVED.json", reportSha256: "sha256:arrived" }],
-    response: {
-      migration: {
-        ...migrationResponse.migration,
-        state: "completed",
-        manifestPath: "MIGRATION-MANIFEST.json",
-        manifestSha256: "sha256:manifest",
-        arrivalReportPath: "MIGRATION-ARRIVED.json",
-        arrivalReportSha256: "sha256:arrived",
-        readyAt: "2026-06-29T04:02:00.000Z",
-        flippedAt: "2026-06-29T04:04:00.000Z",
-        arrivedAt: "2026-06-29T04:06:00.000Z",
-        completedAt: "2026-06-29T04:06:00.000Z",
-        revision: 4,
-        updatedAt: "2026-06-29T04:06:00.000Z",
-      },
     },
   },
   reminderList: {
@@ -663,6 +671,8 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       services: [{
         id: "client-1",
         clientId: "drive9",
+        official: false,
+        purpose: "",
         name: "Drive9",
         description: null,
         homepageUrl: null,
@@ -695,9 +705,12 @@ const sdkFixtures: Record<AgentApiRouteKey, {
         logoUrl: null,
         installedOnServer: false,
         updatedAt: "2026-06-28T02:00:00.000Z",
+        official: false,
+        purpose: "",
       }],
     },
   },
+  integrationToken: { input: [{ service: "drive9" }], response: { access_token: "fixture.jwt.token", token_type: "Bearer", audience: "drive9", expires_in: 300, expires_at: "2026-10-05T00:05:00.000Z" } },
   integrationLogin: {
     input: [{ service: "drive9", scopes: ["openid", "profile"], target: "#wg-raft-cli" }],
     response: {
@@ -705,6 +718,8 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       service: {
         id: "client-1",
         clientId: "drive9",
+        official: false,
+        purpose: "",
         name: "Drive9",
         description: null,
         homepageUrl: null,
@@ -855,6 +870,10 @@ const sdkFixtures: Record<AgentApiRouteKey, {
     input: [{ attachmentId: "attachment/with space" }],
     response: new Uint8Array([1, 2, 3]),
   },
+  attachmentDownloadUrl: {
+    input: [{ attachmentId: "attachment/with space" }],
+    response: { url: "https://objects.example.test/a?X-Amz-Signature=sig", expiresAt: "2026-10-04T08:00:00.000Z", filename: "report.pdf", mimeType: "application/pdf" },
+  },
   attachmentCommentsList: {
     input: [{ attachmentId: "attachment/with space" }, { limit: "25" }],
     response: {
@@ -888,6 +907,10 @@ const sdkFixtures: Record<AgentApiRouteKey, {
       },
     },
   },
+  pushWebhookStatus: { input: [], response: { registered: true, url: "https://hooks.example.test/raft", enabled: true, disabledReason: null, disabledAt: null, lastAttemptAt: null, lastDeliveryAt: "2026-06-29T04:00:00.000Z", lastError: null, consecutiveFailures: 0, nextAttemptAt: null } },
+  pushWebhookRegister: { input: [{ url: "https://hooks.example.test/raft", secret: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }], response: { registered: true, url: "https://hooks.example.test/raft", enabled: true, disabledReason: null, disabledAt: null, lastAttemptAt: null, lastDeliveryAt: "2026-06-29T04:00:00.000Z", lastError: null, consecutiveFailures: 0, nextAttemptAt: null } },
+  pushWebhookDelete: { input: [], response: null },
+  mentionsList: { input: [{ limit: "50" }], response: { mentions: [], has_more: false } },
 };
 
 function _agentApiSdkPathParamBrandChecks(
@@ -1085,4 +1108,24 @@ test("SDK fetch transport handles binary contract responses", async () => {
   const headers = fetchCalls[0]?.init.headers as Record<string, string>;
   assert.equal(fetchCalls[0]?.init.method, "GET");
   assert.equal(headers.accept, "*/*");
+});
+
+test("taskAssign sends each body variant it accepts: an assignee, a cleared assignee, and an expected revision", async () => {
+  const bodies: unknown[] = [];
+  const client = createAgentApiClient({
+    fetch: {
+      baseUrl: "https://raft.example",
+      fetch: async (_input, init) => {
+        bodies.push(JSON.parse(String(init?.body)));
+        return Response.json({ ok: true, revision: 4, assignee: "@akko" });
+      },
+    },
+  });
+  const variants = [
+    { channel: "#wg-raft-cli", task_number: 25, assignee: "@akko" },
+    { channel: "#wg-raft-cli", task_number: 25, assignee: null },
+    { channel: "#wg-raft-cli", task_number: 25, assignee: "@akko", expected_revision: 3 },
+  ];
+  for (const variant of variants) assert.equal((await client.tasks.assign(variant)).ok, true);
+  assert.deepEqual(bodies, variants);
 });

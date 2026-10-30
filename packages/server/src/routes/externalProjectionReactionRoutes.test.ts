@@ -1,10 +1,10 @@
-import { createApiTest } from "../test/integration/apiTest.js";
+import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
 import { eq } from "drizzle-orm";
 
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   channelAgents,
   externalActorProjections,
@@ -13,13 +13,13 @@ import {
   serverMembers,
   tasks,
   users,
-} from "../db/schema.js";
-import { assignMachine, createAgent } from "../services/agentService.js";
-import { mintAgentCredential } from "../services/agentCredentialService.js";
-import { createChannel } from "../services/channelService.js";
-import { createCanonicalExternalMessage } from "../services/externalProjectionService.js";
-import { registerMachine } from "../services/machineService.js";
-import { createServer } from "../services/serverService.js";
+} from "../db/schema";
+import { assignMachine, createAgent } from "../services/agentService";
+import { mintAgentCredential } from "../services/agentCredentialService";
+import { createChannel } from "../services/channelService";
+import { createCanonicalExternalMessage } from "../services/externalProjectionService";
+import { registerMachine } from "../services/machineService";
+import { createServer } from "../services/serverService";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 
@@ -167,7 +167,10 @@ async function seedHostileExternalReactionFixture() {
   };
 }
 
-async function assertInertReactionResponse(
+// Slack-bridged rows reach Agents as ordinary messages: ordinary content and
+// the reading Agent's minted mention fact, while every authority field stays
+// stripped and provenance stays attached.
+async function assertSlackBridgedReactionResponse(
   response: Response,
   expectedEmoji: string,
   expectedCount: number,
@@ -175,7 +178,7 @@ async function assertInertReactionResponse(
   assert.equal(response.status, 200);
   const body = await response.json() as Record<string, unknown>;
   assert.equal(body.senderType, "third_party_app");
-  assert.equal(body.mentioned, false);
+  assert.equal(body.mentioned, true);
   assert.deepEqual(body.external_message, {
     schema: "external-message-provenance.v1",
     provider: "slack",
@@ -186,8 +189,8 @@ async function assertInertReactionResponse(
     actor_kind: "human",
     projection_id: body.senderId,
   });
-  assert.match(String(body.content), /&lt;result&gt;/);
-  assert.doesNotMatch(String(body.content), /<result>|@owner/);
+  assert.equal(body.content, RAW_EXTERNAL_CONTENT);
+  assert.doesNotMatch(String(body.content), /user:owner|&lt;result&gt;/);
   for (const field of FORBIDDEN_AGENT_AUTHORITY_FIELDS) {
     assert.equal(field in body, false, `Agent reaction response leaked ${field}`);
   }
@@ -196,7 +199,7 @@ async function assertInertReactionResponse(
   return body;
 }
 
-test("legacy and agent-api reaction add/remove responses downgrade hostile external rows while Human sockets stay enriched", async ({ app }) => {
+test("legacy and agent-api reaction add/remove responses strip authority from hostile Slack rows while Human sockets stay enriched", async ({ app }) => {
   const fixture = await seedHostileExternalReactionFixture();
   const humanSocketPayloads: Array<Record<string, unknown>> = [];
   app.app.set("io", {
@@ -217,13 +220,13 @@ test("legacy and agent-api reaction add/remove responses downgrade hostile exter
     headers: authHeaders(fixture.machineApiKey),
     body: JSON.stringify({ emoji: "👀" }),
   });
-  await assertInertReactionResponse(legacyAdd, "👀", 1);
+  await assertSlackBridgedReactionResponse(legacyAdd, "👀", 1);
   const legacyRemove = await fetch(legacyTarget, {
     method: "DELETE",
     headers: authHeaders(fixture.machineApiKey),
     body: JSON.stringify({ emoji: "👀" }),
   });
-  await assertInertReactionResponse(legacyRemove, "👀", 0);
+  await assertSlackBridgedReactionResponse(legacyRemove, "👀", 0);
 
   const agentApiTarget = `${app.baseUrl}/internal/agent-api/messages/${fixture.message.id}/reactions`;
   const agentApiAdd = await fetch(agentApiTarget, {
@@ -231,13 +234,13 @@ test("legacy and agent-api reaction add/remove responses downgrade hostile exter
     headers: authHeaders(fixture.agentApiKey),
     body: JSON.stringify({ emoji: "👍" }),
   });
-  await assertInertReactionResponse(agentApiAdd, "👍", 1);
+  await assertSlackBridgedReactionResponse(agentApiAdd, "👍", 1);
   const agentApiRemove = await fetch(agentApiTarget, {
     method: "DELETE",
     headers: authHeaders(fixture.agentApiKey),
     body: JSON.stringify({ emoji: "👍" }),
   });
-  await assertInertReactionResponse(agentApiRemove, "👍", 0);
+  await assertSlackBridgedReactionResponse(agentApiRemove, "👍", 0);
 
   assert.equal(humanSocketPayloads.length, 4);
   for (const payload of humanSocketPayloads) {

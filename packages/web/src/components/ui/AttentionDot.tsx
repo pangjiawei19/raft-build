@@ -8,64 +8,65 @@ type SpanPassthroughProps = HTMLAttributes<HTMLSpanElement> &
   Record<`data-${string}`, string | undefined>;
 
 /**
- * Canonical attention-dot primitive — the small filled circle with a black
- * border that flags "something here needs your attention" (unread messages,
- * pending notifications, etc.). Separate from `<StatusDot>`, which signals
- * presence/activity (online / typing / thinking).
+ * Canonical attention-dot primitive — "something here is waiting for you"
+ * (unread messages, pending notifications, an update to install). Raft Design
+ * System › Badge / StatusChip: the attention pixel (`rf-pixel--attention`) is
+ * a pink square pixel with an ink edge, the same in light and dark. Separate
+ * from `<StatusDot>`, which signals presence (online / working / error).
  *
  * **Size = physical fit, NOT priority** (stdrc 2026-05-14 PR #1709 amend,
  * msg=6ad15567). Unread is a binary signal — every attention dot means the
  * same thing ("there is unread here"); size only varies when the dot's
- * physical context can't accommodate the canonical 10×10. An earlier
- * 3-tier mapping (cross-context vs in-surface vs inline) tried to encode
- * priority into size; it didn't survive contact with consumers — two
- * adjacent "unread" signals visually competing because one was tagged
- * "global" was the symptom that motivated this rewrite.
+ * physical context can't accommodate the canonical pixel.
  *
- * - `lg` (default) = `size-2.5` (10×10) — **canonical** attention dot.
- *   Use everywhere unless the host context is physically too tight.
- * - `sm` = `size-1` (4×4) — **compact-only**. Reach for this only when
+ * - `lg` (default) = the DS pixel, 9×9 with a 1.5px ink edge and a 2px
+ *   radius. Use everywhere unless the host context is physically too tight.
+ * - `sm` = 6×6 with a 1px edge — **compact-only**. Reach for this only when
  *   the parent surface (badge interior, dense list-row inline marker) can
- *   not visually fit `lg` without crowding. Not a "lower priority" dot.
+ *   not visually fit `lg`. Not a "lower priority" dot.
  *
  * **Why not merge with StatusDot:** the two primitives have different
- * semantics (attention vs presence) and default colors (brutal-pink vs
- * activity-mapped). Merging would force a one-or-the-other-undefined API;
- * splitting keeps each callsite's intent legible at the JSX level.
+ * semantics (attention vs presence) and default colors (pink vs presence-
+ * mapped). Splitting keeps each callsite's intent legible at the JSX level.
  *
- * **Border rule:** both tiers keep `border border-black`. The border is
- * what makes the dot read as an "attention chip" rather than a decorative
- * pixel — don't drop it even at `sm`.
+ * **Edge rule:** both tiers keep the ink edge (`border-sticker-ink`). Every
+ * colour block in the DS is a sticker; the edge is what makes the dot read as
+ * an attention pixel rather than decoration — don't drop it even at `sm`.
+ * Never animated.
  */
+import Tooltip from "./Tooltip";
+
 export interface AttentionDotProps extends Omit<SpanPassthroughProps, "children"> {
-  /** Size variant. `lg` (default) = `size-2.5` — canonical attention
-   *  dot, use everywhere by default. `sm` = `size-1` — compact-only,
-   *  reach for it only when the parent can not fit `lg`. Size is physical
-   *  fit, not priority. */
+  /** Size variant. `lg` (default) = the 9px DS pixel — use everywhere by
+   *  default. `sm` = 6px — compact-only, reach for it only when the parent
+   *  can not fit `lg`. Size is physical fit, not priority. */
   size?: "sm" | "lg";
-  /** Tailwind bg token for the dot color. Default `"bg-brutal-pink"`.
-   *  Override for notification-kind dots (e.g. `KIND_DOT_BG[kind]` →
-   *  `"bg-brutal-orange"` for warnings) — keep using the existing kind→bg
-   *  map at the callsite. Do NOT override for ordinary unread signals;
-   *  brutal-pink is the canonical unread color. */
+  /** Tailwind bg token for the dot color. Default `"bg-attention"` (pink: it
+   *  waits for you). Override only for notification-kind dots whose kind is
+   *  a problem (`"bg-warning"`, orange) — do NOT override for ordinary unread
+   *  signals. */
   tone?: string;
 }
 
 const SIZE_CLASS: Record<NonNullable<AttentionDotProps["size"]>, string> = {
-  sm: "size-1",
-  lg: "size-2.5",
+  sm: "size-1.5 rounded-[1px] border",
+  lg: "size-[9px] rounded-[2px] border-[1.5px]",
 };
 
 export default function AttentionDot({
   size = "lg",
-  tone = "bg-brutal-pink",
+  tone = "bg-attention",
   className,
+  title,
   ...rest
 }: AttentionDotProps) {
-  return (
+  const dot = (
     <span
       {...rest}
-      className={`inline-block shrink-0 rounded-full border border-black ${SIZE_CLASS[size]} ${tone} ${className ?? ""}`}
+      className={`inline-block shrink-0 border-sticker-ink ${SIZE_CLASS[size]} ${tone} ${className ?? ""}`}
     />
   );
+  // Native title= on a span is only a hover tooltip; route it through the RUI
+  // Tooltip so it follows the theme recipe (title= migration, task #595).
+  return title ? <Tooltip content={title}>{dot}</Tooltip> : dot;
 }

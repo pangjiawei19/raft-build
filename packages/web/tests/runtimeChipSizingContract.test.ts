@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
@@ -9,54 +8,49 @@ function readSource(path: string): string {
   return readFileSync(resolve(repoRoot, path), "utf8");
 }
 
-const compactChipTokens = ["px-2", "py-0.5", "text-xs"];
-const oversizedChipPattern = /\bpx-2\.5\b|\bpy-1\b|\btext-sm\b/;
-
-function assertCompactChipScale(className: string): void {
-  for (const token of compactChipTokens) {
-    assert.match(className, new RegExp(`\\b${token.replace(".", "\\.")}\\b`));
-  }
-  assert.doesNotMatch(className, oversizedChipPattern);
-}
-
-function assertCompactRuntimeChip(className: string): void {
-  assert.match(className, /\bh-6\b/);
-  assertCompactChipScale(className);
-}
-
-function extractRuntimeAccountUsageClass(source: string): string {
-  const matches = [...source.matchAll(
-    /<RuntimeAccountUsageGateChip[\s\S]*?className="([^"]+)"[\s\S]*?>/g,
-  )];
-  assert.equal(matches.length, 1, "Agent runtime chip target changed; update this contract");
-  return matches[0]![1];
-}
-
-function extractValueChipClassAfter(source: string, anchor: string): string {
-  const index = source.indexOf(anchor);
-  assert.notEqual(index, -1, `${anchor} anchor not found`);
-  const match = source.slice(index).match(/value=\{\s*<span className="([^"]+)"/);
-  assert.ok(match, `${anchor} className not found`);
-  return match[1];
-}
-
-test("agent runtime chip keeps the same compact type scale as adjacent config chips", () => {
+// DS PropertyList + StatusChip: the Runtime value is the DS runtime chip
+// (`.rf-runtime`: the cyan-soft Badge in Space Mono 12 400). The model, reasoning
+// and mode values are plain facts — no colour, model ids in Space Mono — because
+// a colour block must mean identity, status, signal or consequence.
+test("agent runtime configuration rows render the DS runtime chip and plain-fact values", () => {
   const source = readSource("src/components/agent/AgentDetailPanel.tsx");
-  const runtimeClassName = extractRuntimeAccountUsageClass(source);
+  assert.match(source, /const RUNTIME_CHIP_CLASS = "font-mono text-mono-meta font-normal";/);
+  const runtime = [...source.matchAll(/<RuntimeAccountUsageGateChip\b([^>]*?)>/g)];
+  assert.equal(runtime.length, 1);
+  assert.match(runtime[0]![1], /appearance="soft"/);
+  assert.match(runtime[0]![1], /variant="information"/);
+  assert.match(runtime[0]![1], /className=\{RUNTIME_CHIP_CLASS\}/);
+  assert.doesNotMatch(runtime[0]![1], /\bstyle=/);
+  // The usage chip names itself from a plain string child.
+  assert.match(source, /className=\{RUNTIME_CHIP_CLASS\}\s*>[\s\S]*?\{formatRuntimeLabelWithStatus\(currentRuntimeConfig\.runtime, formatMessage\)\}\s*<\/RuntimeAccountUsageGateChip>/);
+  // The profile hero carries the same chip with its cpu icon.
+  assert.match(source, /<Badge appearance="soft" variant="information" className=\{RUNTIME_CHIP_CLASS\} data-testid="agent-profile-runtime-chip">\s*<Cpu size=\{14\} aria-hidden="true" \/>/);
 
-  assertCompactRuntimeChip(runtimeClassName);
-  assertCompactChipScale(extractValueChipClassAfter(source, "agent.runtimeConfig.model"));
-  assertCompactChipScale(extractValueChipClassAfter(source, "agent.runtimeConfig.reasoning"));
-  assertCompactChipScale(extractValueChipClassAfter(source, "agent.runtimeConfig.mode"));
+  for (const field of ["model", "reasoning", "mode"]) {
+    const label = `label={formatMessage({ id: "agent.runtimeConfig.${field}" })}`;
+    const index = source.indexOf(label);
+    assert.notEqual(index, -1, `${field} label missing`);
+    const value = source.slice(index, index + 600);
+    assert.doesNotMatch(value.split("</InfoRow>")[0]!, /<Badge\b/, `${field} is a plain fact, not a coloured chip`);
+  }
+  const model = source.slice(source.indexOf('label={formatMessage({ id: "agent.runtimeConfig.model" })}'));
+  assert.match(model, /^[^]*?<span className="min-w-0 break-all font-mono">\{currentRuntimeModelLabel\}<\/span>/);
 });
 
-test("machine detected runtime chips keep the compact 24px recipe in both states", () => {
-  const source = readSource("src/components/machine/MachineDetailPanel.tsx");
-  const detectedMatch = source.match(
-    /\?\s*"([^"]*bg-brutal-cyan[^"]*)"\s*:\s*"([^"]*bg-gray-100[^"]*)";/,
-  );
-  assert.ok(detectedMatch, "Detected Runtimes chip class branches not found");
-
-  assertCompactRuntimeChip(detectedMatch[1]!);
-  assertCompactRuntimeChip(detectedMatch[2]!);
+test("machine runtime chips use the shared badge recipe without forcing a legacy border or height", () => {
+  const source = [
+    readSource("src/components/machine/MachineDetailPanel.tsx"),
+    readSource("src/components/machine/CommandCopyRoot.tsx"),
+    readSource("src/components/machine/WorkspaceDeleteButton.tsx"),
+    readSource("src/components/machine/BulkResetOptionCard.tsx"),
+    readSource("src/components/machine/MachineAgentRow.tsx"),
+  ].join("\n");
+  // Raft DS runtime tags: the badge recipe draws them from props alone —
+  // cyan-soft when detected, stone-soft when not — with no local class
+  // override of colour, border or height.
+  const chips = [...source.matchAll(/<RuntimeAccountUsageGateChip\b([^>]*?)>/g)];
+  assert.equal(chips.length, 1);
+  assert.match(chips[0]![1], /appearance="soft"/);
+  assert.match(chips[0]![1], /variant=\{detected \? "information" : "muted"\}/);
+  assert.doesNotMatch(chips[0]![1], /\b(?:className|style)=/);
 });

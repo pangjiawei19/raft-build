@@ -23,7 +23,7 @@
  * the same client can drive a TTY-style flow and a unit test.
  */
 
-import { fetch } from "undici";
+import { undiciFetch as fetch } from "../proxy";
 
 export interface DeviceCodeLoginUserAction {
   verificationUri: string;

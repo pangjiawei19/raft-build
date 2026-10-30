@@ -4,7 +4,7 @@ import { useAuthStore } from "../store/authStore";
 import { useServerStore } from "../store/serverStore";
 import { useTranslationStore } from "../store/translationStore";
 
-export function useTranslationBatch(messages: Message[]) {
+export function useTranslationBatch(messages: Message[], options?: { skipSettingsLoad?: boolean }) {
   const serverId = useServerStore((s) => s.current?.id ?? null);
   const viewerUserId = useAuthStore((s) => s.user?.id ?? null);
   const settings = useTranslationStore((s) => s.settings);
@@ -12,8 +12,9 @@ export function useTranslationBatch(messages: Message[]) {
   const requestTranslations = useTranslationStore((s) => s.requestTranslations);
 
   useEffect(() => {
+    if (options?.skipSettingsLoad) return;
     void loadSettings(serverId);
-  }, [loadSettings, serverId]);
+  }, [loadSettings, options?.skipSettingsLoad, serverId]);
 
   const messageBatchKey = useMemo(
     () => messages.map((message) => `${message.id}:${message.content}`).join("|"),

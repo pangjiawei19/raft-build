@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
 import {
   projectActionPrepareReceipt,
@@ -11,7 +10,7 @@ import {
   projectAppStatusReceipt,
   projectAppTransferOwnerReceipt,
   projectAppUpdateReceipt,
-} from "./appReceipts.js";
+} from "./appReceipts";
 
 const app = {
   state: "committed" as const,
@@ -61,6 +60,7 @@ test("direct app read receipts recursively project only declared app fields", ()
       publishStatus: undefined,
       enabled: undefined,
       authority: undefined,
+      installationId: undefined,
       recoveryCommand: "raft integration app rotate-secret --client demo-app --output <new-private-path>",
     },
   });
@@ -175,4 +175,13 @@ test("remaining direct app receipts also drop undeclared response fields", () =>
     messageId: "message-1",
     metadata: { kind: "action-card" },
   });
+});
+
+test("setup receipts retain progress but discard nested unexpected credentials", () => {
+  const receipt = projectAppStatusReceipt({ app: { ...app, setup: {
+    status: "pending", url: "https://demo.example/setup", description: "Choose a repository", revision: 1, completedAt: null,
+    client_secret: "setup_secret_must_not_render",
+  } } } as never);
+  assert.equal(receipt.app.setup?.status, "pending");
+  assert.doesNotMatch(JSON.stringify(receipt), /must_not_render/);
 });

@@ -1,18 +1,21 @@
 import http2 from "node:http2";
-import { revokeSocketAccess } from "../socket/accessRevocation.js";
-import { revokeSessionFamilyInTransaction } from "./sessionService.js";
+import { lookup as dnsLookup } from "node:dns/promises";
+import { Agent as HttpsAgent } from "node:https";
+import { isIP } from "node:net";
+import { revokeSocketAccess } from "../socket/accessRevocation";
+import { revokeSessionFamilyInTransaction } from "./sessionService";
 import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from "node:crypto";
-import { currentDate, currentTimeMs, noopTracer, setClockInterval, type Tracer } from "@botiverse/raft-shared";
+import { clearClockTimeout, currentDate, currentTimeMs, noopTracer, setClockInterval, setClockTimeout, type Tracer } from "@botiverse/raft-shared";
 import { setImmediate as waitUntilNextTurn, setTimeout as sleepTimer } from "node:timers/promises";
 import { and, asc, eq, exists, gt, inArray, isNull, lt, or, sql } from "drizzle-orm";
 import jwt from "jsonwebtoken";
 import webpush from "web-push";
-import { getDb, registerDatabaseCloseHookForTests, type DatabaseExecutor } from "../db/index.js";
+import { getDb, registerDatabaseCloseHookForTests, type DatabaseExecutor } from "../db/index";
+import { chunkForBindParameters, insertParametersPerRow } from "../db/bindParameterBudget";
 import {
   agents,
   attachments,
   channels,
-  inboxServingRows,
   messages,
   mobilePushOutbox,
   pushRegistrations,
@@ -22,20 +25,35 @@ import {
   sessionFamilies,
   sessions,
   users,
-} from "../db/schema.js";
-import { addTraceEvent, runWithTraceSpan } from "../tracing/semanticTrace.js";
-import { UUID_RE } from "../lib/messageId.js";
-import type { InboxNotificationFactInput } from "./inboxNotificationService.js";
+} from "../db/schema";
+import { addTraceEvent, errorClassOf, runWithTraceSpan } from "../tracing/semanticTrace";
+import { UUID_RE } from "../lib/messageId";
+import type { InboxNotificationFactInput } from "./inboxNotificationService";
 import {
   formatPushBody,
   formatPushServerLabel,
   formatPushSurfaceTitle,
   summarizePushBody,
-} from "./pushDisplay.js";
+} from "./pushDisplay";
 import {
   evaluateFeatureFlag,
-  MOBILE_PUSH_DELIVERY_FEATURE_FLAG_KEY,
-} from "./featureFlagService.js";
+  evaluateFeatureFlags,
+  MOBILE_PUSH_FCM_FEATURE_FLAG_KEY,
+} from "./featureFlagService";
+import {
+  defaultFcmPushProvider,
+  isNonRetryableFcmError,
+  isTerminalFcmTokenError,
+  type FcmDeliveryInput,
+  type FcmMessage,
+  type FcmPushProvider,
+} from "./fcmPushProvider";
+import { withChannelWriterFence } from "./channelConversionFenceService";
+import { createAppWebhookPinnedLookup } from "./appNotificationDeliveryService";
+import { isPublicWebhookAddress } from "./appWebhookConfigService";
+import { afterAmbientTransaction, recordExternalSinkInsideTransaction } from "../db/ambientTransaction";
+import { getActivityUnreadTotalsBatch } from "./channelService";
+import { usersWithRecentDesktopAttention } from "./desktopAttention";
 
 const VAPID_PUBLIC_KEY = process.env.VAPID_PUBLIC_KEY || "";
 const VAPID_PRIVATE_KEY = process.env.VAPID_PRIVATE_KEY || "";
@@ -43,17 +61,82 @@ const VAPID_SUBJECT = process.env.VAPID_SUBJECT || "mailto:contact@raft.build";
 const DEFAULT_PUSH_TTL_SECONDS = 60 * 60;
 const MOBILE_PUSH_MAX_ATTEMPTS = 3;
 const MOBILE_PUSH_RETRY_BASE_MS = 250;
+const APNS_REQUEST_TIMEOUT_MS = 5_000;
 const MOBILE_PUSH_OUTBOX_BATCH_SIZE = 100;
 const MOBILE_PUSH_OUTBOX_LOCK_TIMEOUT_MS = 5 * 60 * 1000;
 export const PUSH_FAMILY_CAPABILITY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
-let pushEnabled = false;
+const vapidConfigured = Boolean(VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY);
 
-if (VAPID_PUBLIC_KEY && VAPID_PRIVATE_KEY) {
+if (vapidConfigured) {
   webpush.setVapidDetails(VAPID_SUBJECT, VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY);
-  pushEnabled = true;
 } else {
   console.warn("[PushService] VAPID keys not configured — web push disabled");
+}
+
+type WebPushResolvedAddress = { address: string; family: number };
+type WebPushLookup = (
+  hostname: string,
+  options: { all: true; verbatim: true },
+) => Promise<WebPushResolvedAddress[]>;
+
+type WebPushRuntime = {
+  enabled: boolean;
+  lookup: WebPushLookup;
+  sendNotification: typeof webpush.sendNotification;
+};
+
+const defaultWebPushRuntime: WebPushRuntime = {
+  enabled: vapidConfigured,
+  lookup: (hostname, options) => dnsLookup(hostname, options),
+  sendNotification: (subscription, payload, options) => webpush.sendNotification(subscription, payload, options),
+};
+
+let webPushRuntime: WebPushRuntime = defaultWebPushRuntime;
+
+export function __setWebPushRuntimeForTests(runtime: Partial<WebPushRuntime>) {
+  webPushRuntime = { ...defaultWebPushRuntime, ...runtime };
+}
+
+export function __resetWebPushRuntimeForTests() {
+  webPushRuntime = defaultWebPushRuntime;
+}
+
+/**
+ * Hostname of a Web Push endpoint the server may deliver to: an absolute,
+ * credential-free `https:` URL naming a public DNS host. IP literals and
+ * loopback or link-local style names are refused so a subscriber cannot point
+ * the server's push egress at internal services; the resolved addresses are
+ * checked again at send time. Returns null for anything else.
+ */
+export function webPushEndpointHostname(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "https:" || url.username || url.password) return null;
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  if (!hostname || isIP(hostname)) return null;
+  if (hostname === "localhost" || hostname.endsWith(".localhost")) return null;
+  if (hostname.endsWith(".local") || hostname.endsWith(".internal")) return null;
+  return hostname;
+}
+
+/**
+ * Resolves a stored endpoint to the address the connection will be pinned to.
+ * `null` means the endpoint is permanently undeliverable (not a public HTTPS
+ * host, or it resolves to a private or special-use address); a lookup failure
+ * propagates so transient DNS trouble is not mistaken for a bad endpoint.
+ */
+async function resolvePublicWebPushAddress(endpoint: string): Promise<WebPushResolvedAddress | null> {
+  const hostname = webPushEndpointHostname(endpoint);
+  if (!hostname) return null;
+  const addresses = await webPushRuntime.lookup(hostname, { all: true, verbatim: true });
+  if (addresses.length === 0 || addresses.some((entry) => !isPublicWebhookAddress(entry.address))) return null;
+  return addresses[0];
 }
 
 export interface PushPayload {
@@ -72,7 +155,7 @@ export interface PushPayload {
   alwaysShow?: boolean;
 }
 
-export type PushRegistrationProvider = "apns";
+export type PushRegistrationProvider = "apns" | "fcm";
 export type PushRegistrationEnv = "sandbox" | "production";
 
 export interface PushRegistrationInput {
@@ -191,7 +274,8 @@ export interface MobilePushIdentityPayload {
   parentMessageId?: string;
   messageId: string;
   kind: "channel" | "dm" | "thread";
-  badge: number;
+  /** Absent when the badge could not be read; the device then keeps its current badge. */
+  badge?: number;
 }
 
 export interface MobilePushPayload extends MobilePushIdentityPayload {
@@ -260,6 +344,10 @@ export class ApnsDeliveryError extends Error {
 
 class ConfiguredApnsPushProvider implements ApnsPushProvider {
   async send(input: ApnsDeliveryInput): Promise<ApnsDeliveryResult> {
+    // APNs is an external HTTP/2 round-trip (the push build runs inside a
+    // write-lock transaction to serialize with channel conversion — intentional);
+    // report it so the audit can distinguish the known case from any new one.
+    recordExternalSinkInsideTransaction("apns");
     if (!isApnsConfigured()) {
       return { status: "skipped", reason: "provider_not_configured" };
     }
@@ -297,9 +385,12 @@ class ConfiguredApnsPushProvider implements ApnsPushProvider {
             title: input.payload.alertTitle,
             body: input.payload.alertBody,
           },
-          badge: input.payload.badge,
+          ...(input.payload.badge !== undefined ? { badge: input.payload.badge } : {}),
           sound: "default",
-          "thread-id": `${input.payload.serverId}:${input.payload.channelId}`,
+          // Group by the parent channel when this push is a thread reply.
+          // channelId on a thread is the thread's own channel, so using it
+          // splits one channel into a card per topic.
+          "thread-id": `${input.payload.serverId}:${input.payload.parentChannelId || input.payload.channelId}`,
           category: "RAFT_MESSAGE",
         },
         serverId: input.payload.serverId,
@@ -324,7 +415,11 @@ class ConfiguredApnsPushProvider implements ApnsPushProvider {
 }
 
 let apnsPushProvider: ApnsPushProvider = new ConfiguredApnsPushProvider();
-let apnsHttpClient: ApnsHttpClient = defaultApnsHttpClient;
+let fcmPushProvider: FcmPushProvider = defaultFcmPushProvider;
+let apnsHttpClient: ApnsHttpClient = createApnsHttpClient(APNS_REQUEST_TIMEOUT_MS);
+type MobilePushOutboxMutationForTest = "conversion_authority_bypass";
+let mobilePushOutboxMutationForTest: MobilePushOutboxMutationForTest | null = null;
+let afterMobilePushOutboxClaimForTest: (() => Promise<void> | void) | null = null;
 // Include the deferred turn in ownership: a case may finish before work starts.
 const mobilePushTasks = new Set<Promise<void>>();
 const mobilePushTaskFailures: Error[] = [];
@@ -386,8 +481,23 @@ function parseApnsErrorReason(body: string): string | undefined {
   }
 }
 
-async function defaultApnsHttpClient(request: ApnsHttpRequest): Promise<ApnsHttpResponse> {
-  return new Promise((resolve, reject) => {
+export class ApnsRequestTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`APNs request did not complete within ${timeoutMs}ms`);
+    this.name = "ApnsRequestTimeoutError";
+  }
+}
+
+/**
+ * The outbox drain calls APNs while holding the channel writer fence, so every
+ * request must end within a bounded time: an unanswered connect or stream would
+ * otherwise keep that transaction open until Postgres kills it. A timeout is a
+ * transient failure and goes through the normal bounded retry.
+ *
+ * @internal Exported so the timeout can be verified against a local HTTP/2 server.
+ */
+export function createApnsHttpClient(timeoutMs: number): ApnsHttpClient {
+  return (request) => new Promise((resolve, reject) => {
     const client = http2.connect(request.authority);
     let statusCode = 0;
     const chunks: Buffer[] = [];
@@ -396,9 +506,17 @@ async function defaultApnsHttpClient(request: ApnsHttpRequest): Promise<ApnsHttp
     const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
+      clearClockTimeout(timer);
       client.close();
       fn();
     };
+
+    const timer = setClockTimeout(() => {
+      if (settled) return;
+      settled = true;
+      client.destroy();
+      reject(new ApnsRequestTimeoutError(timeoutMs));
+    }, timeoutMs);
 
     client.once("error", (err) => finish(() => reject(err)));
 
@@ -432,12 +550,30 @@ export function __resetApnsPushProviderForTests() {
   apnsPushProvider = new ConfiguredApnsPushProvider();
 }
 
+export function __setFcmPushProviderForTests(provider: FcmPushProvider) {
+  fcmPushProvider = provider;
+}
+
+export function __resetFcmPushProviderForTests() {
+  fcmPushProvider = defaultFcmPushProvider;
+}
+
+export function __setMobilePushOutboxMutationForTests(mutation: MobilePushOutboxMutationForTest | null) {
+  if (process.env.NODE_ENV !== "test") throw new Error("mobile push outbox mutations are test-only");
+  mobilePushOutboxMutationForTest = mutation;
+}
+
+export function __setAfterMobilePushOutboxClaimForTests(hook: (() => Promise<void> | void) | null) {
+  if (process.env.NODE_ENV !== "test") throw new Error("mobile push outbox claim hooks are test-only");
+  afterMobilePushOutboxClaimForTest = hook;
+}
+
 export function __setApnsHttpClientForTests(client: ApnsHttpClient) {
   apnsHttpClient = client;
 }
 
 export function __resetApnsHttpClientForTests() {
-  apnsHttpClient = defaultApnsHttpClient;
+  apnsHttpClient = createApnsHttpClient(APNS_REQUEST_TIMEOUT_MS);
 }
 
 export function __setMobilePushDeliveryRuntimeForTests(runtime: Partial<MobilePushDeliveryRuntime>) {
@@ -458,7 +594,7 @@ export function __resetMobilePushDeliveryRuntimeForTests() {
 }
 
 export function isPushEnabled(): boolean {
-  return pushEnabled;
+  return webPushRuntime.enabled;
 }
 
 export function getVapidPublicKey(): string {
@@ -575,13 +711,86 @@ export async function revokePushRegistration(
   });
 }
 
+export interface MobilePushServerDeliveryStatus {
+  fcmActive: boolean;
+}
+
+/**
+ * For each server the user belongs to: will this installation get pushes through
+ * FCM right now? The Android app raises its own tray notification from the live
+ * connection only where this is false, so a device never gets both. True needs the
+ * FCM rollout switch on (same evaluation as dispatch), FCM configured, and a
+ * live FCM registration of this installation for the user.
+ */
+export async function mobilePushDeliveryStatus(
+  input: { userId: string; installationId: string },
+  executor: DatabaseExecutor = getDb(),
+): Promise<Record<string, MobilePushServerDeliveryStatus>> {
+  const memberships = await executor
+    .select({ serverId: serverMembers.serverId })
+    .from(serverMembers)
+    .where(eq(serverMembers.userId, input.userId));
+  const serverIds = [...new Set(memberships.map((membership) => membership.serverId))];
+  const inactive = () => Object.fromEntries(serverIds.map((serverId) => [serverId, { fcmActive: false }]));
+  if (serverIds.length === 0) return {};
+  if (fcmPushProvider.isConfigured?.() === false) return inactive();
+
+  const [registration] = await executor
+    .select({ id: pushRegistrations.id })
+    .from(pushRegistrations)
+    .innerJoin(sessionFamilies, and(
+      eq(pushRegistrations.sessionFamilyId, sessionFamilies.id),
+      isNull(sessionFamilies.revokedAt),
+    ))
+    .where(and(
+      eq(pushRegistrations.installationId, input.installationId),
+      eq(pushRegistrations.provider, "fcm"),
+      eq(pushRegistrations.userId, input.userId),
+      isNull(pushRegistrations.revokedAt),
+      exists(
+        executor
+          .select({ id: sessions.id })
+          .from(sessions)
+          .where(and(
+            eq(sessions.familyId, sessionFamilies.id),
+            gt(sessions.expiresAt, currentDate()),
+          )),
+      ),
+    ))
+    .limit(1);
+  if (!registration) return inactive();
+
+  const evaluations = await evaluateFeatureFlags(
+    serverIds.map((serverId) => ({
+      key: MOBILE_PUSH_FCM_FEATURE_FLAG_KEY,
+      userId: input.userId,
+      serverId,
+      platform: "mobile" as const,
+    })),
+    executor,
+  );
+  return Object.fromEntries(serverIds.map((serverId, index) => [
+    serverId,
+    { fcmActive: evaluations[index]?.enabled === true },
+  ]));
+}
+
 function isTerminalApnsTokenError(err: unknown): boolean {
   if (!err || typeof err !== "object") return false;
   const candidate = err as { statusCode?: unknown; reason?: unknown };
   return candidate.statusCode === 410 || candidate.reason === "BadDeviceToken";
 }
 
-function apnsDropReason(err: unknown): string {
+/** HTTP status of a provider rejection or an auth-exchange response, when there is one. */
+function mobilePushFailureStatus(err: unknown): number | null {
+  if (!err || typeof err !== "object") return null;
+  const candidate = err as { statusCode?: unknown; response?: { status?: unknown } };
+  if (typeof candidate.statusCode === "number") return candidate.statusCode;
+  if (typeof candidate.response?.status === "number") return candidate.response.status;
+  return null;
+}
+
+function mobilePushDropReason(err: unknown): string {
   if (!err || typeof err !== "object") return "unknown_error";
   const candidate = err as { statusCode?: unknown; reason?: unknown };
   if (typeof candidate.reason === "string" && candidate.reason) return candidate.reason;
@@ -589,68 +798,139 @@ function apnsDropReason(err: unknown): string {
   return err instanceof Error ? err.name : "unknown_error";
 }
 
+/** One delivery to one registration, on whichever provider owns its token. */
+type MobilePushDelivery =
+  | { provider: "apns"; input: ApnsDeliveryInput }
+  | { provider: "fcm"; input: FcmDeliveryInput; env: PushRegistrationEnv; messageId: string };
+
+function deliveryTraceFields(delivery: MobilePushDelivery) {
+  return delivery.provider === "apns"
+    ? {
+        provider: "apns",
+        env: delivery.input.env,
+        registration_id: delivery.input.registrationId,
+        message_id: delivery.input.payload.messageId,
+      }
+    : {
+        provider: "fcm",
+        env: delivery.env,
+        registration_id: delivery.input.registrationId,
+        message_id: delivery.messageId,
+      };
+}
+
+async function sendMobilePushDelivery(delivery: MobilePushDelivery) {
+  return delivery.provider === "apns"
+    ? apnsPushProvider.send(delivery.input)
+    : fcmPushProvider.send(delivery.input);
+}
+
+function isTerminalTokenError(provider: PushRegistrationProvider, err: unknown): boolean {
+  return provider === "apns" ? isTerminalApnsTokenError(err) : isTerminalFcmTokenError(err);
+}
+
+function isNonRetryableDeliveryError(provider: PushRegistrationProvider, err: unknown): boolean {
+  return provider === "fcm" && isNonRetryableFcmError(err);
+}
+
+type MobilePushDeliveryOutcome = "sent" | "skipped" | "revoked" | "dropped";
+
+/**
+ * A bounded, content-free description of why a delivery was not sent: provider,
+ * reason code and HTTP status only (never a token, payload or message text).
+ */
+function mobilePushFailureSummary(provider: PushRegistrationProvider, outcome: MobilePushDeliveryOutcome, err: unknown): string {
+  const status = mobilePushFailureStatus(err);
+  return `${provider} ${outcome}: ${mobilePushDropReason(err)}${status === null ? "" : ` http=${status}`}`.slice(0, 200);
+}
+
+interface MobilePushDeliveryResult {
+  outcome: MobilePushDeliveryOutcome;
+  /** Set when the delivery did not send; see [mobilePushFailureSummary]. */
+  failure?: string;
+}
+
 async function deliverMobilePushWithRetry(
-  input: ApnsDeliveryInput,
+  delivery: MobilePushDelivery,
   executor: DatabaseExecutor,
-): Promise<"sent" | "skipped" | "revoked" | "dropped"> {
+): Promise<MobilePushDeliveryResult> {
+  const trace = deliveryTraceFields(delivery);
+  const registrationId = delivery.input.registrationId;
   for (let attempt = 1; attempt <= MOBILE_PUSH_MAX_ATTEMPTS; attempt += 1) {
     try {
-      const result = await apnsPushProvider.send(input);
+      const result = await sendMobilePushDelivery(delivery);
       addTraceEvent("push.mobile.delivery.attempt", {
-        provider: "apns",
-        env: input.env,
-        registration_id: input.registrationId,
-        message_id: input.payload.messageId,
+        ...trace,
         attempt,
         status: result.status,
         reason: result.reason ?? null,
       });
-      return result.status;
+      return result.status === "skipped"
+        ? { outcome: "skipped", failure: `${delivery.provider} skipped: ${result.reason ?? "unknown"}` }
+        : { outcome: result.status };
     } catch (err) {
-      if (isTerminalApnsTokenError(err)) {
-        const reason = apnsDropReason(err);
-        await revokePushRegistration({ registrationId: input.registrationId, reason }, executor);
+      if (isTerminalTokenError(delivery.provider, err)) {
+        const reason = mobilePushDropReason(err);
+        await revokePushRegistration({ registrationId, reason }, executor);
         addTraceEvent("push.mobile.delivery.drop", {
-          provider: "apns",
-          env: input.env,
-          registration_id: input.registrationId,
-          message_id: input.payload.messageId,
+          ...trace,
           attempt,
           status: "revoked",
           reason,
+          http_status: mobilePushFailureStatus(err),
         });
-        return "revoked";
+        return { outcome: "revoked", failure: mobilePushFailureSummary(delivery.provider, "revoked", err) };
       }
 
-      if (attempt === MOBILE_PUSH_MAX_ATTEMPTS) {
+      if (attempt === MOBILE_PUSH_MAX_ATTEMPTS || isNonRetryableDeliveryError(delivery.provider, err)) {
         addTraceEvent("push.mobile.delivery.drop", {
-          provider: "apns",
-          env: input.env,
-          registration_id: input.registrationId,
-          message_id: input.payload.messageId,
+          ...trace,
           attempt,
           status: "dropped",
-          reason: apnsDropReason(err),
+          reason: mobilePushDropReason(err),
+          http_status: mobilePushFailureStatus(err),
         });
-        return "dropped";
+        return { outcome: "dropped", failure: mobilePushFailureSummary(delivery.provider, "dropped", err) };
       }
 
       const retryDelayMs = mobilePushDeliveryRuntime.jitterMs(attempt);
       addTraceEvent("push.mobile.delivery.retry_scheduled", {
-        provider: "apns",
-        env: input.env,
-        registration_id: input.registrationId,
-        message_id: input.payload.messageId,
+        ...trace,
         attempt,
         next_attempt: attempt + 1,
         retry_delay_ms: retryDelayMs,
-        reason: apnsDropReason(err),
+        reason: mobilePushDropReason(err),
+        http_status: mobilePushFailureStatus(err),
       });
       await mobilePushDeliveryRuntime.sleep(retryDelayMs);
     }
   }
 
-  return "dropped";
+  return { outcome: "dropped", failure: `${delivery.provider} dropped: retries exhausted` };
+}
+
+/**
+ * The FCM wire form of a mobile push: the same identity fields the APNs custom
+ * payload carries, plus the alert text, all as strings (FCM `data` is a string
+ * map). Keys match what the Android client already reads.
+ */
+export function fcmMessageForMobilePush(payload: MobilePushPayload): FcmMessage {
+  const collapseKey = mobilePushCollapseId(payload);
+  const data: Record<string, string> = {
+    serverId: payload.serverId,
+    channelId: payload.channelId,
+    messageId: payload.messageId,
+    kind: payload.kind,
+    category: "RAFT_MESSAGE",
+    title: payload.alertTitle,
+    body: payload.alertBody,
+    notificationKey: collapseKey,
+  };
+  if (payload.threadId) data.threadId = payload.threadId;
+  if (payload.parentChannelId) data.parentChannelId = payload.parentChannelId;
+  if (payload.parentMessageId) data.parentMessageId = payload.parentMessageId;
+  if (payload.badge !== undefined) data.badge = String(payload.badge);
+  return { data, collapseKey };
 }
 
 async function filterMobilePushFactsByServerMode(
@@ -696,60 +976,66 @@ async function filterMobilePushFactsByServerMode(
   });
 }
 
-async function filterMobilePushFactsByFeatureGate(
-  facts: readonly InboxNotificationFactInput[],
-  executor: DatabaseExecutor,
-): Promise<InboxNotificationFactInput[]> {
-  if (facts.length === 0) return [];
-  const evaluationByTarget = new Map<string, Awaited<ReturnType<typeof evaluateFeatureFlag>>>();
-  for (const fact of facts) {
-    const targetKey = `${fact.receiverId}:${fact.serverId}`;
-    if (evaluationByTarget.has(targetKey)) continue;
-    evaluationByTarget.set(targetKey, await evaluateFeatureFlag({
-      key: MOBILE_PUSH_DELIVERY_FEATURE_FLAG_KEY,
-      userId: fact.receiverId,
-      serverId: fact.serverId,
-      platform: "mobile",
-    }, executor));
-  }
-
-  return facts.filter((fact) => {
-    const evaluation = evaluationByTarget.get(`${fact.receiverId}:${fact.serverId}`);
-    if (evaluation?.enabled) return true;
-    addTraceEvent("push.mobile.delivery.skipped", {
-      reason: "feature_gate",
-      gate_key: MOBILE_PUSH_DELIVERY_FEATURE_FLAG_KEY,
-      gate_reason: evaluation?.reason ?? "missing_evaluation",
-      receiver_id: fact.receiverId,
-      server_id: fact.serverId,
-      message_id: fact.messageId,
-    });
-    return false;
-  });
+export interface MobilePushDispatchSummary {
+  attempted: number;
+  sent: number;
+  skipped: number;
+  revoked: number;
+  dropped: number;
+  /** First delivery that did not send: provider, reason code, HTTP status. No content. */
+  firstFailure?: string;
 }
 
 export async function dispatchMobilePushForInboxFacts(
   facts: readonly InboxNotificationFactInput[],
   executor: DatabaseExecutor = getDb(),
-): Promise<{ attempted: number; sent: number; skipped: number; revoked: number; dropped: number }> {
+  options: { badgeByReceiverId?: ReadonlyMap<string, number | undefined> } = {},
+): Promise<MobilePushDispatchSummary> {
   const unreadEligibleFacts = facts.filter((fact) =>
     fact.receiverType === "user"
       && fact.unreadEligible !== false
   );
-  const featureEnabledFacts = await filterMobilePushFactsByFeatureGate(unreadEligibleFacts, executor);
-  const eligibleFacts = await filterMobilePushFactsByServerMode(featureEnabledFacts, executor);
+  const eligibleFacts = await filterMobilePushFactsByServerMode(unreadEligibleFacts, executor);
   if (eligibleFacts.length === 0) return { attempted: 0, sent: 0, skipped: 0, revoked: 0, dropped: 0 };
 
+  let firstFailure: string | undefined;
   let attempted = 0;
   let sent = 0;
   let skipped = 0;
   let revoked = 0;
   let dropped = 0;
 
+  const fcmGateByTarget = new Map<string, boolean>();
+  const fcmEnabledFor = async (fact: InboxNotificationFactInput): Promise<boolean> => {
+    const targetKey = `${fact.receiverId}:${fact.serverId}`;
+    const cached = fcmGateByTarget.get(targetKey);
+    if (cached !== undefined) return cached;
+    const evaluation = await evaluateFeatureFlag({
+      key: MOBILE_PUSH_FCM_FEATURE_FLAG_KEY,
+      userId: fact.receiverId,
+      serverId: fact.serverId,
+      platform: "mobile",
+    }, executor);
+    fcmGateByTarget.set(targetKey, evaluation.enabled);
+    if (!evaluation.enabled) {
+      addTraceEvent("push.mobile.delivery.skipped", {
+        reason: "feature_gate",
+        provider: "fcm",
+        gate_key: MOBILE_PUSH_FCM_FEATURE_FLAG_KEY,
+        gate_reason: evaluation.reason ?? "missing_evaluation",
+        receiver_id: fact.receiverId,
+        server_id: fact.serverId,
+        message_id: fact.messageId,
+      });
+    }
+    return evaluation.enabled;
+  };
+
   for (const fact of eligibleFacts) {
-    const registrations = await executor
+    const allRegistrations = await executor
       .select({
         id: pushRegistrations.id,
+        provider: pushRegistrations.provider,
         installationId: pushRegistrations.installationId,
         deviceToken: pushRegistrations.deviceToken,
         topic: pushRegistrations.topic,
@@ -761,7 +1047,7 @@ export async function dispatchMobilePushForInboxFacts(
         isNull(sessionFamilies.revokedAt),
       ))
       .where(and(
-        eq(pushRegistrations.provider, "apns"),
+        inArray(pushRegistrations.provider, ["apns", "fcm"]),
         eq(pushRegistrations.userId, fact.receiverId),
         isNull(pushRegistrations.revokedAt),
         exists(
@@ -774,29 +1060,58 @@ export async function dispatchMobilePushForInboxFacts(
             )),
         ),
       ));
+    // FCM rolls out behind its own gate; with it off, FCM rows are not
+    // attempted at all (they are not counted as skipped deliveries).
+    const registrations = allRegistrations.some((registration) => registration.provider === "fcm")
+      && !(await fcmEnabledFor(fact))
+      ? allRegistrations.filter((registration) => registration.provider !== "fcm")
+      : allRegistrations;
 
     addTraceEvent("push.mobile.targets.built", {
-      provider: "apns",
       receiver_type: fact.receiverType,
       receiver_id: fact.receiverId,
       server_id: fact.serverId,
       source_channel_id: fact.sourceChannelId,
       message_id: fact.messageId,
       target_count: registrations.length,
+      apns_target_count: registrations.filter((registration) => registration.provider === "apns").length,
+      fcm_target_count: registrations.filter((registration) => registration.provider === "fcm").length,
     });
+    if (registrations.length === 0) continue;
 
-    const payload = await buildMobilePushPayload(fact, executor);
+    const payload = await buildMobilePushPayload(fact, executor, {
+      badgeResolved: options.badgeByReceiverId?.has(fact.receiverId) ?? false,
+      badge: options.badgeByReceiverId?.get(fact.receiverId),
+    });
 
     for (const registration of registrations) {
       attempted += 1;
-      const outcome = await deliverMobilePushWithRetry({
-        registrationId: registration.id,
-        installationId: registration.installationId,
-        deviceToken: registration.deviceToken,
-        topic: registration.topic,
-        env: registration.env as PushRegistrationEnv,
-        payload,
-      }, executor);
+      const env = registration.env as PushRegistrationEnv;
+      const delivery: MobilePushDelivery = registration.provider === "fcm"
+        ? {
+            provider: "fcm",
+            env,
+            messageId: payload.messageId,
+            input: {
+              registrationId: registration.id,
+              installationId: registration.installationId,
+              deviceToken: registration.deviceToken,
+              message: fcmMessageForMobilePush(payload),
+            },
+          }
+        : {
+            provider: "apns",
+            input: {
+              registrationId: registration.id,
+              installationId: registration.installationId,
+              deviceToken: registration.deviceToken,
+              topic: registration.topic,
+              env,
+              payload,
+            },
+          };
+      const { outcome, failure } = await deliverMobilePushWithRetry(delivery, executor);
+      if (failure && firstFailure === undefined) firstFailure = failure;
       if (outcome === "sent") sent += 1;
       if (outcome === "skipped") skipped += 1;
       if (outcome === "revoked") revoked += 1;
@@ -805,7 +1120,6 @@ export async function dispatchMobilePushForInboxFacts(
   }
 
   addTraceEvent("push.mobile.delivery.summary", {
-    provider: "apns",
     fact_count: eligibleFacts.length,
     attempted,
     sent,
@@ -814,12 +1128,51 @@ export async function dispatchMobilePushForInboxFacts(
     dropped,
   });
 
-  return { attempted, sent, skipped, revoked, dropped };
+  return { attempted, sent, skipped, revoked, dropped, ...(firstFailure === undefined ? {} : { firstFailure }) };
+}
+
+/**
+ * The phone badge: the sum of the user's in-app Activity badges, read through
+ * the SAME function the app uses, so the two can never count by different rules.
+ * It reads RisingWave (a hard dependency: unconfigured or a failed read throws),
+ * so callers must not hold a Postgres transaction open around it: a slow
+ * RisingWave read would leave that transaction idle, holding a pooled server
+ * connection. The outbox drain loads it before entering the channel writer fence.
+ */
+export async function loadMobilePushBadge(receiverId: string, executor: DatabaseExecutor = getDb()): Promise<number> {
+  const memberships = await executor
+    .select({ serverId: serverMembers.serverId })
+    .from(serverMembers)
+    .where(eq(serverMembers.userId, receiverId));
+  const totals = await getActivityUnreadTotalsBatch(
+    memberships.map((row) => ({ serverId: row.serverId })),
+    receiverId,
+  );
+  const unreadCount = [...totals.values()].reduce((sum, row) => sum + row.totalUnreadCount, 0);
+  return Math.min(9_999, Math.max(1, Number.isFinite(unreadCount) ? unreadCount : 1));
+}
+
+/**
+ * The badge is decoration on a notification that must still be delivered: when
+ * RisingWave cannot answer, send the push without a badge (the device keeps its
+ * current one) rather than failing, retrying and finally dropping the push.
+ */
+export async function loadMobilePushBadgeOrUnknown(
+  receiverId: string,
+  executor: DatabaseExecutor = getDb(),
+): Promise<number | undefined> {
+  try {
+    return await loadMobilePushBadge(receiverId, executor);
+  } catch (err) {
+    console.warn(`[PushService] badge unavailable, sending without badge: ${err instanceof Error ? err.message : String(err)}`);
+    return undefined;
+  }
 }
 
 async function buildMobilePushPayload(
   fact: InboxNotificationFactInput,
   executor: DatabaseExecutor,
+  options: { badge?: number; badgeResolved?: boolean } = {},
 ): Promise<MobilePushPayload> {
   const [messageRow] = await executor
     .select({
@@ -867,15 +1220,10 @@ async function buildMobilePushPayload(
     senderName = sender?.displayName?.trim() || sender?.name?.trim() || senderName;
   }
 
-  const [badgeRow] = await executor
-    .select({ unreadCount: sql<number>`COALESCE(SUM(${inboxServingRows.unreadCount}), 0)` })
-    .from(inboxServingRows)
-    .where(and(
-      eq(inboxServingRows.receiverType, "user"),
-      eq(inboxServingRows.receiverId, fact.receiverId),
-    ));
-  const unreadCount = Number(badgeRow?.unreadCount ?? 0);
-  const badge = Math.min(9_999, Math.max(1, Number.isFinite(unreadCount) ? unreadCount : 1));
+  const badge = options.badgeResolved || options.badge !== undefined
+    ? options.badge
+    : await loadMobilePushBadgeOrUnknown(fact.receiverId, executor);
+
 
   const attachmentCount = Number(attachmentRow?.count ?? 0);
   const messagePreview = messageRow
@@ -989,12 +1337,20 @@ function outboxRowToInboxFact(row: {
   };
 }
 
-export async function drainMobilePushOutbox(
-  batchSize = MOBILE_PUSH_OUTBOX_BATCH_SIZE,
-  executor: DatabaseExecutor = getDb(),
-): Promise<{ claimed: number; processed: number }> {
-  const staleLockedAt = new Date(currentTimeMs() - MOBILE_PUSH_OUTBOX_LOCK_TIMEOUT_MS);
-  const candidates = await executor
+/**
+ * The drain's candidate read: pending rows, and processing rows whose lock went
+ * stale, oldest first. Served by the partial index
+ * idx_mobile_push_outbox_active_created (migration 0359), which holds only
+ * pending/processing rows, so a drain no longer walks the (status, created_at)
+ * index entries of rows that already reached a terminal status (10-16: 0 rows
+ * returned after visiting 34k heap pages).
+ */
+export function mobilePushOutboxDrainCandidatesQuery(
+  executor: DatabaseExecutor,
+  staleLockedAt: Date,
+  batchSize: number,
+) {
+  return executor
     .select()
     .from(mobilePushOutbox)
     .where(or(
@@ -1003,6 +1359,14 @@ export async function drainMobilePushOutbox(
     ))
     .orderBy(asc(mobilePushOutbox.createdAt))
     .limit(batchSize);
+}
+
+export async function drainMobilePushOutbox(
+  batchSize = MOBILE_PUSH_OUTBOX_BATCH_SIZE,
+  executor: DatabaseExecutor = getDb(),
+): Promise<{ claimed: number; processed: number }> {
+  const staleLockedAt = new Date(currentTimeMs() - MOBILE_PUSH_OUTBOX_LOCK_TIMEOUT_MS);
+  const candidates = await mobilePushOutboxDrainCandidatesQuery(executor, staleLockedAt, batchSize);
 
   let claimed = 0;
   let processed = 0;
@@ -1026,9 +1390,33 @@ export async function drainMobilePushOutbox(
       .returning();
     if (!row) continue;
     claimed += 1;
+    await afterMobilePushOutboxClaimForTest?.();
 
     try {
-      const summary = await dispatchMobilePushForInboxFacts([outboxRowToInboxFact(row)], executor);
+      // The badge reads RisingWave: load it before the writer fence opens its
+      // transaction, never while holding one.
+      const badgeByReceiverId = new Map([[row.receiverId, await loadMobilePushBadgeOrUnknown(row.receiverId, executor)]]);
+      // Serialize the final authority read and provider call with channel
+      // conversion. A worker that claimed before cutover either completes
+      // while still owning the source lock (therefore before cutover), or waits
+      // and observes the row revoked. It cannot publish after audience loss.
+      const dispatchWithFreshAuthority = async (tx: DatabaseExecutor) => {
+        const [current] = await tx
+          .select({ status: mobilePushOutbox.status })
+          .from(mobilePushOutbox)
+          .where(eq(mobilePushOutbox.id, row.id))
+          .limit(1);
+        if (current?.status !== "processing") {
+          return { attempted: 0, sent: 0, skipped: 0, revoked: 1, dropped: 0 };
+        }
+        return dispatchMobilePushForInboxFacts([outboxRowToInboxFact(row)], tx, { badgeByReceiverId });
+      };
+      const summary = mobilePushOutboxMutationForTest === "conversion_authority_bypass"
+        // Witnessed predecessor: dispatch from the stale claimed row without
+        // acquiring/re-reading the source authority. The Block 5 race tooth
+        // proves this can call APNs after the row was revoked by cutover.
+        ? await dispatchMobilePushForInboxFacts([outboxRowToInboxFact(row)], executor, { badgeByReceiverId })
+        : await withChannelWriterFence(row.sourceChannelId, dispatchWithFreshAuthority);
       const status = mobilePushOutboxTerminalStatus(summary);
       await executor
         .update(mobilePushOutbox)
@@ -1039,11 +1427,15 @@ export async function drainMobilePushOutbox(
           skippedCount: summary.skipped,
           revokedCount: summary.revoked,
           droppedCount: summary.dropped,
-          lastError: null,
+          // Why a delivery did not send (provider, reason code, HTTP status); no content.
+          lastError: summary.firstFailure ?? null,
           processedAt: sql`now()`,
           updatedAt: sql`now()`,
         })
-        .where(eq(mobilePushOutbox.id, row.id));
+        .where(and(
+          eq(mobilePushOutbox.id, row.id),
+          eq(mobilePushOutbox.status, "processing"),
+        ));
       processed += 1;
     } catch (err) {
       const nextStatus: MobilePushOutboxStatus = row.attemptCount >= MOBILE_PUSH_MAX_ATTEMPTS ? "dropped" : "pending";
@@ -1056,7 +1448,10 @@ export async function drainMobilePushOutbox(
           processedAt: nextStatus === "dropped" ? sql`now()` : null,
           updatedAt: sql`now()`,
         })
-        .where(eq(mobilePushOutbox.id, row.id));
+        .where(and(
+          eq(mobilePushOutbox.id, row.id),
+          eq(mobilePushOutbox.status, "processing"),
+        ));
       addTraceEvent("push.mobile.outbox.drain_error", {
         outbox_id: row.id,
         status: nextStatus,
@@ -1068,9 +1463,57 @@ export async function drainMobilePushOutbox(
   return { claimed, processed };
 }
 
+// The server's tracer, captured when the interval worker starts, so the
+// post-commit kick drain is traced the same way as the worker's.
+let mobilePushDrainTracer: Tracer = noopTracer;
+
 function scheduleMobilePushOutboxDrain() {
   mobilePushDeliveryRuntime.schedule(async () => {
-    await drainMobilePushOutbox();
+    await runMobilePushOutboxWorkerDrain(MOBILE_PUSH_OUTBOX_BATCH_SIZE, mobilePushDrainTracer, "post_commit_kick");
+  });
+}
+
+/**
+ * A joint channel has one local copy per participating server, and a person in
+ * several of them gets one Activity fact per copy for the same message. The
+ * phone must still buzz once, so keep one fact per person + message. Prefer a
+ * copy whose server push mode lets it through (each server keeps its own
+ * all/mentions/none), then the lowest source channel id, so a retried enqueue
+ * lands on the same outbox row and conflicts instead of adding another.
+ */
+async function collapseJointCopiesForPush(
+  facts: readonly InboxNotificationFactInput[],
+  executor: DatabaseExecutor,
+): Promise<Array<InboxNotificationFactInput & { receiverType: "user" }>> {
+  const groups = new Map<string, InboxNotificationFactInput[]>();
+  for (const fact of facts) {
+    const key = `${fact.receiverId}:${fact.messageId}`;
+    const group = groups.get(key);
+    if (group) group.push(fact);
+    else groups.set(key, [fact]);
+  }
+  const duplicated = [...groups.values()].filter((group) => group.length > 1);
+  const modeByTarget = new Map<string, string>();
+  if (duplicated.length > 0) {
+    const copies = duplicated.flat();
+    const memberships = await executor
+      .select({ userId: serverMembers.userId, serverId: serverMembers.serverId, mode: serverMembers.serverPushMode })
+      .from(serverMembers)
+      .where(and(
+        inArray(serverMembers.userId, [...new Set(copies.map((fact) => fact.receiverId))]),
+        inArray(serverMembers.serverId, [...new Set(copies.map((fact) => fact.serverId))]),
+      ));
+    for (const membership of memberships) modeByTarget.set(`${membership.userId}:${membership.serverId}`, membership.mode);
+  }
+  return [...groups.values()].map((group) => {
+    const personalMention = group.some((fact) => fact.personalMention === true);
+    const pushable = (fact: InboxNotificationFactInput) => {
+      const mode = modeByTarget.get(`${fact.receiverId}:${fact.serverId}`);
+      return mode === "all" || (mode === "mentions" && personalMention);
+    };
+    const [chosen] = [...group].sort((a, b) =>
+      Number(pushable(b)) - Number(pushable(a)) || (a.sourceChannelId < b.sourceChannelId ? -1 : a.sourceChannelId > b.sourceChannelId ? 1 : 0));
+    return { ...chosen!, receiverType: "user" as const, personalMention };
   });
 }
 
@@ -1078,13 +1521,17 @@ export async function enqueueMobilePushForInboxFacts(
   facts: readonly InboxNotificationFactInput[],
   executor: DatabaseExecutor = getDb(),
 ): Promise<number> {
-  const queuedFacts = facts
-    .filter((fact) => fact.receiverType === "user" && fact.unreadEligible !== false)
-    .map((fact) => ({ ...fact, receiverType: "user" as const }));
+  const queuedFacts = await collapseJointCopiesForPush(
+    facts.filter((fact) => fact.receiverType === "user" && fact.unreadEligible !== false),
+    executor,
+  );
   if (queuedFacts.length === 0) return 0;
-  const insertedRows = await executor
+  // Chunked to PostgreSQL's per-statement bind-parameter limit: a large channel's fan-out in one
+  // multi-row VALUES fails the whole message transaction (≈5,957 receivers at 11 per row).
+  const insertedRows: { id: string }[] = [];
+  for (const chunk of chunkForBindParameters(queuedFacts, insertParametersPerRow(mobilePushOutbox))) insertedRows.push(...await executor
     .insert(mobilePushOutbox)
-    .values(queuedFacts.map((fact) => ({
+    .values(chunk.map((fact) => ({
       receiverType: fact.receiverType,
       receiverId: fact.receiverId,
       serverId: fact.serverId,
@@ -1105,14 +1552,18 @@ export async function enqueueMobilePushForInboxFacts(
         mobilePushOutbox.messageId,
       ],
     })
-    .returning({ id: mobilePushOutbox.id });
+    .returning({ id: mobilePushOutbox.id }));
 
   addTraceEvent("push.mobile.delivery.enqueued", {
     fact_count: queuedFacts.length,
+    joint_copies_collapsed: facts.filter((fact) => fact.receiverType === "user" && fact.unreadEligible !== false).length - queuedFacts.length,
     outbox_count: insertedRows.length,
   });
 
-  if (insertedRows.length > 0) scheduleMobilePushOutboxDrain();
+  // After commit: the drain reads the outbox on its own connection and opens a
+  // writer-fence transaction, which inside this one became a savepoint that
+  // outlived the commit (prod 25P01, 2026-10-14).
+  if (insertedRows.length > 0) afterAmbientTransaction(scheduleMobilePushOutboxDrain);
   return insertedRows.length;
 }
 
@@ -1133,7 +1584,7 @@ const defaultMobilePushOutboxWorkerClock: MobilePushOutboxWorkerClock = {
 async function runMobilePushOutboxWorkerDrain(
   batchSize: number,
   tracer: Tracer,
-  trigger: "startup" | "interval_worker",
+  trigger: "startup" | "interval_worker" | "post_commit_kick",
 ) {
   const span = tracer.startSpan("server.push.mobile_outbox.drain", {
     surface: "server",
@@ -1153,7 +1604,7 @@ async function runMobilePushOutboxWorkerDrain(
     });
     return result;
   } catch (error) {
-    const errorClass = error instanceof Error ? error.name : typeof error;
+    const errorClass = errorClassOf(error);
     span.addEvent("error", { error_class: errorClass });
     span.end("error", { attrs: { error_class: errorClass } });
     throw error;
@@ -1170,6 +1621,7 @@ export function startMobilePushOutboxWorker(opts: {
   const batchSize = opts.batchSize ?? MOBILE_PUSH_OUTBOX_BATCH_SIZE;
   const clock = opts.clock ?? defaultMobilePushOutboxWorkerClock;
   const tracer = opts.tracer ?? noopTracer;
+  mobilePushDrainTracer = tracer;
   const run = (trigger: "startup" | "interval_worker") => {
     runMobilePushOutboxWorkerDrain(batchSize, tracer, trigger).catch((err) => {
       console.error("[PushService] Failed to drain mobile push outbox:", err);
@@ -1186,7 +1638,7 @@ export function startMobilePushOutboxWorker(opts: {
 }
 
 export async function sendPushToUsers(userIds: string[], payload: PushPayload) {
-  if (!pushEnabled || userIds.length === 0) {
+  if (!webPushRuntime.enabled || userIds.length === 0) {
     return { attempted: 0, delivered: 0, failed: 0 };
   }
 
@@ -1201,21 +1653,34 @@ export async function sendPushToUsers(userIds: string[], payload: PushPayload) {
   }
 
   const body = JSON.stringify(payload);
+  const dropSubscription = (id: string) =>
+    db.delete(pushSubscriptions).where(eq(pushSubscriptions.id, id)).catch(() => {});
   const results = await Promise.allSettled(
     subscriptions.map(async (subscription) => {
+      // Rows may predate endpoint validation, so every send re-checks the host
+      // and pins the connection to the vetted address instead of letting the
+      // HTTP client resolve the name a second time.
+      const pinned = await resolvePublicWebPushAddress(subscription.endpoint);
+      if (!pinned) {
+        await dropSubscription(subscription.id);
+        throw new Error("Web Push endpoint is not a public HTTPS host");
+      }
       try {
-        await webpush.sendNotification(
+        await webPushRuntime.sendNotification(
           {
             endpoint: subscription.endpoint,
             keys: { p256dh: subscription.p256dh, auth: subscription.auth },
           },
           body,
-          { TTL: DEFAULT_PUSH_TTL_SECONDS },
+          {
+            TTL: DEFAULT_PUSH_TTL_SECONDS,
+            agent: new HttpsAgent({ lookup: createAppWebhookPinnedLookup(pinned) as never }),
+          },
         );
       } catch (err: unknown) {
         const statusCode = (err as { statusCode?: number }).statusCode;
         if (statusCode === 404 || statusCode === 410) {
-          await db.delete(pushSubscriptions).where(eq(pushSubscriptions.id, subscription.id)).catch(() => {});
+          await dropSubscription(subscription.id);
         }
         throw err;
       }
@@ -1235,10 +1700,15 @@ export async function sendPushToUsers(userIds: string[], payload: PushPayload) {
 }
 
 export async function sendPushNotifications(targets: Array<{ userId: string; payload: PushPayload }>) {
-  if (!pushEnabled || targets.length === 0) return;
+  if (!webPushRuntime.enabled || targets.length === 0) return;
+
+  // Users who are on Raft Desktop right now get the message there; a browser
+  // notification on top would be a duplicate (task #725).
+  const onDesktop = await usersWithRecentDesktopAttention([...new Set(targets.map((target) => target.userId))]);
 
   const byPayload = new Map<string, { payload: PushPayload; userIds: string[] }>();
   for (const target of targets) {
+    if (onDesktop.has(target.userId)) continue;
     const key = JSON.stringify(target.payload);
     const bucket = byPayload.get(key);
     if (bucket) {

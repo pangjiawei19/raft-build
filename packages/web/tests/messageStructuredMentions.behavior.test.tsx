@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 import { TestIntlProvider } from "./helpers/intl";
@@ -32,6 +31,7 @@ Object.defineProperty(globalThis, "localStorage", {
 
 const { mentionStillAppears } = await import("../src/components/message/MessageInput");
 const { default: MessageItem } = await import("../src/components/message/MessageItem");
+type MentionEntry = import("../src/components/message/MessageItem").MentionEntry;
 const { useAgentStore } = await import("../src/store/agentStore");
 const { useAuthStore } = await import("../src/store/authStore");
 const { useChannelStore } = await import("../src/store/channelStore");
@@ -136,13 +136,13 @@ function resetStores() {
   Object.assign(useChannelStore.getInitialState(), channelState);
 }
 
-function renderMessage(message: Message) {
+function renderMessage(message: Message, mentionMap: Map<string, MentionEntry> = new Map()) {
   return renderToStaticMarkup(
     <MemoryRouter>
       <TestIntlProvider>
         <MessageItem
           message={message}
-          mentionMap={new Map()}
+          mentionMap={mentionMap}
           channels={[]}
           hideThreadActions
         />
@@ -186,6 +186,14 @@ test("composer retains identity-backed mentions after left-boundary edits", () =
   );
   assert.equal(
     mentionStillAppears("先给个草案@Mona继续", { type: "agent", id: "agent-mona", name: "Mona" }),
+    true,
+  );
+  assert.equal(
+    mentionStillAppears("@Mona와 같이", { type: "agent", id: "agent-mona", name: "Mona" }),
+    true,
+  );
+  assert.equal(
+    mentionStillAppears("@Monica", { type: "agent", id: "agent-mona", name: "Mona" }),
     false,
   );
 });
@@ -211,8 +219,54 @@ test("structured mention facts show the send-time name without fallback lookup",
   }));
   assert.match(embedded, /先给个草案[\s\S]*?<a\b(?=[^>]*href="#")[^>]*>@baoyu<\/a>/);
 
+  const cjkSuffix = renderMessage(makeMessage({
+    content: "@baoyu的方案",
+    mentions: [{ type: "agent", id: "agent-lower", name: "baoyu" }],
+  }));
+  assert.match(cjkSuffix, /<a\b(?=[^>]*href="#")[^>]*>@baoyu<\/a>(?:<\/span>)?的方案/);
+
+  const latinSuffix = renderMessage(makeMessage({
+    content: "@baoyuteam",
+    mentions: [{ type: "agent", id: "agent-lower", name: "baoyu" }],
+  }));
+  assert.doesNotMatch(latinSuffix, /<a\b(?=[^>]*href="#")[^>]*>@baoyu<\/a>/);
+
   const plain = renderMessage(makeMessage({ content: "先给个草案@baoyu" }));
   assert.doesNotMatch(plain, /<a\b(?=[^>]*href="#")[^>]*>@baoyu<\/a>/);
+});
+
+test("external messages highlight only server-minted mention facts", () => {
+  resetStores();
+  const members = new Map<string, MentionEntry>([
+    ["owner", { displayName: "owner", type: "user", id: "user-owner" }],
+  ]);
+  const html = renderMessage(makeMessage({
+    senderType: "external_projection",
+    content: "@peng please check with @owner",
+    mentions: [{ type: "agent", id: "agent-peng", name: "peng" }],
+  }), members);
+  assert.match(html, /<a\b(?=[^>]*href="#")[^>]*>@peng<\/a>/);
+  assert.doesNotMatch(html, /<a\b(?=[^>]*href="#")[^>]*>@owner<\/a>/, "free text keeps no authority");
+});
+
+test("free-text mentions keep a glued CJK suffix and never split Latin text", () => {
+  resetStores();
+  const members = new Map<string, MentionEntry>([
+    ["ops", { displayName: "ops", type: "user", id: "user-ops" }],
+  ]);
+
+  for (const suffix of ["的方案", "와", "さん"]) {
+    const html = renderMessage(makeMessage({ content: `@ops${suffix}` }), members);
+    assert.match(
+      html,
+      new RegExp(`<a\\b(?=[^>]*href="#")[^>]*>@ops<\\/a>(?:<\\/span>)?${suffix}`),
+      `@ops${suffix} links ops and keeps ${suffix}`,
+    );
+  }
+
+  const latin = renderMessage(makeMessage({ content: "@opsteam" }), members);
+  assert.doesNotMatch(latin, /<a\b(?=[^>]*href="#")[^>]*>@ops/);
+  assert.match(latin, /@opsteam/);
 });
 
 test("Computer and App refs render as typed chips without becoming mentions", () => {
@@ -223,9 +277,15 @@ test("Computer and App refs render as typed chips without becoming mentions", ()
   }));
 
   assert.match(html, /data-testid="computer-reference-550e8400-e29b-41d4-a716-446655440000"/);
-  assert.match(html, /bg-brutal-cyan/);
+  // The Computer ref is a raft-ui MessageReferenceChip (link variant): a
+  // typed chip on the info-soft fill, not a mention link.
+  assert.match(
+    html,
+    /<a\b(?=[^>]*data-testid="computer-reference-550e8400-e29b-41d4-a716-446655440000")(?=[^>]*data-slot="message-reference")(?=[^>]*class="[^"]*(?<=["\s])bg-info-soft(?=["\s]))[^>]*>@Desk<\/a>/,
+  );
   assert.match(html, /data-testid="app-reference-system.reminder"/);
-  assert.match(html, />@system\.reminder<\/span>/);
+  assert.match(html, /@system\.reminder/);
+  assert.match(html, /data-base-ui-tooltip-trigger/);
   assert.doesNotMatch(html, /data-mention=/);
 });
 

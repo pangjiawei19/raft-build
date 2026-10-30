@@ -1,11 +1,10 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
-import { closeTestDatabase } from "../test/integration/database.js";
-import { afterEach } from "vitest";
+import { dbTest as test } from "../test/integration/dbTest";
+import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { eq } from "drizzle-orm";
 
 import { asServerId } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   agents,
   channelAgents,
@@ -18,10 +17,11 @@ import {
   serverMembers,
   servers,
   users,
-} from "../db/schema.js";
-import { prepareActionCard } from "./actionCardsService.js";
-import { broadcastAndDeliver, broadcastSystemMessage, recordInboxFactsForPersistedMessages } from "./messageService.js";
-import * as taskService from "./taskService.js";
+} from "../db/schema";
+import { prepareActionCard } from "./actionCardsService";
+import { broadcastAndDeliver, broadcastSystemMessage, recordInboxFactsForPersistedMessages } from "./messageService";
+import * as taskService from "./taskService";
+import { withChannelDelivery } from "../test/orchestratorStub";
 
 
 afterEach(async () => {
@@ -102,7 +102,7 @@ test("persisted message boundary emits inbox facts for every countable message c
 
   const { owner, member, server, agent, channel } = await seedSurface();
   const io = createIoStub();
-  const agentOrchestrator = { deliverMessage: async () => undefined } as any;
+  const agentOrchestrator = withChannelDelivery({ deliverMessage: async () => undefined }) as any;
 
   const regular = await broadcastAndDeliver(io, agentOrchestrator, {
     channelId: channel.id,

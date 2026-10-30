@@ -1,5 +1,5 @@
-import type { ParsedEvent } from "./types.js";
-import type { JsonRpcMessage } from "./codexEventNormalizer.js";
+import type { ParsedEvent } from "./types";
+import type { JsonRpcMessage } from "./codexEventNormalizer";
 
 type TelemetryAttrs = Extract<ParsedEvent, { kind: "telemetry" }>["attrs"];
 
@@ -29,6 +29,8 @@ function parseTokenUsageTelemetry(message: JsonRpcMessage): ParsedEvent | null {
   const cachedInputTokens = finiteNumber(total.cachedInputTokens);
   const totalTokens = finiteNumber(total.totalTokens);
   const modelContextWindow = finiteNumber(usage.modelContextWindow);
+  // The model call this update reports; lets a turn find the totals it started from.
+  const last = usage.last && typeof usage.last === "object" ? usage.last : undefined;
 
   const attrs = withDefined({
     totalTokens,
@@ -36,6 +38,9 @@ function parseTokenUsageTelemetry(message: JsonRpcMessage): ParsedEvent | null {
     cachedInputTokens,
     outputTokens: finiteNumber(total.outputTokens),
     reasoningOutputTokens: finiteNumber(total.reasoningOutputTokens),
+    lastInputTokens: finiteNumber(last?.inputTokens),
+    lastCachedInputTokens: finiteNumber(last?.cachedInputTokens),
+    lastOutputTokens: finiteNumber(last?.outputTokens),
     modelContextWindow,
     cachedInputRatio: ratio(cachedInputTokens, inputTokens),
     contextUtilization: ratio(totalTokens, modelContextWindow),

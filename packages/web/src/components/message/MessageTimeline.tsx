@@ -256,7 +256,7 @@ const SENTINEL_ROOT_MARGIN_PX = 200;
 const SENTINEL_ROOT_MARGIN = `${SENTINEL_ROOT_MARGIN_PX}px`;
 const PROGRAMMATIC_SCROLL_MAX_FRAMES = 60;
 const ANCHOR_PRESERVE_LAYOUT_CHANGE_MS = 1200;
-// How long after a user scroll gesture (wheel/touch/pointer) the resulting
+// How long after a user scroll gesture (wheel/touch/pointer/keyboard) the resulting
 // inertial/momentum `scroll` events are still attributed to that gesture.
 // Covers iOS Safari fling deceleration, which emits scroll events with no
 // further gesture events for a few hundred ms after touchend. Refreshed on
@@ -309,7 +309,7 @@ const MessageTimeline = forwardRef<MessageTimelineHandle, MessageTimelineProps>(
     // when it is armed so momentum from the gesture that selected the search
     // result cannot release the sentinel barrier after the context commit.
     const userScrollGestureGenerationRef = useRef(0);
-    // Timestamp of the most recent user gesture (wheel/touch/pointer) that
+    // Timestamp of the most recent user gesture (wheel/touch/pointer/keyboard) that
     // started a scroll. Safari/WKWebView can keep emitting inertial `scroll`
     // events after the gesture ends, with no fresh gesture event. Retaining
     // the gesture attribution lets momentum settling at the bottom re-arm
@@ -644,8 +644,7 @@ const MessageTimeline = forwardRef<MessageTimelineHandle, MessageTimelineProps>(
       prevScrollHeightRef.current = scroller.scrollHeight;
       atBottomStateRef.current = true;
       setAtBottomState(true);
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [messages, initialFocusMessageId, persistKey]);
+      }, [messages, initialFocusMessageId, persistKey, beginProgrammaticScroll]);
 
     // ── Data mutation classifier (append vs prepend vs context-jump) ──────
     useLayoutEffect(() => {
@@ -834,7 +833,25 @@ const MessageTimeline = forwardRef<MessageTimelineHandle, MessageTimelineProps>(
               userScrollGestureGenerationRef.current
               > sentinelAutoLoadBlockGestureGenerationRef.current
             ) {
+              const wasBlocked = sentinelAutoLoadBlockedRef.current;
               sentinelAutoLoadBlockedRef.current = false;
+              if (wasBlocked) {
+                // IO may have delivered the newly visible sentinel before
+                // this rAF released the barrier. It will not repeat an
+                // unchanged intersection, so consume the current geometry.
+                const bounds = scroller.getBoundingClientRect();
+                const isVisible = (node: HTMLElement | null) => {
+                  if (!node) return false;
+                  const rect = node.getBoundingClientRect();
+                  return rect.bottom >= bounds.top - SENTINEL_ROOT_MARGIN_PX
+                    && rect.top <= bounds.bottom + SENTINEL_ROOT_MARGIN_PX;
+                };
+                if (isVisible(topSentinelRef.current)) requestOlderFromSentinel();
+                const current = sourceRef.current;
+                if (isVisible(bottomSentinelRef.current) && current.hasNewer && !current.loading) {
+                  void current.loadNewer();
+                }
+              }
             }
             // The follow flag is the user's intent; only user-driven
             // scrolls are allowed to flip it.
@@ -852,10 +869,26 @@ const MessageTimeline = forwardRef<MessageTimelineHandle, MessageTimelineProps>(
           }
         });
       };
-      const markUserScrollIntent = () => {
+      const markUserScrollIntent = (event: Event) => {
+        // Pointerdown bubbles from every message control. Those descendant
+        // presses are actions inside the timeline (for example, the inline
+        // reply button that synchronously captures a pre-thread-layout
+        // anchor), not evidence that the user is taking over scrolling.
+        // A native scrollbar/track press targets the scroller itself, so it
+        // remains an explicit scroll owner; wheel and touch keep their normal
+        // bubbling semantics.
+        if (event.type === "pointerdown" && event.target !== scroller) return;
+        if (event.type === "keydown") {
+          const key = event as KeyboardEvent;
+          // Only native navigation of the focused scroll container owns the
+          // viewport. Editing/activating descendants must not lift a barrier.
+          if (event.target !== scroller || key.defaultPrevented || key.altKey || key.ctrlKey || key.metaKey) return;
+          if (!["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(key.key)) return;
+        }
         userScrollGestureGenerationRef.current += 1;
         userScrollIntentRef.current = true;
       };
+      scroller.addEventListener("keydown", markUserScrollIntent);
       scroller.addEventListener("wheel", markUserScrollIntent, { passive: true });
       scroller.addEventListener("touchstart", markUserScrollIntent, { passive: true });
       // Refresh attribution during a slow drag that outlives the window.
@@ -863,13 +896,14 @@ const MessageTimeline = forwardRef<MessageTimelineHandle, MessageTimelineProps>(
       scroller.addEventListener("pointerdown", markUserScrollIntent, { passive: true });
       scroller.addEventListener("scroll", onScroll, { passive: true });
       return () => {
+        scroller.removeEventListener("keydown", markUserScrollIntent);
         scroller.removeEventListener("wheel", markUserScrollIntent);
         scroller.removeEventListener("touchstart", markUserScrollIntent);
         scroller.removeEventListener("touchmove", markUserScrollIntent);
         scroller.removeEventListener("pointerdown", markUserScrollIntent);
         scroller.removeEventListener("scroll", onScroll);
       };
-    }, [reportVisibleMessageWindow]);
+    }, [reportVisibleMessageWindow, requestOlderFromSentinel]);
 
     useLayoutEffect(() => {
       if (messages.length === 0) {

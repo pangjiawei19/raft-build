@@ -5,8 +5,8 @@ import argon2 from "argon2";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
 import pg from "pg";
-import { channelHumans, channels, machines, serverMembers, servers, users } from "../src/db/schema.js";
-import { devSeedOnboardingValues } from "./devSeedOnboarding.js";
+import { channelHumans, channels, machines, serverMembers, servers, users } from "../src/db/schema";
+import { devSeedOnboardingValues } from "./devSeedOnboarding";
 
 async function main(): Promise<void> {
   const output = process.argv[process.argv.indexOf("--output") + 1];

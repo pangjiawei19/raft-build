@@ -18,12 +18,17 @@ assert(pkg.types === "./dist/index.d.ts", "types must select the bundled declara
 assert(pkg.exports?.["."]?.import === "./dist/esm/index.js", "exports.import must select ESM");
 assert(pkg.exports?.["."]?.require === "./dist/cjs/index.cjs", "exports.require must select CJS");
 assert(pkg.exports?.["."]?.types === "./dist/index.d.ts", "exports.types must select declarations");
+assert(pkg.exports?.["./agent"]?.import === "./dist/esm/agent.js", "exports ./agent import must select ESM");
+assert(pkg.exports?.["./agent"]?.require === "./dist/cjs/agent.cjs", "exports ./agent require must select CJS");
+assert(pkg.exports?.["./agent"]?.types === "./dist/agent.d.ts", "exports ./agent types must select declarations");
 assert(Array.isArray(pkg.files) && pkg.files.includes("dist"), "published package must include dist/");
+assert(pkg.files.includes("operations.json"), "published package must include operations.json");
+assert(pkg.exports?.["./operations.json"] === "./operations.json", "exports must expose ./operations.json");
 assert(!pkg.dependencies?.["@botiverse/raft-shared"], "published SDK must not depend on unpublished shared");
 assert(
   pkg.devDependencies?.["@botiverse/raft-shared"] === "workspace:*",
   "@botiverse/raft-shared must remain a workspace-only bundled build input",
 );
-assert(pkg.devDependencies?.["@rslib/core"], "Rslib must remain an explicit build dependency");
+assert(pkg.devDependencies?.["tsdown"], "tsdown must remain an explicit build dependency");
 
 console.log("@botiverse/raft-sdk publish metadata is valid.");

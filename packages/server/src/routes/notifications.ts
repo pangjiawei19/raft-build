@@ -2,7 +2,8 @@ import { Router, type Response, type Router as RouterType } from "express";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { clearClockInterval, currentTimeMs, setClockInterval } from "@botiverse/raft-shared";
 
-import { requireAuth, requireVerified } from "../middleware/auth.js";
+import { requireAuth, requireVerified } from "../middleware/auth";
+import { sharedSseStreamRegistry } from "../services/sseStreamRegistry";
 import {
   NativeNotificationError,
   authenticateNativeCredential,
@@ -16,7 +17,8 @@ import {
   revokeCurrentNativeCredential,
   revokeNativeNotificationDevice,
   rotateNativeCredential,
-} from "../services/nativeNotificationService.js";
+} from "../services/nativeNotificationService";
+import { clientIpForRateLimit } from "../lib/clientIpForRateLimit";
 
 export const notificationRouter: RouterType = Router();
 
@@ -34,7 +36,7 @@ const enrollmentGrantLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: () => process.env.NODE_ENV === "test",
-  keyGenerator: (req) => ipKeyGenerator(req.ip ?? "unknown"),
+  keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
   message: { error: "Too many native notification enrollment attempts", code: "native_notification_rate_limited" },
 });
 
@@ -44,7 +46,7 @@ const enrollmentExchangeLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   skip: () => process.env.NODE_ENV === "test",
-  keyGenerator: (req) => ipKeyGenerator(req.ip ?? "unknown"),
+  keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
   message: { error: "Too many native notification exchange attempts", code: "native_notification_rate_limited" },
 });
 
@@ -184,6 +186,7 @@ notificationRouter.get("/stream", async (req, res) => {
       "x-accel-buffering": "no",
     });
     res.flushHeaders();
+    sharedSseStreamRegistry.register(res);
 
     let cursorSeq = prepared.cursorSeq;
     let closed = false;
@@ -200,6 +203,7 @@ notificationRouter.get("/stream", async (req, res) => {
     const close = () => {
       if (closed) return;
       closed = true;
+      sharedSseStreamRegistry.unregister(res);
       if (timer) clearClockInterval(timer);
       if (!res.writableEnded) res.end();
     };

@@ -1,9 +1,24 @@
+import {
+  Input,
+  Button,
+  Select,
+  SelectContent,
+  SelectIcon,
+  SelectItem,
+  SelectItemIndicator,
+  SelectItemText,
+  SelectList,
+  SelectTrigger,
+  SelectValue,
+  Textarea,
+  ListRowGroup,
+} from "@botiverse/raft-ui";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import type { MessageId } from "../../i18n/messages/en";
-import { Blocks, Check, ChevronDown, ChevronUp, FlaskConical, Info, Link2, Pencil, Plus, Trash2, Unplug } from "lucide-react";
+import { Blocks, Check, FlaskConical, Plus, Trash2 } from "lucide-react";
 import {
   MANAGED_MCP_OAUTH_RESULT_CHANNEL,
 } from "@botiverse/raft-shared";
@@ -14,29 +29,14 @@ import type {
   ManagedMcpRecommendation,
   ManagedMcpServerView,
 } from "@botiverse/raft-shared";
-import {
-  Select,
-  SelectContent,
-  SelectIcon,
-  SelectItem,
-  SelectItemIndicator,
-  SelectItemText,
-  SelectList,
-  SelectTrigger,
-  SelectValue,
-} from "raft-ui";
 import api from "../../api/client";
 import ConfirmDialog from "../ConfirmDialog";
 import Banner from "../ui/Banner";
-import Button from "../ui/Button";
 import DialogCard from "../ui/DialogCard";
 import EmptyState from "../ui/EmptyState";
 import FormField from "../ui/FormField";
-import { KeyValueAddButton, KeyValueInputRow } from "../ui/KeyValueInput";
+import { KeyValueAddButton } from "../ui/KeyValueInput";
 import SectionHeader from "../ui/SectionHeader";
-import SurfaceListItem from "../ui/SurfaceListItem";
-import Textarea from "../ui/Textarea";
-import Tooltip from "../ui/Tooltip";
 import {
   buildManagedMcpCredentialPatch,
   managedMcpHeadersForCreate,
@@ -45,10 +45,12 @@ import {
 import type {
   ManagedMcpHeaderDraft,
 } from "./managedMcpCredentials";
-import { normalizeManagedMcpToolDescription } from "./managedMcpToolDescription";
+import { McpServerListItem } from "./McpServerListItem";
+import { McpRecommendationItem } from "./McpRecommendationItem";
+import { McpHeaderRow } from "./McpHeaderRow";
 
 type ConnectionTestResult = { status: "testing" } | { status: "success"; toolCount: number } | { status: "error"; message: string };
-type ServerDraft = {
+export type ServerDraft = {
   id: string | null;
   name: string;
   description: string;
@@ -174,13 +176,13 @@ export function AgentMcpTab({
     };
   }, [load]);
 
-  const beginAdd = () => {
+  const beginAdd = useCallback(() => {
     setDraft({ ...EMPTY_DRAFT });
     setConnectionTest(null);
     setEditorError(null);
-  };
+  }, []);
 
-  const beginRecommendation = (recommendation: ManagedMcpRecommendation) => {
+  const beginRecommendation = useCallback((recommendation: ManagedMcpRecommendation) => {
     const firstId = headerSequence + 1;
     setDraft({
       ...EMPTY_DRAFT,
@@ -197,9 +199,9 @@ export function AgentMcpTab({
     setConnectionTest(null);
     setEditorError(null);
     setHeaderSequence((value) => value + recommendation.credentialHeaderNames.length);
-  };
+  }, [headerSequence]);
 
-  const beginEdit = (server: ManagedMcpServerView) => {
+  const beginEdit = useCallback((server: ManagedMcpServerView) => {
     const firstId = headerSequence + 1;
     setDraft({
       id: server.id,
@@ -216,19 +218,20 @@ export function AgentMcpTab({
     setConnectionTest(null);
     setEditorError(null);
     setHeaderSequence((value) => value + server.credentialHeaderNames.length);
-  };
+  }, [headerSequence]);
 
-  const updateDraft = (next: ServerDraft) => {
+  const updateDraft = useCallback((next: ServerDraft) => {
     setDraft(next);
     setConnectionTest(null);
     setEditorError(null);
-  };
+  }, []);
 
-  const closeEditor = () => {
+
+  const closeEditor = useCallback(() => {
     setDraft(null);
     setConnectionTest(null);
     setEditorError(null);
-  };
+  }, []);
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
@@ -263,7 +266,7 @@ export function AgentMcpTab({
     }
   };
 
-  const mutate = async (id: string, operation: () => Promise<unknown>) => {
+  const mutate = useCallback(async (id: string, operation: () => Promise<unknown>) => {
     setBusyId(id);
     setError(null);
     try {
@@ -274,9 +277,9 @@ export function AgentMcpTab({
     } finally {
       setBusyId(null);
     }
-  };
+  }, [load, formatMessage]);
 
-  const connectOAuth = async (server: ManagedMcpServerView) => {
+  const connectOAuth = useCallback(async (server: ManagedMcpServerView) => {
     const popup = window.open("about:blank", "_blank");
     if (popup) popup.opener = null;
     setBusyId(server.id);
@@ -294,13 +297,13 @@ export function AgentMcpTab({
     } finally {
       setBusyId(null);
     }
-  };
+  }, [formatMessage]);
 
-  const disconnectOAuth = async (server: ManagedMcpServerView) => {
+  const disconnectOAuth = useCallback(async (server: ManagedMcpServerView) => {
     await mutate(server.id, () => api.delete(`/mcp/servers/${server.id}/oauth`));
-  };
+  }, [mutate]);
 
-  const testDraftConnection = async () => {
+  const testDraftConnection = useCallback(async () => {
     if (!draft) return;
     setConnectionTest({ status: "testing" });
     try {
@@ -318,9 +321,9 @@ export function AgentMcpTab({
     } catch (testError) {
       setConnectionTest({ status: "error", message: messageFor(testError, formatMessage({ id: "agent.mcp.errorRequestFailed" })) });
     }
-  };
+  }, [draft, formatMessage]);
 
-  const deleteServer = async (server: ManagedMcpServerView) => {
+  const deleteServer = useCallback(async (server: ManagedMcpServerView) => {
     setBusyId(server.id);
     setError(null);
     try {
@@ -329,7 +332,75 @@ export function AgentMcpTab({
     } finally {
       setBusyId(null);
     }
-  };
+  }, [load]);
+
+  const handleProviderChange = useCallback((value: unknown) => {
+    if (value == null || !draft) return;
+    const provider = value as ManagedMcpProvider;
+    updateDraft({
+      ...draft,
+      provider,
+      authMode: provider === "custom" ? "none" : "oauth",
+      endpointUrl: provider === "notion"
+        ? "https://mcp.notion.com/mcp"
+        : provider === "linear"
+          ? "https://mcp.linear.app/mcp"
+          : "",
+      headers: [],
+      persistedHeaderNames: [],
+    });
+  }, [draft, updateDraft]);
+
+  const handleAuthModeChange = useCallback((value: unknown) => {
+    if (value == null || !draft) return;
+    const authMode = value as ManagedMcpAuthMode;
+    const firstId = headerSequence + 1;
+    updateDraft({
+      ...draft,
+      authMode,
+      headers: authMode === "headers"
+        ? draft.persistedHeaderNames.map((name, index) => ({
+            id: firstId + index, name, value: "", persistedName: name,
+          }))
+        : [],
+    });
+    if (authMode === "headers") {
+      setHeaderSequence((value) => value + draft.persistedHeaderNames.length);
+    }
+  }, [draft, headerSequence, updateDraft]);
+
+  const handleDraftNameChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    if (draft) updateDraft({ ...draft, name: event.target.value });
+  }, [draft, updateDraft]);
+
+  const handleDraftEndpointChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    if (draft) updateDraft({ ...draft, endpointUrl: event.target.value });
+  }, [draft, updateDraft]);
+
+  const handleDraftDescriptionChange = useCallback((event: React.ChangeEvent<HTMLTextAreaElement>) => {
+    if (draft) updateDraft({ ...draft, description: event.target.value });
+  }, [draft, updateDraft]);
+
+  const handleAddHeader = useCallback(() => {
+    if (!draft) return;
+    const id = headerSequence + 1;
+    setHeaderSequence(id);
+    updateDraft({ ...draft, headers: [...draft.headers, { id, name: "", value: "", persistedName: null }] });
+  }, [draft, headerSequence, updateDraft]);
+
+  const handleTestConnectionClick = useCallback(() => {
+    void testDraftConnection();
+  }, [testDraftConnection]);
+
+  // Return the promise: ConfirmDialog awaits it for its loading state and
+  // surfaces a rejected delete as the dialog error.
+  const handleDeleteConfirm = useCallback(async () => {
+    if (deleteTarget) await deleteServer(deleteTarget);
+  }, [deleteServer, deleteTarget]);
+
+  const handleDeleteClose = useCallback(() => {
+    setDeleteTarget(null);
+  }, []);
 
   const draftHeadersIncomplete = draft?.authMode === "headers" ? managedMcpHeadersIncomplete(draft.headers) : false;
   const visibleServers = scope === "agent"
@@ -337,9 +408,9 @@ export function AgentMcpTab({
     : catalog?.servers ?? [];
 
   return (
-    <div className={scope === "server" ? "" : "flex-1 overflow-y-auto bg-white px-5 py-4"}>
+    <div className={scope === "server" ? "" : "flex-1 overflow-y-auto bg-layer-canvas px-5 py-4 text-foreground"}>
       <div className="space-y-6">
-        {error && <Banner intent="warning" density="sm" className="font-bold">{error}</Banner>}
+        {error && <Banner intent="warning" density="sm">{error}</Banner>}
 
         <section className="space-y-3">
           <div>
@@ -350,15 +421,15 @@ export function AgentMcpTab({
               count={visibleServers.length}
               action={
                 scope === "server" && canManageServer ? (
-                  <Button shape="iconText" onClick={beginAdd}>
-                    <Plus size={13} /> {formatMessage({ id: "agent.mcp.addServer" })}
+                  <Button variant="outline" size="sm" onClick={beginAdd}>
+                    <Plus size={16} /> {formatMessage({ id: "agent.mcp.addServer" })}
                   </Button>
                 ) : loading ? (
-                  <span className="text-xs font-bold text-black/50">{formatMessage({ id: "common.loading" })}</span>
+                  <span className="text-caption text-foreground-hint">{formatMessage({ id: "common.loading" })}</span>
                 ) : null
               }
             />
-            <p className="mt-1 text-xs text-black/60">
+            <p className="mt-1 text-callout text-foreground-muted">
               {scope === "server"
                 ? formatMessage({ id: "agent.mcp.serverDescription" })
                 : formatMessage({ id: "agent.mcpUsage.description" })}
@@ -366,178 +437,30 @@ export function AgentMcpTab({
           </div>
 
           {loading ? (
-            <div className="font-mono text-xs text-black/40">{formatMessage({ id: "agent.mcp.loadingServers" })}</div>
+            <div className="text-callout text-foreground-hint">{formatMessage({ id: "agent.mcp.loadingServers" })}</div>
           ) : visibleServers.length > 0 ? (
-            <div className="space-y-3">
-              {visibleServers.map((server) => {
-                const toolsOpen = expandedTools.has(server.id);
-                const connectionReady = server.authMode !== "oauth" || server.oauthStatus === "connected";
-                return (
-                  <SurfaceListItem key={server.id} interactive={false}>
-                    <div className="flex items-start gap-3">
-                      <div className="flex min-w-0 flex-1 items-start gap-3">
-                        <div className="min-w-0 flex-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <h4 className="break-words text-sm font-bold text-black">{server.name}</h4>
-                            {!server.enabled && <span className="border border-black bg-gray-200 px-1.5 py-0.5 text-[10px] font-bold uppercase">{formatMessage({ id: "agent.mcp.disabledBadge" })}</span>}
-                            <span className="border border-black bg-white px-1.5 py-0.5 text-[10px] font-bold uppercase">{server.provider}</span>
-                            {server.authMode === "oauth" ? (
-                              <span className={`border border-black px-1.5 py-0.5 text-[10px] font-bold uppercase ${server.oauthStatus === "connected" ? "bg-brutal-lime" : server.oauthStatus === "error" ? "bg-brutal-red/30" : "bg-brutal-lavender/40"}`}>
-                                {formatMessage({ id: "agent.mcp.oauthStatus" }, { status: server.oauthStatus })}
-                              </span>
-                            ) : server.hasCredentials ? (
-                              <span className="border border-black bg-brutal-lavender/40 px-1.5 py-0.5 text-[10px] font-bold uppercase">{formatMessage({ id: "agent.mcp.credentialsStoredBadge" })}</span>
-                            ) : null}
-                          </div>
-                          {server.description && <p className="mt-1 text-sm text-black/70">{server.description}</p>}
-                          <p className="mt-1 break-all font-mono text-xs text-black/50">{server.endpointUrl}</p>
-                          {scope === "agent" && server.usage && (
-                            <dl className="mt-3 grid gap-2 text-xs text-black/65 sm:grid-cols-3">
-                              <div>
-                                <dt className="font-bold text-black">
-                                  {formatMessage({ id: "agent.mcpUsage.callsLabel" })}
-                                </dt>
-                                <dd>
-                                  {formatMessage(
-                                    { id: "agent.mcpUsage.callCount" },
-                                    { count: server.usage.invocationCount },
-                                  )}
-                                </dd>
-                              </div>
-                              <div>
-                                <dt className="font-bold text-black">
-                                  {formatMessage({ id: "agent.mcpUsage.lastUsedLabel" })}
-                                </dt>
-                                <dd>
-                                  {formatDate(new Date(server.usage.lastInvokedAt), {
-                                    year: "numeric",
-                                    month: "short",
-                                    day: "numeric",
-                                  })}{" "}
-                                  {formatTime(new Date(server.usage.lastInvokedAt), {
-                                    hour: "2-digit",
-                                    minute: "2-digit",
-                                  })}
-                                </dd>
-                              </div>
-                              <div>
-                                <dt className="font-bold text-black">
-                                  {formatMessage({ id: "agent.mcpUsage.lastToolLabel" })}
-                                </dt>
-                                <dd className="break-all font-mono">{server.usage.lastToolName}</dd>
-                              </div>
-                            </dl>
-                          )}
-                          {server.lastCheckError && (
-                            <Banner intent="warning" density="sm" className="mt-3 font-bold">{server.lastCheckError}</Banner>
-                          )}
-                        </div>
-                      </div>
-                      {scope === "server" && canManageServer && (
-                        <div className="flex shrink-0 items-center gap-1">
-                          {server.authMode === "oauth" && server.oauthStatus !== "connected" && (
-                            <Tooltip content={formatMessage({ id: "agent.mcp.connectName" }, { name: server.name })}>
-                              <Button
-                                shape="icon"
-                                tone="lime"
-                                aria-label={formatMessage({ id: "agent.mcp.connectName" }, { name: server.name })}
-                                disabled={busyId === server.id}
-                                onClick={() => void connectOAuth(server)}
-                              >
-                                <Link2 size={14} />
-                              </Button>
-                            </Tooltip>
-                          )}
-                          {server.authMode === "oauth" && server.oauthStatus === "connected" && (
-                            <Tooltip content={formatMessage({ id: "agent.mcp.disconnectName" }, { name: server.name })}>
-                              <Button
-                                shape="icon"
-                                aria-label={formatMessage({ id: "agent.mcp.disconnectName" }, { name: server.name })}
-                                disabled={busyId === server.id}
-                                onClick={() => void disconnectOAuth(server)}
-                              >
-                                <Unplug size={14} />
-                              </Button>
-                            </Tooltip>
-                          )}
-                          <Tooltip content={formatMessage({ id: "agent.mcp.testRefreshTools" })}>
-                            <Button
-                              shape="icon"
-                              aria-label={formatMessage({ id: "agent.mcp.testName" }, { name: server.name })}
-                              disabled={busyId === server.id || !connectionReady}
-                              onClick={() => void mutate(server.id, () => api.post(`/mcp/servers/${server.id}/test`))}
-                            >
-                              <FlaskConical size={14} />
-                            </Button>
-                          </Tooltip>
-                          <Tooltip content={formatMessage({ id: "agent.mcp.editServer" })}>
-                            <Button shape="icon" aria-label={formatMessage({ id: "agent.mcp.editName" }, { name: server.name })} onClick={() => beginEdit(server)}>
-                              <Pencil size={14} />
-                            </Button>
-                          </Tooltip>
-                          <Tooltip content={formatMessage({ id: "agent.mcp.deleteServer" })}>
-                            <Button shape="icon" tone="red" aria-label={formatMessage({ id: "agent.mcp.deleteName" }, { name: server.name })} onClick={() => setDeleteTarget(server)}>
-                              <Trash2 size={14} />
-                            </Button>
-                          </Tooltip>
-                        </div>
-                      )}
-                    </div>
-
-                    <button
-                      type="button"
-                      className="mt-3 flex items-center gap-1 text-xs font-bold text-black/70 underline hover:text-black"
-                      aria-expanded={toolsOpen}
-                      onClick={() => setExpandedTools((current) => {
-                        const next = new Set(current);
-                        if (toolsOpen) next.delete(server.id); else next.add(server.id);
-                        return next;
-                      })}
-                    >
-                      {toolsOpen ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
-                      {formatMessage({ id: "agent.mcp.toolCount" }, { count: server.toolCatalog.length })}
-                    </button>
-                    {toolsOpen && (
-                      <div className="mt-2 max-h-80 overflow-y-auto border-y border-black/15 bg-black/[0.015]">
-                        <div className="grid grid-cols-1 sm:grid-cols-2">
-                          {server.toolCatalog.map((tool) => {
-                            const label = tool.title || tool.name;
-                            const description = tool.description ? normalizeManagedMcpToolDescription(tool.description) : null;
-                            return (
-                              <div key={tool.name} className="flex min-h-16 items-start gap-2 border-b border-black/10 px-2.5 py-2 sm:even:border-l sm:even:border-black/10">
-                                <span className="min-w-0 flex-1 break-words">
-                                  <span className="flex items-start gap-1">
-                                    <strong className="min-w-0 flex-1 text-sm leading-5 text-black">{label}</strong>
-                                    {description && (
-                                      <Tooltip
-                                        content={<span className="block text-left">{description}</span>}
-                                        contentProps={{
-                                          side: "top",
-                                          align: "end",
-                                          className: "max-h-64 w-80 max-w-[calc(100vw-2rem)] overflow-y-auto border border-black/20 bg-white px-3 py-2 font-normal text-black/70 shadow-sm",
-                                        }}
-                                      >
-                                        <button type="button" className="mt-0.5 shrink-0 text-black/45 hover:text-black" aria-label={formatMessage({ id: "agent.mcp.aboutTool" }, { name: label })}>
-                                          <Info size={13} />
-                                        </button>
-                                      </Tooltip>
-                                    )}
-                                  </span>
-                                  {description && <span className="mt-0.5 line-clamp-2 text-xs leading-4 text-black/55">{description}</span>}
-                                </span>
-                              </div>
-                            );
-                          })}
-                        </div>
-                        {server.toolCatalog.length === 0 && (
-                          <p className="px-2.5 py-3 text-xs text-black/50">{formatMessage({ id: "agent.mcp.testToDiscoverTools" })}</p>
-                        )}
-                      </div>
-                    )}
-                  </SurfaceListItem>
-                );
-              })}
-            </div>
+            /* Raft Design System › ListRow `rf-list--inset`: one card holding the rows, hairlines between them. */
+            <ListRowGroup>
+              {visibleServers.map((server) => (
+                <McpServerListItem
+                  key={server.id}
+                  server={server}
+                  scope={scope}
+                  canManageServer={canManageServer}
+                  busyId={busyId}
+                  expandedTools={expandedTools}
+                  setExpandedTools={setExpandedTools}
+                  connectOAuth={connectOAuth}
+                  disconnectOAuth={disconnectOAuth}
+                  mutate={mutate}
+                  beginEdit={beginEdit}
+                  onDeleteTarget={setDeleteTarget}
+                  formatMessage={formatMessage}
+                  formatDate={formatDate}
+                  formatTime={formatTime}
+                />
+              ))}
+            </ListRowGroup>
           ) : (
             <EmptyState
               icon={<Blocks size={36} />}
@@ -550,8 +473,8 @@ export function AgentMcpTab({
                 ? formatMessage({ id: "agent.mcp.emptyServerDescription" })
                 : formatMessage({ id: "agent.mcpUsage.emptyDescription" })}
               action={scope === "server" && canManageServer ? (
-                <Button shape="iconText" onClick={beginAdd}>
-                  <Plus size={13} /> {formatMessage({ id: "agent.mcp.addServer" })}
+                <Button variant="outline" size="sm" onClick={beginAdd}>
+                  <Plus size={16} /> {formatMessage({ id: "agent.mcp.addServer" })}
                 </Button>
               ) : undefined}
             />
@@ -562,38 +485,26 @@ export function AgentMcpTab({
           <section className="space-y-3">
             <div>
               <SectionHeader label={formatMessage({ id: "agent.mcp.recommendedTitle" })} count={catalog.recommendations.length} />
-              <p className="mt-1 text-xs text-black/60">{formatMessage({ id: "agent.mcp.recommendedDescription" })}</p>
+              <p className="mt-1 text-callout text-foreground-muted">{formatMessage({ id: "agent.mcp.recommendedDescription" })}</p>
             </div>
-            <div className="space-y-3">
-              {catalog.recommendations.map((recommendation) => {
-                const added = catalog.servers.some((server) => server.provider === recommendation.provider);
-                return (
-                  <SurfaceListItem key={recommendation.id} interactive={false}>
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="min-w-0">
-                        <p className="text-sm font-bold text-black">{recommendation.name}</p>
-                        <p className="mt-1 text-sm text-black/60">{recommendation.description}</p>
-                      </div>
-                      <Button
-                        shape="iconText"
-                        disabled={added}
-                        onClick={() => beginRecommendation(recommendation)}
-                      >
-                        {added ? <Check size={13} /> : <Plus size={13} />}
-                        {formatMessage({ id: added ? "agent.mcp.added" : "agent.mcp.add" })}
-                      </Button>
-                    </div>
-                  </SurfaceListItem>
-                );
-              })}
-            </div>
+            <ListRowGroup>
+              {catalog.recommendations.map((recommendation) => (
+                <McpRecommendationItem
+                  key={recommendation.id}
+                  recommendation={recommendation}
+                  added={catalog.servers.some((server) => server.provider === recommendation.provider)}
+                  beginRecommendation={beginRecommendation}
+                  formatMessage={formatMessage}
+                />
+              ))}
+            </ListRowGroup>
           </section>
         )}
       </div>
 
       {scope === "server" && canManageServer && draft && (
         <DialogCard
-          title={draft.id ? draft.name || formatMessage({ id: "agent.mcp.serverFallbackTitle" }) : formatMessage({ id: "agent.mcp.newServerTitle" })}
+          title={draft.id ? formatMessage({ id: "agent.mcp.editTitle" }, { name: draft.name || formatMessage({ id: "agent.mcp.serverFallbackTitle" }) }) : formatMessage({ id: "agent.mcp.newServerTitle" })}
           titleId="mcp-server-form-title"
           onClose={closeEditor}
           maxWidthClass="max-w-2xl"
@@ -603,36 +514,21 @@ export function AgentMcpTab({
             className="space-y-4"
             aria-labelledby="mcp-server-form-title"
           >
-            <p className="text-xs text-black/60">{formatMessage({ id: "agent.mcp.formDescription" })}</p>
+            <p className="text-subhead text-foreground-muted">{formatMessage({ id: "agent.mcp.formDescription" })}</p>
 
             {editorError && (
-              <Banner intent="warning" density="sm" className="font-bold">
+              <Banner intent="warning" density="sm">
                 {editorError}
               </Banner>
             )}
 
             <div className="grid gap-3 sm:grid-cols-2">
-              <FormField label={formatMessage({ id: "agent.mcp.providerLabel" })} labelStyle="plain" size="compact" required>
+              <FormField label={formatMessage({ id: "agent.mcp.providerLabel" })} size="compact" required>
                 <Select
                   value={draft.provider}
                   disabled={draft.id !== null}
                   items={providerSelectOptions}
-                  onValueChange={(value) => {
-                    if (value == null) return;
-                    const provider = value as ManagedMcpProvider;
-                    updateDraft({
-                      ...draft,
-                      provider,
-                      authMode: provider === "custom" ? "none" : "oauth",
-                      endpointUrl: provider === "notion"
-                        ? "https://mcp.notion.com/mcp"
-                        : provider === "linear"
-                          ? "https://mcp.linear.app/mcp"
-                          : "",
-                      headers: [],
-                      persistedHeaderNames: [],
-                    });
-                  }}
+                  onValueChange={handleProviderChange}
                 >
                   <SelectTrigger className="w-full">
                     <SelectValue placeholder={formatMessage({ id: "agent.mcp.providerLabel" })} />
@@ -643,28 +539,12 @@ export function AgentMcpTab({
                   </SelectContent>
                 </Select>
               </FormField>
-              <FormField label={formatMessage({ id: "agent.mcp.authenticationLabel" })} labelStyle="plain" size="compact" required>
+              <FormField label={formatMessage({ id: "agent.mcp.authenticationLabel" })} size="compact" required>
                 <Select
                   value={draft.authMode}
                   disabled={draft.provider !== "custom"}
                   items={authModeSelectOptions}
-                  onValueChange={(value) => {
-                    if (value == null) return;
-                    const authMode = value as ManagedMcpAuthMode;
-                    const firstId = headerSequence + 1;
-                    updateDraft({
-                      ...draft,
-                      authMode,
-                      headers: authMode === "headers"
-                        ? draft.persistedHeaderNames.map((name, index) => ({
-                            id: firstId + index, name, value: "", persistedName: name,
-                          }))
-                        : [],
-                    });
-                    if (authMode === "headers") {
-                      setHeaderSequence((value) => value + draft.persistedHeaderNames.length);
-                    }
-                  }}
+                  onValueChange={handleAuthModeChange}
                 >
                   <SelectTrigger className="w-full">
                     <SelectValue placeholder={formatMessage({ id: "agent.mcp.authenticationLabel" })} />
@@ -675,16 +555,16 @@ export function AgentMcpTab({
                   </SelectContent>
                 </Select>
               </FormField>
-              <FormField label={formatMessage({ id: "agent.mcp.nameLabel" })} labelStyle="plain" size="compact" required>
-                <input required maxLength={120} className="input-brutal w-full text-sm" value={draft.name} onChange={(event) => updateDraft({ ...draft, name: event.target.value })} />
+              <FormField label={formatMessage({ id: "agent.mcp.nameLabel" })} size="compact" required>
+                <Input required maxLength={120} className="w-full" value={draft.name} onChange={handleDraftNameChange} />
               </FormField>
-              <FormField label={formatMessage({ id: "agent.mcp.serverUrlLabel" })} labelStyle="plain" size="compact" required>
-                <input required type="url" disabled={draft.provider !== "custom"} className="input-brutal w-full text-sm disabled:bg-gray-100" value={draft.endpointUrl} onChange={(event) => updateDraft({ ...draft, endpointUrl: event.target.value })} />
+              <FormField label={formatMessage({ id: "agent.mcp.serverUrlLabel" })} size="compact" required>
+                <Input required type="url" disabled={draft.provider !== "custom"} className="w-full" value={draft.endpointUrl} onChange={handleDraftEndpointChange} />
               </FormField>
             </div>
 
-            <FormField label={formatMessage({ id: "agent.mcp.descriptionLabel" })} labelStyle="plain" size="compact" optional>
-              <Textarea rows={2} className="resize-y text-sm" value={draft.description} onChange={(event) => updateDraft({ ...draft, description: event.target.value })} />
+            <FormField label={formatMessage({ id: "agent.mcp.descriptionLabel" })} size="compact" optional>
+              <Textarea rows={2} className="resize-y" value={draft.description} onChange={handleDraftDescriptionChange} />
             </FormField>
 
             {draft.authMode === "oauth" && (
@@ -694,33 +574,14 @@ export function AgentMcpTab({
             )}
 
             {draft.authMode === "headers" && (
-              <FormField label={formatMessage({ id: "agent.mcp.credentialHeadersLabel" })} labelStyle="plain" size="compact" optional>
+              <FormField label={formatMessage({ id: "agent.mcp.credentialHeadersLabel" })} size="compact" optional>
                 <div className="mt-3 space-y-2">
                   {draft.headers.map((header) => (
-                    <KeyValueInputRow
-                      key={header.id}
-                      keyValue={header.name}
-                      value={header.value}
-                      valueType="password"
-                      keyRequired
-                      valueRequired={header.persistedName === null || header.name.trim().toLowerCase() !== header.persistedName.toLowerCase()}
-                      keyPlaceholder={formatMessage({ id: "agent.mcp.authorizationPlaceholder" })}
-                      valuePlaceholder={header.persistedName && header.name.trim().toLowerCase() === header.persistedName.toLowerCase() ? "••••••••" : formatMessage({ id: "agent.mcp.bearerPlaceholder" })}
-                      keyLabel={formatMessage({ id: "agent.mcp.headerNameLabel" })}
-                      valueLabel={formatMessage({ id: "agent.mcp.headerValueLabel" }, { name: header.name || formatMessage({ id: "agent.mcp.credentialHeaderFallback" }) })}
-                      removeLabel={formatMessage({ id: "agent.mcp.removeHeader" })}
-                      onKeyChange={(value) => updateDraft({ ...draft, headers: draft.headers.map((item) => item.id === header.id ? { ...item, name: value } : item) })}
-                      onValueChange={(value) => updateDraft({ ...draft, headers: draft.headers.map((item) => item.id === header.id ? { ...item, value } : item) })}
-                      onRemove={() => updateDraft({ ...draft, headers: draft.headers.filter((item) => item.id !== header.id) })}
-                    />
+                    <McpHeaderRow key={header.id} header={header} draft={draft} updateDraft={updateDraft} formatMessage={formatMessage} />
                   ))}
-                  <KeyValueAddButton label={formatMessage({ id: "agent.mcp.addHeader" })} onClick={() => {
-                    const id = headerSequence + 1;
-                    setHeaderSequence(id);
-                    updateDraft({ ...draft, headers: [...draft.headers, { id, name: "", value: "", persistedName: null }] });
-                  }} />
+                  <KeyValueAddButton label={formatMessage({ id: "agent.mcp.addHeader" })} onClick={handleAddHeader} />
                   {draft.headers.length === 0 && (
-                    <p className="text-xs text-black/50">{formatMessage({ id: "agent.mcp.noCredentialHeaders" })}</p>
+                    <p className="text-caption text-foreground-hint">{formatMessage({ id: "agent.mcp.noCredentialHeaders" })}</p>
                   )}
                 </div>
               </FormField>
@@ -728,12 +589,12 @@ export function AgentMcpTab({
 
             {draft.authMode !== "oauth" && <div className="flex justify-start">
               <Button
-                shape="iconText"
+                variant="outline"
                 size="sm"
                 disabled={connectionTest?.status === "testing" || !draft.endpointUrl.trim() || draftHeadersIncomplete}
-                onClick={() => void testDraftConnection()}
+                onClick={handleTestConnectionClick}
               >
-                <FlaskConical size={13} /> {formatMessage({ id: connectionTest?.status === "testing" ? "agent.mcp.testingConnection" : "agent.mcp.testConnection" })}
+                <FlaskConical size={16} /> {formatMessage({ id: connectionTest?.status === "testing" ? "agent.mcp.testingConnection" : "agent.mcp.testConnection" })}
               </Button>
             </div>}
 
@@ -746,10 +607,10 @@ export function AgentMcpTab({
               <Banner intent="warning" density="sm" withIcon>{connectionTest.message}</Banner>
             )}
 
-            <div className="flex items-center justify-end gap-2 border-t-2 border-black pt-4">
-              <Button size="md" onClick={closeEditor}>{formatMessage({ id: "common.confirm.cancel" })}</Button>
-              <Button type="submit" shape="iconText" tone="lime" size="md" disabled={busyId !== null}>
-                <Check size={14} /> {formatMessage({ id: busyId === (draft.id ?? "new") ? "agent.mcp.saving" : "agent.mcp.save" })}
+            <div className="flex items-center justify-end gap-2 border-t border-line-hairline pt-4">
+              <Button variant="ghost" size="lg" onClick={closeEditor}>{formatMessage({ id: "common.confirm.cancel" })}</Button>
+              <Button type="submit" variant="primary" size="lg" disabled={busyId !== null}>
+                <Check size={16} /> {formatMessage({ id: busyId === (draft.id ?? "new") ? "agent.mcp.saving" : "agent.mcp.save" })}
               </Button>
             </div>
           </form>
@@ -765,9 +626,10 @@ export function AgentMcpTab({
           )}
           confirmLabel={formatMessage({ id: "agent.mcp.deleteConfirmLabel" })}
           loadingLabel={formatMessage({ id: "agent.mcp.deleting" })}
-          confirmIcon={<Trash2 size={14} />}
-          onConfirm={() => deleteServer(deleteTarget)}
-          onClose={() => setDeleteTarget(null)}
+          confirmVariant="danger"
+          confirmIcon={<Trash2 size={16} />}
+          onConfirm={handleDeleteConfirm}
+          onClose={handleDeleteClose}
         />
       )}
     </div>

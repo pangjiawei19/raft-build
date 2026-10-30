@@ -1,15 +1,22 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 import type { ReactNode, MouseEvent } from "react";
 import { createPortal } from "react-dom";
+import { dismissLayerProps } from "./ui/dismissLayer";
 
 /**
  * Reusable modal backdrop with centered content.
  * Backdrop clicks do not close by default to avoid losing in-progress form input.
  * Pass `closeOnBackdrop` to opt specific lightweight modals back in.
- * Use `layer` prop for stacking: layer=0 (default) → z-50, layer=1 → z-[60].
+ * Use `layer` prop for stacking: layer=0 (default) → z-50, layer=1 → z-[60],
+ * layer>=2 → z-[70].
  *
  * Renders via portal to document.body so modals aren't clipped or repositioned
  * by parent containers with CSS transforms (e.g. mobile sidebar drawer).
+ *
+ * Every centred modal dims the page behind it: the Raft Design System scrim
+ * (`rf-scrim`: the backdrop layer, no blur), the same in both modes; there is
+ * no undimmed variant. The card on top is raft-ui's DialogSurface (see
+ * DialogCard). Neither animates: a centred modal is simply there.
  */
 export default function Modal({
   onClose,
@@ -32,7 +39,10 @@ export default function Modal({
   useEffect(() => {
     if (!closeOnEscape) return;
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      // A child that already handled Escape (an open mention/autocomplete
+      // list, a nested picker) marks it with preventDefault; that Escape is
+      // theirs, so the modal must stay open and keep what the user typed.
+      if (e.key === "Escape" && !e.defaultPrevented) onClose();
     };
     // keydown-focus-on-open
     document.addEventListener("keydown", handleKeyDown);
@@ -74,13 +84,18 @@ export default function Modal({
     }
   };
 
-  const zClass = layer >= 1 ? "z-[60]" : "z-50";
+  const zClass = layer >= 2 ? "z-[70]" : layer >= 1 ? "z-[60]" : "z-50";
 
   return createPortal(
     <div
       ref={rootRef}
       tabIndex={-1}
-      className={`fixed inset-0 ${zClass} overflow-y-auto bg-black/60 outline-none`}
+      // Stable marker for hosts that need to know a full-window dismiss layer is
+      // open (the desktop shell turns its native drag region off while one is,
+      // so a click on the title bar can dismiss it — task #121).
+      data-slot="modal-backdrop"
+      {...dismissLayerProps}
+      className={`fixed inset-0 ${zClass} overflow-y-auto bg-layer-backdrop outline-none`}
     >
       <div className="flex min-h-full w-full p-4" onClick={handleBackdropClick}>
         <div className="m-auto flex w-full justify-center" onClick={handleBackdropClick}>

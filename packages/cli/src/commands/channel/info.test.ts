@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
-import type { ApiResponse } from "../../client.js";
-import type { AgentContext } from "../../auth/env.js";
-import { createCommandContext } from "../../core/context.js";
-import { CliError } from "../../core/errors.js";
-import type { CliIo } from "../../core/io.js";
-import { channelInfoCommand } from "./info.js";
+import type { ApiResponse } from "../../client";
+import type { AgentContext } from "../../auth/env";
+import { createCommandContext } from "../../core/context";
+import { CliError } from "../../core/errors";
+import type { CliIo } from "../../core/io";
+import { channelInfoCommand } from "./info";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -147,4 +146,20 @@ test("channel info rejects thread targets before auth bootstrap", async () => {
       return true;
     },
   );
+});
+
+test("channel info takes the target as --target too, as the card's agents tried after a hold", async () => {
+  const { io, stdout } = memoryIo();
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, path: string): Promise<ApiResponse<unknown>> => path.startsWith("/internal/agent-api/channel-members")
+        ? { ok: true, status: 200, error: null, data: { channel: { ref: "#qa-a", type: "public" }, agents: [], humans: [] } }
+        : { ok: true, status: 200, error: null, data: { runtimeContext: { agentId: "agent-1", serverId: "server-1" }, channels: [{ id: "c1", name: "qa-a", joined: true, type: "channel", description: "Product questions" }], agents: [], humans: [] } },
+    }) as any,
+  });
+
+  await channelInfoCommand.handler(ctx, undefined, { target: "#qa-a" });
+  assert.match(stdout.join(""), /Channel: #qa-a/);
 });

@@ -1,52 +1,28 @@
 /**
- * Canonical form-field row — label + control + optional helper / error.
+ * Thin product adapter over RUI Field. It keeps the existing label/help/error
+ * call shape while delegating field semantics and theme styling to RUI.
  *
- * Replaces the inline `<div><label className="mb-1 block text-sm font-bold
- * text-black uppercase tracking-wide">…</label><input className="input-brutal
- * …" /></div>` pattern that appears 30+ times across auth pages, dialogs, and
- * settings panels.
- *
- * Background: stdrc 2026-05-12 #wg-theme:a987f888 asked for the strong-signal
- * primitives to be lifted into one PR. FormField is the highest-leverage of
- * the three (FormField / KeyValueRow / SectionHeader) — every multi-field
- * dialog and every auth page is a stack of these.
- *
- * Slots:
- * - `label`     — the field label text (rendered as `<label>` and tied to
- *                 children via the optional `htmlFor`)
- * - `required`  — true → render the `*` marker in `text-brutal-pink`
- * - `optional`  — true → render the localized optional marker in
- *                 `text-black/40 normal-case`
- *                 (mutually exclusive with `required`)
- * - `hint`      — rendered below the control, `text-xs text-black/50`
- * - `error`     — rendered below the control, `text-xs text-brutal-red`,
- *                 takes precedence over hint
- * - `labelAccessory` — small control or tooltip rendered beside the label
- * - `htmlFor`   — forwarded to the `<label htmlFor>` attribute
- * - `labelStyle`— `"uppercase"` (default, matches dialog convention) or
- *                 `"plain"` (matches auth-page convention — sentence/title case)
- * - `size`      — `"default"` (default, `text-sm` + full-opacity black) or
- *                 `"compact"` (`text-xs` + `text-black/60`). Compact mirrors
- *                 the dense Settings form-row label that uses
- *                 `mb-1 block text-xs font-bold text-black/60`. Use compact
- *                 inside Settings forms to preserve the existing density;
- *                 use default inside dialogs / auth pages.
- * - `className` — additional classes appended to the outer wrapper (e.g.
- *                 `mt-2`)
- *
- * The control itself is `children`. FormField does NOT render the `<input>` /
- * `<textarea>` / `<SegmentedControl>` etc. — pass it explicitly. This keeps
- * FormField agnostic of the control library and avoids prop-explosion.
+ * Raft Design System › TextField: the label sits above the control, always
+ * visible, 13/18 600 ink-2, sentence case (never ALL CAPS); help text below is
+ * 12/16 ink-3; an error turns the control's line and the help line to the
+ * danger ink. raft-ui's raft field recipe draws all of it, including the 6px
+ * label → control → help rhythm (the field's own gap); this adapter only
+ * picks the label step.
  */
 
 import { useContext } from "react";
 import type { LabelHTMLAttributes, ReactNode } from "react";
 import { IntlContext } from "react-intl";
+import {
+  Field,
+  FieldDescription,
+  FieldError,
+  FieldLabel,
+  LabelAsterisk,
+  LabelOptional,
+} from "@botiverse/raft-ui";
 import { en } from "../../i18n/messages/en";
 
-const LABEL_BASE_DEFAULT = "text-sm font-bold text-black";
-const LABEL_BASE_COMPACT = "text-xs font-bold text-black/60";
-const LABEL_UPPERCASE = "uppercase tracking-wide";
 
 export type FormFieldProps = {
   /** Field label text. */
@@ -62,14 +38,12 @@ export type FormFieldProps = {
   error?: ReactNode;
   /** Small control or tooltip rendered beside the label. */
   labelAccessory?: ReactNode;
+  /** Secondary action pushed to the far end of the label row, e.g. the
+   *  sign-in form's "Forgot password?" link. */
+  labelAction?: ReactNode;
   /** `<label htmlFor>` — point at the inner control's `id`. */
   htmlFor?: LabelHTMLAttributes<HTMLLabelElement>["htmlFor"];
-  /** Label case style. `"uppercase"` (default) matches the dialog/settings
-   *  convention. `"plain"` matches the auth-page convention. */
-  labelStyle?: "uppercase" | "plain";
-  /** Label size. `"default"` (default) is `text-sm` + full-opacity black —
-   *  matches dialogs / auth pages. `"compact"` is `text-xs` + `text-black/60`
-   *  — matches the dense Settings form-row labels. */
+  /** Label size. `"compact"` selects the denser settings form treatment. */
   size?: "default" | "compact";
   /** Additional classes appended to the outer `<div>`. */
   className?: string;
@@ -85,8 +59,8 @@ export default function FormField({
   hint,
   error,
   labelAccessory,
+  labelAction,
   htmlFor,
-  labelStyle = "uppercase",
   size = "default",
   className,
   children,
@@ -95,36 +69,40 @@ export default function FormField({
   // without an IntlProvider; keep that path human-readable instead of throwing.
   const intl = useContext(IntlContext);
   const optionalLabel = intl?.formatMessage({ id: "ui.formField.optional" }) ?? en["ui.formField.optional"];
-  const base = size === "compact" ? LABEL_BASE_COMPACT : LABEL_BASE_DEFAULT;
-  const labelTextCls = `${base} ${labelStyle === "uppercase" ? LABEL_UPPERCASE : ""}`.trim();
-  const labelCls = `mb-1 block ${labelTextCls}`;
+  // raft-ui's label step: md = 13/18 600 (the DS field label), sm = 12/16 600
+  // for the denser settings form treatment.
+  const labelSize = size === "compact" ? "sm" : "md";
   const wrapperCls = className ? className : undefined;
+  const hasLabelRow = Boolean(labelAccessory || labelAction);
   const labelElement = (
-    <label
-      className={labelAccessory ? labelTextCls : labelCls}
+    <FieldLabel
+      size={labelSize}
       htmlFor={htmlFor}
     >
       {label}
-      {required ? <span className="ml-1 text-brutal-pink">*</span> : null}
+      {required ? <LabelAsterisk className="ml-1" /> : null}
       {optional ? (
-        <span className="ml-1 font-normal text-black/40 normal-case">{optionalLabel}</span>
+        <LabelOptional className="ml-1">{optionalLabel}</LabelOptional>
       ) : null}
-    </label>
+    </FieldLabel>
   );
   return (
-    <div className={wrapperCls}>
-      {labelAccessory ? (
-        <div className="mb-1 flex items-center gap-1">
+    <Field className={wrapperCls} invalid={Boolean(error)}>
+      {hasLabelRow ? (
+        <div className="flex items-center gap-1">
           {labelElement}
           {labelAccessory}
+          {labelAction ? <span className="ml-auto flex">{labelAction}</span> : null}
         </div>
       ) : labelElement}
       {children}
       {error ? (
-        <p className="mt-1 text-xs font-bold text-brutal-red" role="alert">{error}</p>
+        <FieldError role="alert" match={Boolean(error)}>
+          {error}
+        </FieldError>
       ) : hint ? (
-        <p className="mt-1 text-xs text-black/50">{hint}</p>
+        <FieldDescription>{hint}</FieldDescription>
       ) : null}
-    </div>
+    </Field>
   );
 }

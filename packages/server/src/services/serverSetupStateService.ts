@@ -1,18 +1,23 @@
-import { currentDate, type RuntimeSelectionOption, type ServerRole } from "@botiverse/raft-shared";
+import { currentDate, isExternalAgentRuntime, type RuntimeSelectionOption, type ServerRole } from "@botiverse/raft-shared";
 import { and, eq, isNull } from "drizzle-orm";
-import { getDb } from "../db/index.js";
-import { agents, computers, machines, serverAgentMembers, serverMembers, servers, users } from "../db/schema.js";
-import { getActorServerRoleInServer } from "../lib/actorPermissions.js";
-import type { AgentOrchestrator } from "./agentOrchestrator.js";
-import { hasOfficialOnboardingAgentIdentity } from "./officialOnboardingAgentIdentity.js";
-import { withAgentCreateLock } from "./planService.js";
+import { getDb, type DatabaseExecutor } from "../db/index";
+import { agents, computers, machines, serverAgentMembers, serverMembers, servers, users } from "../db/schema";
+import { lockActorMembershipRow, ServerMembershipRevokedError } from "../lib/actorMembershipFence";
+import { getActorServerRoleInServer } from "../lib/actorPermissions";
+import type { AgentOrchestrator } from "./agentOrchestrator";
+import { resolveHostedCindySetupState, type HostedCindySetupState } from "./hostedCindyService";
+import { hasOfficialOnboardingAgentIdentity } from "./officialOnboardingAgentIdentity";
+import { withAgentCreateLock } from "./planService";
 import {
   projectSetupRuntimeOptions,
   resolveRuntimeAdmissionPolicy,
-} from "./runtimeAdmissionService.js";
+} from "./runtimeAdmissionService";
+import { hasServerCompletedSetupForProjection } from "./serverSetupCompletionService";
 
 /**
- * ONBOARDING HAS ONE CHECKPOINT, AND IT IS "CINDY EXISTS". (@stdrc, 2026-07-14)
+ * ONBOARDING HAS ONE SERVER-WIDE TERMINAL STATE. One owner completing setup completes the
+ * server for every present and future owner. Destructive reset has its own server-wide safety
+ * gate over those durable completion facts. (tasks #240 and #244)
  *
  * Everything about this flow follows from that sentence, so it is written down here rather
  * than left to be re-derived from the code by the next person.
@@ -121,6 +126,12 @@ export interface ServerSetupLiveFacts {
   runtimeOptions?: RuntimeSelectionOption[];
   officialOnboardingAgent: OfficialOnboardingAgentState;
   /**
+   * The onboarding agent is a hosted (Antiproton) Cindy under `antiproton_cindy`:
+   * `usable` skips "connect a computer" (she needs none); `failed` sends setup down
+   * the computer path, where Create Cindy converts her in place. Absent otherwise.
+   */
+  hostedOnboardingAgent?: HostedCindySetupState | null;
+  /**
    * The two steps that follow Create Cindy. They are derived from persisted state,
    * not held in the browser, so closing the tab mid-flow and coming back lands you
    * on the same screen instead of dumping you into the app with an unbriefed agent.
@@ -159,6 +170,7 @@ export type ServerSetupGateReason =
   | "official_onboarding_agent_unusable"
   | "official_onboarding_agent_status_unknown"
   | "completion_pending"
+  | "hosted_onboarding_agent_ready"
   | "setup_complete"
   | "resolver_error"
   | null;
@@ -229,6 +241,7 @@ export interface ServerSetupTransitionCommittedEvent {
 export interface ServerSetupStateServiceDeps {
   repository: ServerSetupStateRepository;
   resolveActorRole(serverId: string, actor: ServerSetupActor): Promise<ServerRole | null>;
+  resolveServerCompleted(serverId: string): Promise<boolean>;
   resolveLiveFacts(serverId: string, userId: string): Promise<ServerSetupLiveFacts>;
   now?: () => Date;
   onTransitionCommitted?: (event: ServerSetupTransitionCommittedEvent) => Promise<void> | void;
@@ -420,6 +433,18 @@ export function projectServerSetup(
     postSetup,
   };
 
+  // A hosted Cindy needs no computer: setup is ready to complete as soon as she is
+  // usable, and connecting a computer is something she helps with afterwards.
+  if (live.hostedOnboardingAgent === "usable" && live.officialOnboardingAgent === "usable") {
+    return {
+      ...base,
+      surface: "create_agent",
+      currentStep: "create_agent",
+      sideEffectState: { transitions: "enabled", completion: "enabled" },
+      gateReason: "hosted_onboarding_agent_ready",
+    };
+  }
+
   if (live.computer !== "online") {
     return {
       ...base,
@@ -603,6 +628,34 @@ export function createServerSetupStateService(deps: ServerSetupStateServiceDeps)
       });
     }
 
+    // Setup belongs to the server, not independently to every owner membership. The member
+    // row records who actually completed the flow; once ANY owner completed it, a later
+    // co-owner inherits the server's terminal state and must never be sent through Create
+    // Cindy again. Synthesize `grandfathered` here so the co-owner is not offered the
+    // original owner's personal survey/handoff screens.
+    let serverCompleted: boolean;
+    try {
+      serverCompleted = await deps.resolveServerCompleted(input.serverId);
+    } catch {
+      return retryProjection(state.status, "resolver_error");
+    }
+    if (serverCompleted) {
+      return projectServerSetup(
+        { ...state, status: "complete", completionReason: "grandfathered" },
+        {
+          computer: "unknown",
+          hasConnectedComputer: false,
+          offlineComputers: [],
+          everHadAgent: true,
+          runtime: "unknown",
+          officialOnboardingAgent: "unknown",
+          ownerSurveyPending: false,
+          ownerHandoffPending: false,
+          actorIsOwner: false,
+        },
+      );
+    }
+
     try {
       return projectServerSetup(state, await deps.resolveLiveFacts(input.serverId, input.actor.id));
     } catch {
@@ -691,13 +744,14 @@ export class DrizzleServerSetupStateRepository implements ServerSetupStateReposi
   }
 }
 
-async function resolveOfficialOnboardingAgentState(serverId: string): Promise<OfficialOnboardingAgentState> {
+async function resolveOnboardingAgentFacts(serverId: string): Promise<Pick<ServerSetupLiveFacts, "officialOnboardingAgent" | "hostedOnboardingAgent">> {
   const [server] = await getDb()
     .select({ onboardingAgentId: servers.onboardingAgentId })
     .from(servers)
     .where(and(eq(servers.id, serverId), isNull(servers.deletedAt)));
 
   let officialOnboardingAgent: OfficialOnboardingAgentState = "unknown";
+  let hostedOnboardingAgent: HostedCindySetupState | null = null;
   if (server) {
     if (!server.onboardingAgentId) {
       officialOnboardingAgent = "missing";
@@ -726,8 +780,12 @@ async function resolveOfficialOnboardingAgentState(serverId: string): Promise<Of
           isNull(agents.deletedAt),
         ));
 
+      // A hosted Cindy has no machine; she is usable by her hosted state instead.
+      hostedOnboardingAgent = agent && !agent.machineId && isExternalAgentRuntime(agent.runtime)
+        ? await resolveHostedCindySetupState({ serverId, agentId: server.onboardingAgentId })
+        : null;
       officialOnboardingAgent = agent
-        && agent.machineId
+        && (agent.machineId || hostedOnboardingAgent === "usable")
         && agent.runtime.trim()
         && hasOfficialOnboardingAgentIdentity(agent, agent.serverRole)
         ? "usable"
@@ -735,7 +793,7 @@ async function resolveOfficialOnboardingAgentState(serverId: string): Promise<Of
     }
   }
 
-  return officialOnboardingAgent;
+  return { officialOnboardingAgent, hostedOnboardingAgent };
 }
 
 /**
@@ -801,7 +859,7 @@ async function resolvePersistedCompletionFacts(serverId: string, actorUserId: st
     everHadAgent: true,
     runtime: "unknown",
     runtimeOptions: [],
-    officialOnboardingAgent: await resolveOfficialOnboardingAgentState(serverId),
+    ...(await resolveOnboardingAgentFacts(serverId)),
   };
 }
 
@@ -928,7 +986,7 @@ export async function resolveServerSetupLiveFacts(
     everHadAgent: !!server?.onboardingAgentId,
     runtime,
     runtimeOptions,
-    officialOnboardingAgent: await resolveOfficialOnboardingAgentState(serverId),
+    ...(await resolveOnboardingAgentFacts(serverId)),
   };
 }
 
@@ -980,26 +1038,26 @@ export async function resetServerSetup(input: {
     if (server.ownerId !== input.actor.id) {
       throw new ServerSetupStateError("INSUFFICIENT_PERMISSION", "Only the owner may reset setup");
     }
+    // Task #91: `servers.ownerId` is immutable and another owner may remove or demote the primary owner, so the
+    // stale field alone is not authority. Require a live owner member row, locked here (after the agent-create
+    // lock, before any Computer row) so a removal or demotion either waits for this reset or is observed by it.
+    // FOR UPDATE rather than FOR SHARE because this transaction updates the same member row below.
+    const lockedRole = await lockActorMembershipRow(tx, input.serverId, input.actor.id, "update").catch((error: unknown) => {
+      if (error instanceof ServerMembershipRevokedError) return null;
+      throw error;
+    });
+    if (lockedRole !== "owner") {
+      throw new ServerSetupStateError("INSUFFICIENT_PERMISSION", "Only the owner may reset setup");
+    }
 
-    // `complete` is TERMINAL, and that includes here. (@stdrc: the setup-state API should only
-    // ever be able to move a server TO complete, never back out of it.)
-    const [member] = await tx
-      .select({ status: serverMembers.setupStatus })
-      .from(serverMembers)
-      .where(and(eq(serverMembers.serverId, input.serverId), eq(serverMembers.userId, server.ownerId)));
-    if (member?.status === "complete") {
+    // Reset authority is deliberately independent from the UI projection helper. Both consume
+    // the same server-wide terminal fact today, but permission checks must not accidentally
+    // inherit future presentation changes. Keep this guard inside the agent-create lock and
+    // transaction, before either destructive write.
+    if (await hasServerCrossedSetupResetBoundary(tx, input.serverId, server.onboardingAgentId)) {
       throw new ServerSetupStateError(
         "SERVER_ALREADY_SET_UP",
         "Setup is complete; it cannot be rolled back",
-      );
-    }
-
-    // The guard. Ask the server's official onboarding-agent pointer, not the flag that
-    // claims to summarise setup and not unrelated/bootstrap agents that are not Cindy.
-    if (server.onboardingAgentId) {
-      throw new ServerSetupStateError(
-        "SERVER_ALREADY_SET_UP",
-        "This server has had an onboarding agent; setup cannot be rolled back",
       );
     }
 
@@ -1021,9 +1079,30 @@ export async function resetServerSetup(input: {
   });
 }
 
+async function hasServerCrossedSetupResetBoundary(
+  db: DatabaseExecutor,
+  serverId: string,
+  onboardingAgentId: string | null,
+): Promise<boolean> {
+  if (onboardingAgentId) return true;
+
+  const [completedMember] = await db
+    .select({ userId: serverMembers.userId })
+    .from(serverMembers)
+    .where(and(
+      eq(serverMembers.serverId, serverId),
+      eq(serverMembers.setupStatus, "complete"),
+    ))
+    .limit(1)
+    .for("share");
+
+  return Boolean(completedMember);
+}
+
 const defaultServerSetupStateService = createServerSetupStateService({
   repository: new DrizzleServerSetupStateRepository(),
   resolveActorRole: (serverId, actor) => getActorServerRoleInServer(serverId, actor.type, actor.id),
+  resolveServerCompleted: (serverId) => hasServerCompletedSetupForProjection(getDb(), serverId),
   resolveLiveFacts: (serverId, userId) => resolvePersistedCompletionFacts(serverId, userId),
 });
 

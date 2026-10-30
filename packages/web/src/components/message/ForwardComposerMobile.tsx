@@ -1,14 +1,20 @@
-import { useEffect, useState } from "react";
-import type { CSSProperties, Dispatch, ReactNode, SetStateAction } from "react";
+import { useCallback, useEffect, useState } from "react";
+import type { ChangeEvent, CSSProperties, Dispatch, ReactNode, SetStateAction } from "react";
 import { ArrowLeft, Check, Search, Undo2 } from "lucide-react";
 import { useIntl } from "react-intl";
-import { Field, FieldLabel, Input } from "raft-ui";
+import { Field, FieldLabel, InputGroup, InputGroupAddon, InputGroupInput, Button, PanelAction, PanelActions, PanelHeader } from "@botiverse/raft-ui";
 import type { Message } from "../../store/messageStore";
-import Button from "../ui/Button";
 import ForwardedBundleCard from "./ForwardedBundleCard";
 import type { ForwardedBundleAttachmentSnapshot, ForwardedBundleMetadata } from "./ForwardedBundleCard";
 import type { MobileForwardStep, SelectedDestination } from "./forwardComposerModel";
 import MessageInput from "./MessageInput";
+import { COMPOSER_DOCK_CLASS } from "./composerHost";
+import SectionEyebrow from "../ui/SectionEyebrow";
+
+// DS NavBar for a pushed phone page is raft-ui's panel head: white bar, seam
+// under it, a ghost Back 3px from the edge, mirroring the last action.
+const FORWARD_MOBILE_TITLE_CLASS = "truncate text-headline";
+const FORWARD_MOBILE_SUBTITLE_CLASS = "truncate text-caption text-foreground-hint";
 
 type Props = {
   mobileStep: MobileForwardStep;
@@ -80,6 +86,23 @@ export default function ForwardComposerMobile({
     { count: sourceMessages.length, source: sourceLabelText },
   );
 
+  const backToPreview = useCallback(() => setMobileStep("preview"), [setMobileStep]);
+  const backToTargets = useCallback(() => setMobileStep("targets"), [setMobileStep]);
+  const cancelMultiSelect = useCallback(() => {
+    setSelectedDestinations(new Map());
+    setMobileMultiSelect(false);
+  }, [setSelectedDestinations, setMobileMultiSelect]);
+  const startMultiSelect = useCallback(() => {
+    setSelectedDestinations(new Map());
+    setMobileMultiSelect(true);
+  }, [setSelectedDestinations, setMobileMultiSelect]);
+  const handleQueryChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const value = event.target.value;
+    setQuery(value);
+    const trimmed = value.trim();
+    if (trimmed) search(trimmed); else resetSearch();
+  }, [setQuery, search, resetSearch]);
+
   useEffect(() => {
     const viewport = window.visualViewport;
     if (!viewport) return;
@@ -116,7 +139,7 @@ export default function ForwardComposerMobile({
 
   return (
     <div
-      className="fixed bottom-0 left-0 right-0 top-0 z-40 flex min-h-0 flex-col bg-white text-black"
+      className="fixed bottom-0 left-0 right-0 top-0 z-40 flex min-h-0 flex-col bg-layer-canvas text-foreground"
       style={visualViewportStyle}
       data-testid={mobileStep === "detail"
         ? "forward-mobile-detail-page"
@@ -126,30 +149,30 @@ export default function ForwardComposerMobile({
     >
       {mobileStep === "detail" ? (
         <>
-          <header className="flex min-h-14 shrink-0 items-center gap-3 border-b-2 border-black px-3 py-2">
-            <Button type="button" shape="icon" tone="white" onClick={() => setMobileStep("preview")} aria-label={formatMessage({ id: "message.forwardComposer.backToPreview" })}>
-              <ArrowLeft size={18} />
-            </Button>
+          <PanelHeader render={<header />}>
+            <PanelAction onClick={backToPreview} aria-label={formatMessage({ id: "message.forwardComposer.backToPreview" })}>
+              <ArrowLeft />
+            </PanelAction>
             <div className="min-w-0">
-              <h1 className="text-base font-bold">{formatMessage({ id: "message.forwardComposer.forwardedMessages" })}</h1>
-              <p className="truncate text-xs font-mono text-black/55">{selectedFrom}</p>
+              <h1 className={FORWARD_MOBILE_TITLE_CLASS}>{formatMessage({ id: "message.forwardComposer.forwardedMessages" })}</h1>
+              <p className={FORWARD_MOBILE_SUBTITLE_CLASS}>{selectedFrom}</p>
             </div>
-          </header>
+          </PanelHeader>
           <main className="min-h-0 flex-1 overflow-y-auto p-3 pb-[max(12px,env(safe-area-inset-bottom))]">
             <ForwardedBundleCard metadata={previewMetadata} onOpenAttachment={onOpenAttachment} forceExpanded fullWidth />
           </main>
         </>
       ) : mobileStep === "preview" ? (
         <>
-          <header className="flex min-h-14 shrink-0 items-center gap-3 border-b-2 border-black px-3 py-2">
-            <Button type="button" shape="icon" tone="white" onClick={() => setMobileStep("targets")} disabled={sending || joinInFlight} aria-label={formatMessage({ id: "message.forwardComposer.backToDestinations" })}>
-              <ArrowLeft size={18} />
-            </Button>
+          <PanelHeader render={<header />}>
+            <PanelAction onClick={backToTargets} disabled={sending || joinInFlight} aria-label={formatMessage({ id: "message.forwardComposer.backToDestinations" })}>
+              <ArrowLeft />
+            </PanelAction>
             <div className="min-w-0 flex-1">
-              <h1 className="text-base font-bold">{formatMessage({ id: "message.forwardComposer.addNoteTitle" })}</h1>
-              <p className="truncate text-xs font-mono text-black/55">{formatMessage({ id: "message.forwardComposer.sendTo" }, { targets: selectedLabels })}</p>
+              <h1 className={FORWARD_MOBILE_TITLE_CLASS}>{formatMessage({ id: "message.forwardComposer.addNoteTitle" })}</h1>
+              <p className={FORWARD_MOBILE_SUBTITLE_CLASS}>{formatMessage({ id: "message.forwardComposer.sendTo" }, { targets: selectedLabels })}</p>
             </div>
-          </header>
+          </PanelHeader>
           <main className="flex min-h-0 flex-1 flex-col overflow-hidden" data-testid="forward-mobile-note-layout">
             <div
               className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3"
@@ -157,12 +180,12 @@ export default function ForwardComposerMobile({
             >
               {warnings}
               <div data-testid="forward-mobile-preview-content">
-                <div className="mb-2 text-xs font-bold">{formatMessage({ id: "message.forwardComposer.messagePreview" })}</div>
+                <SectionEyebrow as="div" className="mb-2">{formatMessage({ id: "message.forwardComposer.messagePreview" })}</SectionEyebrow>
                 <ForwardedBundleCard metadata={previewMetadata} onOpenAttachment={onOpenAttachment} onShowAll={openMobileDetail} fullWidth />
               </div>
             </div>
             <div
-              className="shrink-0 border-t-2 border-black bg-white p-3 pb-[max(12px,env(safe-area-inset-bottom))]"
+              className={`${COMPOSER_DOCK_CLASS} bg-layer-canvas pb-[max(12px,env(safe-area-inset-bottom))]`}
               data-testid="forward-mobile-preview-actions"
             >
               <Field>
@@ -175,7 +198,7 @@ export default function ForwardComposerMobile({
                   mentionChannelId={noteMentionChannelId}
                   mentionScopeChannelType={noteMentionScopeChannelType}
                   loadMentionMembers={Boolean(noteMentionChannelId)}
-                  onSendOverride={(note) => sendForwardNote(note)}
+                  onSendOverride={sendForwardNote}
                   allowEmptySubmit
                   submitDisabled={submitDisabled}
                   submitBusy={sending}
@@ -193,57 +216,58 @@ export default function ForwardComposerMobile({
         </>
       ) : (
         <>
-          <header className="flex min-h-14 shrink-0 items-center gap-3 border-b-2 border-black px-3 py-2">
+          <PanelHeader render={<header />}>
             {mobileMultiSelect ? (
-              <Button type="button" shape="icon" tone="white" onClick={() => { setSelectedDestinations(new Map()); setMobileMultiSelect(false); }} disabled={sending || joinInFlight} aria-label={formatMessage({ id: "common.confirm.cancel" })}>
-                <Undo2 size={14} />
-              </Button>
+              <PanelAction onClick={cancelMultiSelect} disabled={sending || joinInFlight} aria-label={formatMessage({ id: "common.confirm.cancel" })}>
+                <Undo2 />
+              </PanelAction>
             ) : (
-              <Button type="button" shape="icon" tone="white" onClick={onClose} disabled={sending || joinInFlight} aria-label={formatMessage({ id: "message.forwardComposer.closeTargetSelection" })}>
-                <ArrowLeft size={18} />
-              </Button>
+              <PanelAction onClick={onClose} disabled={sending || joinInFlight} aria-label={formatMessage({ id: "message.forwardComposer.closeTargetSelection" })}>
+                <ArrowLeft />
+              </PanelAction>
             )}
             <div className="min-w-0 flex-1">
-              <h1 className="text-base font-bold">{formatMessage({ id: "message.forwardComposer.selectDestinations" })}</h1>
-              <p className="truncate text-xs font-mono text-black/55">{selectedFrom}</p>
+              <h1 className={FORWARD_MOBILE_TITLE_CLASS}>{formatMessage({ id: "message.forwardComposer.selectDestinations" })}</h1>
+              <p className={FORWARD_MOBILE_SUBTITLE_CLASS}>{selectedFrom}</p>
             </div>
+            {/* Done is filled, so its shape (not its glyph) ends on 16: it
+                sits straight in the head. Select multiple is a ghost, so it
+                joins the overhanging actions. */}
             {mobileMultiSelect ? (
-              <Button type="button" tone="pink" size="sm" shape="icon" onClick={openMobilePreview} disabled={!hasSelection || sending || joinInFlight} aria-label={formatMessage({ id: "message.forwardComposer.done" })}>
+              <Button type="button" variant="accent" size="icon-lg" onClick={openMobilePreview} disabled={!hasSelection || sending || joinInFlight} aria-label={formatMessage({ id: "message.forwardComposer.done" })}>
                 <Check size={14} />
               </Button>
             ) : (
-              <Button type="button" tone="white" onClick={() => { setSelectedDestinations(new Map()); setMobileMultiSelect(true); }} disabled={joinInFlight}>
-                {formatMessage({ id: "message.forwardComposer.selectMultiple" })}
-              </Button>
+              <PanelActions>
+                <Button size="sm" type="button" variant="ghost" onClick={startMultiSelect} disabled={joinInFlight}>
+                  {formatMessage({ id: "message.forwardComposer.selectMultiple" })}
+                </Button>
+              </PanelActions>
             )}
-          </header>
+          </PanelHeader>
           <main className="flex min-h-0 flex-1 flex-col p-3">
-            <div className="relative mb-3 w-full shrink-0">
-              <Search size={14} className="pointer-events-none absolute left-3 top-1/2 z-10 -translate-y-1/2 text-black/50" />
-              <Input
+            <InputGroup className="mb-3 shrink-0">
+              <InputGroupAddon align="inline-start">
+                <Search aria-hidden="true" />
+              </InputGroupAddon>
+              <InputGroupInput
                 value={query}
-                onChange={(event) => {
-                  const value = event.target.value;
-                  setQuery(value);
-                  const trimmed = value.trim();
-                  if (trimmed) search(trimmed); else resetSearch();
-                }}
+                onChange={handleQueryChange}
                 placeholder={formatMessage({ id: "message.forwardComposer.searchPlaceholder" })}
-                className="pl-9 placeholder:text-black/35"
                 autoFocus
               />
-            </div>
-            <div className="mb-2 flex h-6 shrink-0 items-center justify-between text-xs font-bold">
+            </InputGroup>
+            <SectionEyebrow as="div" className="mb-1 flex h-6 shrink-0 items-center justify-between px-1">
               <span>{mobileMultiSelect
                 ? formatMessage({ id: "message.forwardComposer.selectedCount" }, { count: selectedDestinations.size })
                 : formatMessage({ id: "message.forwardComposer.recent" })}</span>
               {mobileMultiSelect && selectedDestinations.size > 0 && (
-                <button type="button" onClick={() => setSelectedDestinations(new Map())} disabled={joinInFlight} className="underline underline-offset-2">
+                <button type="button" onClick={() => setSelectedDestinations(new Map())} disabled={joinInFlight} className="font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px]">
                   {formatMessage({ id: "message.forwardComposer.clear" })}
                 </button>
               )}
-            </div>
-            <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto pb-2">{targetResults}</div>
+            </SectionEyebrow>
+            <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto pb-2">{targetResults}</div>
           </main>
         </>
       )}

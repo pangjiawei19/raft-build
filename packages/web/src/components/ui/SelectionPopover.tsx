@@ -1,6 +1,16 @@
-import type { KeyboardEvent, ReactNode } from "react";
-import { Check } from "lucide-react";
+import { useCallback, useRef } from "react";
+import type { ChangeEvent, KeyboardEvent, ReactNode, RefObject } from "react";
+import { Check, Search } from "lucide-react";
 import { useIntl } from "react-intl";
+import { PopoverContent } from "@botiverse/raft-ui";
+import { dismissLayerProps } from "./dismissLayer";
+
+/** Raft Design System › Menu / Select popup (`rf-menu`): the popover layer,
+ *  the container radius, a seam edge plus the float shadow — raft-ui's
+ *  PopoverContent draws it for the positioned popover; a caller that places
+ *  the bare panel itself (SelectionPopoverPanel) adds it. */
+export const SELECTION_POPOVER_SURFACE =
+  "rounded-container bg-layer-popover text-foreground shadow-float ring-1 ring-line-seam";
 
 export interface SelectionPopoverOption {
   key: string;
@@ -8,6 +18,9 @@ export interface SelectionPopoverOption {
   label: string;
   onClick: () => void;
   disabled?: boolean;
+  /** A sentinel row ("Unassigned", "Anyone"): the label reads as a hint,
+   *  ink-2 and never truncated. Despite the name it is not italic — the DS
+   *  has no italic type. */
   italic?: boolean;
   avatar?: ReactNode;
   reserveLeadingSlot?: boolean;
@@ -22,7 +35,6 @@ interface SelectionPopoverBaseProps {
   showHeader?: boolean;
   emptyLabel?: string;
   className?: string;
-  width?: "content" | "trigger";
 }
 
 interface SearchableSelectionPopoverProps extends SelectionPopoverBaseProps {
@@ -41,20 +53,27 @@ interface PlainSelectionPopoverProps extends SelectionPopoverBaseProps {
   onInputKeyDown?: never;
 }
 
-type SelectionPopoverProps = SearchableSelectionPopoverProps | PlainSelectionPopoverProps;
+type SelectionPopoverPanelProps = SearchableSelectionPopoverProps | PlainSelectionPopoverProps;
+
+type SelectionPopoverProps = SelectionPopoverPanelProps & {
+  /** Which edge of the trigger it lines up with (it still shifts to stay on
+   *  screen). */
+  align?: "start" | "end";
+  /** "trigger": exactly as wide as the trigger (a field-style picker). */
+  width?: "content" | "trigger";
+};
 
 /**
  * Shared option row for selection popovers.
  *
- * Origin: stdrc 2026-05-19 #proj-task:572c5ba6 msg=665751bc found filter
- * items with inconsistent heights. Avatar rows were taller than label-only
- * rows because row height was content-driven, and label-only sentinel/channel
- * rows did not reserve the avatar column.
+ * Every row is the same height whatever it holds: a fixed `h-9`, and a
+ * `size-5` leading slot the caller can reserve so label-only rows line up with
+ * avatar rows. Search channel rows pass a real leading icon instead; Tasks
+ * channel rows stay label-only to match the Tasks list.
  *
- * The row therefore uses a fixed `h-9` and can reserve a `size-5` leading
- * slot when the caller needs avatar/list baseline alignment. Search channel
- * rows pass a real leading icon instead, while Tasks channel rows intentionally
- * stay label-only so they match the existing Tasks list style.
+ * Raft Design System › Select / Menu (`rf-menu__item`): 36 tall, 8px radius,
+ * 14/20 500 ink; pointer hover is the yellow-soft highlight; the current value
+ * is a trailing ink check plus bold — a check, never a fill.
  */
 function SelectionPopoverOptionRow({
   checked,
@@ -65,29 +84,26 @@ function SelectionPopoverOptionRow({
   avatar = null,
   reserveLeadingSlot = false,
   leading = null,
-}: SelectionPopoverOption) {
+}: Omit<SelectionPopoverOption, "key">) {
   const leadingContent = leading ?? avatar;
+  // Sentinel rows read as a hint (ink-2).
   const labelClassName = italic
-    ? "-mx-1 px-1 whitespace-nowrap leading-6 italic text-black/70"
-    : "truncate leading-6";
-  // Selection family contract (stdrc #proj-theme:ac79cf20 msg=32e323aa
-  // + msg=832c2c02 + msg=b0b92c1c 2026-05-25): hover = bg-soft-signal/30
-  // (shared with SegmentedControl unselected hover and the MenuItem
-  // pure-action row), selected = no special bg — the trailing ✓ is the
-  // canonical selected indicator. Drops the older yellow-fill "colored"
-  // tone so Select / SelectionPopover / InlineBadgeEditor dropdowns +
-  // sidebar action menus + right-click context menus all share one
-  // hover token.
+    ? "whitespace-nowrap text-foreground-muted"
+    : "truncate";
+  // One hover token for every selection list and menu (Select,
+  // SelectionPopover, InlineBadgeEditor dropdowns, sidebar action menus,
+  // context menus): the DS yellow-soft highlight. A selected row gets no fill
+  // of its own; the trailing check plus bold marks it.
   const rowTone = disabled
-    ? "cursor-not-allowed bg-white text-black/30"
-    : "bg-white text-black hover:bg-soft-signal/30";
+    ? "cursor-not-allowed text-foreground-disabled"
+    : `text-foreground hover:bg-brand-soft focus-visible:bg-brand-soft${checked ? " font-bold" : " font-medium"}`;
 
   return (
     <button
       type="button"
       disabled={disabled}
       onClick={onClick}
-      className={`flex h-9 w-full items-center justify-between gap-2 overflow-hidden border-b border-black/10 px-3 text-left text-xs font-bold last:border-b-0 ${rowTone}`}
+      className={`flex h-9 w-full items-center justify-between gap-2 overflow-hidden rounded-control px-2.5 text-left text-callout outline-none ${rowTone}`}
     >
       <span className="flex min-w-0 items-center gap-2">
         {(reserveLeadingSlot || leadingContent) && (
@@ -99,12 +115,59 @@ function SelectionPopoverOptionRow({
           {label}
         </span>
       </span>
-      {checked && <Check size={12} className="shrink-0" />}
+      {checked && <Check size={16} className="shrink-0 text-foreground" aria-hidden="true" />}
     </button>
   );
 }
 
-export default function SelectionPopover(props: SelectionPopoverProps) {
+/**
+ * The selection list positioned against its trigger. Render it inside a
+ * raft-ui `<Popover open onOpenChange>` next to its `<PopoverTrigger>`: the
+ * popover owns the trigger toggle, outside presses and Escape, and puts the
+ * list in a portal placed by Base UI, which keeps it on screen (it shifts and
+ * flips at the edge, and never grows past the space it has).
+ *
+ * Never position a list inline under its trigger instead (`absolute left-0
+ * top-full`): near an edge it runs off the screen, and focusing its search box
+ * then scrolls the clipped app column sideways — the whole page jumps.
+ */
+export default function SelectionPopover({
+  align = "start",
+  width = "content",
+  className = "",
+  ...panelProps
+}: SelectionPopoverProps) {
+  const searchRef = useRef<HTMLInputElement | null>(null);
+  return (
+    <PopoverContent
+      align={align}
+      sideOffset={8}
+      collisionPadding={8}
+      initialFocus={panelProps.searchable ? searchRef : undefined}
+      className={`flex max-w-(--available-width) flex-col ${width === "trigger" ? "w-(--anchor-width)" : ""} ${className}`}
+      {...dismissLayerProps}
+    >
+      <SelectionPopoverSections {...panelProps} searchRef={searchRef} />
+    </PopoverContent>
+  );
+}
+
+/**
+ * The bare panel, for a caller that already places it (its own portal and
+ * measured position). It brings no surface: pass SELECTION_POPOVER_SURFACE.
+ */
+export function SelectionPopoverPanel({ className = "", ...panelProps }: SelectionPopoverPanelProps) {
+  return (
+    <div className={`flex min-w-0 flex-col overflow-hidden ${className}`} {...dismissLayerProps}>
+      <SelectionPopoverSections {...panelProps} />
+    </div>
+  );
+}
+
+function SelectionPopoverSections(props: SelectionPopoverPanelProps & {
+  /** Set when the popover focuses the search box itself (initialFocus). */
+  searchRef?: RefObject<HTMLInputElement | null>;
+}) {
   const { formatMessage } = useIntl();
   const {
     title,
@@ -113,23 +176,30 @@ export default function SelectionPopover(props: SelectionPopoverProps) {
     onClear,
     showHeader = true,
     emptyLabel,
-    width = "content",
-    className = `absolute left-0 top-[calc(100%+8px)] z-20 ${width === "trigger" ? "w-full" : "min-w-[220px]"} border-2 border-black bg-white shadow-brutal`,
+    searchRef,
   } = props;
   const emptyLabelText = emptyLabel ?? formatMessage({ id: "ui.selectionPopover.emptyLabel" });
+  const { onSearchChange, onInputKeyDown } = props;
+  const handleSearchChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    onSearchChange?.(event.target.value);
+  }, [onSearchChange]);
+  const handleInputKeyDown = useCallback((event: KeyboardEvent<HTMLInputElement>) => {
+    event.stopPropagation();
+    onInputKeyDown?.(event, options);
+  }, [onInputKeyDown, options]);
 
   return (
-    <div className={className}>
+    <>
       {showHeader && (
-        <div className="flex items-center justify-between border-b border-black px-3 py-2">
-          <span className="text-[10px] font-bold uppercase tracking-wide text-black/60">
+        <div className="flex shrink-0 items-center justify-between gap-2 px-4 pt-2.5 pb-1">
+          <span className="text-caption font-bold text-foreground-hint">
             {title}
           </span>
           {showClear && onClear && (
             <button
               type="button"
               onClick={onClear}
-              className="text-[10px] font-bold tracking-wide text-black/50 hover:text-black"
+              className="rounded-[2px] text-caption font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus"
             >
               {formatMessage({ id: "ui.selectionPopover.clear" })}
             </button>
@@ -137,24 +207,26 @@ export default function SelectionPopover(props: SelectionPopoverProps) {
         </div>
       )}
       {props.searchable && (
-        <div className="border-b border-black px-2 py-2">
+        // DS menu search row: flush with the menu's edge, a hairline under it,
+        // and the focus ring drawn inside the edge.
+        <label className="flex h-10 shrink-0 items-center gap-2 border-b border-line-hairline px-3 text-foreground-hint focus-within:shadow-[inset_0_0_0_2px_var(--foreground)]">
+          <Search size={16} className="shrink-0" aria-hidden="true" />
           <input
+            ref={searchRef}
             type="text"
-            autoFocus
+            // The positioned popover focuses it itself, without scrolling.
+            autoFocus={!searchRef}
             value={props.search}
-            onChange={(event) => props.onSearchChange(event.target.value)}
-            onKeyDown={(event) => {
-              event.stopPropagation();
-              props.onInputKeyDown?.(event, options);
-            }}
+            onChange={handleSearchChange}
+            onKeyDown={handleInputKeyDown}
             placeholder={props.searchPlaceholder ?? formatMessage({ id: "ui.selectionPopover.searchPlaceholder" })}
-            className="input-brutal w-full px-2 py-1 text-xs font-mono"
+            className="h-full min-w-0 flex-1 bg-transparent text-callout text-foreground outline-none placeholder:text-foreground-hint"
           />
-        </div>
+        </label>
       )}
-      <div className="max-h-64 overflow-y-auto">
+      <div className="max-h-64 min-h-0 overflow-y-auto p-1.5">
         {options.length === 0 ? (
-          <div className="px-3 py-3 text-center text-[11px] font-mono text-black/40">
+          <div className="px-2.5 py-2 text-callout text-foreground-hint">
             {emptyLabelText}
           </div>
         ) : (
@@ -163,6 +235,6 @@ export default function SelectionPopover(props: SelectionPopoverProps) {
           ))
         )}
       </div>
-    </div>
+    </>
   );
 }

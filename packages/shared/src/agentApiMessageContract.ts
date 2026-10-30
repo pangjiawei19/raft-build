@@ -1,15 +1,18 @@
 import { z } from "zod";
+import { lazySchema } from "./lazySchema";
+import { isSlackBridgedExternalProvider } from "./externalProjection";
 
-const optionalStringSchema = z.string().trim().optional();
-const optionalStringArraySchema = z.array(z.string().trim().min(1)).optional();
-const optionalBooleanSchema = z.boolean().optional();
-const optionalNumberSchema = z.number().finite().optional();
-const optionalIsoTimestampSchema = z.string().datetime().optional();
-const nullableStringSchema = z.string().nullable();
+const optionalStringSchema = lazySchema("optionalStringSchema", () => z.string().trim().optional());
+const optionalStringArraySchema = lazySchema("optionalStringArraySchema", () => z.array(z.string().trim().min(1)).optional());
+const optionalBooleanSchema = lazySchema("optionalBooleanSchema", () => z.boolean().optional());
+const optionalNumberSchema = lazySchema("optionalNumberSchema", () => z.number().finite().optional());
+const optionalExactSeqArraySchema = lazySchema("optionalExactSeqArraySchema", () => z.array(z.number().int().positive()).max(2_500).optional());
+const optionalIsoTimestampSchema = lazySchema("optionalIsoTimestampSchema", () => z.string().datetime().optional());
+const nullableStringSchema = lazySchema("nullableStringSchema", () => z.string().nullable());
 
 const passthroughObject = <T extends z.ZodRawShape>(shape: T) => z.object(shape).passthrough();
 
-export const agentApiFreshnessContextModeSchema = z.enum(["inline", "withheld"]);
+export const agentApiFreshnessContextModeSchema = lazySchema("agentApiFreshnessContextModeSchema", () => z.enum(["inline", "withheld"]));
 
 export interface AgentApiStructuredMention {
   type: "user" | "agent";
@@ -17,43 +20,98 @@ export interface AgentApiStructuredMention {
   name: string;
 }
 
-export const agentApiStructuredMentionSchema = z.object({
+export const agentApiStructuredMentionSchema = lazySchema("agentApiStructuredMentionSchema", () => z.object({
   type: z.enum(["user", "agent"]),
   id: z.string().uuid(),
   name: z.string().trim().min(1).max(128),
-});
+}));
 
-const agentApiSendBodyKnownSchema = z.object({
+/**
+ * A channel's card (passive-AX `channel` resource, versioned by
+ * `channelCardRev`): what `raft channel info` shows about it. Returned with
+ * history reads, and by a send that names its card version.
+ */
+export const agentApiChannelCardSchema = lazySchema("agentApiChannelCardSchema", () => passthroughObject({
+  id: z.string().min(1),
+  name: z.string(),
+  type: z.string().nullable().optional(),
+  description: z.string().nullable().optional(),
+  archived: z.boolean().optional(),
+}));
+
+export interface AgentApiChannelCard {
+  id: string;
+  name: string;
+  type?: string | null;
+  description?: string | null;
+  archived?: boolean;
+}
+
+/**
+ * The other side of a DM (the `sender` passive resource): their kind, handle,
+ * description, and the zone their latest message carried. Returned with
+ * history reads of a DM, and by a send that names its version.
+ */
+export const agentApiPeerCardSchema = lazySchema("agentApiPeerCardSchema", () => passthroughObject({
+  kind: z.enum(["human", "agent"]),
+  name: z.string(),
+  description: z.string().nullable().optional(),
+  timezone: z.string().nullable().optional(),
+}));
+
+export interface AgentApiPeerCard {
+  kind: "human" | "agent";
+  name: string;
+  description?: string | null;
+  timezone?: string | null;
+}
+
+/**
+ * Card versions the sender has in its current model context. `channel`: the
+ * `channelCardRev` of the target's channel card; `peer`: the `peerCardRev`
+ * this context has for a DM target's peer (only null-or-not is compared:
+ * the zone travels with each message). Null: this context has not seen it.
+ * Absent: the client does not track that card (today's behavior).
+ */
+const agentApiSeenCardsSchema = lazySchema("agentApiSeenCardsSchema", () => z.object({
+  channel: z.string().min(1).nullable().optional(),
+  peer: z.string().min(1).nullable().optional(),
+}));
+
+const agentApiSendBodyKnownSchema = lazySchema("agentApiSendBodyKnownSchema", () => z.object({
   target: z.string().optional(),
   content: z.string().optional(),
   attachmentIds: optionalStringArraySchema,
   idempotencyKey: optionalStringSchema,
+  reconcileOnly: optionalBooleanSchema,
   continue: optionalBooleanSchema,
   sendDraft: optionalBooleanSchema,
   continueAnyway: optionalBooleanSchema,
   draftReholdCount: optionalNumberSchema,
   draftReplacedExisting: optionalBooleanSchema,
   seenUpToSeq: optionalNumberSchema,
+  seenExactSeqs: optionalExactSeqArraySchema,
+  seenCards: agentApiSeenCardsSchema.optional(),
   freshnessContextMode: agentApiFreshnessContextModeSchema.optional(),
-});
+}));
 
-export const agentApiSendBodySchema = agentApiSendBodyKnownSchema.passthrough();
+export const agentApiSendBodySchema = lazySchema("agentApiSendBodySchema", () => agentApiSendBodyKnownSchema.passthrough());
 
-export const agentApiSendV2BodySchema = agentApiSendBodyKnownSchema.extend({
+export const agentApiSendV2BodySchema = lazySchema("agentApiSendV2BodySchema", () => agentApiSendBodyKnownSchema.extend({
   mentions: z.array(agentApiStructuredMentionSchema).optional(),
-}).passthrough();
+}).passthrough());
 
-export const legacyAgentSendBodySchema = agentApiSendBodySchema.extend({
+export const legacyAgentSendBodySchema = lazySchema("legacyAgentSendBodySchema", () => agentApiSendBodySchema.extend({
   channel: z.string().optional(),
   dm_to: z.string().optional(),
-});
+}));
 
-export const agentApiAttachmentEnvelopeSchema = passthroughObject({
+export const agentApiAttachmentEnvelopeSchema = lazySchema("agentApiAttachmentEnvelopeSchema", () => passthroughObject({
   id: z.string(),
   filename: z.string(),
-});
+}));
 
-export const agentApiTaskCurrentProjectionSchema = passthroughObject({
+export const agentApiTaskCurrentProjectionSchema = lazySchema("agentApiTaskCurrentProjectionSchema", () => passthroughObject({
   title: z.string(),
   description: z.string().nullable(),
   revision: z.number().int().nonnegative(),
@@ -65,9 +123,9 @@ export const agentApiTaskCurrentProjectionSchema = passthroughObject({
   amendedByName: z.string().nullable().optional(),
   amended_by_name: z.string().nullable().optional(),
   source: z.literal("tasks_current_projection"),
-});
+}));
 
-const agentApiExternalMessageProvenanceSchema = z.object({
+const agentApiExternalMessageProvenanceSchema = lazySchema("agentApiExternalMessageProvenanceSchema", () => z.object({
   schema: z.literal("external-message-provenance.v1"),
   provider: z.string().trim().min(1),
   workspace_id: z.string().trim().min(1),
@@ -76,7 +134,7 @@ const agentApiExternalMessageProvenanceSchema = z.object({
   actor_id: z.string().trim().min(1),
   actor_kind: z.enum(["human", "guest", "remote", "bot", "unknown"]),
   projection_id: z.string().uuid(),
-}).strict();
+}).strict());
 
 export interface AgentApiExternalMessageProvenance {
   schema: "external-message-provenance.v1";
@@ -105,7 +163,7 @@ export function isAgentApiExternalMessageForbiddenAuthorityField(field: string):
     || AGENT_API_EXTERNAL_MESSAGE_TASK_LIFECYCLE_FIELD.test(field);
 }
 
-export const agentApiMessageEnvelopeSchema = passthroughObject({
+export const agentApiMessageEnvelopeSchema = lazySchema("agentApiMessageEnvelopeSchema", () => passthroughObject({
   seq: optionalNumberSchema,
   id: optionalStringSchema,
   message_id: optionalStringSchema,
@@ -117,6 +175,8 @@ export const agentApiMessageEnvelopeSchema = passthroughObject({
   sender_name: optionalStringSchema,
   senderDescription: z.string().nullable().optional(),
   sender_description: z.string().nullable().optional(),
+  senderTimezone: z.string().nullable().optional(),
+  sender_timezone: z.string().nullable().optional(),
   external_message: agentApiExternalMessageProvenanceSchema.optional(),
   channel_type: optionalStringSchema,
   channel_name: optionalStringSchema,
@@ -144,13 +204,20 @@ export const agentApiMessageEnvelopeSchema = passthroughObject({
   if (senderTypes.length === 0 || senderTypes.some((v) => v !== "third_party_app")) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: "external_message requires inert third_party_app sender type", path: ["senderType"] });
   }
-  if (value.mentioned !== false) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "external_message must be explicitly non-mentioned", path: ["mentioned"] });
+  // Slack-bridged messages carry the reader's mention fact like an ordinary
+  // message; every other external provider must stay explicitly non-mentioned.
+  const mentioned = (value as { mentioned?: unknown }).mentioned;
+  if (typeof mentioned !== "boolean") {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "external_message must carry an explicit mentioned boolean", path: ["mentioned"] });
+  } else if (mentioned && !isSlackBridgedExternalProvider(value.external_message.provider)) {
+    ctx.addIssue({ code: z.ZodIssueCode.custom, message: "non-Slack external_message must be explicitly non-mentioned", path: ["mentioned"] });
+  }
   for (const field of Object.keys(value)) if (isAgentApiExternalMessageForbiddenAuthorityField(field)) {
     ctx.addIssue({ code: z.ZodIssueCode.custom, message: `external_message cannot carry ${field} authority`, path: [field] });
   }
-});
+}));
 
-export const agentApiHeldFreshnessResponseSchema = passthroughObject({
+export const agentApiHeldFreshnessResponseSchema = lazySchema("agentApiHeldFreshnessResponseSchema", () => passthroughObject({
   ok: z.literal(true).optional(),
   state: z.literal("held"),
   outcome: z.literal("held").optional(),
@@ -172,9 +239,18 @@ export const agentApiHeldFreshnessResponseSchema = passthroughObject({
   withheldMessageCount: optionalNumberSchema,
   seenUpToSeq: optionalNumberSchema,
   seenUpToMessageId: nullableStringSchema.optional(),
-});
+  /** Why the send was held; absent means unread messages (`unread_messages`). */
+  // Open set: a reason an older client does not know must not fail its parse.
+  holdReasons: z.array(z.string()).optional(),
+  /** The target's channel card, when the send named a version this context has not seen. */
+  channelCard: agentApiChannelCardSchema.optional(),
+  /** True when this context saw an older version of `channelCard`. */
+  channelCardChanged: optionalBooleanSchema,
+  /** A DM target's peer card, when this context has not seen the peer. */
+  peerCard: agentApiPeerCardSchema.optional(),
+}));
 
-export const agentApiSendSentResponseSchema = passthroughObject({
+export const agentApiSendSentResponseSchema = lazySchema("agentApiSendSentResponseSchema", () => passthroughObject({
   ok: z.literal(true),
   state: z.literal("sent"),
   messageId: z.string(),
@@ -189,12 +265,35 @@ export const agentApiSendSentResponseSchema = passthroughObject({
       stillArrives: optionalStringArraySchema,
     }).optional(),
   }).optional(),
-});
+  /** The target's channel card, when the send named a version this context has not seen. */
+  channelCard: agentApiChannelCardSchema.optional(),
+  /** True when this context saw an older version of `channelCard`. */
+  channelCardChanged: optionalBooleanSchema,
+  /** A DM target's peer card, when this context has not seen the peer. */
+  peerCard: agentApiPeerCardSchema.optional(),
+}));
 
-export const agentApiSendResponseSchema = z.discriminatedUnion("state", [
+export const agentApiSendNotFoundResponseSchema = lazySchema("agentApiSendNotFoundResponseSchema", () => passthroughObject({
+  ok: z.literal(true),
+  state: z.literal("not_found"),
+  reconciliation: z.literal(true),
+}));
+
+export const agentApiSendCommittedResponseSchema = lazySchema("agentApiSendCommittedResponseSchema", () => passthroughObject({
+  ok: z.literal(true),
+  state: z.literal("committed"),
+  messageId: z.string(),
+  messageSeq: optionalNumberSchema,
+  reconciliation: z.literal(true),
+  receiptComplete: z.literal(false),
+}));
+
+export const agentApiSendResponseSchema = lazySchema("agentApiSendResponseSchema", () => z.discriminatedUnion("state", [
   agentApiSendSentResponseSchema,
   agentApiHeldFreshnessResponseSchema,
-]);
+  agentApiSendNotFoundResponseSchema,
+  agentApiSendCommittedResponseSchema,
+]));
 
 // Keep the exported request projection independent of Zod so downstream SDK
 // declaration bundles do not require consumers to install our validator.
@@ -205,12 +304,15 @@ interface AgentApiSendBodyKnownFields {
   content?: string;
   attachmentIds?: string[];
   idempotencyKey?: string;
+  reconcileOnly?: boolean;
   continue?: boolean;
   sendDraft?: boolean;
   continueAnyway?: boolean;
   draftReholdCount?: number;
   draftReplacedExisting?: boolean;
   seenUpToSeq?: number;
+  seenExactSeqs?: number[];
+  seenCards?: { channel?: string | null; peer?: string | null };
   freshnessContextMode?: "inline" | "withheld";
 }
 
@@ -260,6 +362,8 @@ export interface AgentApiMessageEnvelope {
   sender_name?: string;
   senderDescription?: string | null;
   sender_description?: string | null;
+  senderTimezone?: string | null;
+  sender_timezone?: string | null;
   external_message?: AgentApiExternalMessageProvenance;
   channel_type?: string;
   channel_name?: string;
@@ -312,6 +416,14 @@ export interface AgentApiHeldFreshnessResponse {
     createdAt?: string | null;
     content?: string;
   };
+  /** Why the send was held (`unread_messages`, `channel_card`, `peer_card`, …); absent means unread messages. */
+  holdReasons?: string[];
+  /** The target's channel card, when the send named a version this context has not seen. */
+  channelCard?: AgentApiChannelCard;
+  /** This context saw an older version of `channelCard`. */
+  channelCardChanged?: boolean;
+  /** A DM target's peer card, when this context has not seen the peer. */
+  peerCard?: AgentApiPeerCard;
   [key: string]: unknown;
 }
 
@@ -332,7 +444,34 @@ export interface AgentApiSendSentResponse {
     };
     [key: string]: unknown;
   };
+  /** The target's channel card, when the send named a version this context has not seen. */
+  channelCard?: AgentApiChannelCard;
+  /** This context saw an older version of `channelCard`. */
+  channelCardChanged?: boolean;
+  /** A DM target's peer card, when this context has not seen the peer. */
+  peerCard?: AgentApiPeerCard;
   [key: string]: unknown;
 }
 
-export type AgentApiSendResponse = AgentApiSendSentResponse | AgentApiHeldFreshnessResponse;
+export interface AgentApiSendNotFoundResponse {
+  ok: true;
+  state: "not_found";
+  reconciliation: true;
+  [key: string]: unknown;
+}
+
+export interface AgentApiSendCommittedResponse {
+  ok: true;
+  state: "committed";
+  messageId: string;
+  messageSeq?: number;
+  reconciliation: true;
+  receiptComplete: false;
+  [key: string]: unknown;
+}
+
+export type AgentApiSendResponse =
+  | AgentApiSendSentResponse
+  | AgentApiHeldFreshnessResponse
+  | AgentApiSendNotFoundResponse
+  | AgentApiSendCommittedResponse;

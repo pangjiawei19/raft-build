@@ -9,20 +9,23 @@
 // them. As defense-in-depth EVERY emitted line is additionally run
 // through `redactSecrets()` so even a future bug that drops a credential
 // into a check `detail` cannot leak it.
-import { buildStatusReport } from "./status.js";
-import type { ServerStatusRow } from "./status.js";
+import { buildStatusReport } from "./status";
+import { describeDuplicateKeyHolder, findDuplicateKeyHolder } from "./duplicateKeyGuard";
+import { describeRaftHomeConflict, findRaftHomeConflictFor, serverRunnerMemoryPath, serviceMemoryPath } from "./paths";
+import { describeRunnerMemory, readRunnerMemorySample } from "./runnerMemory";
+import type { ServerStatusRow } from "./status";
 import {
   ComputerAttachClient,
   LegacyMachinesClient,
   ServerMachinesClient,
   type ServerMachinesResult,
-} from "./apiClient.js";
-import { detectLegacyMigration, type LegacyMachineRosterClientFactory } from "./lib/migration.js";
-import type { MigrationDetection } from "./lib/types.js";
-import { readUserSessionAuth } from "./lib/userSession.js";
-import type { ServerAttachment } from "./serverState.js";
-import { formatServerSlugDisplay, listServerAttachments } from "./serverState.js";
-import { hasUnlinkedComputerHandshake, readRunnerLogTail } from "./internal/runner-log-diagnostics.js";
+} from "./apiClient";
+import { detectLegacyMigration, type LegacyMachineRosterClientFactory } from "./lib/migration";
+import type { MigrationDetection } from "./lib/types";
+import { readUserSessionAuth } from "./lib/userSession";
+import type { ServerAttachment } from "./serverState";
+import { formatServerSlugDisplay, listServerAttachments } from "./serverState";
+import { hasUnlinkedComputerHandshake, readRunnerLogTail } from "./internal/runner-log-diagnostics";
 
 // The CLI presenters (`runDoctor` / `runDoctorMigrationDetails`) live in
 // doctorCli.ts (decycle R0, #wg-raft-computer:18ab6541). The pure check
@@ -51,6 +54,10 @@ export interface DoctorCheck {
 }
 
 interface DoctorDeps {
+  /** task #914 seam: another live service on this host holding the same machine key. */
+  findDuplicateKeyHolder?: typeof findDuplicateKeyHolder;
+  /** task #915 seam: both default homes hold Raft data and nothing picks one. */
+  findRaftHomeConflict?: typeof findRaftHomeConflictFor;
   detectMigration?: (
     slockHome: string,
     serverSlug: string,
@@ -135,6 +142,21 @@ export async function runDoctorChecks(
 
   checks.push({ name: "SLOCK_HOME", ok: true, detail: report.slockHome });
 
+  // task #915: the home above may be a guess between two that hold Raft data.
+  const homeConflict = (opts.findRaftHomeConflict ?? findRaftHomeConflictFor)(slockHome);
+  if (homeConflict) {
+    checks.push({ name: "Raft home", ok: false, detail: describeRaftHomeConflict(homeConflict) });
+  }
+
+  // task #914: two services on one key make the server send commands to
+  // either of them. Name the other holder so the owner can stop or re-bind.
+  const duplicateHolder = await (opts.findDuplicateKeyHolder ?? findDuplicateKeyHolder)(slockHome);
+  checks.push(
+    duplicateHolder
+      ? { name: "machine key holders", ok: false, detail: describeDuplicateKeyHolder(duplicateHolder) }
+      : { name: "machine key holders", ok: true, detail: "no other live Computer service on this host holds this machine key" },
+  );
+
   checks.push(
     report.userSessionError
       ? { name: "user session", ok: false, detail: "invalid user session file — re-run `raft-computer login`" }
@@ -154,26 +176,16 @@ export async function runDoctorChecks(
           detail: "stopped (run `raft-computer start` when you want background)",
         },
   );
-
-  if (report.hostLifecycle) {
+  if (report.service.running) {
     checks.push({
-      name: "macOS login carrier",
-      ok: false,
-      detail:
-        `${report.hostLifecycle.status} (${report.hostLifecycle.errorCode ?? "replacement interrupted"}) — `
-        + "the enabled owner marker is not trusted; repair the saved login carrier before retrying start or upgrade",
-    });
-  }
-
-  if (report.upgrade) {
-    const upgrade = report.upgrade;
-    checks.push({
-      name: "K upgrade receipt",
-      ok: false,
-      detail: upgrade.outcome === null
-        ? `${upgrade.scope} operation ${upgrade.requestId} is active in phase ${upgrade.phase}`
-        : `${upgrade.scope} operation ${upgrade.requestId} is terminal ${upgrade.outcome} and unacknowledged; `
-          + `verify the running Computer, then run \`raft-computer operation acknowledge ${upgrade.requestId}\``,
+      name: "service memory",
+      ok: true,
+      detail: describeRunnerMemory(
+        await readRunnerMemorySample(serviceMemoryPath(slockHome)),
+        report.service.pid,
+        Date.now(),
+        "service",
+      ),
     });
   }
 
@@ -242,6 +254,15 @@ export async function runDoctorChecks(
         ok: runner.ok,
         detail: runner.detail,
       });
+      // Informational: memory never fails doctor.
+      if (statusRow.daemon.running) {
+        const sample = await readRunnerMemorySample(serverRunnerMemoryPath(slockHome, a.serverId));
+        checks.push({
+          name: `memory ${label}`,
+          ok: true,
+          detail: describeRunnerMemory(sample, statusRow.daemon.pid, Date.now()),
+        });
+      }
     }
     const migration = await legacyMigrationForDoctor(slockHome, a, opts);
     const setupBlocker = setupBlockingIdentityDetail(a, migration, runnerOk);

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { test } from "vitest";
 
 import {
   SLACK_BRIDGE_ACTIVE_BOT_SCOPES,
@@ -14,7 +13,7 @@ import {
   SLACK_BRIDGE_REQUIRED_BOT_SCOPES,
   SLACK_BRIDGE_STAGING_EVENTS_REQUEST_URL,
   SLACK_BRIDGE_STAGING_OAUTH_REDIRECT_URI,
-} from "./slackBridgeProductionAppContract.js";
+} from "./slackBridgeProductionAppContract";
 
 const productionManifestUrl = new URL(
   "../../../../infra/slack-bridge/production-app-manifest.json",
@@ -122,6 +121,8 @@ test("initial install closes the approved future-scope reauthorization gap", () 
     "chat:write.customize",
     "groups:history",
     "groups:read",
+    "usergroups:read",
+    "usergroups:write",
     "users:read",
   ], "preauthorization must not silently expand the executable capability manifest");
   const partition = [

@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import {
   applyMachineEvent,
-} from "../src/store/events/machineEvents.js";
+} from "../src/store/events/machineEvents";
 import type {
   MachineDomainState,
-} from "../src/store/events/machineEvents.js";
-import type { Machine } from "../src/store/machineStore.js";
+} from "../src/store/events/machineEvents";
+import type { Machine } from "../src/store/machineStore";
 
 function seedMachine(overrides: Partial<Machine> = {}): Machine {
   return {
@@ -31,7 +30,6 @@ function seedState(
 ): MachineDomainState {
   return {
     machines: [seedMachine()],
-    latestDaemonVersion: null,
     latestComputerVersion: null,
     computerOperationProgress: {},
     ...overrides,
@@ -186,84 +184,6 @@ test("machine capabilities updates only changed fields and preserves no-op refer
   assert.deepEqual(cleared.state.machines[0].runtimeVersions, {});
 });
 
-test("upgrade progress scales download percent and rejects stale request frames", () => {
-  const first = applyMachineEvent(seedState(), {
-    kind: "upgrade-progress",
-    machineId: "machine-1",
-    requestId: "req-1",
-    phase: "downloading",
-    percent: 50,
-    message: "Downloading",
-  });
-
-  assert.equal(first.transition.touched, 1);
-  assert.equal(
-    first.state.computerOperationProgress["machine-1"]?.progressValue,
-    43,
-  );
-  assert.equal(
-    first.state.computerOperationProgress["machine-1"]?.requestId,
-    "req-1",
-  );
-
-  const stale = applyMachineEvent(first.state, {
-    kind: "upgrade-progress",
-    machineId: "machine-1",
-    requestId: "req-old",
-    phase: "applying",
-  });
-
-  assert.equal(stale.transition.touched, 0);
-  assert.equal(stale.state, first.state);
-  assert.equal(
-    stale.state.computerOperationProgress["machine-1"]?.phase,
-    "downloading",
-  );
-});
-
-test("upgrade done completes the matching request and ignores stale completions", () => {
-  const progress = applyMachineEvent(seedState(), {
-    kind: "upgrade-progress",
-    machineId: "machine-1",
-    requestId: "req-1",
-    phase: "applying",
-  }).state;
-
-  const done = applyMachineEvent(progress, {
-    kind: "upgrade-done",
-    machineId: "machine-1",
-    requestId: "req-1",
-    ok: true,
-    newVersion: "0.0.8",
-  });
-
-  assert.equal(done.transition.touched, 1);
-  assert.equal(done.state.computerOperationProgress["machine-1"]?.done, true);
-  assert.equal(
-    done.state.computerOperationProgress["machine-1"]?.progressValue,
-    100,
-  );
-  assert.equal(
-    done.state.computerOperationProgress["machine-1"]?.newVersion,
-    "0.0.8",
-  );
-
-  const stale = applyMachineEvent(done.state, {
-    kind: "upgrade-done",
-    machineId: "machine-1",
-    requestId: "req-old",
-    ok: false,
-    error: "stale",
-  });
-
-  assert.equal(stale.transition.touched, 0);
-  assert.equal(stale.state, done.state);
-  assert.equal(
-    stale.state.computerOperationProgress["machine-1"]?.error,
-    undefined,
-  );
-});
-
 test("restart done completes only the matching request receipt", () => {
   const progress = applyMachineEvent(seedState(), {
     kind: "operation-set",
@@ -309,4 +229,63 @@ test("operation set distinguishes equal-length progress objects with different k
     operation: "restart",
     requestId: "restart-1",
   });
+});
+
+// task #1268: explicit runtime detection state travels with capabilities; a
+// capabilities event without an inventory (previous list unknown on the
+// server) leaves the list untouched and only updates the state.
+test("capabilities carry runtimeDetection, and an inventory-less event keeps the last confirmed list", () => {
+  const state = seedState({
+    machines: [seedMachine({ runtimes: ["node"], runtimeVersions: { node: "22.1.0" } })],
+  });
+  const pending = applyMachineEvent(state, {
+    kind: "capabilities",
+    machineId: "machine-1",
+    runtimes: ["node"],
+    runtimeVersions: { node: "22.1.0" },
+    runtimeDetection: { status: "pending" },
+  });
+  assert.equal(pending.transition.touched, 1);
+  assert.deepEqual(pending.state.machines[0].runtimes, ["node"]);
+  assert.deepEqual(pending.state.machines[0].runtimeDetection, { status: "pending" });
+
+  const withoutInventory = applyMachineEvent(pending.state, {
+    kind: "capabilities",
+    machineId: "machine-1",
+    runtimeDetection: { status: "incomplete", reason: "deadline", unfinishedRuntimes: ["python"] },
+  });
+  assert.equal(withoutInventory.transition.touched, 1);
+  assert.deepEqual(withoutInventory.state.machines[0].runtimes, ["node"], "no runtimes key: the last confirmed list stays");
+  assert.deepEqual(withoutInventory.state.machines[0].runtimeVersions, { node: "22.1.0" });
+  assert.deepEqual(withoutInventory.state.machines[0].runtimeDetection, { status: "incomplete", reason: "deadline", unfinishedRuntimes: ["python"] });
+
+  const complete = applyMachineEvent(withoutInventory.state, {
+    kind: "capabilities",
+    machineId: "machine-1",
+    runtimes: ["node", "python"],
+    runtimeVersions: { node: "22.1.0", python: "3.13.1" },
+    runtimeDetection: { status: "complete" },
+  });
+  assert.deepEqual(complete.state.machines[0].runtimes, ["node", "python"]);
+  assert.deepEqual(complete.state.machines[0].runtimeDetection, { status: "complete" });
+});
+
+test("review: legacy synchronous inventory clears previous incomplete detection", () => {
+  const state = seedState({machines:[seedMachine({runtimeDetection:{status:"incomplete",unfinishedRuntimes:["claude"],reason:"deadline"}})]});
+  const result = applyMachineEvent(state,{kind:"capabilities",machineId:"machine-1",runtimes:["claude"],runtimeVersions:{claude:"2.1.287"}});
+  assert.equal(result.state.machines[0].runtimeDetection ?? null, null);
+});
+
+test("task #1268: a synchronous inventory also clears pending; an inventory-less status event never erases the inventory; an async complete keeps its explicit state", () => {
+  const pendingState = seedState({ machines: [seedMachine({ runtimes: ["node"], runtimeDetection: { status: "pending" } })] });
+  const cleared = applyMachineEvent(pendingState, { kind: "capabilities", machineId: "machine-1", runtimes: ["node", "python"], runtimeVersions: {} });
+  assert.equal(cleared.state.machines[0].runtimeDetection ?? null, null);
+  assert.deepEqual(cleared.state.machines[0].runtimes, ["node", "python"]);
+
+  const statusOnly = applyMachineEvent(cleared.state, { kind: "capabilities", machineId: "machine-1", runtimeDetection: { status: "pending" } });
+  assert.deepEqual(statusOnly.state.machines[0].runtimes, ["node", "python"], "inventory untouched by a status-only event");
+  assert.deepEqual(statusOnly.state.machines[0].runtimeDetection, { status: "pending" });
+
+  const asyncComplete = applyMachineEvent(statusOnly.state, { kind: "capabilities", machineId: "machine-1", runtimes: ["node"], runtimeVersions: {}, runtimeDetection: { status: "complete" } });
+  assert.deepEqual(asyncComplete.state.machines[0].runtimeDetection, { status: "complete" });
 });

@@ -1,9 +1,9 @@
 // @ts-nocheck
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, render, screen } from "@testing-library/react";
 import MobileDownloadChooserPage, { isTouchCapableMac } from "../src/pages/MobileDownloadChooserPage";
+import { resetDesktopPlatformsForTest } from "../src/components/settings/DesktopDownloadOptions";
 import { TestIntlProvider } from "./helpers/intl";
 
 /**
@@ -15,6 +15,28 @@ import { TestIntlProvider } from "./helpers/intl";
  * without a session, and both options route back through our own endpoint
  * rather than at a vendor URL that expires.
  */
+
+// Pinned, so the page does not render differently on a Linux CI host (jsdom's
+// default UA names the host platform) than on a Mac laptop.
+const IPHONE = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1";
+const MAC = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+let originalNavigator;
+function useNavigator(userAgent: string, maxTouchPoints = 0) {
+  Object.defineProperty(globalThis, "navigator", { value: { userAgent, maxTouchPoints }, configurable: true });
+}
+beforeEach(() => {
+  originalNavigator = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  resetDesktopPlatformsForTest(async () => ({
+    mac: { status: "available", version: "0.1.42", universal: false },
+    linux: { status: "available", version: "0.1.42" },
+    windows: { status: "none" },
+  }));
+  useNavigator(IPHONE, 5);
+});
+afterEach(() => {
+  if (originalNavigator) Object.defineProperty(globalThis, "navigator", originalNavigator);
+  resetDesktopPlatformsForTest();
+});
 
 function renderChooser(locale?: "en" | "zh-cn") {
   return render(
@@ -46,6 +68,32 @@ test("both platforms are offered, each through our own endpoint", () => {
       assert.ok(!href.includes("hands.build"), `must not embed a vendor URL: ${href}`);
       assert.ok(!href.includes("testflight.apple.com"), `must not embed a vendor URL: ${href}`);
     }
+
+    // Desktop (task #714): the newsletter links here for desktop readers too.
+    // Every platform goes through our own endpoint (which reads the Latest
+    // release's update feed), never a versioned GitHub asset URL, and stays in
+    // this tab because it is a download.
+    for (const target of ["mac-arm64", "mac-x64", "linux-appimage", "linux-deb"]) {
+      const link = screen.getByTestId(`desktop-download-chooser-${target}`);
+      assert.ok(link.getAttribute("href")?.endsWith(`/desktop-download?target=${target}`), target);
+      assert.equal(link.getAttribute("target"), null, `${target} is a download: same tab`);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("a phone gets no desktop recommendation; a Mac gets one, labelled with its chip", () => {
+  try {
+    renderChooser();
+    assert.ok(screen.queryByTestId("desktop-download-chooser-recommended") === null, "the phone is not the computer");
+    cleanup();
+    useNavigator(MAC, 0);
+    renderChooser();
+    const recommended = screen.getByTestId("desktop-download-chooser-recommended");
+    assert.equal(recommended.textContent, "Download for Mac (Apple silicon)");
+    assert.ok(recommended.getAttribute("href")?.endsWith("/desktop-download?target=mac-arm64"));
+    assert.ok(screen.getByTestId("desktop-download-chooser-intel-hint"));
   } finally {
     cleanup();
   }
@@ -70,10 +118,12 @@ test("neither option is styled as the recommended one", () => {
   // even less, since this page exists precisely because detection failed.
   try {
     renderChooser();
-    for (const id of ["mobile-download-chooser-ios", "mobile-download-chooser-android"]) {
-      const el = screen.getByTestId(id);
-      assert.ok(el.className.includes("bg-white"), `${id} must use the neutral surface`);
-      assert.ok(!el.className.includes("bg-brutal-pink"), `${id} must not take the CTA fill`);
+    const ios = screen.getByTestId("mobile-download-chooser-ios");
+    const android = screen.getByTestId("mobile-download-chooser-android");
+    assert.equal(ios.className, android.className, "both platforms must look the same");
+    for (const el of [ios, android]) {
+      assert.match(el.className, /(?:^|\s)bg-layer-card(?:\s|$)/, "must use the neutral paper button");
+      assert.doesNotMatch(el.className, /bg-attention|bg-palette-pink/, "must not take the CTA fill");
     }
   } finally {
     cleanup();
@@ -84,8 +134,10 @@ test("the page is localized, not English-only", () => {
   try {
     renderChooser("zh-cn");
     const text = document.body.textContent ?? "";
-    assert.match(text, /获取 Raft 手机 App/);
-    assert.ok(!text.includes("Get the Raft mobile app"), "zh-cn must not fall back to English");
+    assert.match(text, /获取 Raft App/);
+    assert.match(text, /桌面版/, "zh-cn must localize the desktop entry");
+    assert.match(text, /macOS（Apple 芯片）/);
+    assert.ok(!text.includes("Get the Raft App"), "zh-cn must not fall back to English");
   } finally {
     cleanup();
   }

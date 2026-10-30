@@ -1,8 +1,8 @@
-import type { AgentConfig } from "@botiverse/raft-shared";
-import { axSurface } from "../agentRuntimeInput.js";
-import { exampleAgentConfig, exampleSystemPromptOptions } from "../axExampleFixtures.js";
-import { buildRaftCliGuideSections } from "./raftCliGuide.js";
-import type { RaftCliGuideShell } from "./raftCliGuide.js";
+import { RECOMMENDED_MEMORY_MD_BYTES, type AgentConfig } from "@botiverse/raft-shared";
+import { axSurface } from "../agentRuntimeInput";
+import { exampleAgentConfig, exampleSystemPromptOptions } from "../axExampleFixtures";
+import { buildRaftCliGuideSections } from "./raftCliGuide";
+import type { RaftCliGuideShell } from "./raftCliGuide";
 
 /*
  * System prompt writing principles
@@ -32,7 +32,31 @@ export interface SystemPromptOptions {
   extraCriticalRules: string[];
   /** Shell syntax used by command examples for this runtime. */
   commandShell?: RaftCliGuideShell;
+  /**
+   * The runtime gives the agent a tool to start sub-agents. Together with the
+   * server's `AgentConfig.subagentDelegation` flag this renders the
+   * "Working through sub-agents" section; either one missing renders nothing.
+   */
+  supportsSubagents?: boolean;
 }
+
+export const SUBAGENT_DELEGATION_SECTION = `## Working through sub-agents
+
+Your runtime can start sub-agents: helper agents that work in parallel with you, report only to you, and have no Raft identity of their own. Split the work this way:
+
+- **You** stay in the conversation. Read what people ask, think it through, decide what needs doing, hand it out, check what comes back, and answer on Raft when a reply is needed. Spend your own attention on thinking and communicating rather than on hands-on execution.
+- **Sub-agents** do the hands-on work: reading and searching code, running commands and tests, editing files, collecting evidence.
+
+This is about your own work. Splitting work into Raft tasks for other named agents (above) is a separate tool; do not turn each sub-agent job into a Raft task.
+
+Defaults:
+1. **Answer first, then delegate.** When a message needs a reply, acknowledge or answer it on Raft before starting longer work. If you can answer from what you already know, answer directly; do not start a sub-agent for it.
+2. **Delegate execution.** Hand anything beyond a few tool calls to a sub-agent. Do a single quick lookup yourself when briefing a sub-agent would take longer than doing it.
+3. **Run independent work in parallel.** Split the work into pieces that do not depend on each other and start them together. Keep dependent steps in order.
+4. **Brief completely.** A sub-agent sees none of your conversation or memory. Give it the goal, the relevant context and paths, the constraints, and what to return. Ask for a conclusion with evidence, not a log.
+5. **Only you speak on Raft.** Tell every sub-agent not to send messages, claim or update tasks, react, or schedule reminders. Everything people see on Raft comes from you.
+6. **You own the result.** Check what a sub-agent returns before you pass it on, and report it in your own words. Say so when something was not verified. Delegating does not widen authority: a sub-agent may only do what you are allowed to do for the current request.
+7. **Stay reachable while work runs.** While sub-agents work, keep reading new messages and answer the ones that need you; the reply-only-when-needed defaults above still apply. "Complete all your work before stopping" still applies: before you stop, every sub-agent you started has finished and its result has been reported.`;
 
 function runtimeContextLines(config: AgentConfig): string[] {
   const ctx = config.runtimeContext;
@@ -71,13 +95,26 @@ function buildPrompt(
   const cliGuideSections = buildRaftCliGuideSections({
     // The daemon prompt audience is always managed-runner regardless of
     // CLI vs MCP variant — both are daemon-spawned. The self-hosted-runner
-    // audience is only used by the manual topic generator script.
+    // audience is used by the manual topic generator and by the server's
+    // `GET /internal/agent-api/context` for external agents.
     audience: "managed-runner",
     identity: {
       handle: config.name,
       displayName: config.displayName || config.name,
     },
+    // Task #319: the Server sends a snapshot of this Server's installed apps
+    // (name/description/whenToUse, already inert-rendered) with `agent:start`.
+    // Absent on old Servers, and empty/absent renders nothing, so the prompt
+    // degrades to exactly its historical text. The snapshot is taken at agent
+    // start: apps installed or disabled mid-run appear on the next start, and
+    // `raft integration list` stays the live answer.
+    installedApps: config.installedApps ?? [],
+    // Reminder / Vault app rollout flags; absent on old Servers, which keeps
+    // the historical Reminders and Credential handling text.
+    reminderApp: config.reminderApp === true,
+    vaultApp: config.vaultApp === true,
     shell: opts.commandShell,
+    ...(config.constructedWakeContext === true ? { memoryIndexBudgetBytes: RECOMMENDED_MEMORY_MD_BYTES } : {}),
   });
 
   const criticalRules = [
@@ -153,16 +190,16 @@ ${startupSteps.join("\n")}`;
 
 ## Messaging
 
-People and agents collaborate asynchronously in Raft. Keep making progress on your current work, and adjust your plan and priorities based on new information you read. Choose when to read pending messages; unread messages do not mean there is no work, and each notice does not require an immediate interruption.
+People and agents collaborate asynchronously in Raft. Keep making progress on your current work, and adjust your plan and priorities based on new information you read. Choose when to read pending messages: you may finish your current step first, but read them before you stop, because they may need a reply or action.
 
 Messages you receive have a single RFC 5424-style structured data header followed by the sender and content:
 
 \`\`\`
-[target=#general msg=00000000 time=2026-03-15T01:00:00 type=human] @richard: hello everyone
-[target=#general msg=11111111 time=2026-03-15T01:00:01 type=agent] @Alice: hi there
-[target=dm:@richard msg=22222222 time=2026-03-15T01:00:02 type=human] @richard: hey, can you help?
-[target=#general:00000000 msg=33333333 time=2026-03-15T01:00:03 type=human] @richard: thread reply
-[target=dm:@richard:22222222 msg=44444444 time=2026-03-15T01:00:04 type=human] @richard: DM thread reply
+[target=#general msg=00000000 time=2026-03-15 01:00:00Z type=human] @richard: hello everyone
+[target=#general msg=11111111 time=2026-03-15 01:00:01Z type=agent] @Alice: hi there
+[target=dm:@richard msg=22222222 time=2026-03-15 01:00:02Z type=human] @richard: hey, can you help?
+[target=#general:00000000 msg=33333333 time=2026-03-15 01:00:03Z type=human] @richard: thread reply
+[target=dm:@richard:22222222 msg=44444444 time=2026-03-15 01:00:04Z type=human] @richard: DM thread reply
 \`\`\`
 
 Prompt examples use obvious placeholder IDs such as \`00000000\`, \`11111111\`,
@@ -173,8 +210,10 @@ received or read.
 Header fields:
 - \`target=\` — where the message came from. Reuse as the \`target\` parameter when replying.
 - \`msg=\` — message short ID (first 8 chars of UUID). Use as thread suffix to start/reply in a thread.
-- \`time=\` — timestamp.
+- \`time=\` — UTC timestamp, e.g. \`2026-03-15 01:00:00Z\`.
 - \`type=\` — sender kind. Values are \`human\`, \`agent\`, \`system\`, or \`third_party_app\`.
+
+A human sender's name may carry a time zone, e.g. \`@richard (Asia/Shanghai)\`: where they were when they sent the message. Read their "today", "tomorrow" or "tonight" in their zone. Later messages from the same sender may omit it; keep using the last zone you saw for them.
 
 \`type=system\` messages announce state changes in the channel (task events, channel archived/unarchived, etc.). They are informational — don't reply to them unless they clearly request action (e.g. a task was just assigned to you). In particular, archive/unarchive notifications do not need any response. If a channel is archived, further writes there will be rejected.
 
@@ -195,7 +234,7 @@ ${historicalReferenceSection}
 ${tasksSection}
 
 ${cliGuideSections.splittingTasks}
-
+${config.subagentDelegation === true && opts.supportsSubagents === true ? `\n${SUBAGENT_DELEGATION_SECTION}\n` : ""}
 ${cliGuideSections.mentions}
 
 ${cliGuideSections.communicationStyle}

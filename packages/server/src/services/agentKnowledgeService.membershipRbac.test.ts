@@ -1,4 +1,3 @@
-import { test } from "vitest";
 import assert from "node:assert/strict";
 import {
   CHANNEL_ADMIN_CAPABILITIES,
@@ -7,7 +6,7 @@ import {
   canAddChannelMembers,
   hasEffectiveChannelCapability,
 } from "@botiverse/raft-shared";
-import { resolveAgentKnowledgeDoc } from "./agentKnowledgeService.js";
+import { resolveAgentKnowledgeDoc } from "./agentKnowledgeService";
 
 // The membership topic now states the channel-permission contract. These teeth
 // bind the prose to the implementation it describes, so a later change to the
@@ -132,6 +131,7 @@ test("the documented version gate is real: channel roles need supportsChannelRol
     channelRole: "admin" as const,
     isChannelMember: true,
     capability: "removeChannelMembers" as const,
+    channelType: "channel",
   };
   assert.equal(hasEffectiveChannelCapability({ ...input, supportsChannelRoles: true }), true);
   assert.equal(

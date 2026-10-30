@@ -1,15 +1,35 @@
-import { createContext, lazy, Suspense, useContext, useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from "react";
+import { composerHostClassName } from "./composerHost";
+import CloseButton from "../ui/CloseButton";
+import { createContext, lazy, memo, Suspense, useContext, useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from "react";
 import type { ComponentType, ReactNode } from "react";
-import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
-import { LogIn, ArrowLeft, Settings, MessageSquare, ListTodo, ArrowDown, Square, Paperclip, Bell, BellOff, X, Search } from "lucide-react";
-import { SortableTabsList, SortableTabsTab, Tabs, TabsLabel, useOrderedTabs } from "raft-ui";
-import { toast } from "raft-ui";
+import { LogIn, ArrowLeft, MessageSquare, ListTodo, ArrowDown, Paperclip, BellOff, X } from "lucide-react";
+import {
+  Badge,
+  ConversationPanelBody,
+  ConversationPanelContent,
+  ConversationPanelFooter,
+  ConversationPanelRoot,
+  ConversationPanelTabs,
+  PanelTitle,
+  SortableTabsList,
+  SortableTabsTab,
+  Tabs,
+  TabsLabel,
+  toast,
+  useOrderedTabs,
+  Button,
+  PanelNotice,
+  PanelNoticeActions,
+  PanelNoticeContent,
+  Status,
+} from "@botiverse/raft-ui";
 import SOSDialog from "./SOSDialog";
 import { useChannelStore } from "../../store/channelStore";
 import type { Channel } from "../../store/channelStore";
 import { canToggleActivityMute, matchesActivityMuteState, matchesMessageDisplayPrefsState, normalizeActivityMuteState, normalizeMessageDisplayPrefs } from "../../store/channelDomain";
 import {
+  CONTEXT_BEYOND_HISTORY_ERROR,
   selectChannelMessageBucket,
   selectChannelWindowMeta,
   useMessageStore,
@@ -19,18 +39,21 @@ import type {
 } from "../../store/messageStore";
 import { useAgentDisplayState, useAgentStore } from "../../store/agentStore";
 import { useServerStore } from "../../store/serverStore";
-import { PLAN_CONFIG, getEffectiveLimits, TOPBAR_OVERFLOW_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
+import { PLAN_CONFIG, getEffectiveLimits } from "@botiverse/raft-shared";
 import type { ServerPlan } from "@botiverse/raft-shared";
 import { CHAT_TAB_QUERY_PARAM, useAppNavigate, useMobileBack } from "../../hooks/useAppNavigate";
 import { useLiveSearchParams } from "../../hooks/useLiveSearchParams";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
-import { useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import { useTranslationBatch } from "../../hooks/useTranslationBatch";
+import { useChannelFirstPageSettled } from "../../hooks/useChannelFirstPageSettled";
 import { useChannelMembers } from "../../hooks/useChannelMembers";
 import StatusDot from "../ui/StatusDot";
+import Tooltip from "../ui/Tooltip";
 import { useThreadStore } from "../../store/threadStore";
+import { ThreadUnreadJumpPill } from "./ThreadUnreadJumpPill";
 import type { OpenThreadRequest } from "../../store/threadStore";
 import Banner from "../ui/Banner";
+import HistoryLimitBanner from "./HistoryLimitBanner";
 import { useProfileStore } from "../../store/profileStore";
 import MessageItem, { buildMentionMap } from "./MessageItem";
 import HistoryTopState from "./HistoryTopState";
@@ -44,6 +67,7 @@ import type {
 } from "./MessageTimeline";
 import SelectModeToolbar from "./SelectModeToolbar";
 import SelectShareLightbox from "./SelectShareLightbox";
+import type { ValidatedScreenshot } from "../../utils/screenshotBudget";
 import {
   buildSelectedMessagePermalinks,
   canForwardFromSource,
@@ -54,22 +78,20 @@ import {
 import { forwardToast } from "./forwardToast";
 import { useSelectionStore } from "../../store/selectionStore";
 import { gatherSelectedMessagesWithMeta, useSelectionShareHandlers } from "./useSelectionShareHandlers";
-import ChannelMembers from "../agent/ChannelMembers";
 import ChannelOverflowMenu from "../channel/ChannelOverflowMenu";
-import Button from "../ui/Button";
 import PanelHeader from "../ui/PanelHeader";
 import EmptyState from "../ui/EmptyState";
 import AvatarSlot from "../ui/AvatarSlot";
-import EditChannelDialog from "../channel/EditChannelDialog";
 import { ChannelKindIcon } from "../channel/channelKindIcon";
+import ChannelDescription from "../channel/ChannelDescription";
 import { selectChannelTaskBucket, useTaskStore } from "../../store/taskStore";
 import type { Task } from "../../store/taskStore";
 import TasksPanel from "../task/TasksPanel";
 import ChannelFilesPanel from "./ChannelFilesPanel";
 import { getHistoryTopState } from "../../utils/historyTopState";
-import SystemMessageGroupDisclosure from "./SystemMessageGroupDisclosure";
+import ThreadPanelSystemMessageGroupDisclosure from "./ThreadPanelSystemMessageGroupDisclosure";
 import { buildSystemMessageRenderStates } from "./systemMessageGrouping";
-import { useStableMessageGrouping } from "./messageGrouping";
+import { followedByFor, followsSystemFor, useStableMessageGrouping } from "./messageGrouping";
 import { DateDivider } from "./DateDivider";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import api from "../../api/client";
@@ -80,10 +102,18 @@ import NotificationActivationBanner, {
   isNotificationActivationComposerEligible,
 } from "./NotificationActivationBanner";
 import type { ForwardDelivery } from "./ForwardComposerDialog";
-import { formatActivityText } from "../../utils/activity";
+import { formatAgentDisplayStateText } from "../../utils/activity";
 import { resolveAgentDmProfileSource } from "../layout/agentDmProfileSource";
+import HostedCindyFailedBanner from "../agent/HostedCindyFailedBanner";
+import { WorkingFaces } from "../layout/WorkingNowSummary";
+import { useLiveAgentActivityStore } from "../../store/liveAgentActivityStore";
+import { useAppearanceStore } from "../../store/appearanceStore";
+import { isJointChannelReadOnly, jointChannelGraceEndsAt, useRerenderAtJointDeadline } from "../../utils/jointChannelLimit";
 
 const ForwardComposerDialog = lazy(() => import("./ForwardComposerDialog"));
+
+// Stable empty-prop bag for the mobile back button (task #709).
+const CHAT_MOBILE_BACK_PROPS = { "data-testid": "chat-mobile-back" } as const;
 
 type ChatPanelTab = "chat" | "tasks" | "files";
 
@@ -127,140 +157,110 @@ export function resolveChatPanelQueryFocusMessageId(searchParams: URLSearchParam
 
 export function ActivityMutedBadge() {
   const { formatMessage } = useIntl();
-  const topbarOverflow = useServerFeatureFlag(TOPBAR_OVERFLOW_FEATURE_FLAG_KEY);
-  // final7 (flag on): icon-only indicator next to the title — no MUTED
-  // text, no enclosing frame. The tooltip keeps the meaning discoverable.
-  // Flag off keeps the legacy framed text badge byte-identical.
-  if (topbarOverflow.enabled) {
-    return (
-      <span
-        className="inline-flex shrink-0 items-center leading-none text-black/70"
-        title={formatMessage({ id: "message.chatPanel.activityMuted" })}
-        data-testid="activity-muted-badge"
-      >
-        <BellOff size={12} />
-      </span>
-    );
-  }
+  // Icon-only indicator; the tooltip keeps the meaning discoverable.
   return (
+    <Tooltip content={formatMessage({ id: "message.chatPanel.activityMuted" })}>
     <span
-      className="inline-flex shrink-0 items-center gap-1 border-2 border-black bg-brutal-orange/25 px-1.5 py-1 text-[11px] font-bold uppercase leading-none"
-      title={formatMessage({ id: "message.chatPanel.activityMuted" })}
+      className="inline-flex shrink-0 items-center leading-none text-foreground-hint"
       data-testid="activity-muted-badge"
     >
-      <BellOff size={11} />
-      {formatMessage({ id: "message.chatPanel.mutedBadge" })}
+      <BellOff size={12} />
     </span>
-  );
-}
-
-export function ActivityMuteToggleButton({
-  activityMuted,
-  disabled,
-  onToggle,
-  dm = false,
-}: {
-  activityMuted: boolean;
-  disabled: boolean;
-  onToggle: () => void;
-  /** DM surfaces say "DM" instead of "channel". The toggle is currently only
-   * rendered for channel/private/joint (see canToggleActivityMute), but the
-   * server already supports DM mute, so the label variant is wired ahead. */
-  dm?: boolean;
-}) {
-  const { formatMessage } = useIntl();
-  const label = formatMessage({
-    id: dm
-      ? (activityMuted ? "message.chatPanel.unmuteActivityDm" : "message.chatPanel.muteActivityDm")
-      : (activityMuted ? "message.chatPanel.unmuteActivityChannel" : "message.chatPanel.muteActivityChannel"),
-  });
-  const Icon = activityMuted ? BellOff : Bell;
-  return (
-    <Button
-      onClick={onToggle}
-      shape="icon"
-      tone={activityMuted ? "orange" : "white"}
-      title={label}
-      aria-label={label}
-      disabled={disabled}
-      data-testid="activity-mute-toggle"
-      className={disabled ? "cursor-wait opacity-60" : ""}
-    >
-      <Icon size={14} />
-    </Button>
+    </Tooltip>
   );
 }
 
 // Isolated component — subscribes to a single agent's activity to avoid
 // re-rendering the entire ChatPanel on any agent status change.
 function AgentDMStatus({ agentId }: { agentId: string }) {
-  const { formatMessage } = useIntl();
+  const intl = useIntl();
   const displayState = useAgentDisplayState(agentId);
-  const activityText = formatActivityText(
-    formatMessage,
-    displayState.activity,
-    displayState.activityDetail,
-    displayState.activityDetailKind,
-  );
+  const activityText = formatAgentDisplayStateText(intl, displayState);
   return (
     <>
-      <StatusDot activity={displayState.activity} external={displayState.isExternal} title={activityText} />
-      <span className="min-w-0 truncate text-sm text-black/60 font-mono" title={activityText}>
+      <StatusDot activity={displayState.activity} external={displayState.isExternal && !displayState.isOnline} title={activityText} />
+      <Tooltip content={activityText}>
+      <span className="min-w-0 flex-1 max-w-fit truncate font-mono text-mono-meta text-foreground-hint">
         {activityText}
       </span>
+      </Tooltip>
     </>
   );
 }
 
-function HistoryLimitBanner() {
-  const { formatMessage } = useIntl();
-  const server = useServerStore((s) => s.current);
-  const billing = useServerStore((s) => s.billing);
-  const nav = useAppNavigate();
-  const plan = (billing?.plan || server?.plan || "free") as ServerPlan;
-  const days = getEffectiveLimits(plan).messageHistoryDays;
+const WORKING_ID_SEPARATOR = "\u0000";
 
+/**
+ * Raft Design System › Panel / AgentActivity: the channel header's subtitle
+ * first says who is working here — a stack of up to three agent faces and
+ * "2 agents working" — then the channel description. Isolated so the live
+ * activity feed re-renders this line only, never the conversation; with
+ * nobody working it renders the description alone (or nothing). Fed by the
+ * same live-activity store and appearance switch as the workspace summary.
+ */
+const ChannelHeaderSubtitle = memo(function ChannelHeaderSubtitle({
+  agentIdKey,
+  description,
+}: {
+  /** Channel agent ids joined by WORKING_ID_SEPARATOR: a stable memo key. */
+  agentIdKey: string;
+  description: string | null;
+}) {
+  const { formatMessage } = useIntl();
+  const items = useLiveAgentActivityStore((state) => state.items);
+  const visible = useAppearanceStore((state) => state.showLiveAgentActivityBar);
+  const working = useMemo(() => {
+    if (!visible || !agentIdKey || items.length === 0) return [];
+    const ids = new Set(agentIdKey.split(WORKING_ID_SEPARATOR));
+    return items.filter((item) => ids.has(item.agentId));
+  }, [agentIdKey, items, visible]);
+  const descriptionNode = description ? <ChannelDescription description={description} /> : null;
+  if (working.length === 0) return descriptionNode;
   return (
-    <Banner intent="warning" density="sm" className="mx-auto mb-3 max-w-md text-center font-bold justify-center">
-      {formatMessage({ id: "message.chatPanel.historyLimit" }, { days, plan: PLAN_CONFIG[plan].displayName })}{" "}
-      <button
-        onClick={() => nav.toSettings("billing")}
-        className="underline"
-      >
-        {formatMessage({ id: "message.chatPanel.viewBilling" })}
-      </button>
-    </Banner>
+    <span className="flex min-w-0 items-center gap-1.5" data-testid="channel-header-working">
+      <WorkingFaces items={working} />
+      <span className="shrink-0">{formatMessage({ id: "layout.workingNow.summary" }, { count: working.length })}</span>
+      {descriptionNode ? (
+        <>
+          <span aria-hidden="true">·</span>
+          {descriptionNode}
+        </>
+      ) : null}
+    </span>
   );
-}
+});
+
+// The select-share failure receipt is a DS Toast: neutral HUD, one line, an
+// orange "problem" pixel (raft-ui Status, the error light) in place of a "who".
+const SELECT_SHARE_ERROR_HUD_CLASS = "fixed bottom-20 left-1/2 z-[110] flex max-w-[calc(100vw-2rem)] -translate-x-1/2 items-center gap-3 rounded-container bg-layer-hud px-4 py-3 text-callout text-foreground-on-hud shadow-float";
+
+// UI text link inside banners (DS: ink, 1.5px underline, semibold).
+const BANNER_LINK_CLASS = "font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px]";
 
 export default function ChatPanel({
   channel,
   hideHeader,
   readOnly,
-  // Stryker disable all: workspace host defaults are exercised by the real-panel browser smoke.
+  // Stryker disable all: host defaults are exercised by browser smoke.
   showComposer = true,
   overlayComposer = false,
-  workspaceComposer = false,
   composerAutoFocus = true,
   // Stryker restore all
   onOpenThread,
   onOpenProfile,
   onSearchChannel,
-  headerActionsHost,
 }: {
   channel: Channel | null;
   hideHeader?: boolean;
   readOnly?: boolean;
   showComposer?: boolean;
   overlayComposer?: boolean;
-  workspaceComposer?: boolean;
   composerAutoFocus?: boolean;
   onOpenThread?: (request: OpenThreadRequest) => void;
   onOpenProfile?: (kind: "agent" | "human", id: string) => void;
   onSearchChannel?: (channelId: string) => void;
-  headerActionsHost?: Element | null;
 }) {
-  const { formatMessage } = useIntl();
+  const { formatMessage, formatDate } = useIntl();
   const chatPanelTabs = useMemo<PanelTabItem<ChatPanelTab>[]>(() => [
     { id: "chat", icon: MessageSquare, label: formatMessage({ id: "message.chatPanel.tabChat" }) },
     { id: "tasks", icon: ListTodo, label: formatMessage({ id: "message.chatPanel.tabTasks" }) },
@@ -272,11 +272,11 @@ export default function ChatPanel({
   // formatMessage directly; effects/handlers read formatMessageRef.current.
   const formatMessageRef = useRef(formatMessage);
   formatMessageRef.current = formatMessage;
-  const [serverMessageForwardingEnabled, setServerMessageForwardingEnabled] = useState(false);
-  const messageForwardingEnabled = serverMessageForwardingEnabled;
   const channelId = channel?.id ?? null;
-  const topbarOverflow = useServerFeatureFlag(TOPBAR_OVERFLOW_FEATURE_FLAG_KEY);
-  useReadReceiptHydrate(channel);
+  // Members, notification settings and read receipts wait for the first
+  // message page so they don't compete with it (task #17).
+  const channelFirstPageSettled = useChannelFirstPageSettled(channelId);
+  useReadReceiptHydrate(channelFirstPageSettled ? channel : null);
   const messageRenderScope = useContext(ChatPanelMessageRenderScope);
   const messages = useMessageStore((s) => selectChannelMessageBucket(s, channelId));
   const channelWindowMeta = useMessageStore((s) => selectChannelWindowMeta(s, channelId));
@@ -334,7 +334,13 @@ export default function ChatPanel({
     removeHuman: removeMentionChannelHuman,
     changeMemberRole: changeMentionChannelMemberRole,
     roleChangeFailed: mentionRoleChangeFailed,
-  } = useChannelMembers(channel?.id ?? "");
+  } = useChannelMembers(channel?.id ?? "", { enabled: channelFirstPageSettled });
+  // A string key, so the header's who-is-working line only re-filters when
+  // the channel's agent roster changes, not on every canonical agent update.
+  const channelAgentIdKey = useMemo(
+    () => mentionChannelAgents.map((agent) => agent.id).join(WORKING_ID_SEPARATOR),
+    [mentionChannelAgents],
+  );
   const joinChannel = useChannelStore((s) => s.joinChannel);
   const leaveChannel = useChannelStore((s) => s.leaveChannel);
   const setChannelActivityMuteState = useChannelStore((s) => s.setActivityMuteState);
@@ -365,14 +371,27 @@ export default function ChatPanel({
     [channel?.type, orderedTabs],
   );
 
+  // Keyed on the server id: the server object is replaced on unrelated
+  // updates, which used to re-fetch billing each time.
+  const currentServerId = currentServer?.id ?? null;
   useEffect(() => {
-    if (!currentServer) return;
+    if (!currentServerId) return;
     void loadBilling();
-  }, [currentServer?.id, loadBilling, currentServer]);
+  }, [currentServerId, loadBilling]);
 
   const activityMuteSupported =
     !!channelId &&
     canToggleActivityMute(channel ?? undefined);
+
+  // Message display prefs are a per-user "my conversation" setting with a
+  // WIDER type contract than Activity mute: the server accepts every
+  // non-thread channel (DM included — only threads are rejected, they are
+  // managed by the parent). Membership is still required for non-DM channels,
+  // same as before; DMs are only ever visible to their participants.
+  const messageDisplayPrefsSupported =
+    !!channelId &&
+    channel?.type !== "thread" &&
+    (channel?.type === "dm" || channel?.joined === true);
 
   // External API synchronization for the selected conversation's mute setting.
   // oxlint-disable-next-line react-doctor/no-cascading-set-state
@@ -389,6 +408,7 @@ export default function ChatPanel({
 
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setActivityMuteLoading(true);
+    if (!channelFirstPageSettled) return;
     api.get(`/channels/${channelId}/notification-settings`)
       .then((res) => {
         if (canceled) return;
@@ -406,19 +426,20 @@ export default function ChatPanel({
     return () => {
       canceled = true;
     };
-  }, [activityMuteSupported, channelId, setChannelActivityMuteState]);
+  }, [activityMuteSupported, channelFirstPageSettled, channelId, setChannelActivityMuteState]);
 
   // External API synchronization for the selected conversation's collapse
-  // preference (task #187 collapse-long-messages). Same channel-type and
-  // membership gating as the activity-mute effect above, plus the rollout
-  // gate itself. A disabled/unresolved flag must issue no preference request.
+  // preference (task #187 collapse-long-messages). Gated on the display-prefs
+  // contract (messageDisplayPrefsSupported — DM included), which is wider
+  // than the activity-mute effect above: per-DM mute is a documented
+  // non-feature while per-DM display prefs are server-supported (task #703).
   // oxlint-disable-next-line react-doctor/no-cascading-set-state
   useEffect(() => {
     let canceled = false;
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setMessageDisplayPrefsError(null);
 
-    if (!topbarOverflow.enabled || !activityMuteSupported || !channelId) {
+    if (!messageDisplayPrefsSupported || !channelId) {
       // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
       setMessageDisplayPrefsLoading(false);
       return;
@@ -443,7 +464,7 @@ export default function ChatPanel({
     return () => {
       canceled = true;
     };
-  }, [activityMuteSupported, channelId, setChannelMessageDisplayPrefsState, topbarOverflow.enabled]);
+  }, [messageDisplayPrefsSupported, channelId, setChannelMessageDisplayPrefsState]);
 
   const reorderTabs = useCallback((nextOrder: ChatPanelTab[]) => {
     void updateSidebarOrder({ channelPanelTabOrder: nextOrder });
@@ -470,9 +491,8 @@ export default function ChatPanel({
         key={tab.id}
         value={tab.id}
         data-testid={`panel-tab-${tab.id}`}
-        className="!cursor-default"
       >
-        <Icon size={12} />
+        <Icon />
         <TabsLabel>{tab.label}</TabsLabel>
       </SortableTabsTab>
     );
@@ -493,9 +513,7 @@ export default function ChatPanel({
       return next;
     }, { replace: true });
   }, [defaultTab, setSearchParams]);
-  const [showEditDialog, setShowEditDialog] = useState(false);
-  // task #187: with the overflow flag on, the archived banner's Unarchive
-  // link must open the same overflow drawer instead of the legacy sheet.
+  // The archived banner opens the same settings drawer as the header.
   const [overflowOpen, setOverflowOpen] = useState(false);
   const [showSOSDialog, setShowSOSDialog] = useState(false);
   const [activityMuteLoading, setActivityMuteLoading] = useState(false);
@@ -533,6 +551,15 @@ export default function ChatPanel({
   );
   const canManageAgents = capabilities.controlAgentRuntime;
   const focusMessageId = queryFocusMessageId;
+  // The channel-load effect below reads the URL-derived thread/focus values
+  // through refs so a `thread=`-only URL change never appears in its
+  // dependency list — thread navigation owns only the right panel and must not
+  // retrigger channel loading. An actual `msg=` change still retriggers via
+  // `rawQueryFocusMessageId`, which remains a dependency.
+  const threadParamRef = useRef(threadParam);
+  threadParamRef.current = threadParam;
+  const focusMessageIdRef = useRef(focusMessageId);
+  focusMessageIdRef.current = focusMessageId;
 
   // Thread navigation owns only the active-parent focus border. Retire any
   // temporary channel permalink flash before paint without reloading or moving
@@ -553,7 +580,6 @@ export default function ChatPanel({
   // different part of the context window, then open another thread. Reloading
   // here would replace their current channel window with the tail. A channel
   // change or an actual `msg=` change remains a channel-load intent.
-  // oxlint-disable react-hooks/exhaustive-deps -- thread-only URL changes do not own channel loading
   // oxlint-disable-next-line react-doctor/no-cascading-set-state
   useEffect(() => {
     if (!channelId) return;
@@ -569,9 +595,13 @@ export default function ChatPanel({
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setAtBottom(true);
     const pendingTransientFocus = transientFocusRequestRef.current;
+    // Retrigger key for actual `msg=` changes; the value itself is read
+    // through `focusMessageIdRef` so thread-only URL changes stay out of the
+    // dependency list (see the comment above this effect).
+    void rawQueryFocusMessageId;
     if (
-      !threadParam &&
-      !queryFocusMessageId &&
+      !threadParamRef.current &&
+      !focusMessageIdRef.current &&
       pendingTransientFocus?.channelId === channelId &&
       pendingTransientFocus.nonce !== handledTransientFocusNonceRef.current
     ) {
@@ -580,8 +610,9 @@ export default function ChatPanel({
       // request from immediately triggering a normal tail reload.
       return;
     }
-    if (focusMessageId) {
-      loadMessageContext(channelId, focusMessageId);
+    const urlFocusMessageId = focusMessageIdRef.current;
+    if (urlFocusMessageId) {
+      loadMessageContext(channelId, urlFocusMessageId);
       return;
     }
     // Restore prior scroll position if we have one — load centered around the
@@ -604,7 +635,6 @@ export default function ChatPanel({
     rawQueryFocusMessageId,
     setNearBottom,
   ]);
-  // oxlint-enable react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!channelId || threadParam || queryFocusMessageId) return;
@@ -658,7 +688,7 @@ export default function ChatPanel({
       }
     }
     prevMessageCountRef.current = messages.length;
-  }, [messages]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [messages]);
 
   // Scroll to bottom when switching back to chat tab
   const prevActiveTabRef = useRef(activeTab);
@@ -670,7 +700,7 @@ export default function ChatPanel({
         timelineRef.current?.scrollToBottom();
       });
     }
-  }, [activeTab, hasNewer, messages.length]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [activeTab, hasNewer, messages.length]);
 
   const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
     isNearBottomRef.current = atBottom;
@@ -766,12 +796,8 @@ export default function ChatPanel({
   const channelMuteFromSeq = storeChannel?.muteFromSeq ?? channel?.muteFromSeq ?? null;
   const channelPrefsVersion = storeChannel?.prefsVersion ?? channel?.prefsVersion;
   const activityMuted = channelActivityMuted;
-  const channelCollapseLongMessages = topbarOverflow.enabled
-    ? storeChannel?.collapseLongMessages ?? channel?.collapseLongMessages ?? true
-    : true;
-  const channelDisplayPrefsVersion = topbarOverflow.enabled
-    ? storeChannel?.displayPrefsVersion ?? channel?.displayPrefsVersion
-    : undefined;
+  const channelCollapseLongMessages = storeChannel?.collapseLongMessages ?? channel?.collapseLongMessages ?? true;
+  const channelDisplayPrefsVersion = storeChannel?.displayPrefsVersion ?? channel?.displayPrefsVersion;
 
   const handleToggleActivityMute = useCallback(async () => {
     if (!activityMuteSupported || !channelId || activityMuteSaving) return;
@@ -822,7 +848,7 @@ export default function ChatPanel({
   ]);
 
   const handleToggleCollapseLongMessages = useCallback(async () => {
-    if (!topbarOverflow.enabled || !activityMuteSupported || !channelId || messageDisplayPrefsSaving) return;
+    if (!messageDisplayPrefsSupported || !channelId || messageDisplayPrefsSaving) return;
     const previous = {
       collapseLongMessages: channelCollapseLongMessages,
       prefsVersion: channelDisplayPrefsVersion,
@@ -853,13 +879,12 @@ export default function ChatPanel({
       setMessageDisplayPrefsSaving(false);
     }
   }, [
-    activityMuteSupported,
+    messageDisplayPrefsSupported,
     channelCollapseLongMessages,
     channelDisplayPrefsVersion,
     channelId,
     messageDisplayPrefsSaving,
     setChannelMessageDisplayPrefsState,
-    topbarOverflow.enabled,
   ]);
 
   // Memoize mention map and agent lookup for MessageItem props
@@ -891,6 +916,13 @@ export default function ChatPanel({
     }
     return map;
   }, [members, mentionChannelHumans]);
+  // Provider-side projections (Slack members bound to this channel), keyed by
+  // projection id — same id the `type:"external"` structured mention carries.
+  const externalById = useMemo(() => {
+    const map = new Map<string, typeof mentionChannelExternalMembers[0]>();
+    for (const external of mentionChannelExternalMembers) map.set(external.id, external);
+    return map;
+  }, [mentionChannelExternalMembers]);
 
   // Thread summaries
   const threadSummaries = useThreadStore((s) => s.summaries);
@@ -964,13 +996,39 @@ export default function ChatPanel({
       return next;
     });
   }, []);
+  // Thread jump pill: scroll the chat to a parent message and flash it. A loaded
+  // message only needs the highlight (its effect scrolls); otherwise load the
+  // context window around it, which sets the same highlight.
+  const threadJumpLoadedRange = useMemo(() => ({
+    oldestAt: messages[0]?.createdAt ?? null,
+    newestAt: messages[messages.length - 1]?.createdAt ?? null,
+    hasNewer,
+  }), [hasNewer, messages]);
+  const threadJumpRenderKey = `${messages.length}:${messages[0]?.id ?? ""}:${messages[messages.length - 1]?.id ?? ""}`;
+  const handleJumpToParentMessage = useCallback((messageId: string) => {
+    if (!channelId) return;
+    if (messages.some((message) => message.id === messageId)) {
+      setHighlightedMessageId(messageId);
+      return;
+    }
+    void loadMessageContext(channelId, messageId);
+  }, [channelId, loadMessageContext, messages, setHighlightedMessageId]);
   const preserveChannelAnchorForThreadOpen = useCallback(() => {
     timelineRef.current?.preserveAnchorOnNextLayoutChange();
   }, []);
 
-  const canReactInChannel = !readOnly
+  const isGuest = currentServer?.role === "guest";
+  const canReactInChannel = !isGuest
+    && !readOnly
     && !channel?.archivedAt
     && (channel?.type === "dm" || channel?.type === "thread" || channel?.joined === true);
+  // #693 DM read status (artin, option C): only the DM's last message, and only
+  // at the live edge — in a context window (`hasNewer`) the last loaded message
+  // is not the conversation's last. MessageItem still gates on own sender, the
+  // read-receipts flag and the peer watermark.
+  const dmReadStatusMessageId = channel?.type === "dm" && !hasNewer
+    ? messages[messages.length - 1]?.id ?? null
+    : null;
   const renderChannelItem = useCallback((msg: Message, index: number) => {
     const systemMessageState = systemMessageRenderStates[index];
     const wrapMessageRender = (children: ReactNode) =>
@@ -992,10 +1050,11 @@ export default function ChatPanel({
           // forces the vertical clip. See MessageItem hover toolbar.
           style={{ contain: "layout style", overflow: "clip visible" }}
         >
-          <SystemMessageGroupDisclosure
+          <ThreadPanelSystemMessageGroupDisclosure
             summary={systemMessageState.content}
             expanded={expanded}
-            onToggle={() => toggleSystemMessageGroup(systemMessageState.groupId)}
+            groupId={systemMessageState.groupId}
+            onToggleGroup={toggleSystemMessageGroup}
           >
             {systemMessageState.messageIndexes.map((messageIndex) => {
               const originalMessage = messages[messageIndex];
@@ -1011,8 +1070,9 @@ export default function ChatPanel({
                   previewSenderMember={originalMessage.senderType === "user" ? memberById.get(originalMessage.senderId) : undefined}
                   channelParticipantAgentsById={agentById}
                   channelParticipantMembersById={memberById}
+                  channelParticipantExternalsById={externalById}
                   threadSummary={threadSummaries[originalMessage.id]}
-                  parentChannelId={channel?.id ?? ""}
+                  parentChannelId={channel?.id || ""}
                   mentionComposerChannelId={channel?.id ?? originalMessage.channelId}
                   hideThreadActions
                   onBeforeOpenThread={preserveChannelAnchorForThreadOpen}
@@ -1022,12 +1082,14 @@ export default function ChatPanel({
                 />
               );
             })}
-          </SystemMessageGroupDisclosure>
+          </ThreadPanelSystemMessageGroupDisclosure>
         </div>
       );
     }
 
     const groupState = messageGrouping.get(msg.id);
+    const followedBy = followedByFor(messages, index, messageGrouping);
+    const followsSystem = followsSystemFor(messages, index);
     return wrapMessageRender(
       <>
         {groupState?.showDayDivider && <DateDivider createdAt={msg.createdAt} />}
@@ -1050,23 +1112,29 @@ export default function ChatPanel({
             previewSenderMember={msg.senderType === "user" ? memberById.get(msg.senderId) : undefined}
             channelParticipantAgentsById={agentById}
             channelParticipantMembersById={memberById}
+            channelParticipantExternalsById={externalById}
             threadSummary={threadSummaries[msg.id]}
-            parentChannelId={channel?.id ?? ""}
+            parentChannelId={channel?.id || ""}
             mentionComposerChannelId={channel?.id ?? msg.channelId}
             onBeforeOpenThread={preserveChannelAnchorForThreadOpen}
             onOpenThread={onOpenThread}
             onOpenProfile={onOpenProfile}
             canReact={canReactInChannel}
             groupState={groupState}
+            followedBy={followedBy}
+            followsSystem={followsSystem}
+            showDmReadStatus={msg.id === dmReadStatusMessageId}
           />
         </div>
       </>
     );
-  }, [agentById, canReactInChannel, channel?.id, channelId, channels, expandedSystemMessageGroups, memberById, mentionMap, messageRenderScope, messages, messageGrouping, onOpenProfile, onOpenThread, preserveChannelAnchorForThreadOpen, systemMessageRenderStates, taskByMessageId, threadSummaries, toggleSystemMessageGroup]);
+  }, [agentById, canReactInChannel, channel?.id, channelId, channels, dmReadStatusMessageId, expandedSystemMessageGroups, externalById, memberById, mentionMap, messageRenderScope, messages, messageGrouping, onOpenProfile, onOpenThread, preserveChannelAnchorForThreadOpen, systemMessageRenderStates, taskByMessageId, threadSummaries, toggleSystemMessageGroup]);
 
   const channelHeader = useMemo(() => (
     <div className="px-3 pt-3">
-      {contextLoadError && (
+      {contextLoadError === CONTEXT_BEYOND_HISTORY_ERROR ? (
+        <HistoryLimitBanner target />
+      ) : contextLoadError && (
         <Banner intent="warning" density="sm" className="mx-auto mb-3 max-w-md text-center font-bold justify-center">
           {formatMessage({ id: "message.chatPanel.messageNotFound" })}
         </Banner>
@@ -1087,7 +1155,12 @@ export default function ChatPanel({
   const channelFooter = useMemo(() => (
     <div className="px-3 pb-3">
       {loadingNewer && (
-        <div className="py-2 text-center text-black/40 font-mono text-xs">{formatMessage({ id: "message.chatPanel.loadingNewer" })}</div>
+        <div
+          data-testid="list-loading-newer"
+          className="py-2 text-center font-mono text-mono-meta text-foreground-hint"
+        >
+          {formatMessage({ id: "message.chatPanel.loadingNewer" })}
+        </div>
       )}
       <div className="h-3" />
     </div>
@@ -1121,7 +1194,7 @@ export default function ChatPanel({
     channelType: channel?.type,
     joined: channel?.joined,
     archived: !!channel?.archivedAt,
-    jointLocked: channel?.type === "joint" && channel.jointBillingLocked === true,
+    jointLocked: isJointChannelReadOnly(channel),
     quotaReadOnly: isReadOnlyByQuota,
     selectMode: !!channel && selectModeActive && selectModeChannelId === channel.id,
   });
@@ -1157,18 +1230,13 @@ export default function ChatPanel({
     channelMessages: messagesBelongToChannel ? messages : [],
     onUnresolvedSelection: showUnresolvedSelectionToast,
   });
-  const picPreviewRef = useRef<string | null>(null);
+  const picPreviewRef = useRef<ValidatedScreenshot | null>(null);
   picPreviewRef.current = picPreview;
 
   useEffect(() => {
-    void api.get<{ enabled?: unknown }>("/messages/forward/enabled")
-      .then((res) => {
-        setServerMessageForwardingEnabled(res.data.enabled === true);
-      })
-      .catch(() => {});
     void useAttachmentPreviewGate.getState().load();
   },
-  // Stryker disable next-line ArrayDeclaration: alternate static dependency arrays still run this mount-only flag fetch once.
+  // Stryker disable next-line ArrayDeclaration: alternate static dependency arrays still run this mount-only attachment gate load once.
   []);
 
   // When the user navigates away from the channel (channel.id changes), exit
@@ -1199,7 +1267,7 @@ export default function ChatPanel({
     return () => window.removeEventListener("keydown", handler);
   }, [escGuard, exitSelection]);
 
-  const showForwardAction = messageForwardingEnabled && canForwardFromSource(channel);
+  const showForwardAction = !isGuest && canForwardFromSource(channel);
 
   const openForwardComposer = () => {
     const { messages: selected, unresolvedCount } = gatherSelectedMessagesWithMeta({
@@ -1232,7 +1300,7 @@ export default function ChatPanel({
     });
   };
 
-  const copySelectedLinks = () => {
+  const copySelectedLinks = useCallback(() => {
     if (!channel || !serverSlug) return;
     const { messages: selected, unresolvedCount } = gatherSelectedMessagesWithMeta({
       channelMessages: messagesBelongToChannel ? messages : [],
@@ -1247,14 +1315,66 @@ export default function ChatPanel({
     }).catch(() => {
       toast.error(formatMessageRef.current({ id: "message.chatPanel.clipboardBlocked" }), SELECTION_TOAST_OPTIONS);
     });
-  };
+  }, [channel, serverSlug, messagesBelongToChannel, messages, showUnresolvedSelectionToast]);
+
+  useRerenderAtJointDeadline(channel?.type === "joint" ? channel.jointOverLimitGraceEndsAt : null);
+
+  const handleSearchThisChannel = useCallback((searchChannelId: string) => {
+    if (onSearchChannel) onSearchChannel(searchChannelId);
+    else nav.toSearch(undefined, { channelId: searchChannelId, deferUntilQuery: true });
+  }, [onSearchChannel, nav]);
+  const handleSearchCurrentChannel = useCallback(() => handleSearchThisChannel(channel?.id ?? ""), [handleSearchThisChannel, channel?.id]);
+  const handleLeaveChannel = useCallback(() => leaveChannel(channel?.id ?? ""), [leaveChannel, channel?.id]);
+  const handleStopAllAgents = useCallback(() => setShowSOSDialog(true), []);
+  const handleDismissActivityMuteError = useCallback(() => setActivityMuteError(null), []);
+  const handleDismissMessageDisplayPrefsError = useCallback(() => setMessageDisplayPrefsError(null), []);
+  const handleJoinChannel = useCallback(() => joinChannel(channel?.id ?? ""), [joinChannel, channel?.id]);
+  const handleCloseSOSDialog = useCallback(() => setShowSOSDialog(false), []);
+  const handleClosePicPreview = useCallback(() => setPicPreview(null), [setPicPreview]);
+  const handlePicPreviewSaved = useCallback(() => {
+    setPicPreview(null);
+    useSelectionStore.getState().exit();
+  }, [setPicPreview]);
+  const overflowActivityMute = useMemo(() => activityMuteSupported ? {
+    muted: activityMuted,
+    busy: activityMuteLoading || activityMuteSaving,
+    onToggle: () => void handleToggleActivityMute(),
+  } : undefined, [activityMuteSupported, activityMuted, activityMuteLoading, activityMuteSaving, handleToggleActivityMute]);
+  const overflowCollapseLongMessages = useMemo(() => messageDisplayPrefsSupported ? {
+    enabled: channelCollapseLongMessages,
+    busy: messageDisplayPrefsLoading || messageDisplayPrefsSaving,
+    onToggle: () => void handleToggleCollapseLongMessages(),
+  } : undefined, [messageDisplayPrefsSupported, channelCollapseLongMessages, messageDisplayPrefsLoading, messageDisplayPrefsSaving, handleToggleCollapseLongMessages]);
+  const overflowMembers = useMemo(() => ({
+    agents: mentionChannelAgents,
+    humans: mentionChannelHumans,
+    externalMembers: mentionChannelExternalMembers,
+    loading: mentionMembersLoading,
+    addMembers: addMentionChannelMembers,
+    addAgent: addMentionChannelAgent,
+    removeAgent: removeMentionChannelAgent,
+    addHuman: addMentionChannelHuman,
+    removeHuman: removeMentionChannelHuman,
+    changeMemberRole: changeMentionChannelMemberRole,
+    roleChangeFailed: mentionRoleChangeFailed,
+  }), [mentionChannelAgents, mentionChannelHumans, mentionChannelExternalMembers, mentionMembersLoading, addMentionChannelMembers, addMentionChannelAgent, removeMentionChannelAgent, addMentionChannelHuman, removeMentionChannelHuman, changeMentionChannelMemberRole, mentionRoleChangeFailed]);
+  const overflowSettings = useMemo(() => {
+    const joinedNow = channel?.type === "dm" || channel?.type === "thread" ? true : channel?.joined;
+    const isAll = channel?.type !== "dm" && channel?.type !== "thread" && channel?.name === "all";
+    const canLeave = !isAll;
+    return joinedNow === true && (canManageChannels || canLeave) ? {
+      initialName: channel?.name ?? "",
+      initialDescription: channel?.description || "",
+      onLeaveChannel: canLeave ? handleLeaveChannel : undefined,
+    } : undefined;
+  }, [canManageChannels, channel?.type, channel?.joined, channel?.name, channel?.description, handleLeaveChannel]);
 
   if (!channel) {
     return (
-      <div className="flex flex-1 flex-col items-center justify-center text-black/40 font-display text-lg font-bold uppercase">
-        <button onClick={onMobileBack} className="btn-brutal-sm p-1.5 mb-4 md:hidden">
+      <div className="flex flex-1 flex-col items-center justify-center text-headline text-foreground-muted">
+        <Button onClick={onMobileBack} size="icon-sm" variant="outline" className="mb-4 md:hidden">
           <ArrowLeft size={14} />
-        </button>
+        </Button>
         {formatMessage({ id: "message.chatPanel.selectChannel" })}
       </div>
     );
@@ -1292,9 +1412,11 @@ export default function ChatPanel({
   const hideAllChannelMembersButton = isAllChannel
     && currentServer?.role === "member"
     && currentServer.hideHumansFromMembers;
-  const showChannelSearchButton = isJoinableChannel;
   const isArchived = !!channel.archivedAt;
-  const isJointChannelFeatureLocked = channel.type === "joint" && channel.jointBillingLocked === true;
+  const isJointChannelFeatureLocked = isJointChannelReadOnly(channel);
+  // Contract v0.3 §18.8: shown to every member during the over-limit grace so
+  // members can relay it to admins who are not in this channel.
+  const jointOverLimitGraceEndsAt = jointChannelGraceEndsAt(channel);
   // `joined` is tri-state: `true` (member), `false` (not member), `undefined`
   // (membership not yet hydrated). The bottom CTA must distinguish these:
   // joined → composer, not joined → Join CTA, unknown → render nothing so we
@@ -1308,130 +1430,72 @@ export default function ChatPanel({
   // DMs and threads are forced to `true` because their composability doesn't
   // depend on a join relation.
   const joined: boolean | undefined = isDM || isThread ? true : channel.joined;
-  const isGuestReadOnlyChannel = isJoinableChannel
-    && currentServer?.role === "guest"
-    && joined === false
-    && channel.guestJoinable !== true;
-  const canLeaveChannel = !isAllChannel;
-  // Stryker disable next-line ConditionalExpression,LogicalOperator: behavior tests pin owner/member/#all/unjoined visibility; equivalent guard mutants time out under instrumented ChatPanel rendering.
-  const showChannelOptionsButton = joined === true && (canManageChannels || canLeaveChannel);
+  const isGuestReadOnlyChannel = isGuest
+    && (joined === true || channel.guestJoinable !== true);
   const selectModeScopedHere = selectModeActive && selectModeChannelId === channel.id;
-  const channelHeaderIcon = isRegularChannel ? <ChannelKindIcon type={channel.type} /> : undefined;
-  const channelSubtitle =
-    isRegularChannel
-      ? channel.description || undefined
-      : undefined;
+  const channelHeaderIcon = isRegularChannel ? <ChannelKindIcon type={channel.type} onPublicPage={currentServer?.publicPageLive === true && channel.guestVisible === true && !channel.archivedAt} /> : undefined;
+  const channelSubtitle = isRegularChannel
+    ? <ChannelHeaderSubtitle agentIdKey={channelAgentIdKey} description={channel.description || null} />
+    : undefined;
   const regularTitleSuffix = isRegularChannel && (isArchived || activityMuted) ? (
     <div className="flex items-center gap-1.5">
       {isArchived && (
-        <span className="inline-flex shrink-0 items-center border-2 border-black bg-brutal-orange/30 px-1.5 py-1 text-[11px] font-bold uppercase tracking-wide leading-none">
+        <Badge appearance="soft" variant="muted" className="shrink-0">
           {formatMessage({ id: "message.chatPanel.archived" })}
-        </span>
+        </Badge>
       )}
       {activityMuted && <ActivityMutedBadge />}
     </div>
   ) : undefined;
-  const activityMuteButton = activityMuteSupported ? (
-    <ActivityMuteToggleButton
-      activityMuted={activityMuted}
-      disabled={activityMuteLoading || activityMuteSaving}
-      onToggle={handleToggleActivityMute}
-      dm={isDM}
-    />
-  ) : null;
-
   const bottomButtonCount = hasNewer ? currentUnreadCount : newMessageCount;
   const showBottomButton = hasNewer || !atBottom || newMessageCount > 0;
   const handleBottomButton = hasNewer ? handleBackToBottom : scrollToBottom;
-  const handleSearchThisChannel = (searchChannelId: string) => {
-    if (onSearchChannel) onSearchChannel(searchChannelId);
-    else nav.toSearch(undefined, { channelId: searchChannelId, deferUntilQuery: true });
-  };
-  // task #187 `topbar_overflow_v0`: on regular channels settings/member
-  // actions collapse into a 「Settings」 overflow drawer while Search remains
-  // a sibling topbar action. DMs and thread-type
-  // channels keep the legacy row — the redesign scope is channel/thread
-  // top bars only. Flag off = byte-identical legacy actions.
-  const channelHeaderActions = topbarOverflow.enabled && isJoinableChannel ? (
+  const bottomButton = showBottomButton ? (
+    <Button
+      onClick={handleBottomButton}
+      size="sm"
+      variant="outline"
+      className="w-fit"
+    >
+      <ArrowDown size={12} />
+      {bottomButtonCount > 0
+        ? formatMessage({ id: "message.chatPanel.newMessagesCount" }, { count: bottomButtonCount })
+        : formatMessage({ id: "message.chatPanel.backToBottom" })}
+    </Button>
+  ) : null;
+  // Regular channels use the settings drawer; DMs share the same overflow
+  // component in its DM mode (task #703).
+  const channelHeaderActions = isJoinableChannel ? (
     <ChannelOverflowMenu
       channelId={channel.id}
       channelName={channel.name}
       open={overflowOpen}
       onOpenChange={setOverflowOpen}
-      onSearch={() => handleSearchThisChannel(channel.id)}
-      activityMute={activityMuteSupported ? {
-        muted: activityMuted,
-        busy: activityMuteLoading || activityMuteSaving,
-        onToggle: () => void handleToggleActivityMute(),
-      } : undefined}
-      collapseLongMessages={topbarOverflow.enabled && activityMuteSupported ? {
-        enabled: channelCollapseLongMessages,
-        busy: messageDisplayPrefsLoading || messageDisplayPrefsSaving,
-        onToggle: () => void handleToggleCollapseLongMessages(),
-      } : undefined}
+      onSearch={handleSearchCurrentChannel}
+      activityMute={overflowActivityMute}
+      collapseLongMessages={overflowCollapseLongMessages}
       showMembers={!hideAllChannelMembersButton}
-      members={{
-        agents: mentionChannelAgents,
-        humans: mentionChannelHumans,
-        externalMembers: mentionChannelExternalMembers,
-        loading: mentionMembersLoading,
-        addMembers: addMentionChannelMembers,
-        addAgent: addMentionChannelAgent,
-        removeAgent: removeMentionChannelAgent,
-        addHuman: addMentionChannelHuman,
-        removeHuman: removeMentionChannelHuman,
-        changeMemberRole: changeMentionChannelMemberRole,
-        roleChangeFailed: mentionRoleChangeFailed,
-      }}
-      settings={showChannelOptionsButton ? {
-        initialName: channel.name,
-        initialDescription: channel.description || "",
-        onLeaveChannel: canLeaveChannel ? () => leaveChannel(channel.id) : undefined,
-      } : undefined}
-      onStopAllAgents={joined && canManageAgents ? () => setShowSOSDialog(true) : undefined}
+      members={overflowMembers}
+      settings={overflowSettings}
+      onStopAllAgents={joined && canManageAgents ? handleStopAllAgents : undefined}
     />
-  ) : (activityMuteSupported || isJoinableChannel) ? (
-    <>
-      {showChannelSearchButton && (
-        <Button
-          onClick={() => handleSearchThisChannel(channel.id)}
-          shape="icon"
-          title={formatMessage({ id: "message.chatPanel.searchChannel" })}
-          aria-label={formatMessage({ id: "message.chatPanel.searchChannel" })}
-        >
-          <Search size={14} />
-        </Button>
-      )}
-      {activityMuteButton}
-      {isJoinableChannel && (
-        <>
-          {joined && canManageAgents && (
-            <Button
-              onClick={() => setShowSOSDialog(true)}
-              shape="icon"
-              title={formatMessage({ id: "message.chatPanel.stopAllAgents" })}
-            >
-              <Square size={14} />
-            </Button>
-          )}
-          {showChannelOptionsButton && (
-            <Button
-              onClick={() => setShowEditDialog(true)}
-              shape="icon"
-              title={canManageChannels ? formatMessage({ id: "message.chatPanel.editChannel" }) : formatMessage({ id: "message.chatPanel.channelOptions" })}
-              aria-label={canManageChannels ? formatMessage({ id: "message.chatPanel.editChannel" }) : formatMessage({ id: "message.chatPanel.channelOptions" })}
-            >
-              <Settings size={14} />
-            </Button>
-          )}
-          {!hideAllChannelMembersButton && <ChannelMembers channelId={channel.id} />}
-        </>
-      )}
-    </>
+  ) : isDM ? (
+    /* task #703 / #1281: the DM gets the SAME overflow component as a channel
+       (artin: 用统一组件), but a 1:1 DM settings sheet no longer shows a
+       members section. Its root view is just the shared preferences; no edit
+       form, no mute (documented non-feature), no add-member affordance. */
+    <ChannelOverflowMenu
+      channelId={channel.id}
+      channelName={displayName}
+      open={overflowOpen}
+      onOpenChange={setOverflowOpen}
+      onSearch={handleSearchCurrentChannel}
+      collapseLongMessages={overflowCollapseLongMessages}
+    />
   ) : null;
 
   return (
-    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+    <ConversationPanelRoot edge="inset" className="relative">
       {/* Header — hidden when embedded in detail panels.
           DMs use titleSlot because the avatar is an interactive profile
           trigger. Regular channels use PanelHeader's native title/subtitle
@@ -1439,23 +1503,26 @@ export default function ChatPanel({
       {!hideHeader && (
       <PanelHeader
         onMobileBack={onMobileBack}
-        mobileBackProps={{ "data-testid": "chat-mobile-back" }}
+        mobileBackProps={CHAT_MOBILE_BACK_PROPS}
         icon={channelHeaderIcon}
+        iconTone="location"
         iconAlwaysVisible={isRegularChannel}
         title={isRegularChannel ? channel.name : undefined}
         titleSuffix={regularTitleSuffix}
         subtitle={channelSubtitle}
+        subtitleMultiline={isRegularChannel}
+        subtitleClassName="empty:hidden"
         titleSlot={
           isAgentDM ? (
             <div className="flex min-w-0 items-center gap-3">
               <button
                 onClick={() => channel.peerId && useProfileStore.getState().openProfile("agent", channel.peerId, { openSource: "channel" })}
-                className="shrink-0 hover:brightness-90 transition-colors"
+                className="shrink-0 rounded-sticker outline-none focus-visible:shadow-focus"
               >
                 <AvatarSlot context="panel-header" type="agent" agentAvatarUrl={dmAvatarUrl} />
               </button>
               <div className="flex min-w-0 flex-1 items-center gap-2">
-                <span className="min-w-0 truncate font-bold text-black text-base leading-tight" title={displayName}>{displayName}</span>
+                <Tooltip content={displayName}><PanelTitle render={<span className="min-w-0 truncate" />}>{displayName}</PanelTitle></Tooltip>
                 {channel.peerId && <AgentDMStatus agentId={channel.peerId} />}
                 {activityMuted && <ActivityMutedBadge />}
               </div>
@@ -1464,7 +1531,7 @@ export default function ChatPanel({
             <div className="flex min-w-0 items-center gap-3">
               <button
                 onClick={() => channel.peerId && useProfileStore.getState().openProfile("human", channel.peerId, { openSource: "channel" })}
-                className="shrink-0 hover:brightness-90 transition-colors"
+                className="shrink-0 rounded-sticker outline-none focus-visible:shadow-focus"
               >
                 <AvatarSlot
                   context="panel-header"
@@ -1475,7 +1542,7 @@ export default function ChatPanel({
                 />
               </button>
               <div className="flex min-w-0 flex-1 items-center gap-2">
-                <span className="min-w-0 truncate font-bold text-black text-base leading-tight" title={displayName}>{displayName}</span>
+                <Tooltip content={displayName}><PanelTitle render={<span className="min-w-0 truncate" />}>{displayName}</PanelTitle></Tooltip>
                 {activityMuted && <ActivityMutedBadge />}
               </div>
             </div>
@@ -1484,80 +1551,70 @@ export default function ChatPanel({
         actions={channelHeaderActions}
       />
       )}
-      {hideHeader && headerActionsHost && channelHeaderActions
-        ? createPortal(
-            <div className="workspace-grid-tabset-actions" data-testid="workspace-tabset-context-actions">
-              {channelHeaderActions}
-            </div>,
-            headerActionsHost,
-          )
-        : null}
+
+      <ConversationPanelContent>
 
       {!hideHeader && activityMuteError && (
-        <div
-          className="flex items-center justify-between gap-3 border-b-2 border-black bg-brutal-orange/20 px-5 py-2 text-xs font-bold text-black"
-          role="alert"
-          data-testid="activity-mute-error"
-        >
-          <span>{formatMessage({ id: activityMuteError })}</span>
-          <button
-            type="button"
-            className="btn-brutal-sm inline-flex size-6 shrink-0 items-center justify-center bg-white"
-            aria-label={formatMessage({ id: "message.chatPanel.dismissActivityMuteError" })}
-            onClick={() => setActivityMuteError(null)}
-          >
-            <X size={12} />
-          </button>
-        </div>
+        <PanelNotice role="alert" data-testid="activity-mute-error">
+          <PanelNoticeContent>{formatMessage({ id: activityMuteError })}</PanelNoticeContent>
+          <PanelNoticeActions>
+            <CloseButton
+              type="button"
+              aria-label={formatMessage({ id: "message.chatPanel.dismissActivityMuteError" })}
+              onClick={handleDismissActivityMuteError}
+            >
+              <X size={12} />
+            </CloseButton>
+          </PanelNoticeActions>
+        </PanelNotice>
       )}
 
       {!hideHeader && messageDisplayPrefsError && (
-        <div
-          className="flex items-center justify-between gap-3 border-b-2 border-black bg-brutal-orange/20 px-5 py-2 text-xs font-bold text-black"
-          role="alert"
-          data-testid="message-display-prefs-error"
-        >
-          <span>{formatMessage({ id: messageDisplayPrefsError })}</span>
-          <button
-            type="button"
-            className="btn-brutal-sm inline-flex size-6 shrink-0 items-center justify-center bg-white"
-            aria-label={formatMessage({ id: "message.chatPanel.dismissMessageDisplayPrefsError" })}
-            onClick={() => setMessageDisplayPrefsError(null)}
-          >
-            <X size={12} />
-          </button>
-        </div>
+        <PanelNotice role="alert" data-testid="message-display-prefs-error">
+          <PanelNoticeContent>{formatMessage({ id: messageDisplayPrefsError })}</PanelNoticeContent>
+          <PanelNoticeActions>
+            <CloseButton
+              type="button"
+              aria-label={formatMessage({ id: "message.chatPanel.dismissMessageDisplayPrefsError" })}
+              onClick={handleDismissMessageDisplayPrefsError}
+            >
+              <X size={12} />
+            </CloseButton>
+          </PanelNoticeActions>
+        </PanelNotice>
       )}
 
       {/* Chat/Tasks tab bar — hidden when there's only one tab (e.g. thread
           surface only has Chat) to avoid an empty-looking single-tab strip. */}
       {showPanelTabs && (
-        <Tabs<ChatPanelTab> value={activeTab} onValueChange={setActiveTab} className="overflow-hidden border-b-2 border-black bg-white">
+        <ConversationPanelTabs render={<Tabs<ChatPanelTab> value={activeTab} onValueChange={setActiveTab} />}>
           <SortableTabsList<ChatPanelTab>
             value={visibleTabIds}
             onReorder={reorderTabs}
-            className="max-w-none border-y-0 border-l-0 border-r-2 border-black bg-white"
           >
             {visibleTabButtons}
           </SortableTabsList>
-        </Tabs>
+        </ConversationPanelTabs>
       )}
 
       {/* Channel tasks reuse the server-wide board/list surface. */}
       {activeTab === "tasks" ? (
-        <TasksPanel channelId={channel.id} />
+        <ConversationPanelBody className="flex flex-col"><TasksPanel channelId={channel.id} /></ConversationPanelBody>
       ) : activeTab === "files" ? (
-        <ChannelFilesPanel channel={channel} />
+        <ConversationPanelBody className="flex flex-col"><ChannelFilesPanel channel={channel} /></ConversationPanelBody>
       ) : (
         <>
           {/* Messages — virtualized.
               stdrc 2026-05-02 #proj-uiux:95e25b5b e33f2924: main panel
-              整个 white 底，messages scroller 也跟上。bg-white 让整个
-              主聊天列从 header 到 composer 全白。 */}
-          <div className="relative flex-1 overflow-hidden bg-white">
+              整个 white 底，messages scroller 也跟上 — the whole chat column
+              is DS paper (bg-layer-canvas) from header to composer. */}
+          <div
+            className="relative flex-1 overflow-hidden bg-layer-canvas"
+            data-testid="message-content-surface"
+          >
             {loading && !shouldShowMessageTimeline ? (
               <div className="flex-1 flex items-center justify-center py-4">
-                <div className="text-center text-black/40 font-mono text-sm">{formatMessage({ id: "message.chatPanel.loading" })}</div>
+                <div className="text-center font-mono text-mono-meta text-foreground-hint">{formatMessage({ id: "message.chatPanel.loading" })}</div>
               </div>
             ) : !shouldShowMessageTimeline ? (
               <EmptyState
@@ -1581,71 +1638,84 @@ export default function ChatPanel({
                 sparseAnchor="bottom"
               />
             )}
-            {showBottomButton && (
-              <button
-                onClick={handleBottomButton}
-                className="btn-brutal-sm absolute bottom-3 left-1/2 -translate-x-1/2 flex items-center gap-1.5 bg-white px-3 py-1.5 text-xs font-bold z-10"
-              >
-                <ArrowDown size={12} />
-                {bottomButtonCount > 0
-                  ? formatMessage({ id: "message.chatPanel.newMessagesCount" }, { count: bottomButtonCount })
-                  : formatMessage({ id: "message.chatPanel.backToBottom" })}
-              </button>
+            {!isDM && !isThread ? (
+              <ThreadUnreadJumpPill
+                channelId={channel.id}
+                onJumpToMessage={handleJumpToParentMessage}
+                bottomButton={bottomButton}
+                loadedRange={threadJumpLoadedRange}
+                renderKey={threadJumpRenderKey}
+              />
+            ) : bottomButton && (
+              <div className="absolute inset-x-0 bottom-3 z-10 mx-auto w-fit">{bottomButton}</div>
             )}
           </div>
 
           {/* Input or Join bar */}
           {showComposer ? (
-            <div
-              className={overlayComposer ? "absolute inset-x-0 bottom-0 z-20 bg-white shadow-brutal" : "contents"}
-              data-testid={workspaceComposer ? "workspace-panel-composer" : undefined}
-            >
-          {readOnly ? (
-            <div className="border-t-2 border-black bg-white px-4 py-3">
-              <div className="input-brutal flex items-center px-3 py-2 opacity-50 cursor-not-allowed">
-                <span className="text-sm text-black/40">{formatMessage({ id: "message.chatPanel.unavailable" })}</span>
+            <ConversationPanelFooter className={composerHostClassName(overlayComposer)}>
+          {jointOverLimitGraceEndsAt && !readOnly && !isArchived && (
+            <div className="bg-layer-canvas px-3 pt-2">
+              <Banner intent="warning" className="justify-center text-center font-bold" data-testid="joint-over-limit-grace-banner">
+                {formatMessage(
+                  { id: "message.chatPanel.jointOverLimitGrace" },
+                  { deadline: formatDate(new Date(jointOverLimitGraceEndsAt), { dateStyle: "medium", timeStyle: "short" }) },
+                )}
+              </Banner>
+            </div>
+          )}
+          {dmAgent?.raftbenchService ? (
+            <div className="bg-layer-canvas px-3 pt-2 pb-3" data-testid="raftbench-service-dm-notice">
+              <Banner intent="info" className="justify-center text-center">
+                {formatMessage({ id: "message.chatPanel.raftbenchServiceDm" })}
+              </Banner>
+            </div>
+          ) : readOnly ? (
+            <div className="bg-layer-canvas px-3 pt-2 pb-3">
+              <div className="flex min-h-11 cursor-not-allowed items-center rounded-container border-[1.5px] border-line-hairline bg-fill-muted px-3">
+                <span className="text-body text-foreground-disabled">{formatMessage({ id: "message.chatPanel.unavailable" })}</span>
               </div>
             </div>
           ) : isArchived ? (
-            <div className="flex items-center border-t-2 border-black bg-brutal-orange/20 p-3">
-              <div className="flex w-full items-center justify-center gap-2 text-sm font-bold text-black">
-                {formatMessage({ id: "message.chatPanel.archivedNotice" })}
+            <div className="bg-layer-canvas p-3">
+              <Banner intent="warning" className="justify-center text-center font-bold">
+                {formatMessage({ id: "message.chatPanel.archivedNotice" })}{" "}
                 {effectiveChannelCapabilities.archiveChannels && (
                   <button
-                    onClick={() => topbarOverflow.enabled ? setOverflowOpen(true) : setShowEditDialog(true)}
-                    className="font-bold text-black underline"
+                    onClick={() => setOverflowOpen(true)}
+                    className={BANNER_LINK_CLASS}
                   >
                     {formatMessage({ id: "message.chatPanel.unarchive" })}
                   </button>
                 )}
-              </div>
+              </Banner>
             </div>
           ) : isJointChannelFeatureLocked ? (
-            <div className="border-t-2 border-black bg-white p-3">
+            <div className="bg-layer-canvas p-3">
               <Banner intent="warning" className="justify-center text-center font-bold">
-                {formatMessage({ id: "message.chatPanel.jointLocked" })}
+                {formatMessage({ id: "message.chatPanel.jointLocked" })}{" "}
                 <button
                   onClick={() => nav.toSettings("billing")}
-                  className="font-bold text-black underline"
+                  className={BANNER_LINK_CLASS}
                 >
                   {formatMessage({ id: "message.chatPanel.viewBilling" })}
                 </button>
               </Banner>
             </div>
           ) : isReadOnlyByQuota ? (
-            <div className="border-t-2 border-black bg-white p-3">
+            <div className="bg-layer-canvas p-3">
               <Banner intent="warning" className="justify-center text-center font-bold">
                 {formatMessage({ id: "message.chatPanel.readOnlyQuota" }, { plan: PLAN_CONFIG[plan].displayName })}{" "}
                 <button
                   onClick={() => nav.toSettings("billing")}
-                  className="font-bold text-black underline"
+                  className={BANNER_LINK_CLASS}
                 >
                   {formatMessage({ id: "message.chatPanel.upgradeForMoreChannels" })}
                 </button>
               </Banner>
             </div>
           ) : isGuestReadOnlyChannel ? (
-            <div className="border-t-2 border-black bg-white p-3" data-testid="guest-readonly-channel-banner">
+            <div className="bg-layer-canvas p-3" data-testid="guest-readonly-channel-banner">
               <Banner intent="warning" className="justify-center text-center font-bold">
                 {formatMessage({ id: "message.chatPanel.guestReadOnlyChannel" })}
               </Banner>
@@ -1663,9 +1733,14 @@ export default function ChatPanel({
                 onCopyMd={onCopyMd}
               />
             ) : (
-              <>
+              <div className="flex flex-col gap-2">
+                {dmAgent ? <HostedCindyFailedBanner agent={dmAgent} /> : null}
+                {primaryComposerEligible && !isMobileComposer ? (
+                  <NotificationActivationBanner placement="desktop" />
+                ) : null}
                 <MessageInput
                   channelId={channel.id}
+                  deferUntilFirstPage
                   channelName={isDM ? `@${displayName}` : `#${channel.name}`}
                   showTaskButton={supportsChannelTasks}
                   autoFocus={composerAutoFocus}
@@ -1674,29 +1749,35 @@ export default function ChatPanel({
                     ? <NotificationActivationBanner placement="mobile" />
                     : undefined}
                 />
-                {primaryComposerEligible && !isMobileComposer ? (
-                  <NotificationActivationBanner placement="desktop" />
-                ) : null}
-              </>
+              </div>
             )
           ) : joined === false
             && (currentServer?.role !== "guest" || channel.guestJoinable === true) ? (
-            <div className="flex items-center border-t-2 border-black bg-white p-3">
-              <button
-                onClick={() => joinChannel(channel.id)}
-                className="btn-brutal flex w-full items-center justify-center gap-1.5 bg-brutal-pink px-3 py-1.5 text-sm font-bold"
+            <div className="flex flex-col items-center gap-2 bg-layer-canvas p-3">
+              <Button
+                onClick={handleJoinChannel}
+                size="lg"
+                variant="accent"
+                className="w-full"
               >
                 <LogIn size={14} />
                 {formatMessage({ id: "message.chatPanel.joinChannel" }, { channel: channel.name })}
-              </button>
+              </Button>
+              {isGuest ? (
+                <p className="text-center text-caption text-foreground-hint" data-testid="guest-join-explanation">
+                  {formatMessage({ id: "message.chatPanel.guestJoinExplanation" })}
+                </p>
+              ) : null}
             </div>
           ) : null}
-            </div>
+            </ConversationPanelFooter>
           ) : null}
         </>
       )}
 
-      {messageForwardingEnabled && forwardComposer && (
+      </ConversationPanelContent>
+
+      {!isGuest && forwardComposer && (
         <Suspense fallback={null}>
           <ForwardComposerDialog
             sourceMessages={forwardComposer.messages}
@@ -1710,53 +1791,36 @@ export default function ChatPanel({
         </Suspense>
       )}
 
-      {showEditDialog && isRegularChannel && (
-        <EditChannelDialog
-          channelId={channel.id}
-          initialName={channel.name}
-          initialDescription={channel.description || ""}
-          onLeaveChannel={canLeaveChannel ? () => leaveChannel(channel.id) : undefined}
-          onClose={() => setShowEditDialog(false)}
-          collapseLongMessages={topbarOverflow.enabled && activityMuteSupported ? {
-            enabled: channelCollapseLongMessages,
-            busy: messageDisplayPrefsLoading || messageDisplayPrefsSaving,
-            onToggle: () => void handleToggleCollapseLongMessages(),
-          } : undefined}
-        />
-      )}
-
       {showSOSDialog && (
         <SOSDialog
           channelId={channel.id}
           channelName={channel.name}
-          onClose={() => setShowSOSDialog(false)}
+          onClose={handleCloseSOSDialog}
         />
       )}
 
       {picPreview && (
         <SelectShareLightbox
-          dataUrl={picPreview}
+          image={picPreview}
           filename={`slock-${channel.name || "export"}-${new Date().toISOString().slice(0, 10)}.png`}
-          onClose={() => setPicPreview(null)}
+          onClose={handleClosePicPreview}
           onShareToX={onSharePreviewToX}
-          onSaved={() => {
-            setPicPreview(null);
-            useSelectionStore.getState().exit();
-          }}
+          onSaved={handlePicPreviewSaved}
         />
       )}
 
       {picError && (
         <div
           role="alert"
-          className="fixed bottom-20 left-1/2 z-[110] -translate-x-1/2 border-2 border-black bg-brutal-orange px-3 py-2 text-xs font-bold shadow-brutal-sm"
+          className={SELECT_SHARE_ERROR_HUD_CLASS}
           onClick={() => setPicError(null)}
           data-testid="select-share-error"
         >
+          <Status aria-hidden="true" presence="error" />
           {formatMessage({ id: "message.chatPanel.imageActionFailed" }, { error: picError })}
         </div>
       )}
 
-    </div>
+    </ConversationPanelRoot>
   );
 }

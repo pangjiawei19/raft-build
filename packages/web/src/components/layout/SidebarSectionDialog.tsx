@@ -1,9 +1,17 @@
-import { useState } from "react";
-import { X } from "lucide-react";
+import { InputGroup, InputGroupAddon, InputGroupInput, Button } from "@botiverse/raft-ui";
+import { useCallback, useId, useState } from "react";
+import type { ChangeEvent } from "react";
 import { useIntl } from "react-intl";
-import Modal from "../Modal";
+import DialogCard from "../ui/DialogCard";
 import SidebarSectionEmojiPicker from "./SidebarSectionEmojiPicker";
 
+/**
+ * Create / rename a custom sidebar section (Raft Design System › Dialog): the
+ * product's DialogCard shell (popover layer, 16px radius, headline title,
+ * ghost close), one labelled field, then at most two actions — a ghost Cancel
+ * on the left and the pink primary on the right, the dialog's one reason to
+ * exist.
+ */
 export default function SidebarSectionDialog({
   title,
   initialName = "",
@@ -20,54 +28,50 @@ export default function SidebarSectionDialog({
   onClose: () => void;
 }) {
   const { formatMessage } = useIntl();
+  const titleId = useId();
   const [name, setName] = useState(initialName);
   const [emoji, setEmoji] = useState(initialEmoji);
   const trimmedName = name.trim();
+  const handleNameChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setName(event.target.value), []);
 
   return (
-    <Modal onClose={onClose} closeOnBackdrop>
-      <div className="card-brutal w-full max-w-sm bg-white p-5">
-        <div className="mb-4 flex items-center justify-between gap-3">
-          <h2 className="text-base font-bold uppercase">{title}</h2>
-          <button type="button" onClick={onClose} className="btn-brutal-sm bg-white p-1" aria-label={formatMessage({ id: "common.close" })}>
-            <X size={18} />
-          </button>
+    <DialogCard title={title} titleId={titleId} onClose={onClose} closeOnBackdrop maxWidthClass="max-w-[400px]">
+      <form
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!trimmedName) return;
+          onSubmit({ name: trimmedName, emoji: emoji.trim() || null });
+        }}
+        className="flex flex-col gap-5"
+      >
+        <div className="flex flex-col gap-1.5">
+          <div className="font-sans text-footnote font-semibold text-foreground">
+            {formatMessage({ id: "layout.sidebar.sectionName" })}
+          </div>
+          <InputGroup>
+            <InputGroupAddon className="p-0">
+            <SidebarSectionEmojiPicker value={emoji} onChange={setEmoji} />
+            </InputGroupAddon>
+            <InputGroupInput
+              autoFocus
+              aria-label={formatMessage({ id: "layout.sidebar.sectionName" })}
+              maxLength={80}
+              value={name}
+              onChange={handleNameChange}
+              className="min-w-0 flex-1"
+              placeholder={formatMessage({ id: "layout.sidebar.sectionNamePlaceholder" })}
+            />
+          </InputGroup>
         </div>
-        <form
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (!trimmedName) return;
-            onSubmit({ name: trimmedName, emoji: emoji.trim() || null });
-          }}
-          className="space-y-4"
-        >
-          <div>
-            <div className="mb-1 text-xs font-bold uppercase">
-              {formatMessage({ id: "layout.sidebar.sectionName" })}
-            </div>
-            <div className="flex items-stretch border-2 border-black bg-white shadow-brutal-sm focus-within:shadow-brutal">
-              <SidebarSectionEmojiPicker value={emoji} onChange={setEmoji} />
-              <input
-                autoFocus
-                aria-label={formatMessage({ id: "layout.sidebar.sectionName" })}
-                maxLength={80}
-                value={name}
-                onChange={(event) => setName(event.target.value)}
-                className="min-w-0 flex-1 bg-white px-3 py-2 font-display normal-case focus:outline-none"
-                placeholder={formatMessage({ id: "layout.sidebar.sectionNamePlaceholder" })}
-              />
-            </div>
-          </div>
-          <div className="flex justify-end gap-2">
-            <button type="button" onClick={onClose} className="btn-brutal bg-white px-3 py-2 text-sm">
-              {formatMessage({ id: "layout.sidebar.cancelSection" })}
-            </button>
-            <button type="submit" disabled={!trimmedName} className="btn-brutal bg-brutal-pink px-3 py-2 text-sm disabled:opacity-50">
-              {submitLabel}
-            </button>
-          </div>
-        </form>
-      </div>
-    </Modal>
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button size="lg" variant="ghost" type="button" onClick={onClose}>
+            {formatMessage({ id: "layout.sidebar.cancelSection" })}
+          </Button>
+          <Button size="lg" variant="primary" type="submit" disabled={!trimmedName}>
+            {submitLabel}
+          </Button>
+        </div>
+      </form>
+    </DialogCard>
   );
 }

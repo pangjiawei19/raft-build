@@ -1,19 +1,24 @@
-import { useMemo, useState } from "react";
+import { Card, Checkbox, Textarea, Button } from "@botiverse/raft-ui";
+import { useCallback, useMemo, useState } from "react";
 import { Bug, CheckCircle } from "lucide-react";
 import { useIntl } from "react-intl";
+import { useNavigate } from "react-router-dom";
 import type { IntlShape } from "react-intl";
+import type { MessageId } from "../../i18n/messages";
 import DialogCard from "../ui/DialogCard";
 import Banner from "../ui/Banner";
-import Checkbox from "../ui/Checkbox";
 import SectionEyebrow from "../ui/SectionEyebrow";
 import FormField from "../ui/FormField";
 import api from "../../api/client";
+import { createAgentIssueTicket } from "../../feedback/agentIssueTicket";
+import { startTranscriptRequest } from "../../feedback/transcriptRequestState";
+import type { TranscriptRequestState } from "../../feedback/transcriptRequestState";
 import { useAuthStore } from "../../store/authStore";
 import { useServerStore } from "../../store/serverStore";
 import { useAgentStore } from "../../store/agentStore";
 import type { Agent } from "../../store/agentStore";
 import { useMachineStore } from "../../store/machineStore";
-import { buildFeedbackExportBundle } from "../../utils/feedbackExportBundle";
+import { buildFeedbackExportBundle, snapshotAgentMachine } from "../../utils/feedbackExportBundle";
 import type { FeedbackExportBundleV2 } from "../../utils/feedbackExportBundle";
 import { detectBrowserTimezone } from "../../utils/timeFormatting";
 import { WEB_APP_VERSION } from "../../utils/webAppVersion";
@@ -50,10 +55,23 @@ type CreateReportResponse = {
   expiresAt: string;
 };
 
+const TRANSCRIPT_REQUEST_STATE_COPY: Record<TranscriptRequestState, MessageId> = {
+  pending: "agent.reportIssue.runtimeTranscriptRequestPending",
+  requested: "agent.reportIssue.runtimeTranscriptRequested",
+  request_failed: "agent.reportIssue.runtimeTranscriptRequestFailed",
+  request_unconfirmed: "agent.reportIssue.runtimeTranscriptRequestUnconfirmed",
+};
+
 type SubmittedReport = {
   reportId: string;
-  artifactId?: string;
+  // Null when the bundle uploaded but filing the Hands ticket failed; the
+  // report id is then the only handle the user can pass on.
+  ticketId: string | null;
+  // Kept so a failed ticket can be retried with the same submission id, which
+  // Hands uses to dedupe: a retry after a lost response cannot file twice.
+  ticketRequest: Parameters<typeof createAgentIssueTicket>[0];
   serverId: string;
+  serverSlug: string | null;
   issueDescription?: string;
   transcriptAttachmentRequested: boolean;
 };
@@ -113,6 +131,18 @@ async function describeFetchFailure(
   );
 }
 
+// Resolves to null on failure: the bundle is already uploaded, so a Hands
+// outage must not fail the report itself.
+function fileTicket(request: Parameters<typeof createAgentIssueTicket>[0]): Promise<string | null> {
+  return createAgentIssueTicket(request).then(
+    (ticket) => ticket.id,
+    (err) => {
+      console.warn("[ReportIssueDialog] Failed to file the feedback ticket", err);
+      return null;
+    },
+  );
+}
+
 function buildExportFilename(agent: Agent) {
   const safeName = (agent.displayName || agent.name)
     .replace(/[^A-Za-z0-9._-]+/g, "-")
@@ -120,10 +150,6 @@ function buildExportFilename(agent: Agent) {
     .replace(/^-|-$/g, "") || "agent";
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   return `slock-feedback-export-${safeName}-${timestamp}.json`;
-}
-
-function browserLocaleHint(): string | null {
-  return navigator.languages?.[0] || navigator.language || null;
 }
 
 async function sha256Hex(blob: Blob) {
@@ -139,7 +165,8 @@ export default function ReportIssueDialog({
   onClose,
   feedbackExportUrl = FEEDBACK_EXPORT_URL,
 }: ReportIssueDialogProps) {
-  const { formatMessage } = useIntl();
+  const { formatMessage, locale } = useIntl();
+  const navigate = useNavigate();
   const user = useAuthStore((s) => s.user);
   const server = useServerStore((s) => s.current);
   const getActivityLog = useAgentStore((s) => s.getActivityLog);
@@ -155,14 +182,29 @@ export default function ReportIssueDialog({
   const [includeActivityLog, setIncludeActivityLog] = useState(true);
   const [includeTrajectoryLog, setIncludeTrajectoryLog] = useState(true);
   const [includeSessionTranscript, setIncludeSessionTranscript] = useState(Boolean(agent.machineId));
+  // Tier 2 (task #272): machine runner log tail, offered only to the human who
+  // attached the machine; the server re-checks ownership. task #279 (artin):
+  // for the reporter's OWN machine it defaults ON — most reports never carried
+  // it while it was off — and stays a visible, untickable box with disclosure.
+  const canIncludeMachineLog = Boolean(agent.machineId && machine?.computerAttachedByCurrentUser);
+  // The machine list can load after the dialog mounts, so the default is
+  // DERIVED from ownership at render time rather than captured at mount: until
+  // the user touches the box it follows `canIncludeMachineLog`; once touched,
+  // the user's choice wins and later store updates cannot re-tick it
+  // (Jianwei, #7798 review).
+  const [machineLogTailChoice, setMachineLogTailChoice] = useState<boolean | null>(null);
+  const includeMachineLogTail = machineLogTailChoice ?? canIncludeMachineLog;
   const [consented, setConsented] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState(false);
   const [submittedReport, setSubmittedReport] = useState<SubmittedReport | null>(null);
   const [reportRefCopied, setReportRefCopied] = useState(false);
+  const [ticketRetrying, setTicketRetrying] = useState(false);
+  // task #1228 ①: only the HTTP result of our own request is known here.
+  const [transcriptRequestState, setTranscriptRequestState] = useState<TranscriptRequestState | null>(null);
 
-  const handleSubmit = async () => {
+  const handleSubmit = useCallback(async () => {
     if (!consented || loading) return;
     if (!feedbackExportUrl) {
       setError(formatMessage({ id: "agent.reportIssue.exportNotConfigured" }));
@@ -194,9 +236,10 @@ export default function ReportIssueDialog({
         const activityLog = includeActivityLog ? getActivityLog(agent.id) : null;
         const trajectoryLog = includeTrajectoryLog ? getTrajectoryLog(agent.id) : null;
 
+        const { daemonVersion, ...machineSnapshot } = snapshotAgentMachine(machine);
         bundle = buildFeedbackExportBundle({
           appVersion: FEEDBACK_APP_VERSION,
-          daemonVersion: machine?.daemonVersion ?? null,
+          daemonVersion,
           reporter: {
             id: user?.id ?? null,
             email: user?.email ?? null,
@@ -218,8 +261,7 @@ export default function ReportIssueDialog({
             model: agent.model,
             reasoningEffort: agent.reasoningEffort,
             machineId: agent.machineId,
-            machineName: machine?.name ?? null,
-            machineStatus: machine?.status ?? null,
+            ...machineSnapshot,
           },
           recentMessages,
           ephemeralActivityBuffer: activityLog,
@@ -353,27 +395,46 @@ export default function ReportIssueDialog({
         );
       }
 
-      await api.post(
-        `/servers/${server.id}/feedback/${report.id}/receipt`,
-        { locale: browserLocaleHint() }
-      ).catch((err) => {
-        console.warn("[ReportIssueDialog] Failed to send feedback receipt email", describeApiFailure(err, formatMessage));
-      });
-
       const transcriptAttachmentRequested = includeSessionTranscript && Boolean(agent.machineId);
       if (transcriptAttachmentRequested && agent.machineId) {
-        void api.post(
-          `/servers/${server.id}/machines/${agent.machineId}/agents/${agent.id}/feedback/${report.id}/transcript`,
-          { reportGeneratedAt: bundle.generatedAt }
-        ).catch((err) => {
-          console.warn("[ReportIssueDialog] Failed to queue runtime transcript attachment", describeApiFailure(err, formatMessage));
-        });
+        const machineId = agent.machineId;
+        // Started BEFORE the ticket and never awaited by the submission: the
+        // state updates on its own (10 s cap measured from this start), and
+        // the helper's promise never rejects.
+        startTranscriptRequest(
+          () => api.post(
+            `/servers/${server.id}/machines/${machineId}/agents/${agent.id}/feedback/${report.id}/transcript`,
+            {
+              reportGeneratedAt: bundle.generatedAt,
+              ...(canIncludeMachineLog && includeMachineLogTail ? { includeMachineLogTail: true } : {}),
+            }
+          ).catch((err: unknown) => {
+            console.warn("[ReportIssueDialog] Session record request failed", describeApiFailure(err, formatMessage));
+            throw err;
+          }),
+          setTranscriptRequestState,
+        );
       }
+
+      const agentTitle = formatMessage(
+        { id: "agent.reportIssue.titleForAgent" },
+        { name: agent.displayName || agent.name },
+      );
+      const ticketRequest = {
+        message: [agentTitle, description.trim()].filter(Boolean).join("\n\n"),
+        feedbackReportId: report.id,
+        submissionId: crypto.randomUUID(),
+        // The same react-intl locale that formatted agentTitle above.
+        locale,
+      };
+      const ticketId = await fileTicket(ticketRequest);
 
       setSubmittedReport({
         reportId: report.id,
-        artifactId: report.artifactId,
+        ticketId,
+        ticketRequest,
         serverId: server.id,
+        serverSlug: server.slug ?? null,
         issueDescription: description.trim() || undefined,
         transcriptAttachmentRequested,
       });
@@ -383,72 +444,135 @@ export default function ReportIssueDialog({
     } finally {
       setLoading(false);
     }
-  };
+  }, [agent, canIncludeMachineLog, consented, description, dmChannelId, feedbackExportUrl, formatMessage, locale, getActivityLog, getTrajectoryLog, includeActivityLog, includeMachineLogTail, includeRecentMessages, includeSessionTranscript, includeTrajectoryLog, loading, machine, server, user]);
 
-  const handleCopyReportReference = async () => {
+  const handleRetryTicket = useCallback(async () => {
+    if (!submittedReport || submittedReport.ticketId) return;
+    setTicketRetrying(true);
+    try {
+      const ticketId = await fileTicket(submittedReport.ticketRequest);
+      if (ticketId) setSubmittedReport({ ...submittedReport, ticketId });
+    } finally {
+      setTicketRetrying(false);
+    }
+  }, [submittedReport]);
+
+  const handleCopyReportReference = useCallback(async () => {
     if (!submittedReport) return;
     const lines = [
       `reportId: ${submittedReport.reportId}`,
       `serverId: ${submittedReport.serverId}`,
-      submittedReport.artifactId ? `artifactId: ${submittedReport.artifactId}` : null,
       submittedReport.issueDescription ? `issueDescription:\n${submittedReport.issueDescription}` : null,
     ].filter(Boolean);
     await navigator.clipboard.writeText(lines.join("\n"));
     setReportRefCopied(true);
-  };
+  }, [submittedReport]);
+
+  const handleDescriptionChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setDescription(e.target.value);
+  }, []);
+
+  const handleRecentMessagesChange = useCallback((checked: boolean) => {
+    setIncludeRecentMessages(checked);
+  }, []);
+
+  const handleActivityLogChange = useCallback((checked: boolean) => {
+    setIncludeActivityLog(checked);
+  }, []);
+
+  const handleTrajectoryLogChange = useCallback((checked: boolean) => {
+    setIncludeTrajectoryLog(checked);
+  }, []);
+
+  const handleSessionTranscriptChange = useCallback((checked: boolean) => {
+    setIncludeSessionTranscript(checked);
+  }, []);
+
+  const handleMachineLogTailChange = useCallback((checked: boolean) => {
+    setMachineLogTailChoice(checked);
+  }, []);
+
+  const handleConsentedChange = useCallback((checked: boolean) => {
+    setConsented(checked);
+  }, []);
+
+  const ticketPath = submittedReport?.ticketId && submittedReport.serverSlug
+    ? `/s/${submittedReport.serverSlug}/settings/feedback/ticket/${encodeURIComponent(submittedReport.ticketId)}`
+    : null;
+
+  const handleViewTicket = useCallback(() => {
+    if (!ticketPath) return;
+    onClose();
+    navigate(ticketPath);
+  }, [onClose, navigate, ticketPath]);
 
   if (submitted) {
     return (
       <DialogCard title={formatMessage({ id: "agent.reportIssue.submittedTitle" })} onClose={onClose} maxWidthClass="max-w-sm">
           <div className="flex flex-col items-center gap-4 py-4">
-            <div className="flex size-12 items-center justify-center border-2 border-black bg-brutal-lime">
-              <CheckCircle size={24} />
+            <div className="flex size-12 items-center justify-center rounded-sticker border-[1.5px] border-sticker-ink bg-success text-sticker-ink">
+              <CheckCircle size={24} aria-hidden="true" />
             </div>
             <div className="text-center">
-              <p className="font-bold text-black">{formatMessage({ id: "agent.reportIssue.uploaded" })}</p>
-              <p className="mt-1 text-sm text-black/60">
-                {formatMessage({ id: "agent.reportIssue.uploadedDescription" })}
+              <p className="text-subhead font-bold text-foreground">{formatMessage({ id: "agent.reportIssue.uploaded" })}</p>
+              <p className="mt-1 text-callout text-foreground-muted">
+                {formatMessage({ id: submittedReport?.ticketId ? "agent.reportIssue.ticketFiled" : "agent.reportIssue.uploadedDescription" })}
               </p>
             </div>
-            {submittedReport && (
-              <div className="w-full border-2 border-black bg-white p-3 text-left">
+            {submittedReport && !submittedReport.ticketId && (
+              <Card className="block w-full p-3 text-left">
+                <Banner intent="warning" density="sm" className="mb-3" role="alert">
+                  {formatMessage({ id: "agent.reportIssue.ticketFailed" })}
+                </Banner>
                 <SectionEyebrow as="div" className="mb-1">{formatMessage({ id: "agent.reportIssue.reportReference" })}</SectionEyebrow>
-                <dl className="space-y-1 text-xs">
+                <dl className="space-y-1">
                   <div>
-                    <dt className="font-bold uppercase text-black/60">{formatMessage({ id: "agent.reportIssue.reportId" })}</dt>
-                    <dd className="break-all font-mono text-black">{submittedReport.reportId}</dd>
+                    <dt className="text-caption font-semibold text-foreground-muted">{formatMessage({ id: "agent.reportIssue.reportId" })}</dt>
+                    <dd className="break-all font-mono text-mono-meta text-foreground">{submittedReport.reportId}</dd>
                   </div>
-                  {submittedReport.artifactId && (
-                    <div>
-                      <dt className="font-bold uppercase text-black/60">{formatMessage({ id: "agent.reportIssue.artifactId" })}</dt>
-                      <dd className="break-all font-mono text-black">{submittedReport.artifactId}</dd>
-                    </div>
-                  )}
                   <div>
-                    <dt className="font-bold uppercase text-black/60">{formatMessage({ id: "agent.reportIssue.serverId" })}</dt>
-                    <dd className="break-all font-mono text-black">{submittedReport.serverId}</dd>
+                    <dt className="text-caption font-semibold text-foreground-muted">{formatMessage({ id: "agent.reportIssue.serverId" })}</dt>
+                    <dd className="break-all font-mono text-mono-meta text-foreground">{submittedReport.serverId}</dd>
                   </div>
-                  {submittedReport.transcriptAttachmentRequested && (
-                    <div>
-                      <dt className="font-bold uppercase text-black/60">{formatMessage({ id: "agent.reportIssue.runtimeTranscript" })}</dt>
-                      <dd className="text-black">{formatMessage({ id: "agent.reportIssue.runtimeTranscriptQueued" })}</dd>
-                    </div>
-                  )}
                 </dl>
-                <button
+                <Button size="sm"
+                  variant="outline"
                   type="button"
                   onClick={handleCopyReportReference}
-                  className="btn-brutal-sm mt-3 bg-white px-3 py-1 text-xs"
+                  className="mt-3"
                 >
                   {formatMessage({ id: reportRefCopied ? "agent.reportIssue.copied" : "agent.reportIssue.copyReference" })}
-                </button>
-              </div>
+                </Button>
+                <Button size="sm"
+                  variant="outline"
+                  type="button"
+                  onClick={handleRetryTicket}
+                  disabled={ticketRetrying}
+                  className="mt-3 ml-2"
+                >
+                  {formatMessage({ id: ticketRetrying ? "agent.reportIssue.retryingTicket" : "agent.reportIssue.retryTicket" })}
+                </Button>
+              </Card>
+            )}
+            {submittedReport?.transcriptAttachmentRequested && transcriptRequestState && (
+              <p className="text-caption text-foreground-hint" role="status">
+                {formatMessage({ id: TRANSCRIPT_REQUEST_STATE_COPY[transcriptRequestState] })}
+              </p>
             )}
           </div>
-          <div className="flex justify-end">
-            <button type="button" onClick={onClose} className="btn-brutal bg-brutal-lime px-4 py-2 text-sm">
+          <div className="flex justify-end gap-2">
+            {ticketPath && (
+              <Button size="lg"
+                variant="outline"
+                type="button"
+                onClick={handleViewTicket}
+              >
+                {formatMessage({ id: "agent.reportIssue.viewTicket" })}
+              </Button>
+            )}
+            <Button size="lg" variant="primary" type="button" onClick={onClose}>
               {formatMessage({ id: "agent.reportIssue.done" })}
-            </button>
+            </Button>
           </div>
       </DialogCard>
     );
@@ -458,7 +582,7 @@ export default function ReportIssueDialog({
     <DialogCard
       title={(
         <span className="flex items-center gap-2">
-          <Bug size={18} />
+          <Bug size={18} aria-hidden="true" />
           {formatMessage({ id: "agent.reportIssue.title" })}
         </span>
       )}
@@ -466,108 +590,131 @@ export default function ReportIssueDialog({
       maxWidthClass="max-w-sm"
     >
 
-        <div className="mb-4 border-2 border-black bg-white px-3 py-2">
+        <Card className="mb-4 block px-3 py-2">
           <SectionEyebrow>{formatMessage({ id: "agent.reportIssue.agentLabel" })}</SectionEyebrow>
-          <p className="mt-0.5 font-bold text-black">{agent.displayName || agent.name}</p>
-        </div>
+          <p className="mt-0.5 text-subhead font-semibold text-foreground">{agent.displayName || agent.name}</p>
+        </Card>
 
         <FormField label={formatMessage({ id: "agent.reportIssue.describeLabel" })} optional className="mb-4">
-          <textarea
-            className="input-brutal w-full resize-none rounded-none p-2 text-sm"
+          <Textarea
+            className="w-full resize-none"
             rows={3}
             placeholder={formatMessage({ id: "agent.reportIssue.describePlaceholder" })}
             value={description}
-            onChange={(e) => setDescription(e.target.value)}
+            onChange={handleDescriptionChange}
             disabled={loading}
           />
         </FormField>
 
         <div className="mb-4">
           <SectionEyebrow as="div" className="mb-1">{formatMessage({ id: "agent.reportIssue.includeLabel" })}</SectionEyebrow>
-          <p className="mb-2 text-xs text-black/60">
+          <p className="mb-2 text-caption text-foreground-hint">
             {formatMessage({ id: "agent.reportIssue.defaultIncludedDisclosure" })}
           </p>
-          <div className="flex flex-col gap-1.5">
-            <label className="flex select-none items-center gap-2">
+          <p className="mb-2 text-caption text-foreground-hint">
+            {formatMessage({ id: "agent.reportIssue.structuredSummaryDisclosure" })}
+          </p>
+          <div className="flex flex-col gap-1">
+            <label className="flex min-h-8 select-none items-center gap-2 has-[[data-disabled]]:text-foreground-disabled">
               <Checkbox
                 checked={includeRecentMessages}
-                onChange={(e) => setIncludeRecentMessages(e.target.checked)}
+                onCheckedChange={handleRecentMessagesChange}
                 disabled={loading}
               />
-              <span className="text-sm">{formatMessage({ id: "agent.reportIssue.includeRecentMessages" })}</span>
+              <span className="text-callout font-semibold">{formatMessage({ id: "agent.reportIssue.includeRecentMessages" })}</span>
             </label>
-            <label className="flex select-none items-center gap-2">
+            <label className="flex min-h-8 select-none items-center gap-2 has-[[data-disabled]]:text-foreground-disabled">
               <Checkbox
                 checked={includeActivityLog}
-                onChange={(e) => setIncludeActivityLog(e.target.checked)}
+                onCheckedChange={handleActivityLogChange}
                 disabled={loading}
               />
-              <span className="text-sm">{formatMessage({ id: "agent.reportIssue.includeLiveActivity" })}</span>
+              <span className="text-callout font-semibold">{formatMessage({ id: "agent.reportIssue.includeLiveActivity" })}</span>
             </label>
-            <label className="flex select-none items-center gap-2">
+            <label className="flex min-h-8 select-none items-center gap-2 has-[[data-disabled]]:text-foreground-disabled">
               <Checkbox
                 checked={includeTrajectoryLog}
-                onChange={(e) => setIncludeTrajectoryLog(e.target.checked)}
+                onCheckedChange={handleTrajectoryLogChange}
                 disabled={loading}
               />
-              <span className="text-sm">{formatMessage({ id: "agent.reportIssue.includeActivityHistory" })}</span>
+              <span className="text-callout font-semibold">{formatMessage({ id: "agent.reportIssue.includeActivityHistory" })}</span>
             </label>
-            <label className="flex select-none items-center gap-2">
+            <label className="flex min-h-8 select-none items-center gap-2 has-[[data-disabled]]:text-foreground-disabled">
               <Checkbox
                 checked={includeSessionTranscript}
-                onChange={(e) => setIncludeSessionTranscript(e.target.checked)}
+                onCheckedChange={handleSessionTranscriptChange}
                 disabled={loading || !agent.machineId}
               />
-              <span className="text-sm">{formatMessage({ id: "agent.reportIssue.includeRuntimeTranscript" })}</span>
+              <span className="text-callout font-semibold">{formatMessage({ id: "agent.reportIssue.includeRuntimeTranscript" })}</span>
             </label>
+            {includeSessionTranscript && agent.machineId && (
+              <p className="ml-7 text-caption text-foreground-hint">
+                {formatMessage({ id: "agent.reportIssue.runtimeTranscriptHint" })}
+              </p>
+            )}
+            {canIncludeMachineLog && (
+              <label className="flex min-h-8 select-none items-start gap-2 py-1.5 has-[[data-disabled]]:text-foreground-disabled">
+                <Checkbox
+                  checked={includeMachineLogTail}
+                  onCheckedChange={handleMachineLogTailChange}
+                  disabled={loading || !includeSessionTranscript}
+                />
+                <span className="text-callout font-semibold">
+                  {formatMessage({ id: "agent.reportIssue.includeMachineLogTail" })}
+                  <span className="block text-caption font-normal text-foreground-hint">
+                    {formatMessage({ id: "agent.reportIssue.machineLogTailDisclosure" })}
+                  </span>
+                </span>
+              </label>
+            )}
           </div>
           {!agent.machineId && (
-            <p className="mt-1 text-xs text-black/60">
+            <p className="mt-1 text-caption text-foreground-hint">
               {formatMessage({ id: "agent.reportIssue.runtimeTranscriptUnavailable" })}
             </p>
           )}
         </div>
 
         <Banner intent="warning" withIcon density="sm" className="mb-5">
-          <p className="mb-2 text-black/80">
+          <p className="mb-2">
             {formatMessage(
               { id: "agent.reportIssue.sensitiveDataWarning" },
               { strong: (chunks) => <strong key="strong">{chunks}</strong> },
             )}
           </p>
-          <label className="flex select-none items-center gap-2">
+          <label className="flex min-h-8 select-none items-center gap-2 has-[[data-disabled]]:text-foreground-disabled">
             <Checkbox
               checked={consented}
-              onChange={(e) => setConsented(e.target.checked)}
+              onCheckedChange={handleConsentedChange}
               disabled={loading}
             />
-            <span className="text-xs font-bold">{formatMessage({ id: "agent.reportIssue.consent" })}</span>
+            <span className="text-callout font-semibold">{formatMessage({ id: "agent.reportIssue.consent" })}</span>
           </label>
         </Banner>
 
         {error && (
-          <Banner intent="warning" className="mb-4 font-bold">
+          <Banner intent="warning" className="mb-4">
             {error}
           </Banner>
         )}
 
-        <div className="flex justify-end gap-3">
-          <button
+        <div className="flex justify-end gap-2">
+          <Button size="lg"
+            variant="ghost"
             type="button"
             onClick={onClose}
             disabled={loading}
-            className="btn-brutal bg-white px-4 py-2 text-sm disabled:opacity-50"
           >
             {formatMessage({ id: "common.confirm.cancel" })}
-          </button>
-          <button
+          </Button>
+          <Button size="lg"
+            variant="primary"
             type="button"
             onClick={handleSubmit}
             disabled={loading || !consented}
-            className="btn-brutal bg-brutal-pink px-4 py-2 text-sm disabled:cursor-not-allowed disabled:opacity-50"
           >
             {formatMessage({ id: loading ? "agent.reportIssue.submitting" : "agent.reportIssue.title" })}
-          </button>
+          </Button>
         </div>
     </DialogCard>
   );

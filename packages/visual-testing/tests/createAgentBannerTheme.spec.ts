@@ -1,33 +1,37 @@
 import { expect, test } from "@playwright/test";
 
 /**
- * The Create Agent capacity banner must follow the theme.
+ * The Create Agent capacity banner is a raft-ui Banner that follows the mode.
  *
  * Before the raft-ui swap this banner was hand-rolled from raw utilities
- * (`border-2 border-black bg-brutal-orange/20`). The `[data-theme="elegant"]`
- * patch layer in index.css targets legacy CLASSES, which those utilities are
- * not — so the banner measured IDENTICALLY in both themes while the
- * `.card-brutal` shell around it themed correctly. An elegant soft-grey rounded
- * card containing a hard black brutal banner.
+ * (`border-2 border-black bg-brutal-orange/20`): a literal surface and a hard
+ * black rule that nothing above the callsite could restyle, so it rendered
+ * identically whatever the shell around it did.
  *
- * Read under BOTH themes and required to disagree, because that is the only
- * shape of assertion a hardcoded colour cannot satisfy. A single-theme
+ * Read in light AND dark and required to disagree, because that is the only
+ * shape of assertion a hardcoded colour cannot satisfy. A single-mode
  * measurement cannot tell a literal from a token — which is exactly how the
  * `text-black/60` override on KeyValueAddButton survived a fully green suite
  * (@Dozy, PR #7010).
+ *
+ * The register is the DS Banner (raft-ui design/components/Banner): a soft
+ * intent surface on the container radius (radius-lg, 10), a 1px `line` hairline
+ * drawn inside, no ink border, 12/14 padding and 14/20 text.
  *
  * Uses the real Create Agent dialog via the `dialog-capacity-banner` case.
  * Neither of this dialog's banners rendered in ANY case before that was added:
  * a surface no case renders cannot regress visibly.
  */
-type Theme = "brutal" | "elegant";
+type Mode = "light" | "dark";
 
-const CASE = (theme: Theme) =>
+// The visual host reads its mode from `?theme=dark` and renders light
+// otherwise (requestedMode in packages/web/visual-testing/VisualTestingCases.tsx).
+const CASE = (mode: Mode) =>
   "/visual-testing.html?case=components.members.create-agent.dialog-capacity-banner" +
-  (theme === "elegant" ? "&theme=elegant" : "");
+  (mode === "dark" ? "&theme=dark" : "");
 
-async function readBanner(page: import("@playwright/test").Page, theme: Theme) {
-  await page.goto(CASE(theme));
+async function readBanner(page: import("@playwright/test").Page, mode: Mode) {
+  await page.goto(CASE(mode));
   // Wait for the DIALOG, not the banner slot. Waiting on `[data-slot="banner"]`
   // means a revert to the hand-rolled banner (a bare div with no slot) fails as
   // a bare 10s timeout, which reads as "the harness is broken" rather than "this
@@ -45,44 +49,49 @@ async function readBanner(page: import("@playwright/test").Page, theme: Theme) {
       return { missing: true as const, legacyBannerPresent: legacy };
     }
     const s = getComputedStyle(root);
+    const d = getComputedStyle(description);
     return {
       background: s.backgroundColor,
-      borderColor: s.borderTopColor,
       borderWidth: s.borderTopWidth,
+      boxShadow: s.boxShadow,
       radius: s.borderRadius,
+      padding: s.padding,
+      textMetrics: `${d.fontSize}/${d.lineHeight}`,
       text: (description.textContent ?? "").trim(),
     };
   });
 }
 
-test("the capacity banner is a raft-ui Banner that follows the theme", async ({ page }) => {
-  const brutal = await readBanner(page, "brutal");
-  const elegant = await readBanner(page, "elegant");
+test("the capacity banner is a raft-ui Banner that follows the mode", async ({ page }) => {
+  const light = await readBanner(page, "light");
+  const dark = await readBanner(page, "dark");
 
-  // Preconditions. Without these the inequalities below pass vacuously on a
+  // Preconditions. Without these the inequality below passes vacuously on a
   // banner that failed to render at all.
-  for (const [theme, read] of [["brutal", brutal], ["elegant", elegant]] as const) {
-    expect(read, `${theme}: the capacity banner must render`).not.toBeNull();
+  for (const [mode, read] of [["light", light], ["dark", dark]] as const) {
+    expect(read, `${mode}: the capacity banner must render`).not.toBeNull();
     expect(
-      "missing" in read! ? read.legacyBannerPresent : false,
-      `${theme}: found the hand-rolled banner (bg-brutal-orange) instead of a raft-ui Banner — the callsite was reverted off <Banner status=...>`,
+      "missing" in read ? read.legacyBannerPresent : false,
+      `${mode}: found the hand-rolled banner (bg-brutal-orange) instead of a raft-ui Banner — the callsite was reverted off <Banner status=...>`,
     ).toBe(false);
-    expect("missing" in read!, `${theme}: no [data-slot="banner"] rendered`).toBe(false);
+    expect("missing" in read, `${mode}: no [data-slot="banner"] rendered`).toBe(false);
+    if ("missing" in read) continue;
+
+    expect(read.text).toMatch(/agent limit reached/i);
+    // The DS register, in both modes: a highlight, not a sticker.
+    expect(read.borderWidth, `${mode}: no ink border — the soft surface is a highlight, not a sticker`).toBe("0px");
+    expect(read.boxShadow, `${mode}: the 1px line hairline sits inside the container`).toContain("0px 0px 0px 1px inset");
+    expect(read.radius, `${mode}: container radius (radius-lg)`).toBe("10px");
+    expect(read.padding, `${mode}: banner padding`).toBe("12px 14px");
+    expect(read.textMetrics, `${mode}: banner text`).toBe("14px/20px");
   }
-  expect(brutal!.text).toMatch(/agent limit reached/i);
 
   // `[data-slot="banner"]` only exists on raft-ui's Banner — the hand-rolled one
   // was a bare div, so reaching this point already proves the swap held.
+  const lightBg = "missing" in light ? null : light.background;
+  const darkBg = "missing" in dark ? null : dark.background;
   expect(
-    elegant!.background,
-    `the banner's surface must change with the theme — got ${brutal!.background} under both, which is what the hand-rolled bg-brutal-orange/20 did`,
-  ).not.toBe(brutal!.background);
-
-  // The register change, not just a tint: brutal keeps its hard 2px rule,
-  // elegant drops to a soft rounded surface. The old banner kept 2px/0px in both.
-  expect(brutal!.borderWidth, "brutal keeps the hard rule").toBe("2px");
-  expect(
-    elegant!.borderWidth === brutal!.borderWidth && elegant!.radius === brutal!.radius,
-    `elegant must not inherit brutal's register — border ${elegant!.borderWidth} radius ${elegant!.radius} vs brutal ${brutal!.borderWidth}/${brutal!.radius}`,
-  ).toBe(false);
+    darkBg,
+    `the banner's surface must change with the mode — got ${lightBg} in both, which is what the hand-rolled bg-brutal-orange/20 did`,
+  ).not.toBe(lightBg);
 });

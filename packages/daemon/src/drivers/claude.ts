@@ -1,22 +1,23 @@
-import { spawn } from "node:child_process";
+import { spawnRuntimeChild } from "./runtimeChild";
 import type { AgentConfig, AxSurfaceText } from "@botiverse/raft-shared";
-import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent, RuntimeProbeResult } from "./types.js";
-import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport.js";
-import { ClaudeEventNormalizer } from "./claudeEventNormalizer.js";
-import { assertClaudeStartupPayloadWithinBudget } from "./claudeInputBudget.js";
-import { buildClaudeArgs, buildClaudeManagedMcpConfig, buildClaudeSpawnSpec, probeClaude, probeClaudeLaunch, resolveClaudeLaunchCommand, writeClaudeSystemPromptFile } from "./claudeLaunch.js";
+import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent, RuntimeProbeResult } from "./types";
+import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
+import { ClaudeEventNormalizer } from "./claudeEventNormalizer";
+import { assertClaudeStartupPayloadWithinBudget } from "./claudeInputBudget";
+import { buildClaudeArgs, buildClaudeManagedMcpConfig, buildClaudeSpawnSpec, probeClaude, probeClaudeLaunch, resolveClaudeLaunchCommand, resolveClaudeLaunchCommandAsync, writeClaudeSystemPromptFile } from "./claudeLaunch";
+import { ProbeChildError } from "./probeChild";
 import {
   buildClaudeProviderIsolationEnv,
   isClaudeCustomProviderConfig,
   LEGACY_CLAUDE_PROVIDER_CONFIG_DIR,
   shouldWarnLegacyClaudeProviderConfigDir,
-} from "./claudeProviderIsolation.js";
-import { logger } from "../logger.js";
-import { resolveRaftHome } from "../raftHome.js";
+} from "./claudeProviderIsolation";
+import { logger } from "../logger";
+import { resolveRaftHome } from "../raftHome";
 import {
   prepareManagedMcpRuntimeProxy,
   writeManagedMcpRuntimeConfigFile,
-} from "../managedMcpRuntimeProxy.js";
+} from "../managedMcpRuntimeProxy";
 
 export {
   buildClaudeArgs,
@@ -27,8 +28,8 @@ export {
   probeClaude,
   resolveClaudeCommand,
   resolveClaudeLaunchCommand,
-} from "./claudeLaunch.js";
-export { buildClaudeProviderIsolationEnv } from "./claudeProviderIsolation.js";
+} from "./claudeLaunch";
+export { buildClaudeProviderIsolationEnv } from "./claudeProviderIsolation";
 
 export class ClaudeDriver implements RuntimeDriver {
   readonly id = "claude";
@@ -133,14 +134,20 @@ export class ClaudeDriver implements RuntimeDriver {
       `[Agent ${ctx.agentId}] transport=cli cli=${ctx.slockCliPath} token_file=${tokenFile}`,
     );
 
-    const claudeCommand = resolveClaudeLaunchCommand(ctx.config);
-    const spawnSpec = buildClaudeSpawnSpec(claudeCommand);
+    // task #1277: the PATH lookup runs as a bounded probe child under this
+    // start attempt's signal; a cancelled lookup is rethrown, never a verdict.
+    const claudeCommand = await resolveClaudeLaunchCommandAsync(ctx.config, { signal: ctx.launchSignal });
+    const spawnSpec = buildClaudeSpawnSpec(claudeCommand, args, { env: spawnEnv as NodeJS.ProcessEnv });
 
-    const proc = spawn(spawnSpec.command, args, {
+    // task #365: after the last await, right before the child exists.
+    ctx.assertLaunchCurrent?.();
+    // A start stopped while the lookup ran must not create a child.
+    if (ctx.launchSignal?.aborted) throw new ProbeChildError("claude launch cancelled before the child was created", { code: "ABORT_ERR" });
+    const proc = spawnRuntimeChild(spawnSpec.command, spawnSpec.args, {
       cwd: ctx.workingDirectory,
       stdio: ["pipe", "pipe", "pipe"],
-      env: spawnEnv as NodeJS.ProcessEnv,
-      shell: spawnSpec.shell,
+      env: spawnSpec.env ?? spawnEnv as NodeJS.ProcessEnv,
+      shell: false,
     });
 
     // Send initial prompt via stdin (stream-json format)
@@ -183,6 +190,8 @@ export class ClaudeDriver implements RuntimeDriver {
   buildSystemPrompt(config: AgentConfig, _agentId: string): AxSurfaceText {
     return buildCliTransportSystemPrompt(config, {
       extraCriticalRules: [],
+      // Claude Code's `Agent` tool is not in CLAUDE_DISALLOWED_TOOLS.
+      supportsSubagents: true,
     });
   }
 

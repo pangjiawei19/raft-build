@@ -1,35 +1,42 @@
 import { Bot, TriangleAlert, X } from "lucide-react";
+import { useMemo } from "react";
+import { PanelAction } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 import { useMobileBack } from "../../hooks/useAppNavigate";
 import { useServerStore } from "../../store/serverStore";
 import EmptyState from "../ui/EmptyState";
 import PanelHeader from "../ui/PanelHeader";
+import Tooltip from "../ui/Tooltip";
 
 export default function AgentUnavailablePanel({ onClose }: { onClose?: () => void }) {
   const { formatMessage } = useIntl();
   const slug = useServerStore((s) => s.current?.slug);
   const onMobileBack = useMobileBack(onClose ?? (slug ? `/s/${slug}/members` : "/"));
+  const mobileBackProps = useMemo(
+    () => ({
+      "data-testid": "agent-mobile-back",
+      title: formatMessage({ id: "common.announcement.back" }),
+    }),
+    [formatMessage],
+  );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-white">
+    <div className="flex min-h-0 flex-1 flex-col bg-layer-canvas">
       <PanelHeader
         title={formatMessage({ id: "agent.detail.unavailableTitle" })}
         onMobileBack={onMobileBack}
-        mobileBackProps={{
-          "data-testid": "agent-mobile-back",
-          title: formatMessage({ id: "common.announcement.back" }),
-        }}
+        mobileBackProps={mobileBackProps}
         icon={<Bot size={18} />}
-        iconBg="bg-gray-200"
         actions={onClose ? (
-          <button
-            type="button"
-            onClick={onClose}
-            className="btn-brutal-sm hidden size-7 items-center justify-center bg-white md:flex"
-            title={formatMessage({ id: "common.close" })}
-          >
-            <X size={14} />
-          </button>
+          <Tooltip content={formatMessage({ id: "common.close" })}>
+            <PanelAction
+              onClick={onClose}
+              className="hidden md:flex"
+              aria-label={formatMessage({ id: "common.close" })}
+            >
+              <X />
+            </PanelAction>
+          </Tooltip>
         ) : null}
       />
       <EmptyState

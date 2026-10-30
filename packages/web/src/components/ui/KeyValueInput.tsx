@@ -1,8 +1,8 @@
 import { Plus, Trash2 } from "lucide-react";
-import { useId } from "react";
-import type { HTMLInputTypeAttribute } from "react";
+import { useCallback, useId } from "react";
+import type { ChangeEvent, HTMLInputTypeAttribute } from "react";
 import { useIntl } from "react-intl";
-import { Button, Field, Input } from "raft-ui";
+import { Button, Field, Input } from "@botiverse/raft-ui";
 
 export function KeyValueInputRow({
   keyValue,
@@ -57,20 +57,30 @@ export function KeyValueInputRow({
    * (Found in review by @Dozy on PR #7010.)
    */
   const rowId = useId();
+  const handleKeyChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => onKeyChange(event.target.value),
+    [onKeyChange],
+  );
+  const handleValueChange = useCallback(
+    (event: ChangeEvent<HTMLInputElement>) => onValueChange(event.target.value),
+    [onValueChange],
+  );
 
   return (
     <div className="flex items-center gap-2">
       <Field className="contents">
-        <Input id={`${rowId}-key`} required={keyRequired} aria-label={resolvedKeyLabel} type="text" value={keyValue} onChange={(event) => onKeyChange(event.target.value)} className="w-1/3 min-w-0" placeholder={resolvedKeyPlaceholder} />
+        <Input id={`${rowId}-key`} required={keyRequired} aria-label={resolvedKeyLabel} type="text" value={keyValue} onChange={handleKeyChange} className="w-1/3 min-w-0" placeholder={resolvedKeyPlaceholder} />
       </Field>
-      {/* Themed, not `text-black/40`: a literal cannot follow the theme, and
-          leaving one behind in the file being cleaned of them made no sense. */}
-      <span className="text-foreground-muted">=</span>
+      {/* The `=` is machine syntax: Space Mono, ink-3. */}
+      <span className="font-mono text-mono-code text-foreground-hint">=</span>
       <Field className="contents">
-        <Input id={`${rowId}-value`} required={valueRequired} aria-label={resolvedValueLabel} type={valueType} value={value} onChange={(event) => onValueChange(event.target.value)} className="min-w-0 flex-1" placeholder={resolvedValuePlaceholder} />
+        <Input id={`${rowId}-value`} required={valueRequired} aria-label={resolvedValueLabel} type={valueType} value={value} onChange={handleValueChange} className="min-w-0 flex-1" placeholder={resolvedValuePlaceholder} />
       </Field>
-      <Button type="button" size="icon-xs" variant="default" onClick={onRemove} aria-label={resolvedRemoveLabel}>
-        <Trash2 size={14} />
+      {/* Removing an unsaved row is reversible (nothing is written until the
+          form saves), so it is a quiet ghost icon button, not the red sticker
+          the DS keeps for irreversible consequences. */}
+      <Button type="button" size="icon-sm" variant="ghost" onClick={onRemove} aria-label={resolvedRemoveLabel} className="shrink-0">
+        <Trash2 size={16} />
       </Button>
     </div>
   );
@@ -79,16 +89,15 @@ export function KeyValueInputRow({
 /**
  * No colour override on the Button.
  *
- * `variant="ghost"` already carries the themed treatment —
- * `text-foreground-strong`, plus `hover:border-line-strong hover:bg-fill-muted`.
- * The `text-black/60 hover:text-black` that used to sit here replaced all of it
- * with a literal, so the control could not follow the theme: exactly the defect
- * this migration exists to remove (@cindyz).
+ * `variant="ghost"` already carries the themed treatment (ink text, the
+ * pressed wash on hover); a literal colour here would stop the control from
+ * following the theme. `size="sm"` is raft-ui's 32px text button (an alias of
+ * `md`).
  */
 export function KeyValueAddButton({ label, onClick }: { label: string; onClick: () => void }) {
   return (
     <Button type="button" size="sm" variant="ghost" onClick={onClick}>
-      <Plus size={14} />
+      <Plus size={16} />
       {label}
     </Button>
   );

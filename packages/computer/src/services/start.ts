@@ -24,41 +24,55 @@
 //     narrow-split): the service emits a structured `ready` event with the
 //     ready Map + managed targets; the adapter formats the user-visible
 //     line. Keeps service env-pure.
+import { describeDuplicateKeyHolder, findDuplicateKeyHolder } from "../duplicateKeyGuard";
+import { releaseHeldComputerMutationLock } from "../concurrency";
+import {
+  clearSupervisorRecord,
+  describeSupervisorUnreachable,
+  inspectSupervisor,
+  runSystemctl,
+  showUnitProperty,
+  type SupervisorInspection,
+  type SystemctlRunner,
+} from "../externalSupervisor";
 import { setTimeout as delay } from "node:timers/promises";
 
 import { currentTimeMs } from "@botiverse/raft-shared";
-import { isProcessAlive, readPidfileAt } from "../internal/process-primitives.js";
-import { findLiveServicePid } from "../internal/service-pid-fallback.js";
+import { isProcessAlive, readPidfileAt } from "../internal/process-primitives";
+import { findLiveServicePid } from "../internal/service-pid-fallback";
 import {
   PARENT_LOCK_HELD_ENV_VAR,
   readServiceVersionEvidence,
   runService,
   spawnDetachedService,
-} from "../service.js";
-import { connectService } from "../lib/ipc-client.js";
+} from "../service";
+import { connectService } from "../lib/ipc-client";
 import {
+  describeRaftHomeConflict,
+  findRaftHomeConflictFor,
   serverRunnerLogReadFallback,
   serviceLogPath,
   serviceVersionPath,
-} from "../paths.js";
-import { listAttachedServerIds, readServerAttachment, setServerManaged } from "../serverState.js";
-import { isDegraded, readTerminalUnlinked } from "../health.js";
-import { resetRunner } from "../reset.js";
-import type { ComputerApiEvent } from "../lib/events.js";
-import { ComputerServiceError } from "./errors.js";
-import { COMPUTER_VERSION } from "../version.js";
-import { hasUnlinkedComputerHandshake, readRunnerLogTail } from "../internal/runner-log-diagnostics.js";
-import { collectMachineFacts } from "../machineFacts.js";
-import { machineReadiness } from "../machineReadiness.js";
+} from "../paths";
+import { listAttachedServerIds, readServerAttachment, setServerManaged } from "../serverState";
+import { isDegraded, readTerminalUnlinked } from "../health";
+import { resetRunner } from "../reset";
+import type { ComputerApiEvent } from "../lib/events";
+import { ComputerServiceError } from "./errors";
+import { COMPUTER_VERSION } from "../version";
+import { hasUnlinkedComputerHandshake, readRunnerLogTail } from "../internal/runner-log-diagnostics";
+import { collectMachineFacts } from "../machineFacts";
+import { machineReadiness } from "../machineReadiness";
 import {
   convergeCliHostLifecycle,
-  resolveStableDispatcherPath,
-  type HostLifecycleConvergenceResult,
+  hostLifecycleSkipped,
   type MacosHostLifecycleDeps,
-} from "../macosLoginCarrier.js";
+} from "../macosLoginCarrier";
 
 const START_ENSURE_TIMEOUT_MS = 15_000;
 const START_ENSURE_POLL_INTERVAL_MS = 100;
+const SERVICE_IDENTITY_SETTLE_ATTEMPTS = 20;
+const SERVICE_IDENTITY_SETTLE_POLL_MS = 100;
 const inFlightStartByHome = new Map<string, Promise<StartResult>>();
 
 export interface StartInput {
@@ -126,6 +140,21 @@ export interface StartDeps {
   signal?: AbortSignal;
   convergeHostLifecycle?: typeof convergeCliHostLifecycle;
   hostLifecycleDeps?: MacosHostLifecycleDeps;
+  /** task #914: refuses to spawn when another live service on this host holds the same machine key. */
+  findDuplicateKeyHolder?: typeof findDuplicateKeyHolder;
+  /** task #917 seams: the systemd unit (if any) that owns the service, and systemctl. */
+  inspectSupervisor?: (slockHome: string) => Promise<SupervisorInspection | null>;
+  systemctl?: SystemctlRunner;
+  /**
+   * task #917: the foreground loop releases the calling command's mutation
+   * lock once the service has run startup recovery (just before it owns the
+   * IPC endpoint), so `stop`/`start` from another process are not refused
+   * with CONCURRENT_OPERATION for the service's whole lifetime. Default:
+   * release the lock this process holds for `slockHome`, if any.
+   */
+  releaseMutationLock?: (slockHome: string) => Promise<unknown>;
+  /** task #915: refuses when both default homes hold Raft data and no RAFT_HOME picks one. */
+  findRaftHomeConflict?: typeof findRaftHomeConflictFor;
 }
 
 export interface StartOptions extends StartDeps {
@@ -188,8 +217,37 @@ async function waitForManagedDaemonPids(
   }
 }
 
-async function assertNoServiceVersionSkew(slockHome: string, servicePid: number): Promise<void> {
-  const evidence = await readServiceVersionEvidence(slockHome);
+/** A starting service publishes its pidfile before its version evidence
+ * (`publishServiceIdentityAfterIpcBind`), so a `start` that polls the pidfile
+ * can see the new pid beside the previous service's evidence, or beside none.
+ * That is publication in progress, not skew: re-read a bounded number of times
+ * before judging. A matching pid with a different version is never retried. */
+async function readSettledServiceVersionEvidence(
+  slockHome: string,
+  servicePid: number,
+  opts: StartOptions,
+) {
+  const sleep = opts.sleep ?? ((ms: number) => delay(ms));
+  let evidence = await readServiceVersionEvidence(slockHome);
+  for (
+    let attempt = 0;
+    attempt < SERVICE_IDENTITY_SETTLE_ATTEMPTS
+      && (evidence === null || evidence.pid !== servicePid);
+    attempt += 1
+  ) {
+    opts.signal?.throwIfAborted?.();
+    await sleep(SERVICE_IDENTITY_SETTLE_POLL_MS);
+    evidence = await readServiceVersionEvidence(slockHome);
+  }
+  return evidence;
+}
+
+async function assertNoServiceVersionSkew(
+  slockHome: string,
+  servicePid: number,
+  opts: StartOptions,
+): Promise<void> {
+  const evidence = await readSettledServiceVersionEvidence(slockHome, servicePid, opts);
   if (!evidence) {
     throw new ComputerServiceError(
       "SERVICE_VERSION_SKEW_SUSPECT",
@@ -255,20 +313,37 @@ function buildTerminalUnlinkedMessage(slockHome: string, serverId: string, label
   );
 }
 
-async function assertNoTerminalUnlinkedTargets(
+/**
+ * Drop attachments the server has terminally unlinked from an unscoped start.
+ * One unlinked server must not keep the rest offline: the upgrade engine
+ * restarts the service with an unscoped `start`, so refusing here fails both
+ * the candidate start and the rollback. A scoped start of an unlinked server,
+ * or an unscoped start where every target is unlinked, still refuses.
+ */
+async function selectStartableTargets(
   slockHome: string,
   serverIds: string[],
   input: StartInput,
-): Promise<void> {
+): Promise<{ startable: string[]; unlinked: string[] }> {
+  const startable: string[] = [];
+  const unlinked: string[] = [];
   for (const serverId of serverIds) {
     const attachment = await readServerAttachment(slockHome, serverId);
-    if (!(await readTerminalUnlinked(slockHome, serverId, attachment?.serverMachineId ?? null))) continue;
+    if (await readTerminalUnlinked(slockHome, serverId, attachment?.serverMachineId ?? null)) {
+      unlinked.push(serverId);
+    } else {
+      startable.push(serverId);
+    }
+  }
+  if (unlinked.length > 0 && (input.serverId || startable.length === 0)) {
+    const serverId = unlinked[0]!;
     const label = input.serverId === serverId ? input.serverLabel ?? serverId : serverId;
     throw new ComputerServiceError(
       "COMPUTER_MACHINE_UNLINKED",
       buildTerminalUnlinkedMessage(slockHome, serverId, label),
     );
   }
+  return { startable, unlinked };
 }
 
 async function buildTimeoutMessage(
@@ -330,6 +405,13 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
   options.signal?.throwIfAborted?.();
   const { slockHome } = input;
 
+  // task #915: before reading anything under the resolved home, make sure it
+  // is not a guess between two homes that both hold Raft data.
+  const homeConflict = (options.findRaftHomeConflict ?? findRaftHomeConflictFor)(slockHome);
+  if (homeConflict) {
+    throw new ComputerServiceError("RAFT_HOME_AMBIGUOUS", describeRaftHomeConflict(homeConflict));
+  }
+
   // 1. Validate attached set — service-axis throw, byte-identical message.
   const attached = await listAttachedServerIds(slockHome);
   options.signal?.throwIfAborted?.();
@@ -351,15 +433,22 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
   // reconcile picks up the correct managed intent. Scoped start is additive:
   // it must not clear another server that the user already brought online.
   // Use `stop <server>` to clear that server's managed intent explicitly.
-  const managedTargets = input.serverId ? [input.serverId] : attached;
+  const requestedTargets = input.serverId ? [input.serverId] : attached;
   emit(options, {
     kind: "start.starting",
-    managedTargets,
+    managedTargets: requestedTargets,
     attachedCount: attached.length,
     foreground: !!input.foreground,
   });
 
-  await assertNoTerminalUnlinkedTargets(slockHome, managedTargets, input);
+  const { startable: managedTargets, unlinked } = await selectStartableTargets(
+    slockHome,
+    requestedTargets,
+    input,
+  );
+  if (unlinked.length > 0) {
+    emit(options, { kind: "start.skipped_unlinked", serverIds: unlinked });
+  }
   options.signal?.throwIfAborted?.();
 
   for (const id of managedTargets) {
@@ -367,25 +456,20 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
     await setServerManaged(slockHome, id);
   }
 
-  const hostLifecycleOwner = input.hostLifecycleOwner ?? "none";
-  let hostLifecycle: HostLifecycleConvergenceResult | null = null;
-  if (hostLifecycleOwner !== "none") {
-    if (hostLifecycleOwner === "cli" && input.foreground && process.platform === "darwin") {
-      throw new ComputerServiceError(
-        "HOST_LIFECYCLE_FOREGROUND_UNSUPPORTED",
-        "macOS post-login recovery cannot be verified for `--foreground`. Run `raft-computer start` without `--foreground`.",
+  // The CLI no longer autostarts at login: this only removes a leftover macOS
+  // LaunchAgent from older releases and records the owner. It never starts
+  // the service (step 3 below does) and a failure never blocks the start.
+  if ((input.hostLifecycleOwner ?? "none") !== "none") {
+    try {
+      await (options.convergeHostLifecycle ?? convergeCliHostLifecycle)(
+        slockHome,
+        "enabled",
+        options.hostLifecycleDeps ?? {},
       );
+    } catch (error) {
+      emit(options, hostLifecycleSkipped("start", error));
     }
-    const hostDeps = { ...(options.hostLifecycleDeps ?? {}) };
-    if (hostDeps.platform === undefined) hostDeps.platform = process.platform;
-    if (hostDeps.platform === "darwin" && hostDeps.dispatcherPath === undefined) {
-      hostDeps.dispatcherPath = resolveStableDispatcherPath(slockHome);
-    }
-    hostLifecycle = await (options.convergeHostLifecycle ?? convergeCliHostLifecycle)(
-      slockHome,
-      "enabled",
-      hostDeps,
-    );
+    options.signal?.throwIfAborted?.();
   }
 
   // 3. Idempotent live-service pidfile check. Walk the on-disk
@@ -397,37 +481,15 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
   //    Computer (RFC v9.8 §1) — the symmetry has to hold across stop /
   //    upgrade / start / status. The helper clears stale candidates in
   //    place so they do not haunt later reads.
-  let { pid: existing } = await findLiveServicePid(slockHome, {
+  const { pid: existing } = await findLiveServicePid(slockHome, {
     readPidfile: options.readPidfile,
     isProcessAlive: options.isProcessAlive,
   });
-  if (
-    existing === null
-    && hostLifecycle?.status === "converged"
-    && hostLifecycle.owner === "cli"
-    && hostLifecycle.enabled
-  ) {
-    const sleep = options.sleep ?? delay;
-    const deadline = currentTimeMs() + (options.ensureTimeoutMs ?? START_ENSURE_TIMEOUT_MS);
-    while (existing === null && currentTimeMs() < deadline) {
-      await sleep(Math.min(options.ensurePollIntervalMs ?? START_ENSURE_POLL_INTERVAL_MS, deadline - currentTimeMs()));
-      ({ pid: existing } = await findLiveServicePid(slockHome, {
-        readPidfile: options.readPidfile,
-        isProcessAlive: options.isProcessAlive,
-      }));
-    }
-    if (existing === null) {
-      throw new ComputerServiceError(
-        "HOST_LIFECYCLE_START_FAILED",
-        "launchd accepted the macOS post-login carrier, but its service did not become live before the startup deadline. Inspect `raft-computer logs --service` and retry.",
-      );
-    }
-  }
   options.signal?.throwIfAborted?.();
   await clearDegradedRecoveryStateForStart(slockHome, managedTargets, existing, options);
   options.signal?.throwIfAborted?.();
   if (existing !== null) {
-    await assertNoServiceVersionSkew(slockHome, existing);
+    await assertNoServiceVersionSkew(slockHome, existing, options);
     options.signal?.throwIfAborted?.();
     emit(options, {
       kind: "start.already_running",
@@ -455,6 +517,16 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
     };
   }
 
+  // task #914: a second service holding the same machine key on this host
+  // (an old install root still running, a stop that did not stop) is a second
+  // daemon on the same key; the server would send commands to either. Refuse
+  // before either start path (foreground loop or detached spawn) runs, and
+  // name the holder. Same-root duplicates were handled above (already_running).
+  const duplicateHolder = await (options.findDuplicateKeyHolder ?? findDuplicateKeyHolder)(slockHome);
+  if (duplicateHolder) {
+    throw new ComputerServiceError("DUPLICATE_KEY_HOLDER", describeDuplicateKeyHolder(duplicateHolder));
+  }
+
   // 4. Foreground path: run the service loop inline. Service emits
   // `running` event, then yields control to runService (which blocks
   // until SIGTERM / Ctrl-C). On return, we report status="running" with
@@ -469,8 +541,21 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
     const service = options.runService ?? runService;
     const previousParentLockMarker = process.env[PARENT_LOCK_HELD_ENV_VAR];
     process.env[PARENT_LOCK_HELD_ENV_VAR] = "1";
+    const releaseMutationLock = options.releaseMutationLock ?? releaseHeldComputerMutationLock;
     try {
-      await service();
+      await service({
+        // Startup recovery (which honours the parent-lock marker) has run by
+        // the time the mutation surface exists; from here the service, not
+        // the command, is the single writer.
+        onMutationsReady: async () => {
+          await releaseMutationLock(slockHome);
+          // The marker told startup recovery that the parent held the lock;
+          // once released it must not be inherited by anything the service
+          // launches later (the installer, a replacement), or they would skip
+          // their own stale-lock cleanup (archer).
+          delete process.env[PARENT_LOCK_HELD_ENV_VAR];
+        },
+      });
     } finally {
       if (previousParentLockMarker === undefined) delete process.env[PARENT_LOCK_HELD_ENV_VAR];
       else process.env[PARENT_LOCK_HELD_ENV_VAR] = previousParentLockMarker;
@@ -493,12 +578,47 @@ async function startInner(input: StartInput, options: StartOptions = {}): Promis
   // is detached + has its own lifecycle — abort becomes a no-op.
   options.signal?.throwIfAborted?.();
 
+  // task #917: a systemd unit that exists for this install root owns the
+  // service. Starting beside it would leave a process systemd does not track
+  // and the next boot's unit start would collide with the duplicate-key guard.
+  // Delegation keys on the unit EXISTING (loaded), not on a live pid: after
+  // `systemctl stop` the unit is inactive and `raft-computer start` must still
+  // go through it. A unit file that is gone makes the record stale: clear it
+  // and fall through to the detached spawn.
   let pid: number;
-  try {
-    pid = await (options.spawnDetachedService ?? spawnDetachedService)(slockHome);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    throw new ComputerServiceError("SUPERVISOR_SPAWN_FAILED", msg, err);
+  const supervision = await (options.inspectSupervisor ?? ((home: string) => inspectSupervisor(home, { systemctl: options.systemctl })))(slockHome);
+  if (supervision && !supervision.reachable) {
+    throw new ComputerServiceError(
+      "START_SUPERVISOR_UNREACHABLE",
+      describeSupervisorUnreachable(supervision.record, "systemctl did not answer"),
+    );
+  }
+  if (supervision && supervision.unitLoaded) {
+    const systemctl = options.systemctl ?? runSystemctl;
+    const { scope, unit } = supervision.record;
+    const result = await systemctl(scope, ["start", unit]);
+    if (result.code !== 0) {
+      throw new ComputerServiceError(
+        "START_SUPERVISOR_FAILED",
+        describeSupervisorUnreachable(supervision.record, `\`systemctl start ${unit}\` exited ${result.code ?? "without a code"}: ${result.stderr.trim() || result.stdout.trim() || "no output"}`),
+      );
+    }
+    const mainPid = await showUnitProperty(systemctl, scope, unit, "MainPID");
+    pid = Number(mainPid);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      throw new ComputerServiceError(
+        "START_SUPERVISOR_FAILED",
+        describeSupervisorUnreachable(supervision.record, `the unit reports no main process after start (MainPID=${mainPid ?? "unknown"})`),
+      );
+    }
+  } else {
+    if (supervision) await clearSupervisorRecord(slockHome).catch(() => undefined);
+    try {
+      pid = await (options.spawnDetachedService ?? spawnDetachedService)(slockHome);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw new ComputerServiceError("SUPERVISOR_SPAWN_FAILED", msg, err);
+    }
   }
 
   emit(options, {

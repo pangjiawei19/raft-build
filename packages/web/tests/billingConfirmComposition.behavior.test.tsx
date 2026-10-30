@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { act, cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 
@@ -134,10 +133,12 @@ test("zh-CN seat update confirmation is one complete Chinese PlanSection surface
   const confirmButton = screen.getByRole("button", { name: "确认并更新席位" });
   assert.ok(screen.getByRole("button", { name: "取消" }));
   assert.ok(screen.getByRole("button", { name: "关闭对话框" }));
-  assert.equal(screen.queryByRole("button", { name: "Cancel" }), null);
-  assert.equal(screen.queryByRole("button", { name: "Confirm and update seats" }), null);
-  assert.equal(screen.queryByRole("button", { name: "Review seat update" }), null,
-    "the review button used to stay English under the old split; it must not now");
+  assert.ok(screen.queryByRole("button", { name: "Cancel" }) === null);
+  assert.ok(screen.queryByRole("button", { name: "Confirm and update seats" }) === null);
+  assert.ok(
+    screen.queryByRole("button", { name: "Review seat update" }) === null,
+    "the review button used to stay English under the old split; it must not now",
+  );
 
   await act(async () => {
     fireEvent.click(confirmButton);
@@ -228,4 +229,48 @@ test("promotion code seat increase previews Stripe amounts and confirms with the
       previewToken: "signed-seat-preview-token",
     },
   });
+});
+
+function seedFirstCheckout() {
+  seedManageSeatsPlan();
+  const state = useServerStore.getState();
+  useServerStore.setState({
+    current: { ...state.current!, plan: "free" },
+    billing: { ...state.billing!, plan: "free", serverPlan: "free", source: "server", subscription: null },
+  });
+}
+
+test("first Checkout uses latest raw code after editing, never a cached promotion ID or preview", async () => {
+  seedFirstCheckout();
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  api.post = (async (url: string, body: Record<string, unknown>) => {
+    calls.push({ url, body });
+    throw { response: { data: { code: "promotion_code_unavailable", error: "opaque provider error" } } };
+  }) as typeof api.post;
+  render(<PlanSection />);
+  const input = screen.getByRole("textbox", { name: "Promotion code (optional)" });
+  fireEvent.change(input, { target: { value: "OLD-CODE" } });
+  fireEvent.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+  assert.ok(screen.getByRole("heading", { name: "Confirm Pro Checkout" }));
+  fireEvent.click(screen.getByRole("button", { name: "Cancel", exact: true }));
+  fireEvent.change(input, { target: { value: " NEW-CODE " } });
+  fireEvent.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+  assert.ok(screen.getByText("Promotion code: NEW-CODE. The final discount is confirmed on Stripe Checkout."));
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Continue to Stripe" })); });
+  await waitFor(() => assert.equal(calls.length, 1));
+  assert.equal(calls[0].url, "/billing/checkout"); assert.equal(calls[0].body.promotionCode, "NEW-CODE");
+  assert.equal(Object.hasOwn(calls[0].body, "promotionCodeId"), false); assert.equal(Object.hasOwn(calls[0].body, "discounts"), false);
+  assert.ok(screen.getByText("This promotion code is unavailable. Check it or remove it to continue."));
+  assert.equal(screen.queryByText("opaque provider error"), null);
+});
+
+test("blank first-Checkout input omits code and Manage Seats still owns its existing preview contract", async () => {
+  seedFirstCheckout();
+  const calls: Array<{ url: string; body: Record<string, unknown> }> = [];
+  api.post = (async (url: string, body: Record<string, unknown>) => { calls.push({ url, body }); return { data: { url: "#synthetic-checkout" } }; }) as typeof api.post;
+  render(<PlanSection />);
+  fireEvent.change(screen.getByRole("textbox", { name: "Promotion code (optional)" }), { target: { value: "  " } });
+  fireEvent.click(screen.getByRole("button", { name: "Upgrade to Pro" }));
+  await act(async () => { fireEvent.click(screen.getByRole("button", { name: "Continue to Stripe" })); });
+  assert.equal(calls.length, 1); assert.equal(calls[0].url, "/billing/checkout"); assert.equal(Object.hasOwn(calls[0].body, "promotionCode"), false);
 });

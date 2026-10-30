@@ -31,9 +31,9 @@ export function canRenderAgentDetail(
         && typeof agent.status === "string",
     );
   }
+  // An archived (deleted) agent still has a read-only profile.
   return Boolean(
     agent
-      && !agent.deletedAt
       && typeof agent.id === "string"
       && typeof agent.name === "string"
       && typeof agent.status === "string"

@@ -1,18 +1,22 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import { getDefaultModel } from "@botiverse/raft-shared";
 import {
   reasoningEffortOptionsForModel,
   reconcileReasoningEffort,
-} from "../src/utils/reasoningEffortOptions.js";
+} from "../src/utils/reasoningEffortOptions";
 
 // WEB half of the Codex reasoning task: the model form reads Tenny's shared
 // RUNTIME_MODELS.codex data (supportedReasoningEfforts / defaultReasoningEffort)
 // rather than hardcoding per-variant level lists. These assertions pin the
 // picker behavior against that shared data.
 
-test("codex default model is GPT-6 Astra", () => {
-  assert.equal(getDefaultModel("codex"), "gpt-6-astra");
+test("codex default model is GPT-6.1 Sol", () => {
+  assert.equal(getDefaultModel("codex"), "gpt-6.1-sol");
+});
+
+test("GPT-6.1 Sol exposes all six reasoning levels including Ultra; GPT-6 Luna stops at Max", () => {
+  assert.deepEqual(reasoningEffortOptionsForModel("codex", "gpt-6.1-sol").map((o) => o.value), ["low", "medium", "high", "xhigh", "max", "ultra"]);
+  assert.deepEqual(reasoningEffortOptionsForModel("codex", "gpt-6-luna").map((o) => o.value), ["low", "medium", "high", "xhigh", "max"]);
 });
 
 test("Astra exposes all six reasoning levels including Ultra", () => {
@@ -60,11 +64,13 @@ test("selecting luna clamps an Ultra choice down to the model default", () => {
 });
 
 test("non-gating models fall back to the BASE set — max/ultra must NOT leak (task #496)", () => {
-  const values = reasoningEffortOptionsForModel("claude", "sonnet").map((o) => o.value);
-  // Claude declares no supportedReasoningEfforts → BASE set only, not the full
-  // catalog. max/ultra are Codex-GPT-5.6-only and must never appear on Claude.
+  // A model that declares no supportedReasoningEfforts (Claude Haiku 4.5, which
+  // takes no effort) gets the BASE set only, not the full catalog.
+  const values = reasoningEffortOptionsForModel("claude", "claude-haiku-4-5").map((o) => o.value);
   assert.deepEqual(values, ["low", "medium", "high", "xhigh"]);
-  assert.ok(!values.includes("max") && !values.includes("ultra"), "claude must not offer max/ultra");
+  assert.ok(!values.includes("max") && !values.includes("ultra"), "a non-gating model must not offer max/ultra");
+  // Claude models that declare low..max offer max, never ultra.
+  assert.deepEqual(reasoningEffortOptionsForModel("claude", "sonnet").map((o) => o.value), ["low", "medium", "high", "xhigh", "max"]);
   // A base-level value passes through unchanged (incl. null).
   assert.equal(reconcileReasoningEffort("claude", "sonnet", "high"), "high");
   assert.equal(reconcileReasoningEffort("claude", "sonnet", null), null);

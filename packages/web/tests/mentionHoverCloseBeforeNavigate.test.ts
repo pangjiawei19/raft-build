@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 /**
  * Every navigation out of the mention hover card must dismiss it FIRST.
@@ -25,9 +24,11 @@ const SOURCE = readFileSync(
 
 /** Body of an arrow handler declared as `const <name> = (...) => { ... }`. */
 function handlerBody(name: string): string {
-  const start = SOURCE.indexOf(`const ${name} = (`);
+  let start = SOURCE.indexOf(`const ${name} = (`);
+  if (start === -1) start = SOURCE.indexOf(`const ${name} = useCallback((`);
   assert.notEqual(start, -1, `${name} must exist in MessageItem.tsx`);
-  const end = SOURCE.indexOf("\n  };", start);
+  let end = SOURCE.indexOf("\n  };", start);
+  if (end === -1) end = SOURCE.indexOf("\n  }, [", start);
   assert.notEqual(end, -1, `${name} must be a brace-delimited arrow body`);
   return SOURCE.slice(start, end);
 }

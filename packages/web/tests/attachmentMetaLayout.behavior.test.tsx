@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { cleanup, render as rtlRender } from "@testing-library/react";
 import { TestIntlProvider } from "./helpers/intl";
 const render: typeof rtlRender = (ui, options) => rtlRender(ui, { wrapper: TestIntlProvider, ...options });
 import { AttachmentChip } from "../src/components/message/AttachmentChip";
-import { AttachmentMetaText } from "../src/components/message/MessageItem";
+import { AttachmentMetaText } from "../src/components/message/AttachmentMetaText";
 
 afterEach(() => {
   cleanup();
@@ -18,7 +17,7 @@ function assertPinnedChipLayout(root: Element) {
   assert.match(root.className, /\boverflow-hidden\b/);
 }
 
-test("long attachment filenames stay clipped inside the same pinned compact and wide chip", () => {
+test("long attachment filenames stay clipped inside the same pinned chip, preview or download", () => {
   const filename = "a-very-long-document-name-that-must-not-expand-the-message-column.csv";
   const attachment = {
     id: "attachment-long-name",
@@ -27,43 +26,41 @@ test("long attachment filenames stay clipped inside the same pinned compact and 
     sizeBytes: 13_312,
   };
 
-  const compact = render(
+  const preview = render(
     <AttachmentChip
       attachment={attachment}
-      variant="compact"
       isOptimistic={false}
       affordance="preview"
       onClick={() => undefined}
     />,
   );
-  const compactRoot = compact.container.firstElementChild;
-  assert.ok(compactRoot);
-  assertPinnedChipLayout(compactRoot);
-  const compactTextSlot = compact.container.querySelector("[data-message-affordance='attachment-text-slot']");
-  const compactFilename = compact.container.querySelector("[data-message-affordance='attachment-filename']");
-  assert.ok(compactTextSlot);
-  assert.ok(compactFilename);
-  assert.match(compactTextSlot.className, /\bw-full\b/);
-  assert.match(compactTextSlot.className, /\bmin-w-0\b/);
-  assert.match(compactTextSlot.className, /\bmax-w-full\b/);
-  assert.match(compactTextSlot.className, /\boverflow-hidden\b/);
-  assert.match(compactFilename.className, /\btruncate\b/);
-  assert.equal(compactFilename.textContent, filename);
+  const previewRoot = preview.container.firstElementChild;
+  assert.ok(previewRoot);
+  assertPinnedChipLayout(previewRoot);
+  const previewTextSlot = preview.container.querySelector("[data-message-affordance='attachment-text-slot']");
+  const previewFilename = preview.container.querySelector("[data-message-affordance='attachment-filename']");
+  assert.ok(previewTextSlot);
+  assert.ok(previewFilename);
+  assert.match(previewTextSlot.className, /\bw-full\b/);
+  assert.match(previewTextSlot.className, /\bmin-w-0\b/);
+  assert.match(previewTextSlot.className, /\bmax-w-full\b/);
+  assert.match(previewTextSlot.className, /\boverflow-hidden\b/);
+  assert.match(previewFilename.className, /\btruncate\b/);
+  assert.equal(previewFilename.textContent, filename);
 
-  compact.unmount();
-  const wide = render(
+  preview.unmount();
+  const download = render(
     <AttachmentChip
       attachment={attachment}
-      variant="wide"
       isOptimistic={false}
       affordance="download"
       onClick={() => undefined}
     />,
   );
-  const wideRoot = wide.container.firstElementChild;
-  assert.ok(wideRoot);
-  assertPinnedChipLayout(wideRoot);
-  assert.equal(wideRoot.className, compactRoot.className, "compact and wide variants share one rendered layout");
+  const downloadRoot = download.container.firstElementChild;
+  assert.ok(downloadRoot);
+  assertPinnedChipLayout(downloadRoot);
+  assert.equal(downloadRoot.className, previewRoot.className, "preview and download chips share one rendered layout");
 });
 
 test("attachment metadata truncates the MIME label while preserving the APK size", () => {
@@ -75,7 +72,6 @@ test("attachment metadata truncates the MIME label while preserving the APK size
         mimeType: "application/vnd.android.package-archive",
         sizeBytes: 154_140_672,
       }}
-      variant="wide"
       isOptimistic={false}
       affordance="download"
       meta={<AttachmentMetaText label="application/vnd.android.package-archive" sizeBytes={154_140_672} />}
@@ -101,7 +97,7 @@ test("attachment metadata truncates the MIME label while preserving the APK size
   assert.equal(size.textContent, "147.0 MB");
 });
 
-test("attachment summary text clips before the fixed preview affordance slot", () => {
+test("attachment summary text clips inside the RUI summary slot", () => {
   const { container } = render(
     <AttachmentChip
       attachment={{
@@ -110,7 +106,6 @@ test("attachment summary text clips before the fixed preview affordance slot", (
         mimeType: "text/csv",
         sizeBytes: 13_312,
       }}
-      variant="compact"
       isOptimistic={false}
       affordance="preview"
       affordanceName="document-preview"
@@ -126,14 +121,18 @@ test("attachment summary text clips before the fixed preview affordance slot", (
   assert.ok(summaryText);
   assert.ok(previewIcon);
 
+  // RUI MessageAttachment anatomy (2026-09-23): the summary lives in the
+  // MessageAttachmentSummary slot and the affordance icon is an RUI action in
+  // the meta row end — no more absolutely-positioned corner box, so the old
+  // pr-6 clearance is gone.
+  assert.equal(summarySlot.getAttribute("data-slot"), "message-attachment-summary");
   assert.match(summarySlot.className, /\bmin-w-0\b/);
   assert.match(summarySlot.className, /\boverflow-hidden\b/);
-  assert.match(summarySlot.className, /\bpr-6\b/);
+  assert.doesNotMatch(summarySlot.className, /\bpr-6\b/);
   assert.match(summaryText.className, /\bmin-w-0\b/);
   assert.match(summaryText.className, /\bflex-1\b/);
   assert.match(summaryText.className, /\btruncate\b/);
-  assert.match(previewIcon.className, /\babsolute\b/);
-  assert.match(previewIcon.className, /\bsize-5\b/);
-  assert.match(previewIcon.className, /\bshrink-0\b/);
-  assert.match(previewIcon.className, /\bright-1\.5\b/);
+  assert.equal(previewIcon.getAttribute("data-slot"), "message-attachment-action");
+  assert.equal(previewIcon.parentElement?.getAttribute("data-slot"), "message-attachment-meta-end");
+  assert.doesNotMatch(previewIcon.className, /(^|\s)absolute(\s|$)/);
 });

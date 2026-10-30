@@ -5,15 +5,15 @@
 //
 // Companion: ../service.test.ts asserts the CLI adapter (`runStart`)
 // still emits the pre-extraction info()/fail() lines byte-identically.
+import { runStart } from "../startStop";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "vitest";
 
-import { ComputerServiceError } from "./errors.js";
-import { start } from "./start.js";
-import type { ComputerApiEvent } from "../lib/events.js";
+import { ComputerServiceError } from "./errors";
+import { start } from "./start";
+import type { ComputerApiEvent } from "../lib/events";
 import {
   legacyServerRunnerLogPath,
   legacyServerRunnerPidPath,
@@ -26,13 +26,14 @@ import {
   servicePidPath,
   serviceLogPath,
   serviceVersionPath,
-} from "../paths.js";
-import { isServerManaged, setServerManaged } from "../serverState.js";
-import { isDegraded, markTerminalUnlinked, readTerminalUnlinked, recordCrash } from "../health.js";
-import { buildDetachedServiceEnv, PARENT_LOCK_HELD_ENV_VAR } from "../service.js";
-import { COMPUTER_VERSION } from "../version.js";
-import { buildStatusReport } from "../status.js";
-import { writeResidentConnectedMarker } from "../residentConnectionMarker.js";
+} from "../paths";
+import { isServerManaged, setServerManaged } from "../serverState";
+import { isDegraded, markTerminalUnlinked, readTerminalUnlinked, recordCrash } from "../health";
+import { buildDetachedServiceEnv, PARENT_LOCK_HELD_ENV_VAR } from "../service";
+import { readSupervisorRecord, writeSupervisorRecord } from "../externalSupervisor";
+import { COMPUTER_VERSION } from "../version";
+import { buildStatusReport } from "../status";
+import { writeResidentConnectedMarker } from "../residentConnectionMarker";
 
 const SERVER_A = "11111111-1111-4111-8111-111111111111";
 const SERVER_B = "22222222-2222-4222-8222-222222222222";
@@ -158,6 +159,100 @@ test("start service: serverId not in attached set throws NOT_ATTACHED", async ()
 });
 
 // --- Gate 3: SUPERVISOR_SPAWN_FAILED (spawn throws) ---
+test("task #914: start refuses to spawn when another live service on this host holds the same machine key", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    let spawned = 0;
+    await assert.rejects(
+      () =>
+        start(
+          { slockHome: home },
+          {
+            spawnDetachedService: async () => { spawned += 1; return 999; },
+            findDuplicateKeyHolder: async () => ({
+              root: "/Users/someone/.slock",
+              servicePid: 777,
+              computerVersion: "1.0.25",
+              serverIds: [SERVER_A],
+              fingerprints: ["0123456789abcdef"],
+            }),
+          },
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof ComputerServiceError);
+        assert.equal((err as ComputerServiceError).code, "DUPLICATE_KEY_HOLDER");
+        assert.match((err as ComputerServiceError).message, /pid 777 \(Computer version 1\.0\.25\)/);
+        assert.match((err as ComputerServiceError).message, /raft-computer stop/);
+        return true;
+      },
+    );
+    assert.equal(spawned, 0, "nothing is spawned behind a refused start");
+  });
+});
+
+test("task #915: start refuses, before reading the home or spawning, when both default homes hold Raft data", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    let spawned = 0;
+    let seenHome: string | null = null;
+    await assert.rejects(
+      () =>
+        start(
+          { slockHome: home },
+          {
+            spawnDetachedService: async () => { spawned += 1; return 999; },
+            findRaftHomeConflict: (slockHome) => {
+              seenHome = slockHome;
+              return {
+                homes: [
+                  { path: "/Users/alice/.slock", agentCount: 0 },
+                  { path: "/Users/alice/.raft", agentCount: 2 },
+                ],
+              };
+            },
+          },
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof ComputerServiceError);
+        assert.equal((err as ComputerServiceError).code, "RAFT_HOME_AMBIGUOUS");
+        assert.match((err as ComputerServiceError).message, /RAFT_HOME=/);
+        return true;
+      },
+    );
+    assert.equal(seenHome, home);
+    assert.equal(spawned, 0, "nothing is spawned behind a refused start");
+  });
+});
+
+test("task #914: a foreground start is refused the same way, before the service loop runs", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    let serviceCalled = 0;
+    await assert.rejects(
+      () =>
+        start(
+          { foreground: true, slockHome: home },
+          {
+            runService: async () => { serviceCalled += 1; },
+            findDuplicateKeyHolder: async () => ({
+              root: "/Users/someone/.slock",
+              servicePid: 777,
+              computerVersion: "1.0.25",
+              serverIds: [SERVER_A],
+              fingerprints: ["0123456789abcdef"],
+            }),
+          },
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof ComputerServiceError);
+        assert.equal((err as ComputerServiceError).code, "DUPLICATE_KEY_HOLDER");
+        return true;
+      },
+    );
+    assert.equal(serviceCalled, 0, "the foreground service loop never starts behind a refused start");
+  });
+});
+
 test("start service: spawnDetachedService failure throws SUPERVISOR_SPAWN_FAILED with cause", async () => {
   await withHome(async (home) => {
     await writeAttach(home, SERVER_A);
@@ -186,43 +281,69 @@ test("start service: spawnDetachedService failure throws SUPERVISOR_SPAWN_FAILED
   });
 });
 
-test("start service: macOS CLI carrier becomes the sole background executor before readback", async () => {
+test("start service: on macOS the CLI host lifecycle never starts the service; start spawns it", async () => {
   await withHome(async (home) => {
     await writeAttach(home, SERVER_A);
-    let spawnCount = 0;
     const order: string[] = [];
     const result = await start(
       { slockHome: home, hostLifecycleOwner: "cli" },
       {
-        hostLifecycleDeps: {
-          platform: "darwin",
-          dispatcherPath: "/usr/local/bin/raft-computer",
-        },
+        hostLifecycleDeps: { platform: "darwin" },
         convergeHostLifecycle: async (_actualHome, desired) => {
-          order.push(`carrier:${desired}`);
+          order.push(`lifecycle:${desired}`);
+          return {
+            owner: "cli",
+            enabled: true,
+            status: "not-applicable",
+            label: null,
+            definitionPath: null,
+            definition: null,
+          };
+        },
+        spawnDetachedService: async () => {
+          order.push("spawn");
           await mkdir(join(servicePidPath(home), ".."), { recursive: true });
           await writeFile(servicePidPath(home), String(process.pid));
           await writeServiceVersion(home, COMPUTER_VERSION);
           await writeReadyRunner(home, SERVER_A);
-          return {
-            owner: "cli",
-            enabled: true,
-            status: "converged",
-            label: "build.raft.computer.login.test",
-            definitionPath: "/tmp/test.plist",
-            definition: "plist",
-          };
-        },
-        spawnDetachedService: async () => {
-          spawnCount += 1;
           return process.pid;
         },
         isProcessAlive: (pid) => pid === process.pid,
       },
     );
-    assert.deepEqual(order, ["carrier:enabled"]);
-    assert.equal(spawnCount, 0);
-    assert.equal(result.status, "already_running");
+    assert.deepEqual(order, ["lifecycle:enabled", "spawn"]);
+    assert.notEqual(result.status, "already_running");
+  });
+});
+
+test("start service: a host-lifecycle failure never blocks the start", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    const events: ComputerApiEvent[] = [];
+    let spawned = false;
+    await start(
+      { slockHome: home, hostLifecycleOwner: "cli" },
+      {
+        onEvent: (e) => events.push(e),
+        hostLifecycleDeps: { platform: "darwin" },
+        convergeHostLifecycle: async () => {
+          throw new ComputerServiceError("HOST_LIFECYCLE_OWNER_UNREADABLE", "owner record unreadable");
+        },
+        spawnDetachedService: async () => {
+          spawned = true;
+          await mkdir(join(servicePidPath(home), ".."), { recursive: true });
+          await writeFile(servicePidPath(home), String(process.pid));
+          await writeServiceVersion(home, COMPUTER_VERSION);
+          await writeReadyRunner(home, SERVER_A);
+          return process.pid;
+        },
+        isProcessAlive: (pid) => pid === process.pid,
+      },
+    );
+    assert.equal(spawned, true);
+    const skipped = events.find((e) => e.kind === "host_lifecycle.skipped");
+    assert.equal(skipped?.kind === "host_lifecycle.skipped" && skipped.operation, "start");
+    assert.equal(skipped?.kind === "host_lifecycle.skipped" && skipped.code, "HOST_LIFECYCLE_OWNER_UNREADABLE");
   });
 });
 
@@ -309,6 +430,75 @@ test("start service: live service with stale version pid fails as skew suspect b
         return true;
       },
     );
+  });
+});
+
+// The service writes its pidfile before its version evidence. A start that
+// sees the new pid first must wait for the evidence to catch up instead of
+// reporting the previous service's file (or no file yet) as skew.
+for (const initial of ["previous service's evidence", "no evidence yet"] as const) {
+  test(`start service: ${initial} that catches up to the live service pid is not a skew suspect`, async () => {
+    await withHome(async (home) => {
+      await writeAttach(home, SERVER_A);
+      await mkdir(join(home, "computer", "run"), { recursive: true });
+      await writeFile(servicePidPath(home), String(process.pid)); // alive
+      if (initial === "previous service's evidence") {
+        await writeServiceVersion(home, COMPUTER_VERSION, process.pid + 1);
+      }
+      let sleeps = 0;
+      await assert.rejects(
+        () =>
+          start(
+            { serverId: SERVER_A, serverLabel: "/alpha", slockHome: home },
+            {
+              ensureTimeoutMs: 0,
+              ensurePollIntervalMs: 1,
+              sleep: async () => {
+                sleeps += 1;
+                // The starting service finishes publishing its identity.
+                if (sleeps === 2) await writeServiceVersion(home, COMPUTER_VERSION, process.pid);
+              },
+            },
+          ),
+        (err: unknown) => {
+          assert.ok(err instanceof ComputerServiceError);
+          // Past the skew check: the only remaining failure is the runner
+          // that this fixture never makes ready.
+          assert.equal((err as ComputerServiceError).code, "START_DAEMON_TIMEOUT");
+          return true;
+        },
+      );
+      assert.equal(sleeps, 2, "stops re-reading as soon as the evidence names the live pid");
+    });
+  });
+}
+
+test("start service: evidence that settles on an old version still fails loud as skew", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    await mkdir(join(home, "computer", "run"), { recursive: true });
+    await writeFile(servicePidPath(home), String(process.pid)); // alive
+    let sleeps = 0;
+    await assert.rejects(
+      () =>
+        start(
+          { serverId: SERVER_A, serverLabel: "/alpha", slockHome: home },
+          {
+            ensureTimeoutMs: 0,
+            ensurePollIntervalMs: 1,
+            sleep: async () => {
+              sleeps += 1;
+              if (sleeps === 1) await writeServiceVersion(home, "0.0.68", process.pid);
+            },
+          },
+        ),
+      (err: unknown) => {
+        assert.ok(err instanceof ComputerServiceError);
+        assert.equal((err as ComputerServiceError).code, "SERVICE_VERSION_SKEW");
+        return true;
+      },
+    );
+    assert.equal(sleeps, 1);
   });
 });
 
@@ -595,6 +785,59 @@ test("start service: terminal unlinked marker blocks retry and preserves stale-s
     assert.deepEqual(resets, []);
     assert.equal(await isServerManaged(home, SERVER_A), false);
     assert.equal((await readTerminalUnlinked(home, SERVER_A, `cm-${SERVER_A}`))?.statusCode, 401);
+  });
+});
+
+test("start service: unscoped start skips a terminally unlinked server and starts the rest", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    await writeAttach(home, SERVER_B);
+    await markTerminalUnlinked(home, SERVER_A, `cm-${SERVER_A}`, 401);
+    await mkdir(join(home, "computer", "run"), { recursive: true });
+    await writeFile(servicePidPath(home), String(process.pid));
+    await writeServiceVersion(home, COMPUTER_VERSION, process.pid);
+    await writeReadyRunner(home, SERVER_B);
+
+    const events: Array<{ kind: string; serverIds?: string[] }> = [];
+    const result = await start(
+      { slockHome: home },
+      {
+        ensureTimeoutMs: 1000,
+        ensurePollIntervalMs: 1,
+        onEvent: (event) => events.push(event as { kind: string; serverIds?: string[] }),
+      },
+    );
+
+    assert.equal(result.status, "already_running");
+    assert.deepEqual(result.managedTargets, [SERVER_B]);
+    assert.equal(result.attachedCount, 2);
+    assert.deepEqual(
+      events.find((event) => event.kind === "start.skipped_unlinked")?.serverIds,
+      [SERVER_A],
+    );
+    assert.equal(await isServerManaged(home, SERVER_A), false);
+    assert.equal(await isServerManaged(home, SERVER_B), true);
+  });
+});
+
+test("start service: unscoped start still refuses when every attached server is unlinked", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    await writeAttach(home, SERVER_B);
+    await markTerminalUnlinked(home, SERVER_A, `cm-${SERVER_A}`, 401);
+    await markTerminalUnlinked(home, SERVER_B, `cm-${SERVER_B}`, 401);
+
+    await assert.rejects(
+      () => start(
+        { slockHome: home },
+        {
+          spawnDetachedService: async () => {
+            throw new Error("must not spawn");
+          },
+        },
+      ),
+      (err: unknown) => err instanceof ComputerServiceError && err.code === "COMPUTER_MACHINE_UNLINKED",
+    );
   });
 });
 
@@ -916,16 +1159,18 @@ test("start service: source contains ZERO process.kill / kill(SIG*) callsites", 
 // SERVICE_VERSION_SKEW* are launch-before UX additions: they fail loud when a
 // newer app/CLI is likely talking to an already-running older service, before
 // the fallback path can degrade into START_DAEMON_TIMEOUT.
-test("start service: closed-set start codes include host-lifecycle failures", async () => {
+test("start service: closed-set start codes", async () => {
   const expected = new Set([
     "COMPUTER_MACHINE_UNLINKED",
-    "HOST_LIFECYCLE_FOREGROUND_UNSUPPORTED",
-    "HOST_LIFECYCLE_START_FAILED",
     "NO_ATTACHMENT",
     "NOT_ATTACHED",
     "SERVICE_VERSION_SKEW",
     "SERVICE_VERSION_SKEW_SUSPECT",
     "SUPERVISOR_SPAWN_FAILED",
+    "START_SUPERVISOR_UNREACHABLE",
+    "START_SUPERVISOR_FAILED",
+    "DUPLICATE_KEY_HOLDER",
+    "RAFT_HOME_AMBIGUOUS",
     "START_DAEMON_TIMEOUT",
   ]);
   const src = await readFile(new URL("./start.ts", import.meta.url), "utf8");
@@ -933,4 +1178,98 @@ test("start service: closed-set start codes include host-lifecycle failures", as
   const found = new Set<string>();
   for (const m of src.matchAll(re)) found.add(m[1]);
   assert.deepEqual([...found].sort(), [...expected].sort());
+});
+
+
+// --- task #917: a systemd unit that exists for this root is started through systemd ---
+test("task #917: start delegates to `systemctl start` whenever the unit exists, even while it is inactive", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    let spawned = 0;
+    const calls: string[] = [];
+    const result = await start(
+      { slockHome: home },
+      {
+        spawnDetachedService: async () => { spawned += 1; return 999; },
+        inspectSupervisor: async () => ({
+          record: { kind: "systemd", scope: "user", unit: "raft-computer.service", invocationId: "x", pid: 0, recordedAt: "t" },
+          unitLoaded: true, enabledState: "enabled", activeState: "inactive", mainPid: 0, killMode: "process", reachable: true,
+        }),
+        systemctl: async (scope, args) => {
+          calls.push(`${scope}:${args.join(" ")}`);
+          if (args[0] === "start") { await writeReadyRunner(home, SERVER_A); return { code: 0, stdout: "", stderr: "" }; }
+          if (args[0] === "show" && args[2] === "MainPID") return { code: 0, stdout: "4242\n", stderr: "" };
+          return { code: 1, stdout: "", stderr: "unexpected" };
+        },
+      },
+    );
+    assert.equal(result.status, "spawned");
+    assert.equal(result.servicePid, 4242);
+    assert.equal(spawned, 0, "nothing is started beside the unit");
+    assert.deepEqual(calls, ["user:start raft-computer.service", "user:show -P MainPID raft-computer.service"]);
+  });
+});
+
+test("task #917: start refuses beside an unreachable manager and reports a failing `systemctl start`", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    const record = { kind: "systemd" as const, scope: "user" as const, unit: "raft-computer.service", invocationId: "x", pid: 0, recordedAt: "t" };
+    let spawned = 0;
+    await assert.rejects(
+      () => start({ slockHome: home }, {
+        spawnDetachedService: async () => { spawned += 1; return 999; },
+        inspectSupervisor: async () => ({ record, unitLoaded: false, enabledState: null, activeState: null, mainPid: null, killMode: null, reachable: false }),
+      }),
+      (err: unknown) => err instanceof ComputerServiceError && err.code === "START_SUPERVISOR_UNREACHABLE",
+    );
+    await assert.rejects(
+      () => start({ slockHome: home }, {
+        spawnDetachedService: async () => { spawned += 1; return 999; },
+        inspectSupervisor: async () => ({ record, unitLoaded: true, enabledState: "enabled", activeState: "inactive", mainPid: 0, killMode: "process", reachable: true }),
+        systemctl: async () => ({ code: 1, stdout: "", stderr: "Failed to start raft-computer.service: Unit not found." }),
+      }),
+      (err: unknown) => err instanceof ComputerServiceError && err.code === "START_SUPERVISOR_FAILED" && /Unit not found/.test(err.message),
+    );
+    assert.equal(spawned, 0);
+  });
+});
+
+test("task #917: a record whose unit file is gone is cleared and the detached spawn runs as before", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    await writeSupervisorRecord(home, { kind: "systemd", scope: "user", unit: "raft-computer.service", invocationId: "x", pid: 0, recordedAt: "t" });
+    const result = await start(
+      { slockHome: home },
+      {
+        spawnDetachedService: async () => { await writeReadyRunner(home, SERVER_A); return process.pid; },
+        inspectSupervisor: async () => ({
+          record: { kind: "systemd", scope: "user", unit: "raft-computer.service", invocationId: "x", pid: 0, recordedAt: "t" },
+          unitLoaded: false, enabledState: null, activeState: null, mainPid: null, killMode: null, reachable: true,
+        }),
+      },
+    );
+    assert.equal(result.status, "spawned");
+    assert.equal(await readSupervisorRecord(home), null);
+  });
+});
+
+
+test("task #917: a foreground start releases the mutation lock once the service's mutation surface exists", async () => {
+  await withHome(async (home) => {
+    await writeAttach(home, SERVER_A);
+    const order: string[] = [];
+    const result = await start(
+      { slockHome: home, foreground: true },
+      {
+        runService: async (deps) => {
+          order.push("service-start");
+          await deps?.onMutationsReady?.({} as never);
+          order.push("service-loop");
+        },
+        releaseMutationLock: async (slockHome) => { assert.equal(slockHome, home); order.push("lock-released"); },
+      },
+    );
+    assert.equal(result.status, "running");
+    assert.deepEqual(order, ["service-start", "lock-released", "service-loop"], "released after startup recovery, before the loop owns IPC");
+  });
 });

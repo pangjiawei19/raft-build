@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
@@ -25,11 +24,15 @@ test("Account and Server Profile share one identity card hierarchy", () => {
 
   assert.match(accountSection, /<SettingsProfileCard[\s\S]*?testId="account-profile-card"/);
   assert.match(profileSection, /<SettingsProfileCard[\s\S]*?testId="server-profile-card"/);
-  assert.match(profileCard, /className="space-y-4 border-2 border-black bg-white p-4 shadow-brutal-sm"/);
+  // Raft DS card (raft-ui Card: surface, hairline, 10px radius, no shadow);
+  // the name is the headline style, the handle is machine text.
+  assert.match(profileCard, /<Card\s+data-testid=\{testId\}\s+className="space-y-4 p-4"/);
+  assert.doesNotMatch(profileCard, /rounded-container border border-line-hairline bg-layer-card/);
   assert.match(profileCard, /className="flex items-start gap-4"/);
-  assert.match(profileCard, /className="min-w-0 truncate text-lg font-bold leading-tight text-black"/);
-  assert.match(profileCard, /className="truncate text-sm font-mono text-black\/50"/);
-  assert.match(profileCard, /className="space-y-3 border-t border-black\/10 pt-4"/);
+  assert.match(profileCard, /className="min-w-0 truncate text-headline text-foreground"/);
+  assert.match(profileCard, /className="mt-0\.5 truncate font-mono text-mono-code text-foreground-muted"/);
+  assert.doesNotMatch(profileCard, /theme-brutal:|shadow-raft-sm/);
+  assert.match(profileCard, /className="space-y-3">\s*<Separator className="mb-4" \/>/);
   assert.doesNotMatch(accountSection, /className="flex items-center gap-4"/);
   assert.doesNotMatch(accountSection, /className="text-sm font-bold text-black">\{user\?\.displayName/);
   assert.doesNotMatch(profileSection, /px-5 py-5|px-5 py-4|p-5/);
@@ -59,13 +62,20 @@ test("Account fields mirror Server Profile display-name then identifier order", 
 
 test("Plan & Billing loading and loaded cards share the current layout and p-4 padding", () => {
   const planSection = readSettingsSection("function PlanBillingLoadingSection()", "// ── Danger Zone Section ──");
+  const loadedPlan = readSource("src/components/settings/PlanSectionContent.tsx");
 
   assert.match(planSection, /function PlanBillingLoadingSection\(\)/);
   assert.match(planSection, /label=\{formatMessage\(\{ id: "billing\.managePlan" \}\)\}/);
   assert.match(planSection, /grid gap-4 p-4/);
-  assert.match(planSection, /grid gap-4 border-2 border-black bg-white p-4 shadow-brutal-sm lg:grid-cols-\[minmax\(0,1fr\)_280px\]/);
-  assert.match(planSection, /border-b-2 border-black bg-brutal-cream px-4 py-4/);
-  assert.match(planSection, /border-t-2 border-black\/10 px-4 py-4/);
+  // The skeleton and the loaded section draw the same DS cards (raft-ui Card),
+  // so the page does not jump when billing arrives.
+  const managePlanCard = /<Card className="mb-6 grid gap-4 p-4 lg:grid-cols-\[minmax\(0,1fr\)_280px\]">/;
+  const planHeader = /className="border-b border-line-hairline px-4 py-4"/;
+  for (const section of [planSection, loadedPlan]) {
+    assert.match(section, managePlanCard);
+    assert.match(section, planHeader);
+    assert.match(section, /<Separator \/>\s*<div className="px-4 py-4">/);
+  }
   assert.doesNotMatch(planSection, /SectionEyebrow as="div" className="mb-3"[\s\S]*Plans/);
   assert.doesNotMatch(planSection, /p-5|px-5 py-4|gap-5/);
 });
@@ -74,7 +84,7 @@ test("Connected Apps controls use shared primitives and primary action color", (
   const integrationsSection = readSettingsSection("function IntegrationsSection()", "function PreJoinAgreementSection()");
   const settingsSegmentedControls = readSource("src/components/settings/SettingsSegmentedControls.tsx");
 
-  assert.match(integrationsSection, /className="btn-brutal inline-flex items-center gap-1\.5 bg-brutal-pink px-3 py-1\.5 text-xs"/);
+  assert.match(integrationsSection, /<Button[\s\S]*?variant="accent"[\s\S]*?onClick=\{openRegisterDrawer\}[\s\S]*?settings\.connectedApps\.registerApp/);
   assert.match(integrationsSection, /<ConnectedAppsTabSegmentedControl/);
   assert.match(settingsSegmentedControls, /<SegmentedControl<ConnectedAppsTab>/);
   assert.match(settingsSegmentedControls, /aria-label=\{formatMessage\(\{ id: "settings\.connectedApps\.viewAria" \}\)\}/);
@@ -85,10 +95,16 @@ test("Connected Apps controls use shared primitives and primary action color", (
 test("release note cards match Account card padding", () => {
   const releaseNotes = readSource("src/components/settings/ReleaseNotesPanel.tsx");
 
-  assert.match(releaseNotes, /const isCurrentRelease = releaseIndex === 0/);
-  assert.match(releaseNotes, /isCurrentRelease \? "bg-soft-signal\/35" : "bg-white"/);
-  assert.match(releaseNotes, />\s*Current\s*<\/span>/);
-  assert.match(releaseNotes, /className="mt-1\.5 list-disc space-y-1\.5 pl-5 marker:text-black\/70"/);
-  assert.match(releaseNotes, /className=\{`border-2 border-black p-4 shadow-brutal-sm/);
+  assert.match(releaseNotes, /const isCurrentRelease = release\.releaseId === currentReleaseId/);
+  // Raft DS: the release you run is marked with the yellow "you" sticker, not
+  // a yellow wash over the whole card.
+  assert.match(releaseNotes, /isCurrentRelease \? \(\s*<Badge appearance="solid" variant="primary">\s*\{formatMessage\(\{ id: "settings\.releaseNotes\.current" \}\)\}/);
+  assert.doesNotMatch(releaseNotes, /bg-brand-soft/);
+  assert.match(releaseNotes, /className="mt-2 list-disc space-y-1\.5 pl-5 marker:text-foreground-hint"/);
+  // The card rides the rui standard component (chrome comes from the recipe);
+  // only the Account-card padding stays local (task #696 — replacing the
+  // hand-rolled frame).
+  assert.match(releaseNotes, /<Card[\s\S]{0,200}className="p-4"/);
+  assert.doesNotMatch(releaseNotes, /className=\{`border border-line-hairline p-4 shadow-raft-sm/);
   assert.doesNotMatch(releaseNotes, /className="border-2 border-black bg-white shadow-brutal-sm p-5"/);
 });

@@ -1,9 +1,11 @@
+import { ambientProcessEnv } from "../processEnvPatch";
 import { writeFileSync } from "node:fs";
 import path from "node:path";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig } from "@botiverse/raft-shared";
-import { isClaudeCustomProviderConfig } from "./claudeProviderIsolation.js";
-import type { RuntimeProbeResult } from "./types.js";
-import { firstExistingPath, readCommandVersion, resolveCommandOnPath, resolveHomePath, type ProbeDeps } from "./probe.js";
+import { isClaudeCustomProviderConfig } from "./claudeProviderIsolation";
+import type { RuntimeProbeResult } from "./types";
+import { firstExistingPath, formatCommandLookupTiming, lookupCommandOnPath, lookupCommandOnPathAsync, readCommandVersion, resolveHomePath, type CommandLookup, type ProbeDeps } from "./probe";
+import { resolveRuntimeLaunch, resolveWindowsDirectLaunch, type DirectLaunch, type WindowsLaunchDeps } from "./windowsLaunch";
 
 export const CLAUDE_DESKTOP_CLI_RELATIVE_PATH = path.join("Applications", "Claude Code URL Handler.app", "Contents", "MacOS", "claude");
 export const CLAUDE_DESKTOP_CLI_SYSTEM_PATH = "/Applications/Claude Code URL Handler.app/Contents/MacOS/claude";
@@ -18,14 +20,19 @@ export const CLAUDE_DISALLOWED_TOOLS = [
 ].join(",");
 
 export function resolveClaudeCommand(deps: ProbeDeps = {}): string | null {
-  const pathCommand = resolveCommandOnPath("claude", deps);
-  if (pathCommand) return pathCommand;
+  return lookupClaudeCommand(deps).command;
+}
 
-  if ((deps.platform ?? process.platform) !== "darwin") return null;
-  return firstExistingPath([
+function lookupClaudeCommand(deps: ProbeDeps): CommandLookup {
+  const lookup = lookupCommandOnPath("claude", deps);
+  if (lookup.command) return lookup;
+
+  if ((deps.platform ?? process.platform) !== "darwin") return lookup;
+  const desktop = firstExistingPath([
     resolveHomePath(CLAUDE_DESKTOP_CLI_RELATIVE_PATH, deps),
     CLAUDE_DESKTOP_CLI_SYSTEM_PATH,
   ], deps);
+  return desktop ? { command: desktop } : lookup;
 }
 
 export function resolveClaudeLaunchCommand(config: AgentConfig, deps: ProbeDeps = {}): string | null {
@@ -33,19 +40,49 @@ export function resolveClaudeLaunchCommand(config: AgentConfig, deps: ProbeDeps 
   return launchRuntimeFields.command?.trim() || resolveClaudeCommand(deps);
 }
 
+/** task #1277 — {@link lookupClaudeCommand} off the event loop: the PATH lookup as a bounded probe child, the darwin desktop fallback as before. */
+async function lookupClaudeCommandAsync(deps: ProbeDeps): Promise<CommandLookup> {
+  const lookup = await lookupCommandOnPathAsync("claude", deps);
+  if (lookup.command) return lookup;
+  if ((deps.platform ?? process.platform) !== "darwin") return lookup;
+  const desktop = firstExistingPath([
+    resolveHomePath(CLAUDE_DESKTOP_CLI_RELATIVE_PATH, deps),
+    CLAUDE_DESKTOP_CLI_SYSTEM_PATH,
+  ], deps);
+  return desktop ? { command: desktop } : lookup;
+}
+
+/** task #1277 — {@link resolveClaudeLaunchCommand} off the event loop; a configured command needs no lookup. */
+export async function resolveClaudeLaunchCommandAsync(config: AgentConfig, deps: ProbeDeps = {}): Promise<string | null> {
+  const launchRuntimeFields = runtimeConfigToLaunchFields(hydrateRuntimeConfig(config));
+  const configured = launchRuntimeFields.command?.trim();
+  if (configured) return configured;
+  return (await lookupClaudeCommandAsync(deps)).command;
+}
+
 export function probeClaude(deps: ProbeDeps = {}): RuntimeProbeResult {
-  const command = resolveClaudeCommand(deps);
-  if (!command) return { available: false };
+  const { command, missReason, timing } = lookupClaudeCommand(deps);
+  // task #1240: the lookup's per-child timing (phase, ms, budget, outcome
+  // only) always travels as `lookupTiming` for the detection trace; when the
+  // lookup left the runtime unavailable it is also the diagnostic, so the
+  // diagnostics bundle shows how long the Windows lookup took, not just that
+  // it timed out. A healthy runtime carries no diagnostic (that line warns).
+  const lookupTiming = formatCommandLookupTiming(timing);
+  const timingFields = lookupTiming ? { lookupTiming } : {};
+  if (!command) {
+    return { available: false, unavailableReason: missReason, ...timingFields, ...(lookupTiming ? { diagnostic: `lookup: ${lookupTiming}` } : {}) };
+  }
   return {
     available: true,
     version: readCommandVersion(command, [], deps) ?? undefined,
+    ...timingFields,
   };
 }
 
 export function probeClaudeLaunch(config: AgentConfig, deps: ProbeDeps = {}): RuntimeProbeResult {
   const launchDeps = {
     ...deps,
-    env: { ...(deps.env ?? process.env) },
+    env: { ...(deps.env ?? ambientProcessEnv()) },
   };
   delete launchDeps.env.CLAUDECODE;
   const command = resolveClaudeLaunchCommand(config, launchDeps);
@@ -119,17 +156,15 @@ export function writeClaudeSystemPromptFile(standingPrompt: string, slockDir: st
 
 export function buildClaudeSpawnSpec(
   claudeCommand: string | null,
-  platform: NodeJS.Platform = process.platform,
-): { command: string; shell: boolean } {
-  const lowerClaudeCommand = claudeCommand?.toLowerCase();
-  const isBatchFile = Boolean(
-    platform === "win32" &&
-      lowerClaudeCommand &&
-      (lowerClaudeCommand.endsWith(".cmd") || lowerClaudeCommand.endsWith(".bat")),
-  );
-
-  return {
-    command: claudeCommand ?? "claude",
-    shell: platform === "win32" && (!claudeCommand || isBatchFile),
-  };
+  args: string[],
+  deps: WindowsLaunchDeps = {},
+): DirectLaunch {
+  const platform = deps.platform ?? process.platform;
+  if (platform !== "win32") return { command: claudeCommand ?? "claude", args, shell: false };
+  // A bare configured name is looked up on PATH like the default; a path is
+  // used as given. Either way a .cmd/.bat shim is resolved, never run via cmd.exe.
+  if (!claudeCommand || !/[\\/]/.test(claudeCommand)) {
+    return resolveRuntimeLaunch("claude", claudeCommand ?? "claude", args, deps);
+  }
+  return resolveWindowsDirectLaunch("claude", claudeCommand, args, deps);
 }

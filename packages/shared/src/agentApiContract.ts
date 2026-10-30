@@ -1,13 +1,17 @@
+import { raftbenchContextQuerySchema, raftbenchContextResponseSchema, raftbenchReportSchema, raftbenchSubmitResponseSchema, type RaftbenchContextQuery, type RaftbenchContextResponse, type RaftbenchReport, type RaftbenchSubmitResponse } from "./raftbenchContract";
 import { z } from "zod";
+import { lazySchema } from "./lazySchema";
+
+import { AGENT_API_ROUTE_META, type AgentApiAudience, type AgentApiIdempotency, type AgentApiSideEffect } from "./agentApiRouteMeta";
 import {
   actionCardActionSchema,
   integrationRegisterAppOperationSchema,
   integrationUpdateAppRegistrationOperationSchema,
-} from "./actionCards.js";
-import { ATTENTION_HINT_SCHEMA } from "./attentionDependencyOracle.js";
-import { asChannelId, asMessageId } from "./brandedIds.js";
-import type { ProfileView, TaskResourceReceipt, TaskStatus } from "./index.js";
-import { MAX_KNOWLEDGE_CONTEXT_LENGTH, MIN_KNOWLEDGE_CONTEXT_LENGTH } from "./knowledgeContext.js";
+} from "./actionCards";
+import { ATTENTION_HINT_SCHEMA } from "./attentionDependencyOracle";
+import { asChannelId, asMessageId } from "./brandedIds";
+import type { ProfileView, TaskResourceReceipt, TaskStatus } from "./index";
+import { MAX_KNOWLEDGE_CONTEXT_LENGTH, MIN_KNOWLEDGE_CONTEXT_LENGTH } from "./knowledgeContext";
 import {
   attachmentUploadCapabilitiesSchema,
   attachmentUploadPathParamsSchema,
@@ -15,14 +19,15 @@ import {
   completeAttachmentUploadSessionResponseSchema,
   createAttachmentUploadSessionRequestSchema,
   createAttachmentUploadSessionResponseSchema,
-} from "./attachmentUploadContract.js";
-import type { AgentInboxSourceRef } from "./agentInboxApp.js";
-import { AGENT_API_BASE_PATH } from "./agentApiPaths.js";
+} from "./attachmentUploadContract";
+import type { AgentInboxSourceRef } from "./agentInboxApp";
+import { AGENT_API_BASE_PATH } from "./agentApiPaths";
 import {
   agentApiFreshnessContextModeSchema,
   agentApiHeldFreshnessResponseSchema,
   agentApiMessageEnvelopeSchema,
   agentApiSendBodySchema,
+  agentApiSendCommittedResponseSchema,
   agentApiSendV2BodySchema,
   agentApiSendResponseSchema,
   agentApiTaskCurrentProjectionSchema,
@@ -33,10 +38,16 @@ import {
   type AgentApiSendBody,
   type AgentApiSendV2Body,
   type AgentApiSendResponse,
-} from "./agentApiMessageContract.js";
+  agentApiChannelCardSchema,
+  agentApiPeerCardSchema,
+  type AgentApiChannelCard,
+  type AgentApiPeerCard,
+} from "./agentApiMessageContract";
 
 export {
   agentApiAttachmentEnvelopeSchema,
+  agentApiChannelCardSchema,
+  agentApiPeerCardSchema,
   agentApiFreshnessContextModeSchema,
   agentApiHeldFreshnessResponseSchema,
   agentApiMessageEnvelopeSchema,
@@ -49,23 +60,26 @@ export {
   AGENT_API_EXTERNAL_MESSAGE_FORBIDDEN_AUTHORITY_FIELDS,
   isAgentApiExternalMessageForbiddenAuthorityField,
   legacyAgentSendBodySchema,
-} from "./agentApiMessageContract.js";
+} from "./agentApiMessageContract";
 export {
   AGENT_API_BASE_PATH,
   AGENT_API_MESSAGE_SEND_PATH,
   AGENT_API_MESSAGE_SEND_V2_PATH,
-} from "./agentApiPaths.js";
+} from "./agentApiPaths";
 export type {
   AgentApiAttachmentEnvelope,
+  AgentApiChannelCard,
+  AgentApiPeerCard,
   AgentApiHeldFreshnessResponse,
   AgentApiMessageEnvelope,
   AgentApiSendBody,
+  AgentApiSendCommittedResponse,
   AgentApiSendV2Body,
   AgentApiSendResponse,
   AgentApiSendSentResponse,
   AgentApiStructuredMention,
   LegacyAgentSendBody,
-} from "./agentApiMessageContract.js";
+} from "./agentApiMessageContract";
 
 /**
  * Uniform public failure for agent attachment downloads. The response must not
@@ -85,7 +99,24 @@ export const AGENT_API_ATTACHMENT_DOWNLOAD_UNAVAILABLE_RESPONSE = {
   suggestedNextAction: AGENT_API_ATTACHMENT_DOWNLOAD_UNAVAILABLE_NEXT_ACTION,
 } as const;
 
-export const agentApiMethods = ["GET", "POST", "PATCH", "DELETE"] as const;
+/**
+ * Lifetime of the presigned URLs the agent attachment routes mint: the
+ * download route's 302 target and the download-URL route's `url`.
+ */
+export const AGENT_API_ATTACHMENT_DOWNLOAD_URL_TTL_SECONDS = 300;
+
+/**
+ * The download-URL route's answer (409) when this Server's storage backend
+ * cannot presign (local disk): the attachment is readable, but only through
+ * the binary download route, which streams it.
+ */
+export const AGENT_API_ATTACHMENT_DOWNLOAD_URL_UNAVAILABLE_RESPONSE = {
+  error: "This Server's file storage cannot mint download URLs.",
+  code: "download_url_unavailable",
+  suggestedNextAction: "Download the attachment bytes instead: GET /internal/agent-api/attachments/:attachmentId (`raft attachment view --id <attachmentId> --output <path>`).",
+} as const;
+
+export const agentApiMethods = ["GET", "POST", "PUT", "PATCH", "DELETE"] as const;
 export type AgentApiMethod = (typeof agentApiMethods)[number];
 
 export const agentApiCapabilities = [
@@ -98,39 +129,43 @@ export const agentApiCapabilities = [
   "mentions",
   "reactions",
   "mcp",
+  "raftbench",
 ] as const;
 export type AgentApiCapability = (typeof agentApiCapabilities)[number];
 
-const optionalStringSchema = z.string().trim().optional();
-const optionalStringArraySchema = z.array(z.string().trim().min(1)).optional();
-const optionalBooleanSchema = z.boolean().optional();
-const optionalNumberSchema = z.number().finite().optional();
-const nullableStringSchema = z.string().nullable();
-const nullableNumberSchema = z.number().finite().nullable();
-const optionalIsoTimestampSchema = z.string().datetime().optional();
-const agentStatusSchema = z.enum(["active", "inactive", "stopped"]);
-const reminderStatusSchema = z.enum(["scheduled", "fired", "canceled"]);
-const reminderEventTypeSchema = z.enum(["scheduled", "fired", "snoozed", "updated", "canceled"]);
-const reasoningEffortSchema = z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]);
-const profileVisibilityMembershipStatusSchema = z.enum(["active", "left", "removed"]);
+const optionalStringSchema = lazySchema("optionalStringSchema", () => z.string().trim().optional());
+const optionalStringArraySchema = lazySchema("optionalStringArraySchema", () => z.array(z.string().trim().min(1)).optional());
+const optionalBooleanSchema = lazySchema("optionalBooleanSchema", () => z.boolean().optional());
+const optionalNumberSchema = lazySchema("optionalNumberSchema", () => z.number().finite().optional());
+// What the agent's model context has seen of a task's board (glimpse G2): the
+// attestation a send carries. A task write without it is never held.
+const taskSeenExactSeqsSchema = lazySchema("taskSeenExactSeqsSchema", () => z.array(z.number().int().positive()).max(2_500).optional());
+const nullableStringSchema = lazySchema("nullableStringSchema", () => z.string().nullable());
+const nullableNumberSchema = lazySchema("nullableNumberSchema", () => z.number().finite().nullable());
+const optionalIsoTimestampSchema = lazySchema("optionalIsoTimestampSchema", () => z.string().datetime().optional());
+const agentStatusSchema = lazySchema("agentStatusSchema", () => z.enum(["active", "inactive", "stopped"]));
+const reminderStatusSchema = lazySchema("reminderStatusSchema", () => z.enum(["scheduled", "fired", "canceled"]));
+const reminderEventTypeSchema = lazySchema("reminderEventTypeSchema", () => z.enum(["scheduled", "fired", "snoozed", "updated", "canceled"]));
+const reasoningEffortSchema = lazySchema("reasoningEffortSchema", () => z.enum(["low", "medium", "high", "xhigh", "max", "ultra"]));
+const profileVisibilityMembershipStatusSchema = lazySchema("profileVisibilityMembershipStatusSchema", () => z.enum(["active", "left", "removed"]));
 // The envelope is shared so daemon and Server agree on the HTTP seam. The
 // locator payload itself is intentionally `unknown` here: the Server owns an
 // independent, closed consumer schema so a producer edit cannot weaken both
 // ends of the acceptance boundary.
-export const agentApiFeedbackLocatorIngestBodySchema = z.object({
+export const agentApiFeedbackLocatorIngestBodySchema = lazySchema("agentApiFeedbackLocatorIngestBodySchema", () => z.object({
   artifact_kind: z.string().trim().min(1).max(128),
   event_kind: z.string().trim().min(1).max(128),
   payload: z.unknown(),
-}).strict();
+}).strict());
 
-export const agentApiFeedbackLocatorAcceptanceSchema = z.object({
+export const agentApiFeedbackLocatorAcceptanceSchema = lazySchema("agentApiFeedbackLocatorAcceptanceSchema", () => z.object({
   status: z.literal("accepted"),
   receipt_id: z.string().uuid(),
   report_id: z.string().uuid(),
   duplicate: z.boolean(),
-}).strict();
+}).strict());
 
-export const agentApiFeedbackLocatorListQuerySchema = z.object({
+export const agentApiFeedbackLocatorListQuerySchema = lazySchema("agentApiFeedbackLocatorListQuerySchema", () => z.object({
   report_id: z.string().uuid().optional(),
   runtime: z.enum(["claude", "codex", "grok", "kimi", "kimi-sdk", "pi", "builtin", "other"]).optional(),
   native_status: z.enum(["reachable", "unreachable", "unsupported", "not_attempted", "lookup_failed"]).optional(),
@@ -141,9 +176,9 @@ export const agentApiFeedbackLocatorListQuerySchema = z.object({
   served_exact_sha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
   route_basis: z.enum(["explicit_public_channel", "configured_project_channel"]).optional(),
   limit: z.string().regex(/^([1-9]|[1-9][0-9]|100)$/).optional(),
-}).strict();
+}).strict());
 
-const agentApiFeedbackLocatorIndexEntrySchema = z.object({
+const agentApiFeedbackLocatorIndexEntrySchema = lazySchema("agentApiFeedbackLocatorIndexEntrySchema", () => z.object({
   report_id: z.string().uuid(),
   receipt_id: z.string().uuid(),
   captured_at: z.string().datetime(),
@@ -155,30 +190,56 @@ const agentApiFeedbackLocatorIndexEntrySchema = z.object({
   served_exact_sha256: z.array(z.string().regex(/^[0-9a-f]{64}$/)),
   route_basis: z.enum(["explicit_public_channel", "configured_project_channel"]).nullable(),
   route_target: z.string().nullable(),
-}).strict();
+}).strict());
 
-export const agentApiFeedbackLocatorListResponseSchema = z.object({
+export const agentApiFeedbackLocatorListResponseSchema = lazySchema("agentApiFeedbackLocatorListResponseSchema", () => z.object({
   locators: z.array(agentApiFeedbackLocatorIndexEntrySchema),
-}).strict();
+}).strict());
 
 const passthroughObject = <T extends z.ZodRawShape>(shape: T) => z.object(shape).passthrough();
 
-export const taskStatusSchema = z.enum(["todo", "in_progress", "in_review", "done", "closed"]);
+export const taskStatusSchema = lazySchema("taskStatusSchema", () => z.enum(["todo", "in_progress", "in_review", "done", "closed"]));
 
-export const agentApiEventsQuerySchema = passthroughObject({
+// Task #178: a managed-runner CLI that will acknowledge leased third-party
+// events after writing them out declares it on the /events request. The CLI
+// sends it only from the code path that performs the ack, so "declared but
+// never acked" cannot occur. Daemons without lease support ignore the header.
+export const AGENT_API_EVENTS_ACK_HEADER = "x-raft-events-ack";
+export const AGENT_API_EVENTS_ACK_LEASE = "lease";
+
+export const agentApiEventsQuerySchema = lazySchema("agentApiEventsQuerySchema", () => passthroughObject({
   since: optionalStringSchema,
   limit: optionalStringSchema,
-});
+  // "cursor": durable inbox rows are acknowledged by the NEXT request's
+  // `since` instead of before this response is sent. Omitted = "immediate"
+  // (the behavior every published client relies on).
+  ack: z.enum(["cursor", "immediate"]).optional(),
+}));
 
-export const agentApiHistoryQuerySchema = passthroughObject({
+export const agentApiHistoryQuerySchema = lazySchema("agentApiHistoryQuerySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   before: optionalStringSchema,
   after: optionalStringSchema,
   around: optionalStringSchema,
   limit: optionalStringSchema,
-});
+  /**
+   * `"false"` reads without consuming: the Server returns the page but does
+   * not advance the agent's read cursor, and reports no
+   * `model_seen_up_to_seq`. For reads whose output may never reach the model
+   * (code a hosted agent wrote). Absent or `"true"` keeps the default.
+   */
+  consume: z.enum(["true", "false"]).optional(),
+  /**
+   * `"true"` reads this conversation's unread messages: the page starts right
+   * after the agent's read position (the one `raft inbox check` counts unread
+   * from) and the read advances it. Cannot be combined with before/after/around.
+   * The response echoes `unread_after_seq`; a Server that omits it ignored the
+   * flag.
+   */
+  unread: z.enum(["true", "false"]).optional(),
+}));
 
-export const agentApiKnowledgeGetQuerySchema = passthroughObject({
+export const agentApiKnowledgeGetQuerySchema = lazySchema("agentApiKnowledgeGetQuerySchema", () => passthroughObject({
   topic: z.string().trim().min(1),
   // Optional at the transport schema during the staged rollout. The current
   // CLI advertises manual-context-v1 and requires both before sending; the
@@ -187,9 +248,9 @@ export const agentApiKnowledgeGetQuerySchema = passthroughObject({
   reason: z.string().trim().min(MIN_KNOWLEDGE_CONTEXT_LENGTH).max(MAX_KNOWLEDGE_CONTEXT_LENGTH).optional(),
   turn_id: optionalStringSchema,
   trace_id: optionalStringSchema,
-});
+}));
 
-export const agentApiKnowledgeGetResponseSchema = passthroughObject({
+export const agentApiKnowledgeGetResponseSchema = lazySchema("agentApiKnowledgeGetResponseSchema", () => passthroughObject({
   ok: z.literal(true),
   docId: z.string(),
   topicOrPath: z.string(),
@@ -197,93 +258,37 @@ export const agentApiKnowledgeGetResponseSchema = passthroughObject({
   docState: z.string(),
   contentType: z.string(),
   content: z.string(),
-});
+}));
 
-export const agentApiKnowledgeSearchQuerySchema = passthroughObject({
+export const agentApiKnowledgeSearchQuerySchema = lazySchema("agentApiKnowledgeSearchQuerySchema", () => passthroughObject({
   query: z.string().trim().min(1),
   scope: optionalStringSchema,
   intent: z.string().trim().min(MIN_KNOWLEDGE_CONTEXT_LENGTH).max(MAX_KNOWLEDGE_CONTEXT_LENGTH).optional(),
   reason: z.string().trim().min(MIN_KNOWLEDGE_CONTEXT_LENGTH).max(MAX_KNOWLEDGE_CONTEXT_LENGTH).optional(),
   turn_id: optionalStringSchema,
   trace_id: optionalStringSchema,
-});
+}));
 
-export const agentApiKnowledgeSearchResultSchema = passthroughObject({
+export const agentApiKnowledgeSearchResultSchema = lazySchema("agentApiKnowledgeSearchResultSchema", () => passthroughObject({
   slug: z.string(),
   title: z.string(),
   firstScreen: z.string(),
-});
+}));
 
-export const agentApiKnowledgeSearchResponseSchema = passthroughObject({
+export const agentApiKnowledgeSearchResponseSchema = lazySchema("agentApiKnowledgeSearchResponseSchema", () => passthroughObject({
   ok: z.literal(true),
   query: z.string(),
   scope: z.string().nullable(),
   results: z.array(agentApiKnowledgeSearchResultSchema),
-});
+}));
 
-export const agentApiWikiManifestResponseSchema = passthroughObject({
-  configured: z.literal(true),
-  wikiSpaceId: z.string().uuid(),
-  etag: z.string().nullable(),
-  manifest: z.unknown().nullable(),
-});
-
-export const agentApiWikiArtifactReadParamsSchema = passthroughObject({
-  artifactId: z.string().uuid(),
-});
-
-const agentApiWikiSourceRefSchema = passthroughObject({
-  channelId: z.string().uuid(),
-  messageId: z.string().uuid(),
-  seq: z.number().int().positive(),
-  slockRef: z.string().min(1),
-});
-
-const agentApiWikiArtifactSchema = passthroughObject({
-  id: z.string().uuid(),
-  artifactType: z.enum(["index", "log", "page"]),
-  slug: z.string().min(1),
-  title: z.string().min(1),
-  summary: z.string().nullable(),
-  currentUnderstanding: z.string().nullable(),
-  status: z.enum(["current", "tentative", "contested", "superseded", "stale", "archived"]),
-  confidence: z.enum(["low", "medium", "high"]),
-  sourcePolicy: z.enum(["cached_summary", "prefer_live_source"]),
-  sourceRefs: z.array(agentApiWikiSourceRefSchema),
-  revision: passthroughObject({
-    id: z.string().uuid(),
-    key: z.string().min(1),
-    sha256: z.string().regex(/^[0-9a-f]{64}$/),
-    bytes: z.number().int().positive(),
-  }),
-  updatedAt: z.string().datetime(),
-});
-
-export const agentApiWikiArtifactReadResponseSchema = passthroughObject({
-  configured: z.literal(true),
-  wikiSpaceId: z.string().uuid(),
-  etag: z.string().min(1),
-  artifact: agentApiWikiArtifactSchema,
-  markdown: z.string().min(1),
-});
-
-export const agentApiWikiPublishBodySchema = passthroughObject({
-  expectedEtag: z.string().min(1).nullable(),
-  manifest: z.unknown(),
-  revisionBodies: z.array(passthroughObject({
-    artifactId: z.string().uuid(),
-    revisionId: z.string().uuid(),
-    markdown: z.string().min(1),
-  })).max(100),
-});
-
-const agentApiManagedMcpJsonSchema = z.object({
+const agentApiManagedMcpJsonSchema = lazySchema("agentApiManagedMcpJsonSchema", () => z.object({
   type: z.literal("object"),
   properties: z.record(z.string(), z.object({}).passthrough()).optional(),
   required: z.array(z.string()).optional(),
-}).passthrough();
+}).passthrough());
 
-const agentApiManagedMcpToolSchema = z.object({
+const agentApiManagedMcpToolSchema = lazySchema("agentApiManagedMcpToolSchema", () => z.object({
   mcpServerId: z.string().uuid(),
   serverName: z.string(),
   toolName: z.string(),
@@ -299,33 +304,39 @@ const agentApiManagedMcpToolSchema = z.object({
   }).optional(),
   configVersion: z.number().int().positive(),
   assignmentVersion: z.number().int().positive(),
-});
+}));
 
-export const agentApiManagedMcpToolsResponseSchema = z.object({
+export const agentApiManagedMcpToolsResponseSchema = lazySchema("agentApiManagedMcpToolsResponseSchema", () => z.object({
   catalogVersion: z.literal(1),
   tools: z.array(agentApiManagedMcpToolSchema),
-});
+  /** Connectors the agent would have tools from that need a server admin to reconnect them (no tools). */
+  unavailable: z.array(z.object({
+    mcpServerId: z.string().uuid(),
+    serverName: z.string(),
+    status: z.literal("reconnect_required"),
+  })).optional(),
+}));
 
-export const agentApiManagedMcpCallBodySchema = z.object({
+export const agentApiManagedMcpCallBodySchema = lazySchema("agentApiManagedMcpCallBodySchema", () => z.object({
   mcpServerId: z.string().uuid(),
   toolName: z.string().trim().min(1),
   arguments: z.record(z.string(), z.unknown()),
   expectedConfigVersion: z.number().int().positive(),
   expectedAssignmentVersion: z.number().int().positive(),
-});
+}));
 
-const agentApiManagedMcpResultContentSchema = z.discriminatedUnion("type", [
+const agentApiManagedMcpResultContentSchema = lazySchema("agentApiManagedMcpResultContentSchema", () => z.discriminatedUnion("type", [
   z.object({ type: z.literal("text"), text: z.string() }),
   z.object({ type: z.literal("image"), data: z.string(), mimeType: z.string() }),
-]);
+]));
 
-export const agentApiManagedMcpCallResponseSchema = z.object({
+export const agentApiManagedMcpCallResponseSchema = lazySchema("agentApiManagedMcpCallResponseSchema", () => z.object({
   content: z.array(agentApiManagedMcpResultContentSchema),
   isError: z.boolean(),
   structuredContent: z.record(z.string(), z.unknown()).optional(),
-});
+}));
 
-export const agentApiMessageSearchQuerySchema = passthroughObject({
+export const agentApiMessageSearchQuerySchema = lazySchema("agentApiMessageSearchQuerySchema", () => passthroughObject({
   q: optionalStringSchema,
   channel: optionalStringSchema,
   sender: optionalStringSchema,
@@ -335,60 +346,109 @@ export const agentApiMessageSearchQuerySchema = passthroughObject({
   after: optionalStringSchema,
   limit: optionalStringSchema,
   offset: optionalStringSchema,
-});
+  /** A previous page's nextCursor, unchanged (recent-sort text search only). */
+  cursor: optionalStringSchema,
+}));
 
-export const agentApiMessageResolveParamsSchema = passthroughObject({
+export const agentApiMessageResolveParamsSchema = lazySchema("agentApiMessageResolveParamsSchema", () => passthroughObject({
   msgId: z.string().trim().min(1).transform(asMessageId),
-});
+}));
 
-export const agentApiMessageReactionParamsSchema = passthroughObject({
+export const agentApiMessageReactionParamsSchema = lazySchema("agentApiMessageReactionParamsSchema", () => passthroughObject({
   msgId: z.string().trim().min(1).transform(asMessageId),
-});
+}));
 
-export const agentApiMessageReactionBodySchema = passthroughObject({
+export const agentApiMessageReactionBodySchema = lazySchema("agentApiMessageReactionBodySchema", () => passthroughObject({
   emoji: z.string().trim().min(1).max(16).refine((value) => !/\s/.test(value), {
     message: "A single reaction emoji is required",
   }),
-});
+}));
 
-export const agentApiChannelMembershipParamsSchema = passthroughObject({
+export const agentApiChannelMembershipParamsSchema = lazySchema("agentApiChannelMembershipParamsSchema", () => passthroughObject({
   channelId: z.string().trim().min(1).transform(asChannelId),
-});
+}));
 
-export const agentApiChannelLifecycleBodySchema = passthroughObject({
+export const agentApiChannelLifecycleBodySchema = lazySchema("agentApiChannelLifecycleBodySchema", () => passthroughObject({
   target: z.string().trim().min(1),
-});
+}));
 
-export const agentApiAttachmentDownloadParamsSchema = passthroughObject({
+const agentApiChannelVisibilitySchema = lazySchema("agentApiChannelVisibilitySchema", () => z.enum(["public", "private"]));
+
+/** `POST /channels`: the Server checks the bound agent's createChannels role. */
+export const agentApiChannelCreateBodySchema = lazySchema("agentApiChannelCreateBodySchema", () => passthroughObject({
+  name: z.string().trim().min(1),
+  description: z.string().max(500).optional(),
+  visibility: agentApiChannelVisibilitySchema.optional(),
+}));
+
+/** `PATCH /channels/:channelId`: any subset; visibility needs changeChannelVisibility. */
+export const agentApiChannelUpdateBodySchema = lazySchema("agentApiChannelUpdateBodySchema", () => passthroughObject({
+  name: z.string().trim().min(1).optional(),
+  description: z.string().max(500).optional(),
+  visibility: agentApiChannelVisibilitySchema.optional(),
+}));
+
+/** Exactly one member target; the Server rejects zero or several. */
+export const agentApiChannelMemberBodySchema = lazySchema("agentApiChannelMemberBodySchema", () => passthroughObject({
+  userId: z.string().trim().min(1).optional(),
+  agentId: z.string().trim().min(1).optional(),
+  user: z.string().trim().min(1).optional(),
+  human: z.string().trim().min(1).optional(),
+  agent: z.string().trim().min(1).optional(),
+}));
+
+/** The created or updated channel row (with joint-channel metadata when it has any). */
+export const agentApiChannelRowResponseSchema = lazySchema("agentApiChannelRowResponseSchema", () => passthroughObject({
+  id: z.string(),
+  name: z.string(),
+  type: z.string(),
+  description: z.string().nullable().optional(),
+}));
+
+
+export const agentApiAttachmentDownloadParamsSchema = lazySchema("agentApiAttachmentDownloadParamsSchema", () => passthroughObject({
   attachmentId: z.string().trim().min(1),
-});
+}));
 
-export const agentApiAttachmentCommentsParamsSchema = passthroughObject({
+/**
+ * Short-lived download URL for an attachment visible to the bound agent
+ * credential (`GET /attachments/:attachmentId/url`). For runtimes that cannot
+ * take binary tool results: the agent fetches the bytes itself from `url`
+ * before `expiresAt`. The URL is a bearer capability; never log it.
+ */
+export const agentApiAttachmentDownloadUrlResponseSchema = lazySchema("agentApiAttachmentDownloadUrlResponseSchema", () => passthroughObject({
+  url: z.string().min(1),
+  expiresAt: z.string().datetime(),
+  filename: z.string(),
+  mimeType: z.string(),
+}));
+
+export const agentApiAttachmentCommentsParamsSchema = lazySchema("agentApiAttachmentCommentsParamsSchema", () => passthroughObject({
   attachmentId: z.string().trim().min(1),
-});
+}));
 
-export const agentApiAttachmentCommentsQuerySchema = passthroughObject({
+export const agentApiAttachmentCommentsQuerySchema = lazySchema("agentApiAttachmentCommentsQuerySchema", () => passthroughObject({
   limit: optionalStringSchema,
-});
+}));
 
-const agentApiAttachmentCommentAnchorSchema = passthroughObject({
+const agentApiAttachmentCommentAnchorSchema = lazySchema("agentApiAttachmentCommentAnchorSchema", () => passthroughObject({
   type: z.string().trim().min(1),
   data: z.record(z.string(), z.unknown()),
-});
+}));
 
-const agentApiAttachmentCommentReactionSchema = passthroughObject({
+const agentApiAttachmentCommentReactionSchema = lazySchema("agentApiAttachmentCommentReactionSchema", () => passthroughObject({
   emoji: z.string().trim().min(1),
   reactorType: z.string().trim().min(1),
   reactorId: z.string().trim().min(1),
   createdAt: z.string().datetime(),
-});
+}));
 
-const agentApiAttachmentCommentResolvedBySchema = passthroughObject({
+const agentApiAttachmentCommentResolvedBySchema = lazySchema("agentApiAttachmentCommentResolvedBySchema", () => passthroughObject({
   reactorId: z.string().trim().min(1),
   reactorType: z.string().trim().min(1),
-});
+}));
 
-export const agentApiAttachmentCommentSchema = passthroughObject({
+export const agentApiAttachmentCommentSchema = lazySchema("agentApiAttachmentCommentSchema", () => passthroughObject({
   id: z.string().trim().min(1),
   channelId: z.string().trim().min(1).optional(),
   senderId: z.string().trim().min(1),
@@ -403,9 +463,9 @@ export const agentApiAttachmentCommentSchema = passthroughObject({
   resolved: z.boolean().optional(),
   resolvedBy: agentApiAttachmentCommentResolvedBySchema.nullable().optional(),
   resolvedAt: z.string().datetime().nullable().optional(),
-});
+}));
 
-export const agentApiAttachmentCommentsResponseSchema = passthroughObject({
+export const agentApiAttachmentCommentsResponseSchema = lazySchema("agentApiAttachmentCommentsResponseSchema", () => passthroughObject({
   comments: z.array(agentApiAttachmentCommentSchema),
   threadChannelId: nullableStringSchema.optional(),
   viewer: passthroughObject({
@@ -417,33 +477,86 @@ export const agentApiAttachmentCommentsResponseSchema = passthroughObject({
       emoji: z.string().trim().min(1),
     }).optional(),
   }).optional(),
-});
+}));
 
-export const agentApiChannelMembersQuerySchema = passthroughObject({
+export const agentApiChannelMembersQuerySchema = lazySchema("agentApiChannelMembersQuerySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
-});
+}));
 
-export const agentApiResolveChannelBodySchema = passthroughObject({
+export const agentApiResolveChannelBodySchema = lazySchema("agentApiResolveChannelBodySchema", () => passthroughObject({
   target: z.string().trim().min(1),
-});
+}));
 
-export const agentApiResolveChannelResponseSchema = passthroughObject({
+export const agentApiResolveChannelResponseSchema = lazySchema("agentApiResolveChannelResponseSchema", () => passthroughObject({
   channelId: z.string().trim().min(1),
-});
+}));
 
-export const agentApiThreadUnfollowBodySchema = passthroughObject({
+export const agentApiThreadUnfollowBodySchema = lazySchema("agentApiThreadUnfollowBodySchema", () => passthroughObject({
   thread: z.string().trim().min(1),
   reason: z.string().trim().min(1).max(200).optional(),
-});
+}));
 
-export const agentApiTaskClaimBodySchema = passthroughObject({
+export const agentApiThreadListItemSchema = lazySchema("agentApiThreadListItemSchema", () => passthroughObject({
+  target: z.string().trim().min(1),
+  threadChannelId: z.string().uuid(),
+  parentChannelRef: z.string().trim().min(1),
+  parentMessageId: z.string().uuid(),
+  parentMessageShortId: z.string().trim().length(8),
+  followedAt: z.string().datetime(),
+  reason: z.string().trim().min(1),
+  doneAt: z.string().datetime().nullable(),
+}));
+
+export const agentApiThreadListResponseSchema = lazySchema("agentApiThreadListResponseSchema", () => passthroughObject({
+  threads: z.array(agentApiThreadListItemSchema),
+}));
+
+export const AGENT_API_INBOX_VIEWS = ["unread", "mentions"] as const;
+export type AgentApiInboxView = (typeof AGENT_API_INBOX_VIEWS)[number];
+export const AGENT_API_INBOX_DEFAULT_LIMIT = 20;
+export const AGENT_API_INBOX_MAX_LIMIT = 50;
+
+const positiveIntegerStringSchema = lazySchema("positiveIntegerStringSchema", () => z.string().trim().regex(/^[1-9][0-9]*$/, "must be a positive integer"));
+
+export const agentApiInboxListQuerySchema = lazySchema("agentApiInboxListQuerySchema", () => passthroughObject({
+  view: z.enum(AGENT_API_INBOX_VIEWS).optional(),
+  before_seq: positiveIntegerStringSchema.optional(),
+  limit: positiveIntegerStringSchema.optional(),
+}));
+
+export const agentApiInboxConversationSchema = lazySchema("agentApiInboxConversationSchema", () => passthroughObject({
+  target: z.string().trim().min(1),
+  kind: z.enum(["dm", "channel", "thread"]),
+  unread: z.number().int().nonnegative(),
+  mentions: z.number().int().nonnegative(),
+  lastReadSeq: z.number().int().nonnegative(),
+  activitySeq: z.number().int().nonnegative(),
+  latestSenderName: z.string().nullable(),
+  latestAt: z.string().datetime().nullable(),
+}));
+
+export const agentApiInboxListResponseSchema = lazySchema("agentApiInboxListResponseSchema", () => passthroughObject({
+  view: z.enum(AGENT_API_INBOX_VIEWS),
+  items: z.array(agentApiInboxConversationSchema),
+  hasMore: z.boolean(),
+  nextBeforeSeq: z.number().int().positive().nullable(),
+  totals: passthroughObject({
+    conversations: z.number().int().nonnegative(),
+    dms: z.number().int().nonnegative(),
+    mentions: z.number().int().nonnegative(),
+  }),
+}));
+
+export const agentApiTaskClaimBodySchema = lazySchema("agentApiTaskClaimBodySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   task_numbers: z.array(z.number().int().positive()).optional(),
   message_ids: optionalStringArraySchema,
+  seenUpToSeq: optionalNumberSchema,
+  seenExactSeqs: taskSeenExactSeqsSchema,
   freshnessContextMode: agentApiFreshnessContextModeSchema.optional(),
-});
+}));
 
-export const agentApiTaskListQuerySchema = passthroughObject({
+export const agentApiTaskListQuerySchema = lazySchema("agentApiTaskListQuerySchema", () => passthroughObject({
   channel: z.string().trim().min(1).optional(),
   mine: z.literal("true").optional(),
   status: z.union([taskStatusSchema, z.literal("all")]).optional(),
@@ -455,9 +568,9 @@ export const agentApiTaskListQuerySchema = passthroughObject({
       message: "exactly one of channel or mine=true is required",
     });
   }
-});
+}));
 
-export const agentApiTaskCreateBodySchema = passthroughObject({
+export const agentApiTaskCreateBodySchema = lazySchema("agentApiTaskCreateBodySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   tasks: z.array(passthroughObject({
     title: z.string().trim().min(1),
@@ -467,12 +580,20 @@ export const agentApiTaskCreateBodySchema = passthroughObject({
     (value) => value.startsWith("@") && value.slice(1).trim().length > 0,
     { message: "assignee must be an @handle" },
   ).optional(),
-});
+  /**
+   * Retry key (same rules as message send's): a repeat with the same key and
+   * the same request replays the first response without creating anything;
+   * the same key with a different request is refused (409
+   * `idempotency_key_reused`). Scoped to the agent and this route, and valid
+   * for 24 hours; after that the key is forgotten and is a new request.
+   */
+  idempotencyKey: optionalStringSchema,
+}));
 
-export const agentApiTaskUnclaimBodySchema = passthroughObject({
+export const agentApiTaskUnclaimBodySchema = lazySchema("agentApiTaskUnclaimBodySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   task_number: z.number().int().positive(),
-});
+}));
 
 /**
  * Set or clear a task's assignee.
@@ -486,21 +607,23 @@ export const agentApiTaskUnclaimBodySchema = passthroughObject({
  * task it just read has nothing to be stale about; supplied when the caller
  * wants to lose rather than clobber.
  */
-export const agentApiTaskAssignBodySchema = passthroughObject({
+export const agentApiTaskAssignBodySchema = lazySchema("agentApiTaskAssignBodySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   task_number: z.number().int().positive(),
   assignee: z.string().trim().min(1).nullable(),
   expected_revision: z.number().int().nonnegative().optional(),
-});
+}));
 
-export const agentApiTaskUpdateStatusBodySchema = passthroughObject({
+export const agentApiTaskUpdateStatusBodySchema = lazySchema("agentApiTaskUpdateStatusBodySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   task_number: z.number().int().positive(),
   status: taskStatusSchema,
+  seenUpToSeq: optionalNumberSchema,
+  seenExactSeqs: taskSeenExactSeqsSchema,
   freshnessContextMode: agentApiFreshnessContextModeSchema.optional(),
-});
+}));
 
-export const agentApiTaskResourceReceiptSchema = passthroughObject({
+export const agentApiTaskResourceReceiptSchema = lazySchema("agentApiTaskResourceReceiptSchema", () => passthroughObject({
   object: z.string().trim().min(1),
   purpose: z.string().trim().min(1),
   teardown_owner: z.string().trim().refine(
@@ -511,23 +634,23 @@ export const agentApiTaskResourceReceiptSchema = passthroughObject({
   expiry: z.string().datetime(),
   runbook: z.string().trim().min(1),
   tracking: z.string().trim().min(1),
-});
+}));
 
-export const agentApiTaskResourceReceiptBodySchema = passthroughObject({
+export const agentApiTaskResourceReceiptBodySchema = lazySchema("agentApiTaskResourceReceiptBodySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   task_number: z.number().int().positive(),
   receipt: agentApiTaskResourceReceiptSchema,
-});
+}));
 
 /**
  * Delete a task. Same rule as the browser: creator, or an actor holding
  * `deleteAnyTask` on this server. Agents carry a `serverAgentMembers.role`, so
  * "admin" is a real state for them, not a human-only concept.
  */
-export const agentApiTaskDeleteBodySchema = passthroughObject({
+export const agentApiTaskDeleteBodySchema = lazySchema("agentApiTaskDeleteBodySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   task_number: z.number().int().positive(),
-});
+}));
 
 /**
  * Convert an existing message into a task WITHOUT claiming it.
@@ -537,36 +660,38 @@ export const agentApiTaskDeleteBodySchema = passthroughObject({
  * someone else needs conversion on its own, exactly as the browser's
  * `POST /tasks/convert-message` gives a human.
  */
-export const agentApiTaskConvertBodySchema = passthroughObject({
+export const agentApiTaskConvertBodySchema = lazySchema("agentApiTaskConvertBodySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   message_id: z.string().trim().min(1),
-});
+}));
 
-export const agentApiTaskAmendBodySchema = passthroughObject({
+export const agentApiTaskAmendBodySchema = lazySchema("agentApiTaskAmendBodySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   task_number: z.number().int().positive(),
   title: z.string().trim().min(1).max(10_000).optional(),
   description: z.string().max(50_000).nullable().optional(),
+  seenUpToSeq: optionalNumberSchema,
+  seenExactSeqs: taskSeenExactSeqsSchema,
   freshnessContextMode: agentApiFreshnessContextModeSchema.optional(),
 }).refine((value) => value.title !== undefined || value.description !== undefined, {
   message: "At least one of title or description is required",
-});
+}));
 
-export const agentApiTaskHistoryQuerySchema = passthroughObject({
+export const agentApiTaskHistoryQuerySchema = lazySchema("agentApiTaskHistoryQuerySchema", () => passthroughObject({
   channel: z.string().trim().min(1),
   task_number: z.coerce.number().int().positive(),
-});
+}));
 
-export const agentApiReminderListQuerySchema = passthroughObject({
+export const agentApiReminderListQuerySchema = lazySchema("agentApiReminderListQuerySchema", () => passthroughObject({
   status: optionalStringSchema,
   all: optionalStringSchema,
-});
+}));
 
-export const agentApiReminderParamsSchema = passthroughObject({
+export const agentApiReminderParamsSchema = lazySchema("agentApiReminderParamsSchema", () => passthroughObject({
   reminderId: z.string().trim().min(1),
-});
+}));
 
-export const agentApiReminderScheduleBodySchema = passthroughObject({
+export const agentApiReminderScheduleBodySchema = lazySchema("agentApiReminderScheduleBodySchema", () => passthroughObject({
   title: z.string(),
   fireAt: optionalStringSchema,
   delaySeconds: optionalNumberSchema,
@@ -575,54 +700,54 @@ export const agentApiReminderScheduleBodySchema = passthroughObject({
   repeat: optionalStringSchema,
   tz: optionalStringSchema,
   channel: optionalStringSchema,
-});
+}));
 
-export const agentApiReminderSnoozeBodySchema = passthroughObject({
+export const agentApiReminderSnoozeBodySchema = lazySchema("agentApiReminderSnoozeBodySchema", () => passthroughObject({
   delaySeconds: z.number().finite(),
-});
+}));
 
-export const agentApiReminderUpdateBodySchema = passthroughObject({
+export const agentApiReminderUpdateBodySchema = lazySchema("agentApiReminderUpdateBodySchema", () => passthroughObject({
   fireAt: optionalStringSchema,
   delaySeconds: optionalNumberSchema,
   repeat: optionalStringSchema,
   title: optionalStringSchema,
   tz: optionalStringSchema,
-});
+}));
 
-export const agentApiInboxSourceRefSchema = z.object({
+export const agentApiInboxSourceRefSchema = lazySchema("agentApiInboxSourceRefSchema", () => z.object({
   kind: z.string().trim().min(1),
   id: z.string().trim().min(1),
   revision: z.string().trim().min(1).optional(),
-}).strict() satisfies z.ZodType<AgentInboxSourceRef>;
+}).strict() satisfies z.ZodType<AgentInboxSourceRef>);
 
-export const agentApiAppSourceAckBodySchema = passthroughObject({
+export const agentApiAppSourceAckBodySchema = lazySchema("agentApiAppSourceAckBodySchema", () => passthroughObject({
   itemId: z.string().trim().min(1),
   appId: z.string().trim().min(1),
   notificationClass: z.string().trim().min(1),
   sourceRef: agentApiInboxSourceRefSchema,
   ackAttemptId: z.string().uuid(),
-});
+}));
 
-export const agentApiProfileShowQuerySchema = passthroughObject({
+export const agentApiProfileShowQuerySchema = lazySchema("agentApiProfileShowQuerySchema", () => passthroughObject({
   target: optionalStringSchema,
-});
+}));
 
-export const agentApiProfileUpdateBodySchema = passthroughObject({
+export const agentApiProfileUpdateBodySchema = lazySchema("agentApiProfileUpdateBodySchema", () => passthroughObject({
   avatarUrl: optionalStringSchema,
   displayName: optionalStringSchema,
   description: optionalStringSchema,
-});
+}));
 
-const agentApiProfileCreatedAgentSchema = passthroughObject({
+const agentApiProfileCreatedAgentSchema = lazySchema("agentApiProfileCreatedAgentSchema", () => passthroughObject({
   id: z.string(),
   name: z.string(),
   displayName: nullableStringSchema,
   avatarUrl: nullableStringSchema,
   runtime: z.string(),
   status: agentStatusSchema,
-});
+}));
 
-const agentApiProfileCreatorSchema = z.union([
+const agentApiProfileCreatorSchema = lazySchema("agentApiProfileCreatorSchema", () => z.union([
   passthroughObject({
     type: z.literal("human"),
     id: z.string(),
@@ -639,9 +764,9 @@ const agentApiProfileCreatorSchema = z.union([
     avatarUrl: nullableStringSchema,
     deletedAt: nullableStringSchema,
   }),
-]);
+]));
 
-export const agentApiProfileViewSchema: z.ZodType<ProfileView> = z.discriminatedUnion("kind", [
+export const agentApiProfileViewSchema: z.ZodType<ProfileView> = lazySchema("agentApiProfileViewSchema", () => z.discriminatedUnion("kind", [
   passthroughObject({
     kind: z.literal("human"),
     id: z.string(),
@@ -679,18 +804,29 @@ export const agentApiProfileViewSchema: z.ZodType<ProfileView> = z.discriminated
     createdAt: z.string(),
     deletedAt: nullableStringSchema,
   }),
-]);
+]));
 
-export const agentApiIntegrationLoginBodySchema = passthroughObject({
+export const agentApiIntegrationTokenBodySchema = lazySchema("agentApiIntegrationTokenBodySchema", () => z.object({
+  service: z.string().trim().regex(/^[a-z][a-z0-9-]{2,63}$/),
+}).strict());
+export const agentApiIntegrationTokenResponseSchema = lazySchema("agentApiIntegrationTokenResponseSchema", () => z.object({
+  access_token: z.string().min(1),
+  token_type: z.literal("Bearer"),
+  audience: z.string().min(1),
+  expires_in: z.literal(300),
+  expires_at: z.string(),
+}).strict());
+
+export const agentApiIntegrationLoginBodySchema = lazySchema("agentApiIntegrationLoginBodySchema", () => passthroughObject({
   service: z.string().trim().min(1),
   scopes: optionalStringArraySchema,
   target: optionalStringSchema,
-});
+}));
 
-export const agentApiIntegrationMarketplaceQuerySchema = passthroughObject({
+export const agentApiIntegrationMarketplaceQuerySchema = lazySchema("agentApiIntegrationMarketplaceQuerySchema", () => passthroughObject({
   query: z.string().trim().max(200).optional(),
   limit: optionalStringSchema,
-});
+}));
 
 const agentApiIntegrationAppPrepareCommonBodyShape = {
   target: z.string().trim().min(1),
@@ -700,12 +836,14 @@ const agentApiIntegrationAppPrepareCommonBodyShape = {
   homepageUrl: optionalStringSchema,
   returnUrl: optionalStringSchema,
   agentManifestUrl: optionalStringSchema,
+  setupUrl: optionalStringSchema,
+  setupDescription: optionalStringSchema,
   scopes: optionalStringArraySchema,
   unsafeDemoUrlOverride: optionalBooleanSchema,
   draftHint: optionalStringSchema,
 };
 
-export const agentApiIntegrationAppPrepareBodySchema = z.discriminatedUnion("mode", [
+export const agentApiIntegrationAppPrepareBodySchema = lazySchema("agentApiIntegrationAppPrepareBodySchema", () => z.discriminatedUnion("mode", [
   passthroughObject({
     mode: z.literal("register"),
     ...agentApiIntegrationAppPrepareCommonBodyShape,
@@ -716,30 +854,35 @@ export const agentApiIntegrationAppPrepareBodySchema = z.discriminatedUnion("mod
     ...agentApiIntegrationAppPrepareCommonBodyShape,
     clientKey: z.string().trim().min(1),
   }),
-]);
+]));
 
-export const agentApiIntegrationAppRotateSecretBodySchema = passthroughObject({
+export const agentApiIntegrationAppRotateSecretBodySchema = lazySchema("agentApiIntegrationAppRotateSecretBodySchema", () => passthroughObject({
   clientKey: z.string().trim().min(1),
-});
+}));
 
-export const agentApiIntegrationAppTransferOwnerBodySchema = passthroughObject({
+export const agentApiIntegrationAppTransferOwnerBodySchema = lazySchema("agentApiIntegrationAppTransferOwnerBodySchema", () => passthroughObject({
   clientKey: z.string().trim().min(1),
   targetAgent: z.string().trim().min(1),
-});
+}));
 
-export const agentApiIntegrationAppUpdateBodySchema = passthroughObject({
+export const agentApiIntegrationAppUpdateBodySchema = lazySchema("agentApiIntegrationAppUpdateBodySchema", () => passthroughObject({
   clientKey: z.string().trim().min(1),
   name: optionalStringSchema,
   description: optionalStringSchema,
+  // task #319: agent-facing "when to use this app" hint; nullable, at most
+  // 160 code points, single line, no control characters, no bare @scope/pkg.
+  whenToUse: optionalStringSchema,
   category: z.string().trim().min(1).optional(),
   homepageUrl: optionalStringSchema,
   returnUrl: optionalStringSchema,
   agentManifestUrl: optionalStringSchema,
+  setupUrl: optionalStringSchema,
+  setupDescription: optionalStringSchema,
   scopes: optionalStringArraySchema,
   unsafeDemoUrlOverride: optionalBooleanSchema,
-});
+}));
 
-export const agentApiIntegrationAppManageBodySchema = passthroughObject({
+export const agentApiIntegrationAppManageBodySchema = lazySchema("agentApiIntegrationAppManageBodySchema", () => passthroughObject({
   clientKey: z.string().trim().min(1),
   action: z.enum([
     "share_link_get",
@@ -751,31 +894,132 @@ export const agentApiIntegrationAppManageBodySchema = passthroughObject({
     "delete",
   ]),
   expiresInDays: z.number().int().positive().max(365).optional(),
-});
+}));
 
-export const agentApiIntegrationAppStatusQuerySchema = passthroughObject({
+export const agentApiIntegrationAppStatusQuerySchema = lazySchema("agentApiIntegrationAppStatusQuerySchema", () => passthroughObject({
   card: optionalStringSchema,
   client: optionalStringSchema,
-});
+}));
 
-export const agentApiActionPrepareBodySchema = passthroughObject({
+export const agentApiActionPrepareBodySchema = lazySchema("agentApiActionPrepareBodySchema", () => passthroughObject({
   target: z.string().trim().min(1),
   action: actionCardActionSchema,
-});
+  /**
+   * Retry key (same rules as message send's): a repeat with the same key and
+   * the same request replays the first response (same card messageId)
+   * without preparing another card; the same key with a different request is
+   * refused (409 `idempotency_key_reused`). Scoped to the agent and this
+   * route, and valid for 24 hours; after that the key is forgotten.
+   */
+  idempotencyKey: optionalStringSchema,
+}));
 
-export const agentApiServerUpdateBodySchema = passthroughObject({
+export const agentApiServerUpdateBodySchema = lazySchema("agentApiServerUpdateBodySchema", () => passthroughObject({
   name: z.string().trim().min(1).max(100).optional(),
   hideHumansFromMembers: z.boolean().optional(),
-});
+}));
 
-export const agentApiServerUpdateResponseSchema = passthroughObject({
+/** Server Labs as the bound agent sees them (`GET /labs`); `version` guards writes. */
+export const agentApiServerLabsResponseSchema = lazySchema("agentApiServerLabsResponseSchema", () => passthroughObject({
+  serverId: z.string(),
+  accessEnabled: z.boolean(),
+  version: z.number().int().nonnegative(),
+  canManageAccess: z.boolean(),
+  canManageEnrollments: z.boolean(),
+  labs: z.array(passthroughObject({
+    labKey: z.string(),
+    name: z.string(),
+    description: z.string(),
+    state: z.string(),
+    enrolled: z.boolean(),
+    effective: z.boolean(),
+    updatedAt: z.string().nullable(),
+  })),
+}));
+
+/** Labs writes carry the version the caller read; a stale one is a 409. */
+export const agentApiServerLabsMutationBodySchema = lazySchema("agentApiServerLabsMutationBodySchema", () => passthroughObject({
+  enabled: z.boolean(),
+  expectedVersion: z.number().int().nonnegative(),
+}));
+
+export const agentApiServerLabParamsSchema = lazySchema("agentApiServerLabParamsSchema", () => passthroughObject({
+  labKey: z.string().trim().min(1),
+}));
+
+export const agentApiServerLabsMutationResponseSchema = lazySchema("agentApiServerLabsMutationResponseSchema", () => agentApiServerLabsResponseSchema.extend({
+  applied: z.boolean(),
+  auditEventId: z.string().nullable(),
+}));
+
+export const agentApiServerUpdateResponseSchema = lazySchema("agentApiServerUpdateResponseSchema", () => passthroughObject({
   id: z.string(),
   name: z.string(),
   hideHumansFromMembers: z.boolean().nullable().optional(),
   avatarUrl: z.string().nullable().optional(),
-});
+}));
 
-export const agentApiServerInfoResponseSchema = passthroughObject({
+export const agentApiAgentContextResponseSchema = lazySchema("agentApiAgentContextResponseSchema", () => passthroughObject({
+  agent: passthroughObject({
+    id: z.string(),
+    name: z.string(),
+    displayName: z.string().nullable(),
+    description: z.string().nullable(),
+    runtime: z.string(),
+    external: z.boolean(),
+    // RFC 074 §2: set when this agent is someone's personal assistant (the
+    // assistant-only reads exist for it); null otherwise. Optional for older
+    // Servers. Says nothing about whether the feature is on for the server.
+    // A plain string: an odd id must not fail the whole context read.
+    assistantOf: passthroughObject({ userId: z.string() }).nullable().optional(),
+    // Live server role (owner/admin/member/guest); null if not a member.
+    // Optional for older Servers. A plain string, like assistantOf's id.
+    serverRole: z.string().nullable().optional(),
+  }),
+  server: passthroughObject({
+    id: z.string(),
+    slug: z.string(),
+    name: z.string(),
+  }),
+  credential: passthroughObject({
+    capabilities: z.array(z.string()),
+  }),
+  // The self-hosted-runner guide rendered for this agent by the same builder
+  // the daemon uses (`buildRaftCliGuideMarkdown`). Null for managed agents:
+  // their standing prompt comes from the daemon that runs them.
+  prompt: passthroughObject({
+    audience: z.literal("self-hosted-runner"),
+    text: z.string(),
+  }).nullable(),
+  // Server rollout flags that change how an agent should work, the same
+  // values a managed agent's Computer receives at start (AgentConfig
+  // reminderApp / vaultApp). Optional for older Servers; absent means off.
+  features: passthroughObject({
+    reminderApp: z.boolean(),
+    vaultApp: z.boolean(),
+  }).optional(),
+}));
+
+export const agentApiServerInfoChannelSchema = lazySchema("agentApiServerInfoChannelSchema", () => passthroughObject({
+  id: z.string().transform(asChannelId),
+  name: z.string(),
+  joined: z.boolean(),
+}));
+
+export const agentApiServerInfoAgentSchema = lazySchema("agentApiServerInfoAgentSchema", () => passthroughObject({
+  name: z.string(),
+  status: z.string().optional(),
+  activity: z.string().nullable().optional(),
+  activityDetail: z.string().nullable().optional(),
+  role: z.enum(["owner", "admin", "member"]).nullable().optional(),
+}));
+
+export const agentApiServerInfoHumanSchema = lazySchema("agentApiServerInfoHumanSchema", () => passthroughObject({
+  name: z.string(),
+  role: z.enum(["owner", "admin", "member", "guest"]).nullable().optional(),
+}));
+
+export const agentApiServerInfoResponseSchema = lazySchema("agentApiServerInfoResponseSchema", () => passthroughObject({
   runtimeContext: passthroughObject({
     agentId: z.string(),
     runtime: z.string().optional(),
@@ -792,33 +1036,65 @@ export const agentApiServerInfoResponseSchema = passthroughObject({
   }),
   serverRole: z.string().nullable().optional(),
   serverCapabilities: passthroughObject({}).optional(),
-  channels: z.array(passthroughObject({
-    id: z.string().transform(asChannelId),
-    name: z.string(),
-    joined: z.boolean(),
-  })),
-  agents: z.array(passthroughObject({
-    name: z.string(),
-    status: z.string().optional(),
-    activity: z.string().nullable().optional(),
-    activityDetail: z.string().nullable().optional(),
-    role: z.enum(["owner", "admin", "member"]).nullable().optional(),
-  })),
-  humans: z.array(passthroughObject({
-    name: z.string(),
-    role: z.enum(["owner", "admin", "member", "guest"]).nullable().optional(),
-  })),
-});
+  channels: z.array(agentApiServerInfoChannelSchema),
+  agents: z.array(agentApiServerInfoAgentSchema),
+  humans: z.array(agentApiServerInfoHumanSchema),
+}));
 
-export const agentApiMentionActionsPendingQuerySchema = passthroughObject({
+export const AGENT_API_USER_CHANNELS_DEFAULT_LIMIT = 50;
+export const AGENT_API_USER_CHANNELS_MAX_LIMIT = 200;
+
+const nonNegativeIntegerStringSchema = lazySchema("nonNegativeIntegerStringSchema", () => z.string().trim().regex(/^(0|[1-9][0-9]*)$/, "must be a non-negative integer"));
+
+export const agentApiUserChannelsParamsSchema = lazySchema("agentApiUserChannelsParamsSchema", () => passthroughObject({
+  name: z.string().trim().min(1),
+}));
+
+export const agentApiUserChannelsQuerySchema = lazySchema("agentApiUserChannelsQuerySchema", () => passthroughObject({
+  offset: nonNegativeIntegerStringSchema.optional(),
+  // 1..AGENT_API_USER_CHANNELS_MAX_LIMIT (200), as a pattern so the description carries the cap.
+  limit: z.string().trim().regex(/^([1-9]|[1-9][0-9]|1[0-9][0-9]|200)$/, "must be an integer from 1 to 200").optional(),
+}));
+
+const agentApiUserChannelsPageFields = {
+  // The window's channels whose roster lists the user: each channel's own
+  // facts (its `serverInfo` channel fields) plus the user's membership
+  // (`joined: true`, and the user's `channelRole` where channel roles exist),
+  // none of the caller's role, capability, or attention fields.
+  memberships: z.array(agentApiServerInfoChannelSchema),
+  // Window channels whose roster check the Server would refuse (`channelMembers`
+  // 404). Built-in app conversations are inspected (no one is a member), not unchecked.
+  uncheckedCount: z.number().int().nonnegative(),
+  page: passthroughObject({
+    // Every channel visible to the caller (`serverInfo` channels), not memberships.
+    total: z.number().int().nonnegative(),
+    offset: z.number().int().nonnegative(),
+    limit: z.number().int().positive(),
+  }),
+};
+
+/**
+ * One user's visible facts and their memberships among one window of the
+ * caller's visible channels (`GET /users/:name/channels`). `user` is the
+ * user's `serverInfo` agents / humans entry, unchanged.
+ */
+export const agentApiUserChannelsResponseSchema = lazySchema("agentApiUserChannelsResponseSchema", () => z.discriminatedUnion("kind", [
+  passthroughObject({ user: agentApiServerInfoAgentSchema, kind: z.literal("agent"), ...agentApiUserChannelsPageFields }),
+  passthroughObject({ user: agentApiServerInfoHumanSchema, kind: z.literal("human"), ...agentApiUserChannelsPageFields }),
+]));
+
+/** No visible agent or human has this exact name (`404`). */
+export const AGENT_API_USER_NOT_FOUND_CODE = "user_not_found";
+
+export const agentApiMentionActionsPendingQuerySchema = lazySchema("agentApiMentionActionsPendingQuerySchema", () => passthroughObject({
   limit: optionalStringSchema,
-});
+}));
 
-export const agentApiMentionActionEnvelopeSchema = passthroughObject({
+export const agentApiMentionActionEnvelopeSchema = lazySchema("agentApiMentionActionEnvelopeSchema", () => passthroughObject({
   resolutionId: z.string(),
-});
+}));
 
-export const agentApiMentionActionResultSchema = passthroughObject({
+export const agentApiMentionActionResultSchema = lazySchema("agentApiMentionActionResultSchema", () => passthroughObject({
   resolutionId: z.string(),
   status: z.enum([
     "queued",
@@ -837,40 +1113,104 @@ export const agentApiMentionActionResultSchema = passthroughObject({
   targetType: z.enum(["user", "agent"]).optional(),
   targetId: optionalStringSchema,
   dedupedResolutionIds: optionalStringArraySchema,
-});
+}));
 
-export const agentApiMentionActionsPendingResponseSchema = passthroughObject({
+export const agentApiMentionActionsPendingResponseSchema = lazySchema("agentApiMentionActionsPendingResponseSchema", () => passthroughObject({
   pendingMentionActions: z.array(agentApiMentionActionEnvelopeSchema),
   has_more: z.boolean().optional(),
-});
+}));
 
-export const agentApiMentionActionsExecuteBodySchema = passthroughObject({
+/**
+ * task #153 — the author's per-target delivery view. Field set is the ruled
+ * allowlist (@Tenny `4a6a06b8`): outcome + a category coarse enough to act on,
+ * and nothing that explains why the seat broke.
+ */
+/**
+ * Single source for the ruled closed sets. Server projection and CLI rendering
+ * both import these rather than restating them — a hand-copied closed set is
+ * exactly the drift hazard task #154 exists to remove, and writing a second copy
+ * here while reporting that hazard would have been the same mistake twice.
+ */
+export const SENDER_MENTION_DELIVERY_OUTCOMES = ["delivered", "pending", "lost", "unknown"] as const;
+export type SenderMentionDeliveryOutcome = (typeof SENDER_MENTION_DELIVERY_OUTCOMES)[number];
+
+export const SENDER_MENTION_DELIVERY_REASON_CATEGORIES = ["quota", "runtime_error", "not_launched", "unclassified"] as const;
+export type SenderMentionDeliveryReasonCategory = (typeof SENDER_MENTION_DELIVERY_REASON_CATEGORIES)[number];
+
+/**
+ * @Stone finding 2: the boundary must fail closed on the SHAPE, not only the
+ * producer. An optional `reasonCategory` on every outcome lets "field absent"
+ * carry meaning again — the exact defect the ruling removed — if a bad response
+ * ever reaches a client. So the row is discriminated on `outcome`:
+ *   lost                       ⇒ category REQUIRED
+ *   delivered | pending | unknown ⇒ category FORBIDDEN (not merely omitted)
+ * `strict()` rather than passthrough on the non-lost arm is what makes
+ * "forbidden" real; passthrough would silently accept a stray category.
+ */
+export const agentApiSenderMentionDeliveryRowSchema = lazySchema("agentApiSenderMentionDeliveryRowSchema", () => z.discriminatedUnion("outcome", [
+  z.object({
+    targetHandle: z.string(),
+    outcome: z.literal("lost"),
+    reasonCategory: z.enum(SENDER_MENTION_DELIVERY_REASON_CATEGORIES),
+  }).strict(),
+  ...SENDER_MENTION_DELIVERY_OUTCOMES
+    .filter((outcome): outcome is Exclude<SenderMentionDeliveryOutcome, "lost"> => outcome !== "lost")
+    .map((outcome) => z.object({
+      targetHandle: z.string(),
+      outcome: z.literal(outcome),
+    }).strict()),
+]));
+
+export const agentApiSenderMentionDeliveriesParamsSchema = lazySchema("agentApiSenderMentionDeliveriesParamsSchema", () => passthroughObject({
+  messageId: z.string().trim().min(1),
+}));
+
+export const agentApiSenderMentionDeliveriesResponseSchema = lazySchema("agentApiSenderMentionDeliveriesResponseSchema", () => passthroughObject({
+  messageId: z.string(),
+  deliveries: z.array(agentApiSenderMentionDeliveryRowSchema),
+}));
+
+export const agentApiMentionActionsExecuteBodySchema = lazySchema("agentApiMentionActionsExecuteBodySchema", () => passthroughObject({
   action: z.enum(["notify", "add"]),
   resolutionIds: optionalStringArraySchema,
   ids: optionalStringArraySchema,
-});
+}));
 
-export const agentApiMentionActionsExecuteResponseSchema = passthroughObject({
+export const agentApiMentionActionsExecuteResponseSchema = lazySchema("agentApiMentionActionsExecuteResponseSchema", () => passthroughObject({
   ok: z.literal(true),
   action: z.enum(["notify", "add"]),
   results: z.array(agentApiMentionActionResultSchema),
-});
+}));
 
-const agentApiIntegrationServiceSchema = passthroughObject({
+const appSetupStateSchema = lazySchema("appSetupStateSchema", () => z.object({
+  status: z.enum(["not_required", "pending", "complete"]),
+  url: z.string().nullable(),
+  description: z.string().nullable(),
+  revision: z.number().int().positive(),
+  completedAt: z.string().nullable(),
+}));
+
+const agentApiIntegrationServiceSchema = lazySchema("agentApiIntegrationServiceSchema", () => passthroughObject({
   id: z.string(),
   clientId: z.string(),
   appType: z.enum(["server_local", "slock_builtin", "third_party_global"]).optional(),
   name: z.string(),
+  setupUrl: nullableStringSchema.optional(),
+  setupDescription: nullableStringSchema.optional(),
+  setup: appSetupStateSchema.nullable().optional(),
   description: nullableStringSchema,
+  whenToUse: nullableStringSchema.optional(),
   homepageUrl: nullableStringSchema,
   returnUrl: nullableStringSchema,
   agentManifestUrl: nullableStringSchema,
   agentManifestUrlSource: z.enum(["explicit", "well_known"]).nullable().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
-});
+  official: z.boolean().default(false),
+  purpose: z.string().default(""),
+}));
 
-const agentApiActiveIntegrationLoginSchema = passthroughObject({
+const agentApiActiveIntegrationLoginSchema = lazySchema("agentApiActiveIntegrationLoginSchema", () => passthroughObject({
   id: z.string(),
   serviceId: z.string(),
   clientId: z.string(),
@@ -883,17 +1223,20 @@ const agentApiActiveIntegrationLoginSchema = passthroughObject({
   agentManifestUrlSource: z.enum(["explicit", "well_known"]).nullable().optional(),
   scopes: z.array(z.string()),
   createdAt: z.string(),
-});
+}));
 
-export const agentApiIntegrationListResponseSchema = passthroughObject({
+export const agentApiIntegrationListResponseSchema = lazySchema("agentApiIntegrationListResponseSchema", () => passthroughObject({
   services: z.array(agentApiIntegrationServiceSchema),
   activeLogins: z.array(agentApiActiveIntegrationLoginSchema),
-});
+}));
 
-const agentApiMarketplaceIntegrationAppSchema = passthroughObject({
+const agentApiMarketplaceIntegrationAppSchema = lazySchema("agentApiMarketplaceIntegrationAppSchema", () => passthroughObject({
   id: z.string(),
   clientId: z.string(),
   name: z.string(),
+  setupUrl: nullableStringSchema.optional(),
+  setupDescription: nullableStringSchema.optional(),
+  setup: appSetupStateSchema.nullable().optional(),
   description: nullableStringSchema,
   category: z.string(),
   dataAccessSummary: nullableStringSchema,
@@ -904,17 +1247,19 @@ const agentApiMarketplaceIntegrationAppSchema = passthroughObject({
   logoUrl: nullableStringSchema,
   installedOnServer: z.boolean(),
   updatedAt: z.string(),
-});
+  official: z.boolean().default(false),
+  purpose: z.string().default(""),
+}));
 
-export const agentApiIntegrationMarketplaceResponseSchema = passthroughObject({
+export const agentApiIntegrationMarketplaceResponseSchema = lazySchema("agentApiIntegrationMarketplaceResponseSchema", () => passthroughObject({
   surface: z.literal("public_marketplace"),
   metadataTrust: z.literal("untrusted_app_supplied"),
   query: nullableStringSchema,
   limit: z.number().int().min(1).max(50),
   apps: z.array(agentApiMarketplaceIntegrationAppSchema),
-});
+}));
 
-export const agentApiIntegrationLoginResponseSchema = passthroughObject({
+export const agentApiIntegrationLoginResponseSchema = lazySchema("agentApiIntegrationLoginResponseSchema", () => passthroughObject({
   status: z.enum(["logged_in", "already_logged_in", "approval_required", "install_required"]),
   nextAction: z.literal("install_from_marketplace").optional(),
   service: agentApiIntegrationServiceSchema,
@@ -937,9 +1282,9 @@ export const agentApiIntegrationLoginResponseSchema = passthroughObject({
     target: nullableStringSchema,
     actionCardMessageId: nullableStringSchema,
   }).optional(),
-});
+}));
 
-export const agentApiIntegrationAppPrepareResponseSchema = passthroughObject({
+export const agentApiIntegrationAppPrepareResponseSchema = lazySchema("agentApiIntegrationAppPrepareResponseSchema", () => passthroughObject({
   status: z.literal("prepared"),
   mode: z.enum(["register", "update"]),
   target: z.string(),
@@ -948,16 +1293,16 @@ export const agentApiIntegrationAppPrepareResponseSchema = passthroughObject({
     integrationRegisterAppOperationSchema,
     integrationUpdateAppRegistrationOperationSchema,
   ]),
-});
+}));
 
-export const agentApiIntegrationAppRotateSecretResponseSchema = passthroughObject({
+export const agentApiIntegrationAppRotateSecretResponseSchema = lazySchema("agentApiIntegrationAppRotateSecretResponseSchema", () => passthroughObject({
   clientId: z.string(),
   clientKey: z.string(),
   clientName: z.string(),
   clientSecret: z.string(),
-});
+}));
 
-export const agentApiIntegrationAppTransferOwnerResponseSchema = passthroughObject({
+export const agentApiIntegrationAppTransferOwnerResponseSchema = lazySchema("agentApiIntegrationAppTransferOwnerResponseSchema", () => passthroughObject({
   clientId: z.string(),
   clientKey: z.string(),
   clientName: z.string(),
@@ -965,25 +1310,25 @@ export const agentApiIntegrationAppTransferOwnerResponseSchema = passthroughObje
   ownerAgentName: z.string(),
   ownershipOutcome: z.enum(["transferred", "already_owner"]),
   auditEventId: z.string().uuid(),
-});
+}));
 
-export const agentApiIntegrationAppUpdateResponseSchema = passthroughObject({
+export const agentApiIntegrationAppUpdateResponseSchema = lazySchema("agentApiIntegrationAppUpdateResponseSchema", () => passthroughObject({
   clientId: z.string(),
   clientKey: z.string(),
   clientName: z.string(),
   updatedFields: z.array(z.string()),
-});
+}));
 
-const agentApiIntegrationAppShareLinkSchema = passthroughObject({
+const agentApiIntegrationAppShareLinkSchema = lazySchema("agentApiIntegrationAppShareLinkSchema", () => passthroughObject({
   id: z.string(),
   expiresAt: nullableStringSchema,
   revokedAt: nullableStringSchema,
   lastUsedAt: nullableStringSchema,
   createdAt: z.string(),
   updatedAt: z.string(),
-});
+}));
 
-export const agentApiIntegrationAppManageResponseSchema = passthroughObject({
+export const agentApiIntegrationAppManageResponseSchema = lazySchema("agentApiIntegrationAppManageResponseSchema", () => passthroughObject({
   action: agentApiIntegrationAppManageBodySchema.shape.action,
   clientId: z.string(),
   clientKey: z.string(),
@@ -992,23 +1337,27 @@ export const agentApiIntegrationAppManageResponseSchema = passthroughObject({
   logoUrl: nullableStringSchema.optional(),
   shareUrl: nullableStringSchema.optional(),
   link: agentApiIntegrationAppShareLinkSchema.nullable().optional(),
-});
+}));
 
-export const agentApiIntegrationAppLogoResponseSchema = passthroughObject({
+export const agentApiIntegrationAppLogoResponseSchema = lazySchema("agentApiIntegrationAppLogoResponseSchema", () => passthroughObject({
   clientId: z.string(),
   clientKey: z.string(),
   clientName: z.string(),
   logoUrl: z.string(),
-});
+}));
 
 // Unlike the general forward-compatible agent API envelopes, this owner-state
 // projection is deliberately closed: unknown server fields must be stripped
 // before CLI JSON/text rendering so a future DB-shaped response cannot expose
 // secret/hash/token or internal-owner fields by accident.
-export const agentApiOwnedIntegrationAppSchema = z.object({
+export const agentApiOwnedIntegrationAppSchema = lazySchema("agentApiOwnedIntegrationAppSchema", () => z.object({
   state: z.enum(["card_pending", "committed"]),
   card: nullableStringSchema,
+  installationId: z.string().uuid().nullable().optional(),
   name: z.string(),
+  setupUrl: nullableStringSchema.optional(),
+  setupDescription: nullableStringSchema.optional(),
+  setup: appSetupStateSchema.nullable().optional(),
   clientKey: nullableStringSchema,
   createdAt: z.string(),
   updatedAt: nullableStringSchema.optional(),
@@ -1025,23 +1374,23 @@ export const agentApiOwnedIntegrationAppSchema = z.object({
   enabled: z.boolean().nullable().optional(),
   authority: z.enum(["owner", "admin"]).nullable().optional(),
   recoveryCommand: nullableStringSchema,
-});
+}));
 
-export const agentApiIntegrationAppListResponseSchema = z.object({
+export const agentApiIntegrationAppListResponseSchema = lazySchema("agentApiIntegrationAppListResponseSchema", () => z.object({
   apps: z.array(agentApiOwnedIntegrationAppSchema),
-});
+}));
 
-export const agentApiIntegrationAppStatusResponseSchema = z.object({
+export const agentApiIntegrationAppStatusResponseSchema = lazySchema("agentApiIntegrationAppStatusResponseSchema", () => z.object({
   app: agentApiOwnedIntegrationAppSchema,
-});
+}));
 
-export const agentApiAttachmentUploadResponseSchema = passthroughObject({
+export const agentApiAttachmentUploadResponseSchema = lazySchema("agentApiAttachmentUploadResponseSchema", () => passthroughObject({
   id: z.string().trim().min(1),
   filename: z.string(),
   mimeType: nullableStringSchema,
   sizeBytes: z.number().int().nonnegative(),
   thumbnailUrl: nullableStringSchema,
-});
+}));
 
 /* external message contract is defined in agentApiMessageContract.ts */
 /*
@@ -1144,6 +1493,8 @@ export const agentApiMessageEnvelopeSchema = passthroughObject({
   sender_name: optionalStringSchema,
   senderDescription: z.string().nullable().optional(),
   sender_description: z.string().nullable().optional(),
+  senderTimezone: z.string().nullable().optional(),
+  sender_timezone: z.string().nullable().optional(),
   external_message: agentApiExternalMessageProvenanceSchema.optional(),
   mentioned: optionalBooleanSchema,
   channel_type: optionalStringSchema,
@@ -1189,10 +1540,16 @@ export const agentApiMessageEnvelopeSchema = passthroughObject({
       path: ["senderType"],
     });
   }
-  if (value.mentioned !== false) {
+  if (typeof value.mentioned !== "boolean") {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: "external_message must be explicitly non-mentioned",
+      message: "external_message must carry an explicit mentioned boolean",
+      path: ["mentioned"],
+    });
+  } else if (value.mentioned && value.external_message.provider !== "slack") {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "non-Slack external_message must be explicitly non-mentioned",
       path: ["mentioned"],
     });
   }
@@ -1206,43 +1563,175 @@ export const agentApiMessageEnvelopeSchema = passthroughObject({
   }
 });
 */
-export const agentApiEventsResponseSchema = passthroughObject({
+export const agentApiEventsInboxHintSchema = lazySchema("agentApiEventsInboxHintSchema", () => z.object({
+  unread_conversations: z.number().int().nonnegative(),
+  command: z.literal("raft inbox check"),
+}));
+
+export const agentApiEventsResponseSchema = lazySchema("agentApiEventsResponseSchema", () => passthroughObject({
   events: z.array(agentApiMessageEnvelopeSchema),
   last_seen_msgId: nullableStringSchema,
   last_seen_seq: nullableNumberSchema,
   reply_target: nullableStringSchema,
-  pending_notice_ids: z.array(z.string()),
-  wake_reason: z.string().nullable(),
+  // Deprecated placeholders: always `[]` / `null`, read by no client. Kept in
+  // the response only because published CLIs/SDKs before this change parse
+  // them as required; optional here so the server can drop them later.
+  pending_notice_ids: z.array(z.string()).optional(),
+  wake_reason: z.string().nullable().optional(),
   has_more: z.boolean(),
-});
+  // External agents: conversations still unread beyond this bounded batch,
+  // present while any remain. Optional so older servers stay valid.
+  inbox_hint: agentApiEventsInboxHintSchema.nullable().optional(),
+  // How this batch is acknowledged: "cursor" = on the next request whose
+  // `since` covers it; "immediate" = already acknowledged. Absent on older servers.
+  ack_mode: z.enum(["cursor", "immediate"]).optional(),
+  // Task #178: managed runners may also receive `third_party_lease` here. It is
+  // injected by the daemon proxy (see `AgentApiEventsResponse`), never by the
+  // server, so it stays out of this server-router manifest and rides on the
+  // passthrough.
+}));
 
-export const agentApiHistoryResponseSchema = passthroughObject({
+// Authenticated history projection only. This is not a general target alias:
+// consumers may reconcile legacy DM queue metadata only for exact returned IDs.
+export const agentApiHistoryConsumptionScopeSchema = lazySchema("agentApiHistoryConsumptionScopeSchema", () => z.object({
+  agent_id: z.string().uuid(),
+  channel_id: z.string().uuid(),
+  channel_type: z.enum(["dm", "thread"]),
+  target: z.string().min(1),
+}));
+export type AgentApiHistoryConsumptionScope = z.infer<typeof agentApiHistoryConsumptionScopeSchema>;
+
+export const agentApiHistoryResponseSchema = lazySchema("agentApiHistoryResponseSchema", () => passthroughObject({
+  // Canonical target resolved by the server. Optional for older servers; the
+  // CLI falls back to the requested target and stays fail-closed rather than
+  // trying to reconstruct identity from message-rendering fields.
+  target: z.string().min(1).optional(),
+  consumption_scope: agentApiHistoryConsumptionScopeSchema.optional(),
   messages: z.array(agentApiMessageEnvelopeSchema),
   has_more: z.boolean(),
   has_older: z.boolean(),
   has_newer: z.boolean(),
   last_read_seq: nullableNumberSchema.optional(),
-});
+  model_seen_up_to_seq: nullableNumberSchema.optional(),
+  /** Present only for `unread=true`: the read position the page started after. */
+  unread_after_seq: nullableNumberSchema.optional(),
+  /**
+   * Present only for `unread=true`: the read position after this read. Below
+   * the page's newest seq when the newest rows are too recent to settle (seq
+   * order is not commit order); those rows come again on the next unread read.
+   */
+  read_through_seq: nullableNumberSchema.optional(),
+  /**
+   * The card of the channel this read is in (for a thread, its parent
+   * channel): what `raft channel info` shows about it, for the passive-AX
+   * channel resource (`channelCardRev`). Absent for DMs, agent events and
+   * older servers.
+   */
+  channel_card: agentApiChannelCardSchema.optional(),
+  /** The other side of a DM (or of a thread in one); absent otherwise and on older servers. */
+  peer_card: agentApiPeerCardSchema.optional(),
+}));
 
-export const agentApiMessageResolveResponseSchema = passthroughObject({
+// RFC 074 §2 personal assistant (v0). The assistant calls with its own
+// credential; the Server answers as the assistant's owner, minus DMs. Refused
+// with 403 `assistant_not_enabled` unless the bound agent is a live assistant
+// whose owner is still a member and `identity_borrowing` is on for the server.
+export const AGENT_API_ASSISTANT_INBOX_FILTERS = ["all", "unread", "mentions", "unread_mentions"] as const;
+export const AGENT_API_ASSISTANT_INBOX_DEFAULT_LIMIT = 20;
+export const AGENT_API_ASSISTANT_INBOX_MAX_LIMIT = 50;
+export const AGENT_API_ASSISTANT_MESSAGES_DEFAULT_LIMIT = 50;
+export const AGENT_API_ASSISTANT_MESSAGES_MAX_LIMIT = 100;
+
+export const agentApiAssistantOwnerInboxQuerySchema = lazySchema("agentApiAssistantOwnerInboxQuerySchema", () => passthroughObject({
+  filter: z.enum(AGENT_API_ASSISTANT_INBOX_FILTERS).optional(),
+  limit: positiveIntegerStringSchema.optional(),
+  offset: z.string().trim().regex(/^(0|[1-9][0-9]*)$/, "must be a non-negative integer").optional(),
+}));
+
+export const agentApiAssistantOwnerInboxItemSchema = lazySchema("agentApiAssistantOwnerInboxItemSchema", () => passthroughObject({
+  kind: z.enum(["channel", "thread"]),
+  /** Pass to `assistantOwnerMessages` as `channelId` (a thread's own channel id for threads). */
+  channelId: z.string().uuid(),
+  /** The channel's name; for a thread, its parent channel's name. */
+  channelName: z.string(),
+  channelType: z.string(),
+  /** Threads only: the channel and message the thread hangs off. */
+  parentChannelId: z.string().uuid().nullable(),
+  parentMessageId: z.string().uuid().nullable(),
+  unread: z.number().int().nonnegative(),
+  hasMention: z.boolean(),
+  latestAt: z.string().nullable(),
+  latestSenderName: z.string().nullable(),
+  latestPreview: z.string().nullable(),
+  firstUnreadMessageId: z.string().uuid().nullable(),
+}));
+
+export const agentApiAssistantOwnerInboxResponseSchema = lazySchema("agentApiAssistantOwnerInboxResponseSchema", () => passthroughObject({
+  owner: passthroughObject({ userId: z.string().uuid() }),
+  filter: z.enum(AGENT_API_ASSISTANT_INBOX_FILTERS),
+  items: z.array(agentApiAssistantOwnerInboxItemSchema),
+  hasMore: z.boolean(),
+  nextOffset: z.number().int().nonnegative().nullable(),
+}));
+
+export const agentApiAssistantOwnerMessagesQuerySchema = lazySchema("agentApiAssistantOwnerMessagesQuerySchema", () => passthroughObject({
+  channelId: z.string().uuid(),
+  /** Message id, 8-character short id, or seq. At most one of before/after/around. */
+  before: optionalStringSchema,
+  after: optionalStringSchema,
+  around: optionalStringSchema,
+  limit: positiveIntegerStringSchema.optional(),
+}));
+
+export const agentApiAssistantOwnerMessagesResponseSchema = lazySchema("agentApiAssistantOwnerMessagesResponseSchema", () => passthroughObject({
+  owner: passthroughObject({ userId: z.string().uuid() }),
+  channelId: z.string().uuid(),
+  messages: z.array(agentApiMessageEnvelopeSchema),
+  hasMore: z.boolean(),
+  hasOlder: z.boolean(),
+  hasNewer: z.boolean(),
+}));
+
+export const agentApiMessageResolveResponseSchema = lazySchema("agentApiMessageResolveResponseSchema", () => passthroughObject({
   message: agentApiMessageEnvelopeSchema,
-});
+}));
 
-export const agentApiChannelAttentionSchema = passthroughObject({
+export const agentApiChannelAttentionSchema = lazySchema("agentApiChannelAttentionSchema", () => passthroughObject({
   state: optionalStringSchema,
   ordinaryActivity: optionalStringSchema,
   stillArrives: optionalStringArraySchema,
   threadBoundary: optionalStringSchema,
   manageCommand: optionalStringSchema,
   manageApi: optionalStringSchema,
-});
+}));
 
-export const agentApiOkResponseSchema = passthroughObject({
+const agentApiChannelMemberRefSchema = lazySchema("agentApiChannelMemberRefSchema", () => passthroughObject({
+  type: z.enum(["human", "agent"]),
+  id: z.string(),
+  name: z.string(),
+}));
+
+export const agentApiChannelMemberAddResponseSchema = lazySchema("agentApiChannelMemberAddResponseSchema", () => passthroughObject({
+  ok: z.literal(true),
+  alreadyMember: z.boolean(),
+  channelId: z.string(),
+  member: agentApiChannelMemberRefSchema,
+}));
+
+export const agentApiChannelMemberRemoveResponseSchema = lazySchema("agentApiChannelMemberRemoveResponseSchema", () => passthroughObject({
+  ok: z.literal(true),
+  wasMember: z.boolean(),
+  channelId: z.string(),
+  member: agentApiChannelMemberRefSchema,
+  attention: agentApiChannelAttentionSchema.optional(),
+}));
+
+export const agentApiOkResponseSchema = lazySchema("agentApiOkResponseSchema", () => passthroughObject({
   ok: z.literal(true),
   attention: agentApiChannelAttentionSchema.optional(),
-});
+}));
 
-export const agentApiSearchResultSchema = passthroughObject({
+export const agentApiSearchResultSchema = lazySchema("agentApiSearchResultSchema", () => passthroughObject({
   id: z.string(),
   seq: z.number().int().nonnegative(),
   channelId: z.string(),
@@ -1265,14 +1754,57 @@ export const agentApiSearchResultSchema = passthroughObject({
   taskStatus: z.string().nullable().optional(),
   taskNumber: z.number().int().positive().nullable().optional(),
   taskCurrentProjection: agentApiTaskCurrentProjectionSchema.optional(),
-});
+}));
 
-export const agentApiMessageSearchResponseSchema = passthroughObject({
+/**
+ * Server-side paging bounds for `messages.search`. Note that the two layers that
+ * apply them do NOT agree on one input, and the constants deliberately do not hide
+ * that:
+ *
+ *   `searchService`  `Math.min(params.limit ?? DEFAULT, MAX)`  -- explicit 0 stays 0
+ *   the search routes `Math.min(Number(q.limit) || DEFAULT, MAX)` -- explicit 0 becomes
+ *                     DEFAULT, because 0 is falsy (so does "", NaN, and "abc")
+ *
+ * Every caller that reaches the server over HTTP goes through a route, so the `||`
+ * semantics is the one agents actually observe.
+ *
+ * Exported so the CLI can STATE them in `--help` rather than copy them. Before
+ * this, both numbers were inline magic values at two call sites and appeared
+ * nowhere a caller could read: `--help` said only "server default applies if
+ * omitted". Four agents independently read the 20-row default page as a hard cap
+ * on 2026-09-20, because nothing in the CLI, the help, or the response
+ * distinguishes "this is all there is" from "this is one page".
+ *
+ * Two separate gaps remain, and documenting the bounds fixes neither:
+ *
+ * 1. The schema below DOES carry `hasMore`, and the server populates it -- but
+ *    `formatSearchResults` prints only a bare count of the rows it received and
+ *    discards the flag, so nothing in the CLI's output says more rows exist.
+ *    Surfacing it belongs to #proj-daemon #326 / PR #8054, not here.
+ * 2. Nothing in the payload -- `hasMore` included -- reveals that MAX silently
+ *    reduced the limit the caller asked for. `hasMore` answers "are there more
+ *    rows", never "was your request clamped".
+ */
+export const AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT = 20;
+export const AGENT_API_MESSAGE_SEARCH_MAX_LIMIT = 50;
+
+export const agentApiMessageSearchResponseSchema = lazySchema("agentApiMessageSearchResponseSchema", () => passthroughObject({
   results: z.array(agentApiSearchResultSchema),
   hasMore: z.boolean(),
-});
+  /**
+   * The search stopped at its scan budget before the page filled: these are
+   * not all the matches (recent-sort text search; absent otherwise).
+   */
+  incomplete: z.boolean().optional(),
+  /** Continue with cursor=nextCursor (offset 0); present when hasMore or incomplete on that path. */
+  nextCursor: z.string().optional(),
+  /** incomplete only: the oldest message time searched (ISO). */
+  searchedThrough: z.string().optional(),
+  /** incomplete only: how many messages were read before the search stopped. */
+  searchedMessages: z.number().int().nonnegative().optional(),
+}));
 
-export const agentApiChannelMembersResponseSchema = passthroughObject({
+export const agentApiChannelMembersResponseSchema = lazySchema("agentApiChannelMembersResponseSchema", () => passthroughObject({
   channel: passthroughObject({
     ref: z.string(),
     type: z.string(),
@@ -1285,10 +1817,18 @@ export const agentApiChannelMembersResponseSchema = passthroughObject({
     name: z.string(),
     description: z.string().nullable().optional(),
     role: optionalStringSchema,
+    // Joint channels only (RFC 075 phase 1): every server the person
+    // participates through, the agent's own first and marked `yours: true`
+    // when present. Omitted when the person is only on the agent's own server.
+    servers: z.array(passthroughObject({
+      name: z.string(),
+      slug: z.string(),
+      yours: z.literal(true).optional(),
+    })).optional(),
   })),
-});
+}));
 
-export const agentApiChannelMuteResponseSchema = passthroughObject({
+export const agentApiChannelMuteResponseSchema = lazySchema("agentApiChannelMuteResponseSchema", () => passthroughObject({
   activityMuted: optionalBooleanSchema,
   muteFromSeq: nullableNumberSchema.optional(),
   attention: passthroughObject({
@@ -1302,25 +1842,25 @@ export const agentApiChannelMuteResponseSchema = passthroughObject({
     threadBoundary: optionalStringSchema,
     catchUp: optionalStringSchema,
   }).optional(),
-});
+}));
 
-const agentApiChannelLifecycleResponseBaseSchema = passthroughObject({
+const agentApiChannelLifecycleResponseBaseSchema = lazySchema("agentApiChannelLifecycleResponseBaseSchema", () => passthroughObject({
   id: z.string().trim().min(1).transform(asChannelId),
   name: z.string().trim().min(1),
   type: z.enum(["channel", "private"]),
   archivedByUserId: nullableStringSchema.optional(),
   archivedByAgentId: nullableStringSchema.optional(),
-});
+}));
 
-export const agentApiChannelArchiveResponseSchema = agentApiChannelLifecycleResponseBaseSchema.extend({
+export const agentApiChannelArchiveResponseSchema = lazySchema("agentApiChannelArchiveResponseSchema", () => agentApiChannelLifecycleResponseBaseSchema.extend({
   archivedAt: z.string().trim().min(1),
-});
+}));
 
-export const agentApiChannelUnarchiveResponseSchema = agentApiChannelLifecycleResponseBaseSchema.extend({
+export const agentApiChannelUnarchiveResponseSchema = lazySchema("agentApiChannelUnarchiveResponseSchema", () => agentApiChannelLifecycleResponseBaseSchema.extend({
   archivedAt: z.null(),
-});
+}));
 
-export const agentApiChannelMuteBodySchema = passthroughObject({
+export const agentApiChannelMuteBodySchema = lazySchema("agentApiChannelMuteBodySchema", () => passthroughObject({
   attentionHintAccepted: passthroughObject({
     schema: z.literal(ATTENTION_HINT_SCHEMA),
     trigger: z.enum(["M2", "M3"]),
@@ -1329,12 +1869,12 @@ export const agentApiChannelMuteBodySchema = passthroughObject({
     copy_version: z.string().trim().min(1),
     epoch_ms: z.number().int().nonnegative(),
   }).optional(),
-});
+}));
 
 // Effect-boundary projection of a failed claim. The claim API declares which
 // effects this specific conflict blocks; it never rules on lane ownership —
 // canonical DRI/reviewer/evidence identity stays with lane/thread authority.
-export const agentApiTaskClaimConflictSchema = passthroughObject({
+export const agentApiTaskClaimConflictSchema = lazySchema("agentApiTaskClaimConflictSchema", () => passthroughObject({
   kind: z.literal("claim_conflict"),
   conflictScope: z.literal("implementation_execution"),
   // Authoritative CLOSED set: an action not listed here is NOT blocked by
@@ -1351,26 +1891,26 @@ export const agentApiTaskClaimConflictSchema = passthroughObject({
   // Assignment state is reported as of this instant; it is a snapshot, not a
   // ruling that stays true.
   observedAt: z.string(),
-});
+}));
 
-export const agentApiTaskClaimResultSchema = passthroughObject({
+export const agentApiTaskClaimResultSchema = lazySchema("agentApiTaskClaimResultSchema", () => passthroughObject({
   taskNumber: z.number().int().positive().optional(),
   messageId: optionalStringSchema,
   success: z.boolean(),
   reason: optionalStringSchema,
   conflict: agentApiTaskClaimConflictSchema.optional(),
-});
+}));
 
-export const agentApiTaskClaimSuccessResponseSchema = passthroughObject({
+export const agentApiTaskClaimSuccessResponseSchema = lazySchema("agentApiTaskClaimSuccessResponseSchema", () => passthroughObject({
   results: z.array(agentApiTaskClaimResultSchema),
-});
+}));
 
-export const agentApiTaskClaimResponseSchema = z.union([
+export const agentApiTaskClaimResponseSchema = lazySchema("agentApiTaskClaimResponseSchema", () => z.union([
   agentApiTaskClaimSuccessResponseSchema,
   agentApiHeldFreshnessResponseSchema,
-]);
+]));
 
-export const agentApiTaskEnvelopeSchema = passthroughObject({
+export const agentApiTaskEnvelopeSchema = lazySchema("agentApiTaskEnvelopeSchema", () => passthroughObject({
   taskNumber: z.number().int().positive().optional(),
   status: z.string().optional(),
   title: optionalStringSchema,
@@ -1387,9 +1927,9 @@ export const agentApiTaskEnvelopeSchema = passthroughObject({
   resourceReceiptRecordedAt: z.string().datetime().nullable().optional(),
   resourceTeardownOwnerAgentId: nullableStringSchema.optional(),
   resourceExpiryFollowupId: nullableStringSchema.optional(),
-});
+}));
 
-export const agentApiTaskListResponseSchema = passthroughObject({
+export const agentApiTaskListResponseSchema = lazySchema("agentApiTaskListResponseSchema", () => passthroughObject({
   tasks: z.array(agentApiTaskEnvelopeSchema),
   scope: z.enum(["channel", "mine"]).optional(),
   coverage: passthroughObject({
@@ -1403,9 +1943,9 @@ export const agentApiTaskListResponseSchema = passthroughObject({
     mode: z.literal("complete"),
     truncated: z.literal(false),
   }).optional(),
-});
+}));
 
-export const agentApiCreatedTaskEnvelopeSchema = passthroughObject({
+export const agentApiCreatedTaskEnvelopeSchema = lazySchema("agentApiCreatedTaskEnvelopeSchema", () => passthroughObject({
   taskNumber: z.number().int().positive(),
   messageId: z.string(),
   title: z.string(),
@@ -1415,21 +1955,21 @@ export const agentApiCreatedTaskEnvelopeSchema = passthroughObject({
   claimedByName: z.string().nullable().optional(),
   claimedAt: z.string().datetime().nullable(),
   requiresResourceReceipt: z.boolean(),
-});
+}));
 
-export const agentApiTaskAssignmentReceiptSchema = passthroughObject({
+export const agentApiTaskAssignmentReceiptSchema = lazySchema("agentApiTaskAssignmentReceiptSchema", () => passthroughObject({
   messageId: z.string(),
   content: z.string(),
   assignee: z.string().startsWith("@"),
   state: z.enum(["started", "assigned"]),
-});
+}));
 
-export const agentApiTaskCreateResponseSchema = passthroughObject({
+export const agentApiTaskCreateResponseSchema = lazySchema("agentApiTaskCreateResponseSchema", () => passthroughObject({
   tasks: z.array(agentApiCreatedTaskEnvelopeSchema),
   assignmentReceipt: agentApiTaskAssignmentReceiptSchema.optional(),
-});
+}));
 
-export const agentApiTaskResourceReceiptResponseSchema = passthroughObject({
+export const agentApiTaskResourceReceiptResponseSchema = lazySchema("agentApiTaskResourceReceiptResponseSchema", () => passthroughObject({
   ok: z.literal(true),
   taskNumber: z.number().int().positive(),
   revision: z.number().int().nonnegative(),
@@ -1442,44 +1982,44 @@ export const agentApiTaskResourceReceiptResponseSchema = passthroughObject({
     msgId: z.string().uuid(),
     targetChannelId: z.string().uuid(),
   }),
-});
+}));
 
-export const agentApiTaskUnclaimResponseSchema = passthroughObject({
+export const agentApiTaskUnclaimResponseSchema = lazySchema("agentApiTaskUnclaimResponseSchema", () => passthroughObject({
   ok: z.literal(true),
-});
+}));
 
-export const agentApiTaskAssignResponseSchema = passthroughObject({
+export const agentApiTaskAssignResponseSchema = lazySchema("agentApiTaskAssignResponseSchema", () => passthroughObject({
   ok: z.literal(true),
   /** Echoed so a caller that lost a race can retry without a re-read. */
   revision: z.number().int().nonnegative(),
   assignee: z.string().nullable(),
-});
+}));
 
-export const agentApiTaskDeleteResponseSchema = passthroughObject({
+export const agentApiTaskDeleteResponseSchema = lazySchema("agentApiTaskDeleteResponseSchema", () => passthroughObject({
   ok: z.literal(true),
-});
+}));
 
-export const agentApiTaskConvertResponseSchema = passthroughObject({
+export const agentApiTaskConvertResponseSchema = lazySchema("agentApiTaskConvertResponseSchema", () => passthroughObject({
   task: agentApiCreatedTaskEnvelopeSchema,
-});
+}));
 
-export const agentApiTaskUpdateStatusSuccessResponseSchema = passthroughObject({
+export const agentApiTaskUpdateStatusSuccessResponseSchema = lazySchema("agentApiTaskUpdateStatusSuccessResponseSchema", () => passthroughObject({
   ok: z.literal(true),
-});
+}));
 
-export const agentApiTaskUpdateStatusResponseSchema = z.union([
+export const agentApiTaskUpdateStatusResponseSchema = lazySchema("agentApiTaskUpdateStatusResponseSchema", () => z.union([
   agentApiTaskUpdateStatusSuccessResponseSchema,
   agentApiHeldFreshnessResponseSchema,
-]);
+]));
 
-const agentApiTaskCardProjectionSchema = passthroughObject({
+const agentApiTaskCardProjectionSchema = lazySchema("agentApiTaskCardProjectionSchema", () => passthroughObject({
   taskNumber: z.number().int().positive(),
   title: z.string(),
   description: z.string().nullable(),
   revision: z.number().int().nonnegative(),
-});
+}));
 
-const agentApiTaskHistoryEventSchema = passthroughObject({
+const agentApiTaskHistoryEventSchema = lazySchema("agentApiTaskHistoryEventSchema", () => passthroughObject({
   id: z.string().uuid(),
   seq: z.number().int().positive(),
   eventType: z.string().trim().min(1),
@@ -1487,36 +2027,36 @@ const agentApiTaskHistoryEventSchema = passthroughObject({
   actorName: z.string().nullable(),
   payload: z.record(z.string(), z.unknown()),
   createdAt: z.string().datetime(),
-});
+}));
 
-export const agentApiTaskAmendSuccessResponseSchema = passthroughObject({
+export const agentApiTaskAmendSuccessResponseSchema = lazySchema("agentApiTaskAmendSuccessResponseSchema", () => passthroughObject({
   task: agentApiTaskCardProjectionSchema,
   event: agentApiTaskHistoryEventSchema,
-});
+}));
 
-export const agentApiTaskAmendResponseSchema = z.union([
+export const agentApiTaskAmendResponseSchema = lazySchema("agentApiTaskAmendResponseSchema", () => z.union([
   agentApiTaskAmendSuccessResponseSchema,
   agentApiHeldFreshnessResponseSchema,
-]);
+]));
 
-export const agentApiTaskHistoryResponseSchema = passthroughObject({
+export const agentApiTaskHistoryResponseSchema = lazySchema("agentApiTaskHistoryResponseSchema", () => passthroughObject({
   task: agentApiTaskCardProjectionSchema,
   events: z.array(agentApiTaskHistoryEventSchema),
-});
+}));
 
-export const agentApiActionPrepareResponseSchema = passthroughObject({
+export const agentApiActionPrepareResponseSchema = lazySchema("agentApiActionPrepareResponseSchema", () => passthroughObject({
   messageId: z.string(),
   metadata: passthroughObject({
     kind: z.literal("action-card"),
   }),
-});
+}));
 
-export const agentApiReminderRecurrenceSchema = z.object({
+export const agentApiReminderRecurrenceSchema = lazySchema("agentApiReminderRecurrenceSchema", () => z.object({
   kind: z.enum(["interval", "daily", "weekly", "unsupported"]),
   description: z.string(),
-});
+}));
 
-export const agentApiReminderSummarySchema = z.object({
+export const agentApiReminderSummarySchema = lazySchema("agentApiReminderSummarySchema", () => z.object({
   reminderId: z.string(),
   ownerAgentId: z.string(),
   title: z.string(),
@@ -1527,9 +2067,9 @@ export const agentApiReminderSummarySchema = z.object({
   msgRef: nullableStringSchema,
   msgPermalink: nullableStringSchema,
   recurrence: agentApiReminderRecurrenceSchema.nullable(),
-});
+}));
 
-export const agentApiReminderEventSummarySchema = z.object({
+export const agentApiReminderEventSummarySchema = lazySchema("agentApiReminderEventSummarySchema", () => z.object({
   eventId: z.string(),
   reminderId: z.string(),
   eventType: reminderEventTypeSchema,
@@ -1538,22 +2078,22 @@ export const agentApiReminderEventSummarySchema = z.object({
   occurredAt: z.string(),
   nextFireAt: nullableStringSchema,
   metadata: z.record(z.string(), z.unknown()).nullable(),
-});
+}));
 
-export const agentApiReminderListResponseSchema = passthroughObject({
+export const agentApiReminderListResponseSchema = lazySchema("agentApiReminderListResponseSchema", () => passthroughObject({
   reminders: z.array(agentApiReminderSummarySchema),
-});
+}));
 
-export const agentApiReminderResponseSchema = passthroughObject({
+export const agentApiReminderResponseSchema = lazySchema("agentApiReminderResponseSchema", () => passthroughObject({
   reminder: agentApiReminderSummarySchema,
   warning: optionalStringSchema,
-});
+}));
 
-export const agentApiReminderLogResponseSchema = passthroughObject({
+export const agentApiReminderLogResponseSchema = lazySchema("agentApiReminderLogResponseSchema", () => passthroughObject({
   events: z.array(agentApiReminderEventSummarySchema),
-});
+}));
 
-export const agentApiAppSourceAckResponseSchema = passthroughObject({
+export const agentApiAppSourceAckResponseSchema = lazySchema("agentApiAppSourceAckResponseSchema", () => passthroughObject({
   ok: z.literal(true),
   itemId: z.string(),
   appId: z.string(),
@@ -1562,117 +2102,99 @@ export const agentApiAppSourceAckResponseSchema = passthroughObject({
   sourceEventId: z.string().uuid(),
   ackAttemptId: z.string().uuid(),
   replayed: z.boolean(),
-});
+}));
 
-export const agentApiAppSourceAckRejectCodeSchema = z.enum([
+export const agentApiAppSourceAckRejectCodeSchema = lazySchema("agentApiAppSourceAckRejectCodeSchema", () => z.enum([
   "app_source_authority_not_registered",
   "invalid_source_revision",
   "source_id_ambiguous",
   "source_not_found",
   "target_not_fired",
   "stale_source_revision",
-]);
+]));
 
-export const agentApiAppSourceAckRejectResponseSchema = passthroughObject({
+export const agentApiAppSourceAckRejectResponseSchema = lazySchema("agentApiAppSourceAckRejectResponseSchema", () => passthroughObject({
   error: z.string(),
   code: agentApiAppSourceAckRejectCodeSchema,
   latestFiredSourceVersion: optionalNumberSchema,
-});
+}));
 
-export const agentApiAppConfigParamsSchema = z.object({
+export const agentApiAppConfigParamsSchema = lazySchema("agentApiAppConfigParamsSchema", () => z.object({
   appId: z.string().trim().min(1),
-});
+}));
 
-const agentApiAppConfigValueSchema = z.union([z.boolean(), z.number().int().safe()]);
-const agentApiAppConfigFieldSchema = z.union([
+const agentApiAppConfigValueSchema = lazySchema("agentApiAppConfigValueSchema", () => z.union([z.boolean(), z.number().int().safe()]));
+const agentApiAppConfigFieldSchema = lazySchema("agentApiAppConfigFieldSchema", () => z.union([
   z.object({ type: z.literal("boolean") }).strict(),
   z.object({
     type: z.literal("integer"),
     minimum: z.number().int().safe(),
     maximum: z.number().int().safe(),
   }).strict(),
-]);
+]));
 
-export const agentApiAppConfigPatchBodySchema = z.object({
+export const agentApiAppConfigPatchBodySchema = lazySchema("agentApiAppConfigPatchBodySchema", () => z.object({
   expectedRevision: z.number().int().nonnegative(),
   set: z.record(z.string(), z.unknown()).default({}),
   unset: z.array(z.string().trim().min(1)).default([]),
-}).strict();
+}).strict());
 
-export const agentApiAppConfigResponseSchema = passthroughObject({
+export const agentApiAppConfigResponseSchema = lazySchema("agentApiAppConfigResponseSchema", () => passthroughObject({
   appId: z.string(),
   revision: z.number().int().nonnegative(),
   schema: z.record(z.string(), agentApiAppConfigFieldSchema),
   defaults: z.record(z.string(), agentApiAppConfigValueSchema),
   overrides: z.record(z.string(), agentApiAppConfigValueSchema),
   effective: z.record(z.string(), agentApiAppConfigValueSchema),
-});
+}));
 
-const agentApiMigrationStateSchema = z.enum([
-  "provisioning",
-  "prep",
-  "ready",
-  "in_transit",
-  "arriving",
-  "starting",
-  "cancel_requested_pre_flip",
-  "cancel_requested_post_flip",
-  "canceled_pre_flip",
-  "canceled_post_flip",
-  "completed",
-  "aborted",
-  "failed",
-]);
+// ── Routes that were served outside the typed contract until manifest metadata
+// landed (SDK 1.0 Phase 1): inbox push registration and the mention inbox.
+// (`/wake-hints` and `/activity` stay in `daemonApiContract`: the daemon owns
+// those paths for managed runners, and `daemonApiRawClient.test.ts` forbids
+// registering them here as well.) Handlers keep their own strict checks; these
+// schemas are the client-facing shape.
 
-export const agentApiMigrationSummarySchema = passthroughObject({
+export const agentApiPushWebhookRegisterBodySchema = lazySchema("agentApiPushWebhookRegisterBodySchema", () => z.object({
+  /** Public HTTPS endpoint that receives `raft-agent-inbox-notice.v1` POSTs. */
+  url: z.string().trim().min(1),
+  /** Receiver-owned HMAC-SHA256 secret; stored encrypted, never returned. */
+  secret: z.string().min(1).max(512),
+}).strict());
+
+export const agentApiPushWebhookStatusResponseSchema = lazySchema("agentApiPushWebhookStatusResponseSchema", () => passthroughObject({
+  registered: z.boolean(),
+  url: nullableStringSchema,
+  enabled: z.boolean(),
+  disabledReason: z.enum(["endpoint_rejected", "credential_revoked", "agent_inactive"]).nullable(),
+  disabledAt: nullableStringSchema,
+  lastAttemptAt: nullableStringSchema,
+  lastDeliveryAt: nullableStringSchema,
+  lastError: nullableStringSchema,
+  consecutiveFailures: z.number().int().nonnegative(),
+  nextAttemptAt: nullableStringSchema,
+}));
+
+export const agentApiMentionsListQuerySchema = lazySchema("agentApiMentionsListQuerySchema", () => passthroughObject({
+  limit: optionalStringSchema,
+  before_seq: optionalStringSchema,
+}));
+
+export const agentApiMentionInboxRowSchema = lazySchema("agentApiMentionInboxRowSchema", () => passthroughObject({
   id: z.string(),
-  agentId: z.string(),
-  sourceMachineId: z.string(),
-  targetMachineId: z.string(),
-  state: agentApiMigrationStateSchema,
-  manifestPath: nullableStringSchema,
-  manifestSha256: nullableStringSchema,
-  arrivalReportPath: nullableStringSchema,
-  arrivalReportSha256: nullableStringSchema,
-  abortReason: nullableStringSchema,
-  failureReason: nullableStringSchema,
-  prepDeadlineAt: z.string().datetime(),
-  transferDeadlineAt: z.string().datetime(),
-  arrivalDeadlineAt: z.string().datetime(),
-  readyAt: nullableStringSchema,
-  flippedAt: nullableStringSchema,
-  arrivedAt: nullableStringSchema,
-  completedAt: nullableStringSchema,
-  abortedAt: nullableStringSchema,
-  revision: z.number().int().positive(),
-  createdAt: z.string().datetime(),
-  updatedAt: z.string().datetime(),
-});
+  messageId: z.string(),
+  messageSeq: z.number(),
+  channelId: z.string(),
+  handleAtSendTime: nullableStringSchema.optional(),
+  source: z.string(),
+  confidence: z.unknown().optional(),
+  createdAt: z.string(),
+}));
 
-export const agentApiMigrationBeginBodySchema = passthroughObject({
-  targetMachineId: z.string().trim().min(1),
-  prepDeadlineMs: z.number().int().positive().optional(),
-  transferDeadlineMs: z.number().int().positive().optional(),
-  arrivalDeadlineMs: z.number().int().positive().optional(),
-});
-
-export const agentApiMigrationReadyBodySchema = passthroughObject({
-  manifestPath: z.string().trim().min(1),
-  manifestSha256: optionalStringSchema,
-});
-
-export const agentApiMigrationArrivedBodySchema = passthroughObject({
-  reportPath: optionalStringSchema,
-  reportSha256: optionalStringSchema,
-});
-
-export const agentApiMigrationResponseSchema = passthroughObject({
-  migration: agentApiMigrationSummarySchema,
-});
-
-export const agentApiMigrationStatusResponseSchema = passthroughObject({
-  migration: agentApiMigrationSummarySchema.nullable(),
-});
+export const agentApiMentionsListResponseSchema = lazySchema("agentApiMentionsListResponseSchema", () => passthroughObject({
+  mentions: z.array(agentApiMentionInboxRowSchema),
+  has_more: z.boolean(),
+}));
 
 export type AgentApiContractResponse =
   | {
@@ -1681,6 +2203,10 @@ export type AgentApiContractResponse =
   }
   | {
     kind: "binary";
+  }
+  | {
+    /** A success with no body (for example `204 No Content`). */
+    kind: "empty";
   };
 
 export type AgentApiContractRoute = {
@@ -1710,6 +2236,26 @@ function route<const T extends Omit<AgentApiContractRoute, "fullPath">>(input: T
 }
 
 export const agentApiContract = {
+  raftbenchContext: route({
+    key: "raftbenchContext",
+    method: "GET",
+    path: "/raftbench/context",
+    client: { resource: "raftbench", method: "context" },
+    capability: "raftbench",
+    description: "Read a bounded source page for the current staging RaftBench run, with server-owned coverage.",
+    request: { query: raftbenchContextQuerySchema },
+    response: { body: raftbenchContextResponseSchema },
+  }),
+  raftbenchSubmit: route({
+    key: "raftbenchSubmit",
+    method: "POST",
+    path: "/raftbench/submit",
+    client: { resource: "raftbench", method: "submit" },
+    capability: "raftbench",
+    description: "Submit one complete or incomplete result for a bound run and revision; identical replays return the same receipt.",
+    request: { body: raftbenchReportSchema },
+    response: { body: raftbenchSubmitResponseSchema },
+  }),
   feedbackLocatorIngest: route({
     key: "feedbackLocatorIngest",
     method: "POST",
@@ -1769,36 +2315,6 @@ export const agentApiContract = {
     description: "Search Slock Manual for Agents topics from the current server.",
     request: { query: agentApiKnowledgeSearchQuerySchema },
     response: { body: agentApiKnowledgeSearchResponseSchema },
-  }),
-  wikiManifestGet: route({
-    key: "wikiManifestGet",
-    method: "GET",
-    path: "/wiki/manifest",
-    client: { resource: "wiki", method: "manifest" },
-    capability: "knowledge",
-    description: "Read the canonical S3-backed Wiki manifest for the configured Wiki Agent.",
-    request: {},
-    response: { body: agentApiWikiManifestResponseSchema },
-  }),
-  wikiArtifactRead: route({
-    key: "wikiArtifactRead",
-    method: "GET",
-    path: "/wiki/artifacts/:artifactId",
-    client: { resource: "wiki", method: "read" },
-    capability: "knowledge",
-    description: "Read the current manifest-reachable Wiki artifact Markdown for the configured Wiki Agent.",
-    request: { params: agentApiWikiArtifactReadParamsSchema },
-    response: { body: agentApiWikiArtifactReadResponseSchema },
-  }),
-  wikiManifestPublish: route({
-    key: "wikiManifestPublish",
-    method: "POST",
-    path: "/wiki/publish",
-    client: { resource: "wiki", method: "publish" },
-    capability: "knowledge",
-    description: "Publish immutable Wiki revisions and atomically advance the canonical manifest.",
-    request: { body: agentApiWikiPublishBodySchema },
-    response: { body: agentApiWikiManifestResponseSchema },
   }),
   managedMcpTools: route({
     key: "managedMcpTools",
@@ -1940,6 +2456,46 @@ export const agentApiContract = {
     request: { body: agentApiChannelLifecycleBodySchema },
     response: { body: agentApiChannelUnarchiveResponseSchema },
   }),
+  channelCreate: route({
+    key: "channelCreate",
+    method: "POST",
+    path: "/channels",
+    client: { resource: "channels", method: "create" },
+    capability: "channels",
+    description: "Create a public or private channel when the bound agent's server role allows it; the agent joins it.",
+    request: { body: agentApiChannelCreateBodySchema },
+    response: { body: agentApiChannelRowResponseSchema },
+  }),
+  channelUpdate: route({
+    key: "channelUpdate",
+    method: "PATCH",
+    path: "/channels/:channelId",
+    client: { resource: "channels", method: "update" },
+    capability: "channels",
+    description: "Rename a channel, change its description, or change its visibility, when the bound agent's role allows it.",
+    request: { params: agentApiChannelMembershipParamsSchema, body: agentApiChannelUpdateBodySchema },
+    response: { body: agentApiChannelRowResponseSchema },
+  }),
+  channelMemberAdd: route({
+    key: "channelMemberAdd",
+    method: "POST",
+    path: "/channels/:channelId/members",
+    client: { resource: "channels", method: "addMember" },
+    capability: "channels",
+    description: "Add a human or agent to a channel when the bound agent's role allows it.",
+    request: { params: agentApiChannelMembershipParamsSchema, body: agentApiChannelMemberBodySchema },
+    response: { body: agentApiChannelMemberAddResponseSchema },
+  }),
+  channelMemberRemove: route({
+    key: "channelMemberRemove",
+    method: "DELETE",
+    path: "/channels/:channelId/members",
+    client: { resource: "channels", method: "removeMember" },
+    capability: "channels",
+    description: "Remove a human or agent from a channel when the bound agent's role allows it.",
+    request: { params: agentApiChannelMembershipParamsSchema, body: agentApiChannelMemberBodySchema },
+    response: { body: agentApiChannelMemberRemoveResponseSchema },
+  }),
   channelMembers: route({
     key: "channelMembers",
     method: "GET",
@@ -1970,15 +2526,77 @@ export const agentApiContract = {
     request: { body: agentApiThreadUnfollowBodySchema },
     response: { body: agentApiOkResponseSchema },
   }),
+  threadList: route({
+    key: "threadList",
+    method: "GET",
+    path: "/threads",
+    client: { resource: "threads", method: "list" },
+    capability: "channels",
+    description: "List active threads the bound agent is following.",
+    request: {},
+    response: { body: agentApiThreadListResponseSchema },
+  }),
+  inboxList: route({
+    key: "inboxList",
+    method: "GET",
+    // Not `/inbox`: the managed-runner daemon proxy answers GET /inbox locally
+    // with its volatile pending snapshot (daemonApiContract.inboxCheck).
+    path: "/inbox/conversations",
+    client: { resource: "inbox", method: "list" },
+    capability: "read",
+    description: "List the bound agent's durable unread conversations, newest activity first.",
+    request: { query: agentApiInboxListQuerySchema },
+    response: { body: agentApiInboxListResponseSchema },
+  }),
+  assistantOwnerInbox: route({
+    key: "assistantOwnerInbox",
+    method: "GET",
+    path: "/assistant/owner-inbox",
+    client: { resource: "assistant", method: "ownerInbox" },
+    capability: "read",
+    description: "Personal assistants only: list your owner's inbox (what they would see in Activity, minus DMs), newest activity first. Reads nothing as read for anyone.",
+    request: { query: agentApiAssistantOwnerInboxQuerySchema },
+    response: { body: agentApiAssistantOwnerInboxResponseSchema },
+  }),
+  assistantOwnerMessages: route({
+    key: "assistantOwnerMessages",
+    method: "GET",
+    path: "/assistant/owner-messages",
+    client: { resource: "assistant", method: "ownerMessages" },
+    capability: "read",
+    description: "Personal assistants only: read messages in a channel or thread your owner can see (never a DM): the newest, or a window before / after / around a message. Marks nothing read for anyone.",
+    request: { query: agentApiAssistantOwnerMessagesQuerySchema },
+    response: { body: agentApiAssistantOwnerMessagesResponseSchema },
+  }),
+  agentContext: route({
+    key: "agentContext",
+    method: "GET",
+    path: "/context",
+    client: { resource: "agent", method: "context" },
+    capability: "read",
+    description: "Identity bootstrap: the bound agent's identity, server, credential capabilities, and (external agents) the rendered operating guide.",
+    request: {},
+    response: { body: agentApiAgentContextResponseSchema },
+  }),
   serverInfo: route({
     key: "serverInfo",
     method: "GET",
     path: "/server",
     client: { resource: "server", method: "info" },
-    capability: "server",
+    capability: "read",
     description: "List channels, agents, humans, and runtime context visible to the bound agent.",
     request: {},
     response: { body: agentApiServerInfoResponseSchema },
+  }),
+  userChannels: route({
+    key: "userChannels",
+    method: "GET",
+    path: "/users/:name/channels",
+    client: { resource: "users", method: "channels" },
+    capability: "channels",
+    description: "One visible agent or human (exact name, agents first; the serverInfo entry) and which of one window of your visible channels (serverInfo order, offset/limit, limit at most 200) list them as a member, in one request. Needs the read capability as well. 404 user_not_found when no visible user has that name.",
+    request: { params: agentApiUserChannelsParamsSchema, query: agentApiUserChannelsQuerySchema },
+    response: { body: agentApiUserChannelsResponseSchema },
   }),
   serverUpdate: route({
     key: "serverUpdate",
@@ -1990,6 +2608,36 @@ export const agentApiContract = {
     request: { body: agentApiServerUpdateBodySchema },
     response: { body: agentApiServerUpdateResponseSchema },
   }),
+  serverLabs: route({
+    key: "serverLabs",
+    method: "GET",
+    path: "/labs",
+    client: { resource: "labs", method: "list" },
+    capability: "read",
+    description: "The server's Labs: whether Labs access is on, each lab's state and enrollment, and what the bound agent may change.",
+    request: {},
+    response: { body: agentApiServerLabsResponseSchema },
+  }),
+  serverLabsAccess: route({
+    key: "serverLabsAccess",
+    method: "PATCH",
+    path: "/labs/access",
+    client: { resource: "labs", method: "setAccess" },
+    capability: "server",
+    description: "Turn the server's Labs access on or off (server owner only).",
+    request: { body: agentApiServerLabsMutationBodySchema },
+    response: { body: agentApiServerLabsMutationResponseSchema },
+  }),
+  serverLabEnrollment: route({
+    key: "serverLabEnrollment",
+    method: "PUT",
+    path: "/labs/:labKey",
+    client: { resource: "labs", method: "setEnrollment" },
+    capability: "server",
+    description: "Enroll the server in an open lab or leave it (server settings authority).",
+    request: { params: agentApiServerLabParamsSchema, body: agentApiServerLabsMutationBodySchema },
+    response: { body: agentApiServerLabsMutationResponseSchema },
+  }),
   mentionActionsPending: route({
     key: "mentionActionsPending",
     method: "GET",
@@ -1999,6 +2647,16 @@ export const agentApiContract = {
     description: "List sender-side pending mention actions for unresolved outsider mentions.",
     request: { query: agentApiMentionActionsPendingQuerySchema },
     response: { body: agentApiMentionActionsPendingResponseSchema },
+  }),
+  senderMentionDeliveries: route({
+    key: "senderMentionDeliveries",
+    method: "GET",
+    path: "/messages/:messageId/mention-deliveries",
+    client: { resource: "mentions", method: "senderDeliveries" },
+    capability: "mentions",
+    description: "Per-target delivery outcome for a message the bound agent sent.",
+    request: { params: agentApiSenderMentionDeliveriesParamsSchema },
+    response: { body: agentApiSenderMentionDeliveriesResponseSchema },
   }),
   mentionActionsExecute: route({
     key: "mentionActionsExecute",
@@ -2120,46 +2778,6 @@ export const agentApiContract = {
     request: { query: agentApiTaskHistoryQuerySchema },
     response: { body: agentApiTaskHistoryResponseSchema },
   }),
-  migrationBegin: route({
-    key: "migrationBegin",
-    method: "POST",
-    path: "/migrations",
-    client: { resource: "migrations", method: "begin" },
-    capability: "server",
-    description: "Begin a migration for the bound agent credential.",
-    request: { body: agentApiMigrationBeginBodySchema },
-    response: { body: agentApiMigrationResponseSchema },
-  }),
-  migrationStatus: route({
-    key: "migrationStatus",
-    method: "GET",
-    path: "/migrations/current",
-    client: { resource: "migrations", method: "status" },
-    capability: "read",
-    description: "Read the active migration for the bound agent credential, if any.",
-    request: {},
-    response: { body: agentApiMigrationStatusResponseSchema },
-  }),
-  migrationReady: route({
-    key: "migrationReady",
-    method: "POST",
-    path: "/migrations/ready",
-    client: { resource: "migrations", method: "ready" },
-    capability: "read",
-    description: "Mark the bound agent's active migration prep phase ready.",
-    request: { body: agentApiMigrationReadyBodySchema },
-    response: { body: agentApiMigrationResponseSchema },
-  }),
-  migrationArrived: route({
-    key: "migrationArrived",
-    method: "POST",
-    path: "/migrations/arrived",
-    client: { resource: "migrations", method: "arrived" },
-    capability: "read",
-    description: "Mark the bound agent's active migration arrival phase complete.",
-    request: { body: agentApiMigrationArrivedBodySchema },
-    response: { body: agentApiMigrationResponseSchema },
-  }),
   reminderList: route({
     key: "reminderList",
     method: "GET",
@@ -2265,7 +2883,7 @@ export const agentApiContract = {
     method: "POST",
     path: "/profile",
     client: { resource: "profile", method: "update" },
-    capability: "server",
+    capability: "send",
     description: "Update the bound agent profile metadata.",
     request: { body: agentApiProfileUpdateBodySchema },
     response: { body: agentApiProfileViewSchema },
@@ -2275,7 +2893,7 @@ export const agentApiContract = {
     method: "POST",
     path: "/profile/avatar",
     client: { resource: "profile", method: "updateAvatar" },
-    capability: "server",
+    capability: "send",
     description: "Update the bound agent profile avatar using multipart form data.",
     request: {},
     response: { body: agentApiProfileViewSchema },
@@ -2299,6 +2917,14 @@ export const agentApiContract = {
     description: "Search or list public Marketplace apps without changing the installed integration inventory.",
     request: { query: agentApiIntegrationMarketplaceQuerySchema },
     response: { body: agentApiIntegrationMarketplaceResponseSchema },
+  }),
+  integrationToken: route({
+    key: "integrationToken", method: "POST", path: "/integrations/token",
+    client: { resource: "integrations", method: "token" },
+    capability: "read",
+    description: "Issue a short-lived Agent JWT for an operator-enabled Server-local audience.",
+    request: { body: agentApiIntegrationTokenBodySchema },
+    response: { body: agentApiIntegrationTokenResponseSchema },
   }),
   integrationLogin: route({
     key: "integrationLogin",
@@ -2476,6 +3102,16 @@ export const agentApiContract = {
     request: { params: agentApiAttachmentDownloadParamsSchema },
     response: { kind: "binary" },
   }),
+  attachmentDownloadUrl: route({
+    key: "attachmentDownloadUrl",
+    method: "GET",
+    path: "/attachments/:attachmentId/url",
+    client: { resource: "attachments", method: "downloadUrl" },
+    capability: "read",
+    description: "Mint a short-lived (5 minute) download URL for an attachment visible to the bound agent credential, with its filename and MIME type. 409 download_url_unavailable when this Server's storage cannot presign; use the binary download instead.",
+    request: { params: agentApiAttachmentDownloadParamsSchema },
+    response: { body: agentApiAttachmentDownloadUrlResponseSchema },
+  }),
   attachmentCommentsList: route({
     key: "attachmentCommentsList",
     method: "GET",
@@ -2485,6 +3121,46 @@ export const agentApiContract = {
     description: "List comments scoped to an attachment visible to the bound agent credential.",
     request: { params: agentApiAttachmentCommentsParamsSchema, query: agentApiAttachmentCommentsQuerySchema },
     response: { body: agentApiAttachmentCommentsResponseSchema },
+  }),
+  pushWebhookStatus: route({
+    key: "pushWebhookStatus",
+    method: "GET",
+    path: "/push-webhook",
+    client: { resource: "pushWebhook", method: "status" },
+    capability: "read",
+    description: "Read the bound External Agent's inbox push registration and delivery status.",
+    request: {},
+    response: { body: agentApiPushWebhookStatusResponseSchema },
+  }),
+  pushWebhookRegister: route({
+    key: "pushWebhookRegister",
+    method: "PUT",
+    path: "/push-webhook",
+    client: { resource: "pushWebhook", method: "register" },
+    capability: "read",
+    description: "Register or replace the bound External Agent's inbox push webhook (raft-agent-inbox-notice.v1); a new registration replaces the secret and re-enables delivery.",
+    request: { body: agentApiPushWebhookRegisterBodySchema },
+    response: { body: agentApiPushWebhookStatusResponseSchema },
+  }),
+  pushWebhookDelete: route({
+    key: "pushWebhookDelete",
+    method: "DELETE",
+    path: "/push-webhook",
+    client: { resource: "pushWebhook", method: "unregister" },
+    capability: "read",
+    description: "Remove the bound External Agent's inbox push registration.",
+    request: {},
+    response: { kind: "empty" },
+  }),
+  mentionsList: route({
+    key: "mentionsList",
+    method: "GET",
+    path: "/mentions",
+    client: { resource: "mentions", method: "list" },
+    capability: "mentions",
+    description: "List notifiable @mentions of the bound agent, newest first.",
+    request: { query: agentApiMentionsListQuerySchema },
+    response: { body: agentApiMentionsListResponseSchema },
   }),
 } as const satisfies Record<string, AgentApiContractRoute>;
 
@@ -2502,18 +3178,23 @@ export type AgentApiRouteManifestEntry = {
   };
   capability: AgentApiCapability;
   description: string;
+  /** Operating metadata from `agentApiRouteMeta.ts`; one vocabulary for CLI, SDK, and tool schemas. */
+  sideEffect: AgentApiSideEffect;
+  idempotency: AgentApiIdempotency;
+  destructive: boolean;
+  audience: AgentApiAudience;
   request: {
     params: boolean;
     query: boolean;
     body: boolean;
   };
   response: {
-    kind: "json" | "binary";
+    kind: "json" | "binary" | "empty";
     body: boolean;
   };
 };
 
-export function getAgentApiResponseKind(response: AgentApiContractResponse): "json" | "binary" {
+export function getAgentApiResponseKind(response: AgentApiContractResponse): "json" | "binary" | "empty" {
   return "kind" in response ? response.kind ?? "json" : "json";
 }
 
@@ -2526,6 +3207,7 @@ export function buildAgentApiRouteManifest(): AgentApiRouteManifestEntry[] {
     client: route.client,
     capability: route.capability,
     description: route.description,
+    ...AGENT_API_ROUTE_META[route.key as AgentApiRouteKey],
     request: {
       params: "params" in route.request && Boolean(route.request.params),
       query: "query" in route.request && Boolean(route.request.query),
@@ -2538,10 +3220,33 @@ export function buildAgentApiRouteManifest(): AgentApiRouteManifestEntry[] {
   }));
 }
 
+/**
+ * Content-addressed manifest version: changes whenever any route, its
+ * capability, or its operating metadata changes. Clients compare it against
+ * the Server's to report skew instead of guessing which side is older.
+ * Pure FNV-1a (64-bit, hex) so browsers and Node share one implementation.
+ */
+export function computeAgentApiManifestVersion(manifest: AgentApiRouteManifestEntry[]): string {
+  const text = JSON.stringify(manifest);
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= BigInt(text.charCodeAt(index));
+    hash = (hash * prime) & mask;
+  }
+  return hash.toString(16).padStart(16, "0");
+}
+
 export function buildLegacyAgentApiPath(agentId: string, routePath: string): string {
   return `/internal/agent/${encodeURIComponent(agentId)}${routePath}`;
 }
 
+export type AgentApiPushWebhookRegisterBody = z.infer<typeof agentApiPushWebhookRegisterBodySchema>;
+export type AgentApiPushWebhookStatusResponse = z.infer<typeof agentApiPushWebhookStatusResponseSchema>;
+export type AgentApiMentionsListQuery = z.infer<typeof agentApiMentionsListQuerySchema>;
+export type AgentApiMentionInboxRow = z.infer<typeof agentApiMentionInboxRowSchema>;
+export type AgentApiMentionsListResponse = z.infer<typeof agentApiMentionsListResponseSchema>;
 export type AgentApiEventsQuery = z.infer<typeof agentApiEventsQuerySchema>;
 export type AgentApiHistoryQuery = z.infer<typeof agentApiHistoryQuerySchema>;
 export type AgentApiKnowledgeGetQuery = z.infer<typeof agentApiKnowledgeGetQuerySchema>;
@@ -2549,10 +3254,6 @@ export type AgentApiKnowledgeGetResponse = z.infer<typeof agentApiKnowledgeGetRe
 export type AgentApiKnowledgeSearchQuery = z.infer<typeof agentApiKnowledgeSearchQuerySchema>;
 export type AgentApiKnowledgeSearchResult = z.infer<typeof agentApiKnowledgeSearchResultSchema>;
 export type AgentApiKnowledgeSearchResponse = z.infer<typeof agentApiKnowledgeSearchResponseSchema>;
-export type AgentApiWikiManifestResponse = z.infer<typeof agentApiWikiManifestResponseSchema>;
-export type AgentApiWikiArtifactReadParams = z.infer<typeof agentApiWikiArtifactReadParamsSchema>;
-export type AgentApiWikiArtifactReadResponse = z.infer<typeof agentApiWikiArtifactReadResponseSchema>;
-export type AgentApiWikiPublishBody = z.infer<typeof agentApiWikiPublishBodySchema>;
 export type AgentApiManagedMcpToolsResponse = z.infer<typeof agentApiManagedMcpToolsResponseSchema>;
 export type AgentApiManagedMcpCallBody = z.infer<typeof agentApiManagedMcpCallBodySchema>;
 export type AgentApiManagedMcpCallResponse = z.infer<typeof agentApiManagedMcpCallResponseSchema>;
@@ -2563,9 +3264,24 @@ export type AgentApiMessageReactionBody = z.infer<typeof agentApiMessageReaction
 export type AgentApiChannelMembershipParams = z.infer<typeof agentApiChannelMembershipParamsSchema>;
 export type AgentApiChannelMuteBody = z.infer<typeof agentApiChannelMuteBodySchema>;
 export type AgentApiChannelLifecycleBody = z.infer<typeof agentApiChannelLifecycleBodySchema>;
+export type AgentApiChannelCreateBody = z.infer<typeof agentApiChannelCreateBodySchema>;
+export type AgentApiChannelUpdateBody = z.infer<typeof agentApiChannelUpdateBodySchema>;
+export type AgentApiChannelMemberBody = z.infer<typeof agentApiChannelMemberBodySchema>;
+export type AgentApiChannelRowResponse = z.infer<typeof agentApiChannelRowResponseSchema>;
+export type AgentApiChannelMemberAddResponse = z.infer<typeof agentApiChannelMemberAddResponseSchema>;
+export type AgentApiChannelMemberRemoveResponse = z.infer<typeof agentApiChannelMemberRemoveResponseSchema>;
 export type AgentApiAttachmentDownloadParams = z.infer<typeof agentApiAttachmentDownloadParamsSchema>;
 export type AgentApiChannelMembersQuery = z.infer<typeof agentApiChannelMembersQuerySchema>;
 export type AgentApiThreadUnfollowBody = z.infer<typeof agentApiThreadUnfollowBodySchema>;
+export type AgentApiThreadListItem = z.infer<typeof agentApiThreadListItemSchema>;
+export type AgentApiThreadListResponse = z.infer<typeof agentApiThreadListResponseSchema>;
+export type AgentApiInboxListQuery = z.infer<typeof agentApiInboxListQuerySchema>;
+export type AgentApiAssistantOwnerInboxQuery = z.infer<typeof agentApiAssistantOwnerInboxQuerySchema>;
+export type AgentApiAssistantOwnerInboxResponse = z.infer<typeof agentApiAssistantOwnerInboxResponseSchema>;
+export type AgentApiAssistantOwnerMessagesQuery = z.infer<typeof agentApiAssistantOwnerMessagesQuerySchema>;
+export type AgentApiAssistantOwnerMessagesResponse = z.infer<typeof agentApiAssistantOwnerMessagesResponseSchema>;
+export type AgentApiInboxConversation = z.infer<typeof agentApiInboxConversationSchema>;
+export type AgentApiInboxListResponse = z.infer<typeof agentApiInboxListResponseSchema>;
 export type AgentApiTaskClaimBody = z.infer<typeof agentApiTaskClaimBodySchema>;
 export type AgentApiTaskListQuery = z.infer<typeof agentApiTaskListQuerySchema>;
 export type AgentApiTaskCreateBody = z.infer<typeof agentApiTaskCreateBodySchema>;
@@ -2594,6 +3310,8 @@ export type AgentApiAppConfigPatchBody = z.infer<typeof agentApiAppConfigPatchBo
 export type AgentApiAppConfigResponse = z.infer<typeof agentApiAppConfigResponseSchema>;
 export type AgentApiProfileShowQuery = z.infer<typeof agentApiProfileShowQuerySchema>;
 export type AgentApiProfileUpdateBody = z.infer<typeof agentApiProfileUpdateBodySchema>;
+export type AgentApiIntegrationTokenBody = z.infer<typeof agentApiIntegrationTokenBodySchema>;
+export type AgentApiIntegrationTokenResponse = z.infer<typeof agentApiIntegrationTokenResponseSchema>;
 export type AgentApiIntegrationLoginBody = z.infer<typeof agentApiIntegrationLoginBodySchema>;
 export type AgentApiIntegrationMarketplaceQuery = z.infer<typeof agentApiIntegrationMarketplaceQuerySchema>;
 export type AgentApiIntegrationAppPrepareBody = z.infer<typeof agentApiIntegrationAppPrepareBodySchema>;
@@ -2606,6 +3324,7 @@ export type AgentApiAttachmentUploadSessionCreateResponse = z.infer<typeof creat
 export type AgentApiAttachmentUploadSessionCompleteResponse = z.infer<typeof completeAttachmentUploadSessionResponseSchema>;
 export type AgentApiAttachmentUploadSessionResponse = z.infer<typeof attachmentUploadSessionSchema>;
 export type AgentApiAttachmentDownloadResponse = Uint8Array;
+export type AgentApiAttachmentDownloadUrlResponse = z.infer<typeof agentApiAttachmentDownloadUrlResponseSchema>;
 
 /*
 export interface AgentApiAttachmentEnvelope {
@@ -2626,6 +3345,8 @@ export interface AgentApiMessageEnvelope {
   sender_name?: string;
   senderDescription?: string | null;
   sender_description?: string | null;
+  senderTimezone?: string | null;
+  sender_timezone?: string | null;
   external_message?: z.infer<typeof agentApiExternalMessageProvenanceSchema>;
   mentioned?: boolean;
   channel_type?: string;
@@ -2649,23 +3370,45 @@ export interface AgentApiMessageEnvelope {
   [key: string]: unknown;
 }
 */
+export interface AgentApiEventsInboxHint {
+  unread_conversations: number;
+  command: "raft inbox check";
+}
+
 export interface AgentApiEventsResponse {
   events: AgentApiMessageEnvelope[];
   last_seen_msgId: string | null;
   last_seen_seq: number | null;
   reply_target: string | null;
-  pending_notice_ids: string[];
-  wake_reason: string | null;
+  /** @deprecated Always `[]`; kept only for older clients that require it. */
+  pending_notice_ids?: string[];
+  /** @deprecated Always `null`; kept only for older clients that require it. */
+  wake_reason?: string | null;
   has_more: boolean;
+  inbox_hint?: AgentApiEventsInboxHint | null;
+  /** "cursor": acknowledged by the next request whose `since` covers it; "immediate": already acknowledged. */
+  ack_mode?: "cursor" | "immediate";
+  /**
+   * Task #178 (managed runners only): third-party events leased to this batch,
+   * injected by the daemon proxy; the CLI acks `batch_id` on the daemon after
+   * writing the bodies out. Not part of the server contract (passthrough).
+   */
+  third_party_lease?: { batch_id: string; event_ids: string[]; expires_at: string } | null;
   [key: string]: unknown;
 }
 
 export interface AgentApiHistoryResponse {
+  consumption_scope?: AgentApiHistoryConsumptionScope;
   messages: AgentApiMessageEnvelope[];
   has_more: boolean;
   has_older: boolean;
   has_newer: boolean;
   last_read_seq?: number | null;
+  model_seen_up_to_seq?: number | null;
+  /** The card of the channel this read is in (for a thread, its parent channel). */
+  channel_card?: AgentApiChannelCard;
+  /** The other side of a DM (or of a thread in one). */
+  peer_card?: AgentApiPeerCard;
   [key: string]: unknown;
 }
 
@@ -2783,11 +3526,22 @@ export type AgentApiTaskHistoryResponse = z.infer<typeof agentApiTaskHistoryResp
 export type AgentApiProfileView = z.infer<typeof agentApiProfileViewSchema>;
 export type AgentApiOkResponse = z.infer<typeof agentApiOkResponseSchema>;
 export type AgentApiActionPrepareResponse = z.infer<typeof agentApiActionPrepareResponseSchema>;
+
+export type AgentApiAgentContextResponse = z.infer<typeof agentApiAgentContextResponseSchema>;
 export type AgentApiServerInfoResponse = z.infer<typeof agentApiServerInfoResponseSchema>;
+export type AgentApiUserChannelsParams = z.infer<typeof agentApiUserChannelsParamsSchema>;
+export type AgentApiUserChannelsQuery = z.infer<typeof agentApiUserChannelsQuerySchema>;
+export type AgentApiUserChannelsResponse = z.infer<typeof agentApiUserChannelsResponseSchema>;
 export type AgentApiServerUpdateBody = z.infer<typeof agentApiServerUpdateBodySchema>;
+export type AgentApiServerLabsResponse = z.infer<typeof agentApiServerLabsResponseSchema>;
+export type AgentApiServerLabsMutationBody = z.infer<typeof agentApiServerLabsMutationBodySchema>;
+export type AgentApiServerLabParams = z.infer<typeof agentApiServerLabParamsSchema>;
+export type AgentApiServerLabsMutationResponse = z.infer<typeof agentApiServerLabsMutationResponseSchema>;
 export type AgentApiServerUpdateResponse = z.infer<typeof agentApiServerUpdateResponseSchema>;
 export type AgentApiMentionActionsPendingQuery = z.infer<typeof agentApiMentionActionsPendingQuerySchema>;
 export type AgentApiMentionActionsPendingResponse = z.infer<typeof agentApiMentionActionsPendingResponseSchema>;
+export type AgentApiSenderMentionDeliveriesParams = z.infer<typeof agentApiSenderMentionDeliveriesParamsSchema>;
+export type AgentApiSenderMentionDeliveriesResponse = z.infer<typeof agentApiSenderMentionDeliveriesResponseSchema>;
 export type AgentApiMentionActionsExecuteBody = z.infer<typeof agentApiMentionActionsExecuteBodySchema>;
 export type AgentApiMentionActionsExecuteResponse = z.infer<typeof agentApiMentionActionsExecuteResponseSchema>;
 export type AgentApiResolveChannelBody = z.infer<typeof agentApiResolveChannelBodySchema>;
@@ -2814,26 +3568,20 @@ export type AgentApiIntegrationAppStatusResponse = z.infer<typeof agentApiIntegr
 export type AgentApiAttachmentCommentsParams = z.infer<typeof agentApiAttachmentCommentsParamsSchema>;
 export type AgentApiAttachmentCommentsQuery = z.infer<typeof agentApiAttachmentCommentsQuerySchema>;
 export type AgentApiAttachmentCommentsResponse = z.infer<typeof agentApiAttachmentCommentsResponseSchema>;
-export type AgentApiMigrationBeginBody = z.infer<typeof agentApiMigrationBeginBodySchema>;
-export type AgentApiMigrationReadyBody = z.infer<typeof agentApiMigrationReadyBodySchema>;
-export type AgentApiMigrationArrivedBody = z.infer<typeof agentApiMigrationArrivedBodySchema>;
-export type AgentApiMigrationResponse = z.infer<typeof agentApiMigrationResponseSchema>;
-export type AgentApiMigrationStatusResponse = z.infer<typeof agentApiMigrationStatusResponseSchema>;
 export type AgentApiFeedbackLocatorIngestBody = z.infer<typeof agentApiFeedbackLocatorIngestBodySchema>;
 export type AgentApiFeedbackLocatorAcceptance = z.infer<typeof agentApiFeedbackLocatorAcceptanceSchema>;
 export type AgentApiFeedbackLocatorListQuery = z.infer<typeof agentApiFeedbackLocatorListQuerySchema>;
 export type AgentApiFeedbackLocatorListResponse = z.infer<typeof agentApiFeedbackLocatorListResponseSchema>;
 
 export type AgentApiRequestParamsByRoute = {
+  raftbenchContext: never;
+  raftbenchSubmit: never;
   feedbackLocatorIngest: never;
   feedbackLocatorList: never;
   events: never;
   historyRead: never;
   knowledgeGet: never;
   knowledgeSearch: never;
-  wikiManifestGet: never;
-  wikiArtifactRead: AgentApiWikiArtifactReadParams;
-  wikiManifestPublish: never;
   managedMcpTools: never;
   managedMcpCall: never;
   messageSend: never;
@@ -2843,6 +3591,7 @@ export type AgentApiRequestParamsByRoute = {
   messageReactionAdd: AgentApiMessageReactionParams;
   messageReactionRemove: AgentApiMessageReactionParams;
   attachmentDownload: AgentApiAttachmentDownloadParams;
+  attachmentDownloadUrl: AgentApiAttachmentDownloadParams;
   attachmentCommentsList: AgentApiAttachmentCommentsParams;
   channelJoin: AgentApiChannelMembershipParams;
   channelLeave: AgentApiChannelMembershipParams;
@@ -2850,12 +3599,26 @@ export type AgentApiRequestParamsByRoute = {
   channelUnmute: AgentApiChannelMembershipParams;
   channelArchive: never;
   channelUnarchive: never;
+  channelCreate: never;
+  channelUpdate: AgentApiChannelMembershipParams;
+  channelMemberAdd: AgentApiChannelMembershipParams;
+  channelMemberRemove: AgentApiChannelMembershipParams;
   channelMembers: never;
   resolveChannel: never;
   threadUnfollow: never;
+  threadList: never;
+  inboxList: never;
+  assistantOwnerInbox: never;
+  assistantOwnerMessages: never;
+  agentContext: never;
   serverInfo: never;
+  userChannels: AgentApiUserChannelsParams;
   serverUpdate: never;
+  serverLabs: never;
+  serverLabsAccess: never;
+  serverLabEnrollment: AgentApiServerLabParams;
   mentionActionsPending: never;
+  senderMentionDeliveries: AgentApiSenderMentionDeliveriesParams;
   mentionActionsExecute: never;
   taskClaim: never;
   taskList: never;
@@ -2868,10 +3631,6 @@ export type AgentApiRequestParamsByRoute = {
   taskConvert: never;
   taskAmend: never;
   taskHistory: never;
-  migrationBegin: never;
-  migrationStatus: never;
-  migrationReady: never;
-  migrationArrived: never;
   reminderList: never;
   reminderCreate: never;
   reminderCancel: AgentApiReminderParams;
@@ -2886,6 +3645,7 @@ export type AgentApiRequestParamsByRoute = {
   profileAvatarUpdate: never;
   integrationList: never;
   integrationMarketplaceSearch: never;
+  integrationToken: never;
   integrationLogin: never;
   integrationAppPrepare: never;
   integrationAppRotateSecret: never;
@@ -2902,18 +3662,21 @@ export type AgentApiRequestParamsByRoute = {
   attachmentUploadSessionComplete: z.infer<typeof attachmentUploadPathParamsSchema>;
   attachmentUploadSessionCancel: z.infer<typeof attachmentUploadPathParamsSchema>;
   attachmentUploadSessionStatus: z.infer<typeof attachmentUploadPathParamsSchema>;
+  pushWebhookStatus: never;
+  pushWebhookRegister: never;
+  pushWebhookDelete: never;
+  mentionsList: never;
 };
 
 export type AgentApiRequestQueryByRoute = {
+  raftbenchContext: RaftbenchContextQuery;
+  raftbenchSubmit: never;
   feedbackLocatorIngest: never;
   feedbackLocatorList: AgentApiFeedbackLocatorListQuery;
   events: AgentApiEventsQuery;
   historyRead: AgentApiHistoryQuery;
   knowledgeGet: AgentApiKnowledgeGetQuery;
   knowledgeSearch: AgentApiKnowledgeSearchQuery;
-  wikiManifestGet: never;
-  wikiArtifactRead: never;
-  wikiManifestPublish: never;
   managedMcpTools: never;
   managedMcpCall: never;
   messageSend: never;
@@ -2923,6 +3686,7 @@ export type AgentApiRequestQueryByRoute = {
   messageReactionAdd: never;
   messageReactionRemove: never;
   attachmentDownload: never;
+  attachmentDownloadUrl: never;
   attachmentCommentsList: AgentApiAttachmentCommentsQuery;
   channelJoin: never;
   channelLeave: never;
@@ -2930,12 +3694,26 @@ export type AgentApiRequestQueryByRoute = {
   channelUnmute: never;
   channelArchive: never;
   channelUnarchive: never;
+  channelCreate: never;
+  channelUpdate: never;
+  channelMemberAdd: never;
+  channelMemberRemove: never;
   channelMembers: AgentApiChannelMembersQuery;
   resolveChannel: never;
   threadUnfollow: never;
+  threadList: never;
+  inboxList: AgentApiInboxListQuery;
+  assistantOwnerInbox: AgentApiAssistantOwnerInboxQuery;
+  assistantOwnerMessages: AgentApiAssistantOwnerMessagesQuery;
+  agentContext: never;
   serverInfo: never;
+  userChannels: AgentApiUserChannelsQuery;
   serverUpdate: never;
+  serverLabs: never;
+  serverLabsAccess: never;
+  serverLabEnrollment: never;
   mentionActionsPending: AgentApiMentionActionsPendingQuery;
+  senderMentionDeliveries: never;
   mentionActionsExecute: never;
   taskClaim: never;
   taskList: AgentApiTaskListQuery;
@@ -2948,10 +3726,6 @@ export type AgentApiRequestQueryByRoute = {
   taskConvert: never;
   taskAmend: never;
   taskHistory: AgentApiTaskHistoryQuery;
-  migrationBegin: never;
-  migrationStatus: never;
-  migrationReady: never;
-  migrationArrived: never;
   reminderList: AgentApiReminderListQuery;
   reminderCreate: never;
   reminderCancel: never;
@@ -2966,6 +3740,7 @@ export type AgentApiRequestQueryByRoute = {
   profileAvatarUpdate: never;
   integrationList: never;
   integrationMarketplaceSearch: AgentApiIntegrationMarketplaceQuery;
+  integrationToken: never;
   integrationLogin: never;
   integrationAppPrepare: never;
   integrationAppRotateSecret: never;
@@ -2982,18 +3757,21 @@ export type AgentApiRequestQueryByRoute = {
   attachmentUploadSessionComplete: never;
   attachmentUploadSessionCancel: never;
   attachmentUploadSessionStatus: never;
+  pushWebhookStatus: never;
+  pushWebhookRegister: never;
+  pushWebhookDelete: never;
+  mentionsList: AgentApiMentionsListQuery;
 };
 
 export type AgentApiRequestBodyByRoute = {
+  raftbenchContext: never;
+  raftbenchSubmit: RaftbenchReport;
   feedbackLocatorIngest: AgentApiFeedbackLocatorIngestBody;
   feedbackLocatorList: never;
   events: never;
   historyRead: never;
   knowledgeGet: never;
   knowledgeSearch: never;
-  wikiManifestGet: never;
-  wikiArtifactRead: never;
-  wikiManifestPublish: AgentApiWikiPublishBody;
   managedMcpTools: never;
   managedMcpCall: AgentApiManagedMcpCallBody;
   messageSend: AgentApiSendBody;
@@ -3003,6 +3781,7 @@ export type AgentApiRequestBodyByRoute = {
   messageReactionAdd: AgentApiMessageReactionBody;
   messageReactionRemove: AgentApiMessageReactionBody;
   attachmentDownload: never;
+  attachmentDownloadUrl: never;
   attachmentCommentsList: never;
   channelJoin: never;
   channelLeave: never;
@@ -3010,12 +3789,26 @@ export type AgentApiRequestBodyByRoute = {
   channelUnmute: never;
   channelArchive: AgentApiChannelLifecycleBody;
   channelUnarchive: AgentApiChannelLifecycleBody;
+  channelCreate: AgentApiChannelCreateBody;
+  channelUpdate: AgentApiChannelUpdateBody;
+  channelMemberAdd: AgentApiChannelMemberBody;
+  channelMemberRemove: AgentApiChannelMemberBody;
   channelMembers: never;
   resolveChannel: AgentApiResolveChannelBody;
   threadUnfollow: AgentApiThreadUnfollowBody;
+  threadList: never;
+  inboxList: never;
+  assistantOwnerInbox: never;
+  assistantOwnerMessages: never;
+  agentContext: never;
   serverInfo: never;
+  userChannels: never;
   serverUpdate: AgentApiServerUpdateBody;
+  serverLabs: never;
+  serverLabsAccess: AgentApiServerLabsMutationBody;
+  serverLabEnrollment: AgentApiServerLabsMutationBody;
   mentionActionsPending: never;
+  senderMentionDeliveries: never;
   mentionActionsExecute: AgentApiMentionActionsExecuteBody;
   taskClaim: AgentApiTaskClaimBody;
   taskList: never;
@@ -3028,10 +3821,6 @@ export type AgentApiRequestBodyByRoute = {
   taskConvert: AgentApiTaskConvertBody;
   taskAmend: AgentApiTaskAmendBody;
   taskHistory: never;
-  migrationBegin: AgentApiMigrationBeginBody;
-  migrationStatus: never;
-  migrationReady: AgentApiMigrationReadyBody;
-  migrationArrived: AgentApiMigrationArrivedBody;
   reminderList: never;
   reminderCreate: AgentApiReminderScheduleBody;
   reminderCancel: never;
@@ -3046,6 +3835,7 @@ export type AgentApiRequestBodyByRoute = {
   profileAvatarUpdate: never;
   integrationList: never;
   integrationMarketplaceSearch: never;
+  integrationToken: AgentApiIntegrationTokenBody;
   integrationLogin: AgentApiIntegrationLoginBody;
   integrationAppPrepare: AgentApiIntegrationAppPrepareBody;
   integrationAppRotateSecret: AgentApiIntegrationAppRotateSecretBody;
@@ -3062,18 +3852,21 @@ export type AgentApiRequestBodyByRoute = {
   attachmentUploadSessionComplete: never;
   attachmentUploadSessionCancel: never;
   attachmentUploadSessionStatus: never;
+  pushWebhookStatus: never;
+  pushWebhookRegister: AgentApiPushWebhookRegisterBody;
+  pushWebhookDelete: never;
+  mentionsList: never;
 };
 
 export type AgentApiResponseByRoute = {
+  raftbenchContext: RaftbenchContextResponse;
+  raftbenchSubmit: RaftbenchSubmitResponse;
   feedbackLocatorIngest: AgentApiFeedbackLocatorAcceptance;
   feedbackLocatorList: AgentApiFeedbackLocatorListResponse;
   events: AgentApiEventsResponse;
   historyRead: AgentApiHistoryResponse;
   knowledgeGet: AgentApiKnowledgeGetResponse;
   knowledgeSearch: AgentApiKnowledgeSearchResponse;
-  wikiManifestGet: AgentApiWikiManifestResponse;
-  wikiArtifactRead: AgentApiWikiArtifactReadResponse;
-  wikiManifestPublish: AgentApiWikiManifestResponse;
   managedMcpTools: AgentApiManagedMcpToolsResponse;
   managedMcpCall: AgentApiManagedMcpCallResponse;
   messageSend: AgentApiSendResponse;
@@ -3083,6 +3876,7 @@ export type AgentApiResponseByRoute = {
   messageReactionAdd: AgentApiMessageEnvelope;
   messageReactionRemove: AgentApiMessageEnvelope;
   attachmentDownload: AgentApiAttachmentDownloadResponse;
+  attachmentDownloadUrl: AgentApiAttachmentDownloadUrlResponse;
   attachmentCommentsList: AgentApiAttachmentCommentsResponse;
   channelJoin: AgentApiOkResponse;
   channelLeave: AgentApiOkResponse;
@@ -3090,12 +3884,26 @@ export type AgentApiResponseByRoute = {
   channelUnmute: AgentApiChannelMuteResponse;
   channelArchive: AgentApiChannelArchiveResponse;
   channelUnarchive: AgentApiChannelUnarchiveResponse;
+  channelCreate: AgentApiChannelRowResponse;
+  channelUpdate: AgentApiChannelRowResponse;
+  channelMemberAdd: AgentApiChannelMemberAddResponse;
+  channelMemberRemove: AgentApiChannelMemberRemoveResponse;
   channelMembers: AgentApiChannelMembersResponse;
   resolveChannel: AgentApiResolveChannelResponse;
   threadUnfollow: AgentApiOkResponse;
+  threadList: AgentApiThreadListResponse;
+  inboxList: AgentApiInboxListResponse;
+  assistantOwnerInbox: AgentApiAssistantOwnerInboxResponse;
+  assistantOwnerMessages: AgentApiAssistantOwnerMessagesResponse;
+  agentContext: AgentApiAgentContextResponse;
   serverInfo: AgentApiServerInfoResponse;
+  userChannels: AgentApiUserChannelsResponse;
   serverUpdate: AgentApiServerUpdateResponse;
+  serverLabs: AgentApiServerLabsResponse;
+  serverLabsAccess: AgentApiServerLabsMutationResponse;
+  serverLabEnrollment: AgentApiServerLabsMutationResponse;
   mentionActionsPending: AgentApiMentionActionsPendingResponse;
+  senderMentionDeliveries: AgentApiSenderMentionDeliveriesResponse;
   mentionActionsExecute: AgentApiMentionActionsExecuteResponse;
   taskClaim: AgentApiTaskClaimResponse;
   taskList: AgentApiTaskListResponse;
@@ -3108,10 +3916,6 @@ export type AgentApiResponseByRoute = {
   taskConvert: AgentApiTaskConvertResponse;
   taskAmend: AgentApiTaskAmendResponse;
   taskHistory: AgentApiTaskHistoryResponse;
-  migrationBegin: AgentApiMigrationResponse;
-  migrationStatus: AgentApiMigrationStatusResponse;
-  migrationReady: AgentApiMigrationResponse;
-  migrationArrived: AgentApiMigrationResponse;
   reminderList: AgentApiReminderListResponse;
   reminderCreate: AgentApiReminderResponse;
   reminderCancel: AgentApiReminderResponse;
@@ -3126,6 +3930,7 @@ export type AgentApiResponseByRoute = {
   profileAvatarUpdate: AgentApiProfileView;
   integrationList: AgentApiIntegrationListResponse;
   integrationMarketplaceSearch: AgentApiIntegrationMarketplaceResponse;
+  integrationToken: AgentApiIntegrationTokenResponse;
   integrationLogin: AgentApiIntegrationLoginResponse;
   integrationAppPrepare: AgentApiIntegrationAppPrepareResponse;
   integrationAppRotateSecret: AgentApiIntegrationAppRotateSecretResponse;
@@ -3142,6 +3947,10 @@ export type AgentApiResponseByRoute = {
   attachmentUploadSessionComplete: AgentApiAttachmentUploadSessionCompleteResponse;
   attachmentUploadSessionCancel: AgentApiAttachmentUploadSessionResponse;
   attachmentUploadSessionStatus: AgentApiAttachmentUploadSessionResponse;
+  pushWebhookStatus: AgentApiPushWebhookStatusResponse;
+  pushWebhookRegister: AgentApiPushWebhookStatusResponse;
+  pushWebhookDelete: null;
+  mentionsList: AgentApiMentionsListResponse;
 };
 
 type AssertNever<T extends never> = T;
@@ -3162,11 +3971,18 @@ export function parseAgentApiResponse<K extends AgentApiRouteKey>(
   value: unknown,
 ): AgentApiResponseByRoute[K] {
   const response = agentApiContract[key].response;
-  if (getAgentApiResponseKind(response) === "binary") {
+  const kind = getAgentApiResponseKind(response);
+  if (kind === "binary") {
     if (!(value instanceof Uint8Array)) {
       throw new TypeError(`Agent API ${key} response did not contain binary bytes`);
     }
     return value as AgentApiResponseByRoute[K];
+  }
+  if (kind === "empty") {
+    if (value !== null && value !== undefined) {
+      throw new TypeError(`Agent API ${key} response must be empty`);
+    }
+    return null as AgentApiResponseByRoute[K];
   }
   if (!("body" in response)) {
     throw new TypeError(`Agent API ${key} response contract is missing a JSON body schema`);

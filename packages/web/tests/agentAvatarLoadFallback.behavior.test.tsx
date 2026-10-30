@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, fireEvent, render } from "@testing-library/react";
 import { AgentAvatar } from "../src/components/agent/PixelAvatar";
@@ -10,23 +9,27 @@ afterEach(cleanup);
 test("a failed custom agent avatar falls back to the canonical pixel avatar", () => {
   const { container, rerender } = render(
     <TestIntlProvider>
-      <AgentAvatar avatarUrl="https://cdn.example.com/broken-agent.png" size={32} />
+      <AgentAvatar avatarUrl="https://cdn.example.com/broken-agent.png" />
     </TestIntlProvider>,
   );
 
   const customAvatar = container.querySelector<HTMLImageElement>('img[src="https://cdn.example.com/broken-agent.png"]');
   assert.ok(customAvatar);
-  assert.equal(container.querySelector("[data-cell-size]"), null);
+  assert.equal(container.querySelector("[data-agent-pixel-avatar]"), null);
 
   fireEvent.error(customAvatar);
-  assert.equal(container.querySelector("img"), null);
-  assert.ok(container.querySelector("[data-cell-size]"));
+  // The pixel fallback is itself one <img> (task #137), so assert on the
+  // custom URL being gone rather than on "no <img>" at all.
+  assert.equal(container.querySelector('img[src="https://cdn.example.com/broken-agent.png"]') === null, true);
+  const pixel = container.querySelector<HTMLImageElement>('img[data-agent-pixel-avatar="true"]');
+  assert.equal(pixel !== null, true, "the canonical pixel avatar renders");
+  assert.equal(pixel!.getAttribute("src")!.startsWith("data:image/svg+xml"), true);
 
   rerender(
     <TestIntlProvider>
-      <AgentAvatar avatarUrl="https://cdn.example.com/replacement-agent.png" size={32} />
+      <AgentAvatar avatarUrl="https://cdn.example.com/replacement-agent.png" />
     </TestIntlProvider>,
   );
   assert.ok(container.querySelector('img[src="https://cdn.example.com/replacement-agent.png"]'));
-  assert.equal(container.querySelector("[data-cell-size]"), null);
+  assert.equal(container.querySelector("[data-agent-pixel-avatar]"), null);
 });

@@ -1,5 +1,5 @@
-import { fixturePasswordHash } from "../test/integration/credentials.js";
-import { createApiTest } from "../test/integration/apiTest.js";
+import { fixturePasswordHash } from "../test/integration/credentials";
+import { createApiTest } from "../test/integration/apiTest";
 // Black-box regression guard for the task #169 global error boundary. Unlike
 // the DROP-TABLE middleware tests in servers.api.test.ts, this induces the
 // middleware-layer failure through a REAL client-reachable input path (no DB
@@ -14,8 +14,11 @@ import { createApiTest } from "../test/integration/apiTest.js";
 // caught by CI rather than by a client seeing raw SQL.
 import assert from "node:assert/strict";
 
-import { getDb } from "../db/index.js";
-import { users } from "../db/schema.js";
+import { getDb } from "../db/index";
+import { users } from "../db/schema";
+import { createServer as createServerService } from "../services/serverService";
+import { createChannel as createChannelService, addHuman } from "../services/channelService";
+import { createMessage } from "../services/messageService";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 
@@ -57,11 +60,12 @@ async function login(baseUrl: string, email: string): Promise<string> {
   return (await res.json() as { accessToken: string }).accessToken;
 }
 
-// Malformed X-Server-Id (non-UUID) -> uuid cast error inside requireServer
-// (middleware layer) -> must be sanitized by the global boundary, not leaked.
+// Malformed path :id (non-UUID) -> 404 from requireServerMatchesParam before
+// any uuid-column query runs (task #12). The global boundary must not turn it
+// into a 500, and no internals may leak.
 // Path id and X-Server-Id use the SAME non-UUID value so requireServerMatchesParam
-// (header==path) passes and the request reaches the uuid-column query.
-test("malformed X-Server-Id is sanitized by the global error boundary (black-box, no raw DB error)", async ({ app }) => {
+// (header==path) passes the match check and reaches the UUID gate.
+test("malformed server :id is a clean 404, not a 500 (black-box, no raw DB error)", async ({ app }) => {
   const owner = await seedUser("hyg-blackbox-server@slock.test", "hyg-blackbox-server");
   const token = await login(app.baseUrl, owner.email);
   const malformed = "not-a-uuid";
@@ -70,14 +74,11 @@ test("malformed X-Server-Id is sanitized by the global error boundary (black-box
     headers: { Authorization: `Bearer ${token}`, "X-Server-Id": malformed },
   });
 
-  assert.equal(res.status, 500);
+  assert.equal(res.status, 404);
   const raw = await res.text();
-  assertNoLeak(raw, "malformed X-Server-Id");
-  const body = JSON.parse(raw) as { error: string; code?: string; correlationId?: string };
-  assert.equal(body.error, "Internal server error");
-  assert.equal(body.code, "internal_server_error");
-  assert.equal(typeof body.correlationId, "string");
-  assert.equal(res.headers.get("x-slock-error-id"), body.correlationId);
+  assertNoLeak(raw, "malformed server :id");
+  const body = JSON.parse(raw) as { error: string };
+  assert.equal(body.error, "Server not found");
 });
 
 // A mismatched X-Server-Id vs path id is a deliberate typed 4xx from
@@ -95,4 +96,49 @@ test("mismatched X-Server-Id vs path id stays a typed 4xx (not swallowed, not le
   const raw = await res.text();
   assert.doesNotMatch(raw, /internal_server_error/, "typed 4xx was swallowed into a generic 500");
   assertNoLeak(raw, "mismatched X-Server-Id 4xx");
+});
+
+// Malformed ids in other id-keyed GET routes. The CJK case is the real-world
+// vector: a permalink typed straight into Chinese prose (`?msg=<uuid>这条…`)
+// used to send the swallowed text as the id and got a uuid-cast 500.
+test("malformed path and query ids on id-keyed GET routes are clean 4xx (black-box, no raw DB error)", async ({ app }) => {
+  const owner = await seedUser("hyg-blackbox-ids@slock.test", "hyg-blackbox-ids");
+  const token = await login(app.baseUrl, owner.email);
+  const server = await createServerService("Hygiene Ids", "hygiene-ids", owner.id);
+  const channel = await createChannelService(server.id, "hygiene-ids", "test channel");
+  await addHuman(channel.id, owner.id);
+  const messageId = (await createMessage(channel.id, "user", owner.id, "hello")).id;
+
+  const cases: Array<{ path: (bad: string) => string; status: number }> = [
+    { path: (bad) => `/api/messages/context/${bad}`, status: 400 },
+    { path: (bad) => `/api/messages/context/${messageId}?channelId=${bad}`, status: 400 },
+    { path: (bad) => `/api/messages/channel/${bad}`, status: 404 },
+    { path: (bad) => `/api/servers/${server.id}/members/${bad}/profile`, status: 404 },
+    { path: (bad) => `/api/public/servers/${server.slug}/channels/${bad}/messages`, status: 404 },
+    { path: (bad) => `/api/public/servers/${server.slug}/threads/${bad}/messages`, status: 404 },
+    { path: (bad) => `/api/mcp/agents/${bad}`, status: 404 },
+    { path: (bad) => `/api/integrations/agents/${bad}`, status: 404 },
+    { path: (bad) => `/api/integrations/clients/${bad}/app-notifications`, status: 404 },
+    { path: (bad) => `/api/integrations/clients/${bad}/share-link`, status: 404 },
+    { path: (bad) => `/api/integrations/marketplace/${bad}/install/app-notifications`, status: 404 },
+  ];
+  const malformed = ["not-a-uuid", encodeURIComponent(`${messageId}这条你是不是没收到`)];
+
+  for (const { path, status } of cases) {
+    for (const bad of malformed) {
+      const url = path(bad);
+      const res = await fetch(`${app.baseUrl}${url}`, {
+        headers: { Authorization: `Bearer ${token}`, "X-Server-Id": server.id },
+      });
+      const raw = await res.text();
+      assert.equal(res.status, status, `${url}: ${raw}`);
+      assertNoLeak(raw, url);
+    }
+  }
+
+  // The 8-hex short id stays a legal /context target.
+  const shortId = await fetch(`${app.baseUrl}/api/messages/context/${messageId.slice(0, 8)}?channelId=${channel.id}`, {
+    headers: { Authorization: `Bearer ${token}`, "X-Server-Id": server.id },
+  });
+  assert.equal(shortId.status, 200);
 });

@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import {
   BUILTIN_RUNTIME_HOST_PROVIDER_ENV_SCRUB_KEYS,
   BUILTIN_RUNTIME_GATEWAY_PROVIDER_ENV_KEYS,
@@ -19,7 +18,7 @@ import {
   STATIC_RUNTIME_MODEL_SOURCE_IDS,
   STATIC_RUNTIME_MODEL_SOURCE_VERIFICATION,
   runtimeConfigToLaunchFields,
-} from "./index.js";
+} from "./index";
 
 test("only declared closed catalogs are static model sources", () => {
   assert.deepEqual(STATIC_RUNTIME_MODEL_SOURCE_IDS, ["claude", "copilot", "gemini"]);
@@ -58,24 +57,38 @@ test("declared static model sources carry their daemon verification contract", (
   assert.equal(getStaticRuntimeModelSourceSet("opencode"), undefined);
 });
 
-test("Codex bundled fallback tracks upstream Astra picker default", () => {
-  assert.equal(getDefaultModel("codex"), "gpt-6-astra");
-  assert.deepEqual(RUNTIME_MODELS.codex.slice(0, 4).map((model) => model.id), [
+test("Codex bundled fallback tracks upstream picker order and default (GPT-6.1 Sol first)", () => {
+  // Upstream codex-rs/models-manager/models.json (rust-v0.162.0) priorities:
+  // gpt-6.1-sol 1, gpt-6-astra 2, gpt-6-sol 3, gpt-6-luna 4, gpt-5.6-sol 5, ...
+  assert.equal(getDefaultModel("codex"), "gpt-6.1-sol");
+  assert.deepEqual(RUNTIME_MODELS.codex.slice(0, 7).map((model) => model.id), [
+    "gpt-6.1-sol",
     "gpt-6-astra",
+    "gpt-6-sol",
+    "gpt-6-luna",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
   ]);
-  assert.deepEqual(
-    RUNTIME_MODELS.codex.find((model) => model.id === "gpt-6-astra"),
-    {
-      id: "gpt-6-astra",
-      label: "GPT-6-Astra",
-      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
-      defaultReasoningEffort: "low",
-      verified: "launchable",
-    },
-  );
+  const byId = (id: string) => RUNTIME_MODELS.codex.find((model) => model.id === id);
+  assert.deepEqual(byId("gpt-6.1-sol"), {
+    id: "gpt-6.1-sol",
+    label: "GPT-6.1 Sol",
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    defaultReasoningEffort: "low",
+    verified: "launchable",
+  });
+  assert.deepEqual(byId("gpt-6-astra"), {
+    id: "gpt-6-astra",
+    label: "GPT-6-Astra",
+    supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+    defaultReasoningEffort: "low",
+    verified: "launchable",
+  });
+  assert.deepEqual(byId("gpt-6-sol")?.supportedReasoningEfforts, ["low", "medium", "high", "xhigh", "max", "ultra"]);
+  assert.equal(byId("gpt-6-sol")?.defaultReasoningEffort, "medium");
+  assert.deepEqual(byId("gpt-6-luna")?.supportedReasoningEfforts, ["low", "medium", "high", "xhigh", "max"]);
+  assert.equal(byId("gpt-6-luna")?.defaultReasoningEffort, "medium");
 });
 
 test("Claude model catalog includes latest aliases and selected pinned versions", () => {
@@ -88,14 +101,17 @@ test("Claude model catalog includes latest aliases and selected pinned versions"
       "Claude Fable",
       "Claude Sonnet",
       "Claude Haiku",
+      "Claude Opus 5.5",
       "Claude Opus 5",
       "Claude Opus 4.8",
       "Claude Opus 4.7",
       "Claude Opus 4.6",
       "Claude Fable 5.1",
       "Claude Fable 5",
+      "Claude Sonnet 5.5",
       "Claude Sonnet 5",
       "Claude Sonnet 4.6",
+      "Claude Haiku 5.5",
       "Claude Haiku 4.5",
     ],
   );
@@ -106,14 +122,17 @@ test("Claude model catalog includes latest aliases and selected pinned versions"
     "fable",
     "sonnet",
     "haiku",
+    "claude-opus-5-5",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-7",
     "claude-opus-4-6",
     "claude-fable-5-1",
     "claude-fable-5",
+    "claude-sonnet-5-5",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
+    "claude-haiku-5-5",
     "claude-haiku-4-5",
   ]) {
     assert.ok(claudeModelIds.includes(id), `expected Claude model catalog to include ${id}`);
@@ -138,7 +157,7 @@ test("Claude pinned model IDs are presets while unknown model names remain custo
   });
 });
 
-test("Grok model catalog pins the live ACP defaults and reasoning efforts", () => {
+test("Grok bundled catalog offers 4.6 without changing the existing default or claiming availability", () => {
   assert.deepEqual(RUNTIME_MODELS.grok, [
     {
       id: "grok-4.5",
@@ -147,6 +166,7 @@ test("Grok model catalog pins the live ACP defaults and reasoning efforts", () =
       supportedReasoningEfforts: ["high", "medium", "low"],
       defaultReasoningEffort: "high",
     },
+    { id: "grok-4.6", label: "Grok 4.6", verified: "suggestion_only" },
     {
       id: "grok-composer-2.5-fast",
       label: "Composer 2.5",
@@ -177,9 +197,11 @@ test("Built-in Kimi provider defaults mirror Pi internal defaults independent of
 test("Built-in Xiaomi MiMo provider is generated from the Pi model catalog", () => {
   const xiaomiModels = PI_BUILTIN_PROVIDER_MODELS.xiaomi;
 
+  // pi 1.3.0 (as 1.2.0, 1.1.0 and 1.0.2 did) lists MiMo-V2.6 first but keeps V2.5-Pro as the provider default.
   assert.equal(PI_BUILTIN_PROVIDER_DEFAULT_MODELS.xiaomi, "xiaomi/mimo-v2.5-pro");
-  assert.equal(xiaomiModels[0]?.id, "xiaomi/mimo-v2.5-pro");
-  assert.equal(xiaomiModels[0]?.label, "MiMo-V2.5-Pro");
+  assert.equal(xiaomiModels[0]?.id, "xiaomi/mimo-v2.6-pro");
+  assert.equal(xiaomiModels[0]?.label, "MiMo-V2.6-Pro");
+  assert.ok(xiaomiModels.some((model) => model.id === PI_BUILTIN_PROVIDER_DEFAULT_MODELS.xiaomi));
   assert.ok(xiaomiModels.some((model) => model.id === "xiaomi/mimo-v2.5-pro-ultraspeed"));
 });
 

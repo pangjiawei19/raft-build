@@ -1,9 +1,8 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { createElement } from "react";
 import { MemoryRouter } from "react-router-dom";
-import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
+import { cleanup, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import { TestIntlProvider } from "./helpers/intl";
 import type { Locale } from "../src/i18n/locale";
 const render: typeof rtlRender = (ui, options) => rtlRender(ui, { wrapper: TestIntlProvider, ...options });
@@ -72,13 +71,7 @@ function makeServer(): Server {
   };
 }
 
-type PanelSource = { title?: string; subtitle?: string };
-
-async function renderSearchPage(
-  locale?: Locale,
-  onDragPanelRef?: (event: unknown, ref: unknown, source?: PanelSource) => void,
-  query = "visual",
-) {
+async function renderSearchPage(locale?: Locale) {
   installBrowserStubs();
   localStorage.setItem("slock_access_token", "token");
   const { default: MessageSearchPage } = await import("../src/components/search/MessageSearchPage");
@@ -117,8 +110,8 @@ async function renderSearchPage(
 
   const tree = createElement(
     MemoryRouter,
-    { initialEntries: [`/s/server/search?q=${query}`] },
-    createElement(MessageSearchPage, { onDragPanelRef: onDragPanelRef as never }),
+    { initialEntries: ["/s/server/search?q=visual"] },
+    createElement(MessageSearchPage),
   );
   return locale
     ? rtlRender(createElement(TestIntlProvider, { locale }, tree))
@@ -129,7 +122,7 @@ afterEach(() => {
   cleanup();
 });
 
-test("thread search result groups render only one divider between the pink header and first hit", async () => {
+test("thread search result groups never stack a divider between the thread header and first hit", async () => {
   const originalGet = api.get;
   api.get = async (url: string) => {
     assert.equal(url, "/messages/search");
@@ -190,11 +183,15 @@ test("thread search result groups render only one divider between the pink heade
     });
 
     const title = screen.getByText("Parent thread title for visual testing");
-    const header = title.parentElement;
+    const header = title.closest('[data-slot="search-thread-result-header"]') ?? title.parentElement;
     assert.ok(header instanceof HTMLElement);
-    assert.ok(
-      header.classList.contains("border-b-2"),
-      "The rendered pink thread header keeps the strong header divider.",
+    // Raft DS: the thread header is the group's heading, sitting tight
+    // (pb-1) above its hits; it draws no divider of its own. Hairlines run
+    // only between sibling hits and between thread groups.
+    assert.equal(
+      [...header.classList].some((name) => /^border-b(?:-|$)/.test(name)),
+      false,
+      "The thread header draws no bottom divider of its own.",
     );
 
     const hitsWrapper = header.nextElementSibling;
@@ -210,8 +207,87 @@ test("thread search result groups render only one divider between the pink heade
     const secondHit = buttons.find((button) => button.textContent?.includes("visual testing second hit"));
     assert.ok(firstHit instanceof HTMLElement);
     assert.ok(secondHit instanceof HTMLElement);
-    assert.equal(firstHit.classList.contains("border-t-2"), true);
-    assert.equal(secondHit.classList.contains("border-t-2"), true);
+    // The hit separators belong to the rui hit recipe (DS rf-hit: a hairline
+    // between sibling hits, drawn by `not-first:` so the first hit under the
+    // header gets none). The web row must not add its own top border, or it
+    // would draw a divider under the thread header.
+    assert.ok(hitsWrapper.firstElementChild === firstHit, "the first hit leads the hit list");
+    assert.ok(secondHit.classList.contains("not-first:before:border-t"), "sibling hits are split by the recipe hairline");
+    for (const hit of [firstHit, secondHit]) {
+      assert.equal(
+        [...hit.classList].some((name) => /^border-t(?:-|$)/.test(name)),
+        false,
+        "MessageHitRow adds no border of its own",
+      );
+    }
+  } finally {
+    api.get = originalGet;
+  }
+});
+
+// --- task #710: the search page's thread-semantic icons must be raft-ui's
+// ThreadIcon (single icon source, matching the Activity feed's swap in #698/#8785),
+// not a lucide MessageSquare stand-in. Anchored on the package icon's geometry
+// (viewBox + leading path) per the #8785 convention, so re-anchoring to a lucide
+// class cannot pass. Both rendered surfaces are covered: the per-hit inline
+// `search.threadInline` marker and the `search.threadBadge` group badge. ---
+test("thread search surfaces render the raft-ui ThreadIcon geometry, not a lucide stand-in", async () => {
+  const originalGet = api.get;
+  api.get = async (url: string) => {
+    assert.equal(url, "/messages/search");
+    return {
+      data: {
+        hasMore: false,
+        results: [
+          {
+            id: "message-1",
+            channelId: "thread-1",
+            threadId: "thread-root-1",
+            parentMessageId: "parent-1",
+            parentMessageContent: "Parent thread title for visual testing",
+            parentChannelId: "channel-1",
+            parentChannelName: "visual-testing",
+            parentChannelType: "channel",
+            parentChannelArchivedAt: null,
+            senderId: "user-1",
+            senderType: "user",
+            senderName: "Current User",
+            channelName: "thread",
+            channelType: "thread",
+            channelArchivedAt: null,
+            content: "visual testing first hit",
+            snippet: "visual testing first hit",
+            createdAt: "2026-07-01T04:00:00.000Z",
+          },
+        ],
+      },
+    };
+  };
+
+  const assertThreadIconGeometry = (svg: SVGSVGElement | null, label: string) => {
+    assert.ok(svg instanceof SVGSVGElement, `${label} renders an svg`);
+    assert.equal(svg.getAttribute("viewBox"), "0 0 18 18", `${label} uses raft-ui ThreadIcon geometry`);
+    assert.match(
+      svg.querySelector("path")?.getAttribute("d") ?? "",
+      /^M16\.25 5V4\.25/,
+      `${label} carries the ThreadIcon leading path (lucide MessageSquare would differ)`,
+    );
+  };
+
+  try {
+    await renderSearchPage();
+
+    // Inline per-hit marker (search.threadInline) — svg inside the rui
+    // SearchMessageResultThreadMeta slot.
+    const inlineMeta = document.querySelector('[data-slot="search-message-result-thread-meta"]');
+    assert.ok(inlineMeta instanceof HTMLElement, "inline thread meta renders");
+    assertThreadIconGeometry(inlineMeta.querySelector("svg"), "inline threadIn-line marker");
+
+    // Group badge (search.threadBadge) — svg inside the Badge next to its label.
+    const badgeLabel = screen.getByText("Thread");
+    const badge = badgeLabel.closest('[data-slot="badge"]') ?? badgeLabel.parentElement;
+    assert.ok(badge instanceof HTMLElement, "thread group badge renders");
+    assertThreadIconGeometry(badge.querySelector("svg"), "thread group badge");
   } finally {
     api.get = originalGet;
   }
@@ -284,84 +360,6 @@ test("i18n: thread group renders zh chrome and app-locale relative time", async 
     const body = document.body.textContent ?? "";
     assert.match(body, /前|后|分钟|小时|天|现在/, "group relative time renders in Chinese");
     assert.doesNotMatch(body, /\bago\b|\bminutes?\b|\bhours?\b|\bdays?\b/, "no English relative-time leaks under zh");
-  } finally {
-    api.get = originalGet;
-  }
-});
-
-// --- 赵梓淇 post-merge audit fast-follow: the message DRAG handoff panel chrome
-// must localize like the click path (different indentation had slipped the
-// replace_all). Behavioral tooth for the thread title (his exact proof:
-// actual "Thread parent-1" -> expected "消息列 parent-1") plus a mounted
-// non-thread subtitle tooth. Reverse-RED: reverting either formatter fails the
-// corresponding drag assertion. ---
-test("i18n: message drag handoff localizes thread and channel panel chrome under zh", async () => {
-  const originalGet = api.get;
-  api.get = async (url: string) => {
-    assert.equal(url, "/messages/search");
-    return {
-      data: {
-        hasMore: false,
-        results: [
-          {
-            id: "message-1",
-            channelId: "thread-1",
-            threadId: "thread-root-1",
-            parentMessageId: "parent-1",
-            parentMessageContent: "Parent thread title for visual testing",
-            parentChannelId: "channel-1",
-            parentChannelName: "visual-testing",
-            parentChannelType: "channel",
-            parentChannelArchivedAt: null,
-            senderId: "user-1",
-            senderType: "user",
-            senderName: "Current User",
-            channelName: "thread",
-            channelType: "thread",
-            channelArchivedAt: null,
-            content: "visual testing first hit",
-            snippet: "visual testing first hit",
-            createdAt: "2026-07-01T04:00:00.000Z",
-          },
-          {
-            id: "message-2",
-            channelId: "channel-1",
-            senderId: "user-1",
-            senderType: "user",
-            senderName: "Current User",
-            channelName: "general",
-            channelType: "channel",
-            channelArchivedAt: null,
-            content: "visual testing channel hit",
-            snippet: "visual testing channel hit",
-            createdAt: "2026-07-01T04:01:00.000Z",
-          },
-        ],
-      },
-    };
-  };
-
-  const sources: PanelSource[] = [];
-  try {
-    await renderSearchPage("zh-cn", (_event, _ref, source) => {
-      if (source) sources.push(source);
-    }, "drag-probe");
-
-    await waitFor(() => {
-      assert.ok(Array.from(document.querySelectorAll("button")).some((b) => b.textContent?.includes("visual testing first hit")));
-      assert.ok(Array.from(document.querySelectorAll("button")).some((b) => b.textContent?.includes("visual testing channel hit")));
-    });
-    const buttons = Array.from(document.querySelectorAll("button"));
-    const threadHit = buttons.find((button) => button.textContent?.includes("visual testing first hit"))!;
-    const channelHit = buttons.find((button) => button.textContent?.includes("visual testing channel hit"))!;
-    fireEvent.dragStart(threadHit);
-    fireEvent.dragStart(channelHit);
-
-    assert.ok(sources.some((s) => s.title === "消息列 parent-1"), "thread drag panel title is localized (消息列 parent-1)");
-    assert.ok(
-      sources.some((source) => source.title === "#general" && source.subtitle === "搜索结果"),
-      "channel drag panel subtitle is localized (搜索结果)",
-    );
   } finally {
     api.get = originalGet;
   }

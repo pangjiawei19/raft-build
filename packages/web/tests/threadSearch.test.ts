@@ -1,10 +1,9 @@
-import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
   buildThreadSearchMatches,
   getThreadSearchableMessages,
-  highlightThreadSearchMarkdownFragments,
+  highlightThreadSearchInTree,
   isThreadSearchShortcut,
   normalizeThreadSearchQuery,
   normalizeThreadSearchSelectionText,
@@ -75,25 +74,49 @@ test("thread search normalizes whitespace and combines parent with replies", () 
   assert.deepEqual(searchable.map((message) => message.id), ["parent", "reply"]);
 });
 
-test("thread search fragment highlighting marks visible text only", () => {
-  assert.equal(
-    highlightThreadSearchMarkdownFragments("Before Needle after needle", " needle "),
-    "Before <mark>Needle</mark> after <mark>needle</mark>",
+function paragraph(...children: unknown[]) {
+  return { type: "root", children: [{ type: "paragraph", children }] } as never;
+}
+function marked(tree: { children: Array<{ children: unknown[] }> }) {
+  return JSON.stringify(tree.children[0].children);
+}
+
+test("thread search highlighting marks visible text on the markdown tree", () => {
+  const plain = paragraph({ type: "text", value: "Before Needle after needle" });
+  highlightThreadSearchInTree(plain, " needle ");
+  assert.equal(marked(plain), JSON.stringify([
+    { type: "text", value: "Before " },
+    { type: "messageToken", data: { hName: "mark" }, children: [{ type: "text", value: "Needle" }] },
+    { type: "text", value: " after " },
+    { type: "messageToken", data: { hName: "mark" }, children: [{ type: "text", value: "needle" }] },
+  ]));
+
+  const ref = paragraph(
+    { type: "messageToken", data: { hName: "a", hProperties: { dataChannel: "general" } }, children: [{ type: "text", value: "#general" }] },
+    { type: "text", value: " plain" },
   );
-  assert.equal(
-    highlightThreadSearchMarkdownFragments("<a data-channel=\"general\">#general</a> needle", "general"),
-    "<a data-channel=\"general\">#general</a> needle",
-  );
-  assert.equal(
-    highlightThreadSearchMarkdownFragments("visible needle \x00CODE0\x00", "needle"),
-    "visible <mark>needle</mark> \x00CODE0\x00",
-  );
-  assert.equal(
-    highlightThreadSearchMarkdownFragments("safe &amp; &lt;needle&gt;", "<needle>"),
-    "safe &amp; <mark>&lt;needle&gt;</mark>",
-  );
-  assert.equal(
-    highlightThreadSearchMarkdownFragments("safe &amp; text", "amp"),
-    "safe &amp; text",
-  );
+  const before = marked(ref);
+  highlightThreadSearchInTree(ref, "general");
+  assert.equal(marked(ref), before, "refs and mentions are never split by a highlight");
+
+  const code = paragraph({ type: "inlineCode", value: "needle" });
+  highlightThreadSearchInTree(code, "needle");
+  assert.equal(marked(code), JSON.stringify([{ type: "inlineCode", value: "needle" }]), "inline code has its own highlighter");
+
+  const symbols = paragraph({ type: "text", value: "safe & <needle>" });
+  highlightThreadSearchInTree(symbols, "<needle>");
+  assert.match(marked(symbols), /"hName":"mark"\},"children":\[\{"type":"text","value":"<needle>"\}\]/);
+});
+
+test("thread search highlighting marks a link label and keeps the link", () => {
+  const tree = paragraph({ type: "link", url: "https://example.com", children: [{ type: "text", value: "link here" }] });
+  highlightThreadSearchInTree(tree, "link");
+  assert.equal(marked(tree), JSON.stringify([{
+    type: "link",
+    url: "https://example.com",
+    children: [
+      { type: "messageToken", data: { hName: "mark" }, children: [{ type: "text", value: "link" }] },
+      { type: "text", value: " here" },
+    ],
+  }]));
 });

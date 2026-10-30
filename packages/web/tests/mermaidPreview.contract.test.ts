@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const read = (p: string) => readFileSync(resolve(repoRoot, p), "utf8");
@@ -21,7 +20,7 @@ test("official mermaid replaces the limited beautiful-mermaid dependency", () =>
 });
 
 test("Mermaid renderer lazy-loads official mermaid and owns a bounded result cache", () => {
-  const src = read("src/components/markdown/mermaid/mermaidRenderer.ts");
+  const src = read("src/components/mermaid/mermaidRenderer.ts");
   // Dynamic import only — a static `from "beautiful-mermaid"` would pull the
   // layout engine into the main chunk.
   assert.match(src, /import\("mermaid"\)/);
@@ -42,21 +41,26 @@ test("Mermaid renderer lazy-loads official mermaid and owns a bounded result cac
 });
 
 test("①+② attacker-controlled SVG renders in an EMPTY-sandbox iframe, never main DOM", () => {
-  const src = read("src/components/markdown/mermaid/MermaidDiagramViewer.tsx");
+  const src = read("src/components/mermaid/MermaidDiagramViewer.tsx");
+  const frameLayerSrc = read("src/components/mermaid/MermaidFrameLayer.tsx");
   // No string ever reaches the main document — the only safe sink is the
   // sandboxed iframe. dangerouslySetInnerHTML must not exist here at all.
   assert.doesNotMatch(src, /dangerouslySetInnerHTML/);
+  assert.doesNotMatch(frameLayerSrc, /dangerouslySetInnerHTML/);
   // SVG goes into the shared isolation primitive via srcDoc with an EMPTY
   // sandbox (no allow-scripts, no allow-same-origin) → opaque origin, zero
   // script execution, so script/onload/foreignObject/javascript: are inert.
-  assert.match(src, /import SandboxedPreviewFrame from "\.\.\/\.\.\/ui\/SandboxedPreviewFrame"/);
-  assert.match(src, /<SandboxedPreviewFrame\b[\s\S]*?srcDoc=\{result\.srcDoc\}[\s\S]*?sandbox=""/);
+  assert.match(src, /import \{ MermaidFrameLayer \} from "\.\/MermaidFrameLayer"/);
+  assert.match(frameLayerSrc, /import SandboxedPreviewFrame from "\.\.\/ui\/SandboxedPreviewFrame"/);
+  assert.match(src, /<MermaidFrameLayer\b[\s\S]*?srcDoc=\{result\.srcDoc\}/);
+  assert.match(frameLayerSrc, /<SandboxedPreviewFrame\b[\s\S]*?srcDoc=\{srcDoc\}[\s\S]*?sandbox=""/);
   assert.doesNotMatch(src, /sandbox="[^"]*allow-(scripts|same-origin)[^"]*"/);
-  const renderer = read("src/components/markdown/mermaid/mermaidRenderer.ts");
+  assert.doesNotMatch(frameLayerSrc, /sandbox="[^"]*allow-(scripts|same-origin)[^"]*"/);
+  const renderer = read("src/components/mermaid/mermaidRenderer.ts");
   assert.match(renderer, /buildMermaidSrcDoc\(svg\)/);
 
   // srcDoc carries a strict CSP as defense-in-depth on top of the empty sandbox.
-  const frame = read("src/components/markdown/mermaid/mermaidFrame.ts");
+  const frame = read("src/components/mermaid/mermaidFrame.ts");
   assert.match(frame, /Content-Security-Policy/);
   assert.match(frame, /default-src 'none'/);
   assert.match(frame, /export function buildMermaidSrcDoc\(svg: string\): string/);
@@ -66,7 +70,7 @@ test("①+② attacker-controlled SVG renders in an EMPTY-sandbox iframe, never 
 test("Share image consumes a generic static-capture boundary while Mermaid supplies raster ink", () => {
   const screenshot = read("src/utils/selectScreenshot.ts");
   const boundary = read("src/utils/domCaptureSnapshot.ts");
-  const diagram = read("src/components/markdown/mermaid/MermaidDiagram.tsx");
+  const diagram = read("src/components/mermaid/MermaidDiagram.tsx");
   assert.match(screenshot, /import \{ materializeDomCaptureSnapshots \} from "\.\/domCaptureSnapshot"/);
   assert.match(screenshot, /await materializeDomCaptureSnapshots\(node, clone\)/);
   assert.doesNotMatch(screenshot, /mermaid/i,
@@ -82,16 +86,17 @@ test("Share image consumes a generic static-capture boundary while Mermaid suppl
 });
 
 test("interactive Mermaid chrome keeps SVG outside React state and main DOM", () => {
-  const diagramSrc = read("src/components/markdown/mermaid/MermaidDiagram.tsx");
-  const toolbarSrc = read("src/components/markdown/mermaid/MermaidToolbar.tsx");
-  const viewerSrc = read("src/components/markdown/mermaid/MermaidDiagramViewer.tsx");
-  const mermaidCss = read("src/components/markdown/mermaid/mermaid.css");
+  const diagramSrc = read("src/components/mermaid/MermaidDiagram.tsx");
+  const toolbarSrc = read("src/components/mermaid/MermaidToolbar.tsx");
+  const viewerSrc = read("src/components/mermaid/MermaidDiagramViewer.tsx");
+  const frameLayerSrc = read("src/components/mermaid/MermaidFrameLayer.tsx");
+  const mermaidCss = read("src/components/mermaid/mermaid.css");
   const indexCss = read("src/index.css");
   const src = [diagramSrc, toolbarSrc, viewerSrc].join("\n");
   const zoom = read("src/components/ImageZoom.ts");
   assert.match(diagramSrc, /type MermaidRenderState =[\s\S]*status: "loading"[\s\S]*status: "valid"[\s\S]*status: "error"/);
   assert.match(diagramSrc, /renderCounterRef/);
-  assert.match(viewerSrc, /ImageZoomController,[\s\S]*ImageZoomLayoutSettleRequest,[\s\S]*from "\.\.\/\.\.\/ImageZoom"/);
+  assert.match(viewerSrc, /ImageZoomController,[\s\S]*ImageZoomLayoutSettleRequest,[\s\S]*from "\.\.\/ImageZoom"/);
   assert.match(diagramSrc, /wheelRequiresModifier: true/);
   assert.match(diagramSrc, /wheelRequiresModifier: false/);
   assert.match(viewerSrc, /ref=\{zoom\.wheelTargetRef\}/);
@@ -126,11 +131,13 @@ test("interactive Mermaid chrome keeps SVG outside React state and main DOM", ()
   assert.match(viewerSrc, /const MERMAID_RETIRE_PAINT_FRAMES = 6/);
   assert.match(viewerSrc, /const layers = transition[\s\S]*activeFrameId[\s\S]*transition\.id[\s\S]*retiringFrame/);
   assert.match(viewerSrc, /requestAnimationFrame\(\(\) => \{[\s\S]*requestAnimationFrame\(\(\) => \{/);
-  assert.match(viewerSrc, /width: `\$\{layer\.ratio \* 100\}%`[\s\S]*transform: `translate\(-50%, -50%\) scale\(\$\{1 \/ layer\.ratio\}\)`[\s\S]*opacity: 1,[\s\S]*zIndex: 0/);
-  assert.match(viewerSrc, /width: `\$\{100 \/ layer\.ratio\}%`[\s\S]*transform: `translate\(-50%, -50%\) scale\(\$\{layer\.ratio\}\)`[\s\S]*opacity: 1,[\s\S]*zIndex: 2/);
-  assert.match(viewerSrc, /ariaHidden=\{layer\.kind === "active" \? undefined : true\}/);
-  assert.match(viewerSrc, /tabIndex=\{layer\.kind === "active" \? undefined : -1\}/);
-  assert.match(viewerSrc, /onLoad=\{layer\.kind === "prepared" \? \(\) => finishPreparedFrame\(layer\.id\) : undefined\}/);
+  assert.match(frameLayerSrc, /width: `\$\{ratio \* 100\}%`[\s\S]*transform: `translate\(-50%, -50%\) scale\(\$\{1 \/ ratio\}\)`[\s\S]*opacity: 1,[\s\S]*zIndex: 0/);
+  assert.match(frameLayerSrc, /width: `\$\{100 \/ ratio\}%`[\s\S]*transform: `translate\(-50%, -50%\) scale\(\$\{ratio\}\)`[\s\S]*opacity: 1,[\s\S]*zIndex: 2/);
+  assert.match(frameLayerSrc, /ariaHidden=\{kind === "active" \? undefined : true\}/);
+  assert.match(frameLayerSrc, /tabIndex=\{kind === "active" \? undefined : -1\}/);
+  assert.match(viewerSrc, /onPreparedLoad=\{finishPreparedFrame\}/);
+  assert.match(frameLayerSrc, /const handleLoad = useCallback\(\(\) => onPreparedLoad\(id\), \[id, onPreparedLoad\]\)/);
+  assert.match(frameLayerSrc, /onLoad=\{kind === "prepared" \? handleLoad : undefined\}/);
   assert.match(viewerSrc, /<BufferedMermaidFrame[\s\S]*result=\{result\}[\s\S]*zoom=\{zoom\}/);
   assert.match(viewerSrc, /data-testid="mermaid-pan-zoom-viewport"/);
   assert.match(viewerSrc, /onTouchStart=\{zoom\.onTouchStart\}/);
@@ -138,7 +145,7 @@ test("interactive Mermaid chrome keeps SVG outside React state and main DOM", ()
   assert.match(viewerSrc, /onTouchEnd=\{zoom\.onTouchEnd\}/);
   assert.match(viewerSrc, /touchAction: fullscreen \? "none" : "pan-y"/);
   assert.match(toolbarSrc, /data-testid="mermaid-toolbar"/);
-  assert.match(indexCss, /@import "\.\/components\/markdown\/mermaid\/mermaid\.css";/);
+  assert.match(indexCss, /@import "\.\/components\/mermaid\/mermaid\.css";/);
   assert.match(toolbarSrc, /className="r-mermaid-toolbar"/);
   assert.match(toolbarSrc, /className="r-mermaid-toolbar__zoom"/);
   assert.match(toolbarSrc, /MERMAID_TOOLTIP_CONTENT_CLASS = "r-mermaid-tooltip"/);
@@ -165,7 +172,15 @@ test("interactive Mermaid chrome keeps SVG outside React state and main DOM", ()
   assert.match(toolbarSrc, /<Tooltip\b/);
   assert.doesNotMatch(toolbarSrc, /<Button[^>]*\btitle=/);
   assert.doesNotMatch(toolbarSrc, /RotateCcw|resetAria/);
-  assert.match(toolbarSrc, /<CopyButton[\s\S]*?text=\{code\}[\s\S]*?resetKey=\{code\}/);
+  // The copy affordance is the toolbar's own Button — the same control as the
+  // zoom/download/fullscreen cluster, so it keeps one register in every theme —
+  // with the clipboard write and the label lifecycle owned by the shared
+  // copy controller.
+  assert.match(toolbarSrc, /const copyController = useCopyText\(\{ resetKey: code \}\)/);
+  assert.match(toolbarSrc, /const \{ copyText \} = copyController;/);
+  assert.match(toolbarSrc, /void copyText\(code\)\.catch\(\(\) => \{\}\)/);
+  assert.match(toolbarSrc, /copyController\.copied \? <Check size=\{14\} \/> : <Copy size=\{14\} \/>/);
+  assert.doesNotMatch(toolbarSrc, /CopyableCode/);
   assert.match(toolbarSrc, /useBlobDownload\(\)/);
   assert.doesNotMatch(toolbarSrc, /setTimeout\(/);
   assert.match(toolbarSrc, /DropdownMenuTrigger/);
@@ -210,7 +225,7 @@ test("interactive Mermaid chrome keeps SVG outside React state and main DOM", ()
   // mechanism message expand/collapse uses) instead of racing its anchoring.
   assert.match(src, /MessageTimelinePreserveViewportContext/);
   assert.match(src, /preserveTimelineViewport\?\.\(\);/);
-  const frameSrc = read("src/components/markdown/mermaid/mermaidFrame.ts");
+  const frameSrc = read("src/components/mermaid/mermaidFrame.ts");
   assert.match(frameSrc, /overflow:hidden/, "srcdoc must suppress the sub-pixel internal scrollbar");
   assert.match(frameSrc, /max-width:none!important/,
     "settled vector zoom must override Mermaid's inline natural-width clamp");
@@ -224,7 +239,7 @@ test("interactive Mermaid chrome keeps SVG outside React state and main DOM", ()
 
 test("③ HTML preview body uses the shared primitive — behavior preserved", () => {
   const item = read("src/components/message/attachmentPreviewSurfaces.tsx") + read("src/components/message/MessageItem.tsx");
-  assert.match(item, /card-brutal max-w-full overflow-x-clip/, "Markdown attachment preview must not trap sticky toolbars");
+  assert.match(item, /max-w-full overflow-visible overflow-x-clip/, "Markdown attachment preview must not trap sticky toolbars");
   // The frame moved from HtmlAttachmentPreviewModal into HtmlPreviewBody when
   // the comment-mode overlay/bridge wrapped it (task #16, reviewed 702694c8);
   // the pinned isolation contract is unchanged and now lives there.
@@ -242,7 +257,7 @@ test("③ HTML preview body uses the shared primitive — behavior preserved", (
   assert.match(m, /sandbox="allow-scripts"/); // exactly — not tightened/loosened
   assert.doesNotMatch(m, /allow-popups(?:-to-escape-sandbox)?/);
   assert.match(m, /referrerPolicy="no-referrer"/);
-  assert.match(m, /className=\{`h-full w-full border-0 bg-white\$\{externalLinksReady \? "" : " pointer-events-none"\}`\}/);
+  assert.match(m, /className=\{`h-full w-full border-0 bg-sticker-paper\$\{externalLinksReady \? "" : " pointer-events-none"\}`\}/);
   assert.match(m, /title=\{formatMessage\(\{ id: "message\.messageItem\.htmlPreviewTitle" \}, \{ filename \}\)\}/);
   // Threat-model comment retained.
   assert.match(m, /Threat model: any human or agent can upload hostile HTML/);
@@ -253,23 +268,29 @@ test("③ HTML preview body uses the shared primitive — behavior preserved", (
   assert.match(prim, /sandbox = ""/); // primitive defaults to maximally locked
 });
 
-test("④ PDF attachment preview uses the shared primitive — opaque origin, no allow-same-origin", () => {
+test("④ PDF attachment preview is origin-isolated, not sandboxed (Chromium cannot run its PDF viewer in a sandboxed frame)", () => {
   const item = read("src/components/message/attachmentPreviewSurfaces.tsx") + read("src/components/message/MessageItem.tsx");
-  // The PDF branch must not be a bare iframe — that was the pre-fix shape
-  // flagged by react-doctor `iframe-missing-sandbox` (Ark security review,
-  // #proj-frontend:8b1098b4).
   const pdfBranch = item.match(/preview\.kind === "pdf" \? \([\s\S]*?\) : null/);
   assert.ok(pdfBranch, "PDF preview branch not found in DocumentAttachmentPreviewModal");
   const m = pdfBranch[0];
+  // Not a bare iframe (react-doctor `iframe-missing-sandbox`, Ark security
+  // review #proj-frontend:8b1098b4) and not the sandboxed primitive either:
+  // any `sandbox` attribute makes Chrome/Edge/Electron render
+  // chrome-error:// for a PDF (task #91). The dedicated frame enforces the
+  // origin boundary instead.
   assert.doesNotMatch(m, /<iframe\b/, "PDF preview must not render a bare iframe");
-  assert.match(m, /<SandboxedPreviewFrame\b/);
-  // allow-scripts only — native PDF viewers need scripts. allow-same-origin
-  // would dissolve the origin boundary and is forbidden for attacker-uploaded
-  // content (PDF bytes come from any human or agent).
-  assert.match(m, /sandbox="allow-scripts"/);
-  assert.doesNotMatch(m, /sandbox="[^"]*allow-same-origin[^"]*"/);
-  assert.match(m, /referrerPolicy="no-referrer"/);
+  assert.doesNotMatch(m, /<SandboxedPreviewFrame\b/, "PDF preview must not be sandboxed — the viewer cannot load");
+  assert.doesNotMatch(m, /sandbox=/, "no sandbox attribute on the PDF frame");
+  assert.match(m, /<CrossOriginPdfFrame\b/);
   assert.match(m, /title=\{formatMessage\(\{ id: "message\.messageItem\.pdfPreviewTitle" \}, \{ filename \}\)\}/);
+
+  const frame = read("src/components/ui/CrossOriginPdfFrame.tsx");
+  // The origin invariant must be enforced at render time, referrer suppressed,
+  // and there must be no sandbox attribute at all (an empty one still blocks).
+  assert.match(frame, /isPdfPreviewUrlIsolated\(src\)/);
+  assert.match(frame, /parsed\.origin !== appOrigin/);
+  assert.match(frame, /referrerPolicy="no-referrer"/);
+  assert.doesNotMatch(frame, /sandbox=/);
 });
 
 test("shared mermaid renderer is explicitly enabled on message and document surfaces", () => {
@@ -292,11 +313,21 @@ test("shared mermaid renderer is explicitly enabled on message and document surf
   assert.ok(chatBody, "chat MarkdownContent callsite not found");
   assert.match(chatBody[0], /density="compact"[\s\S]*enableMermaid/);
 
-  const wiki = read("src/components/wiki/WikiPanel.tsx");
-  assert.match(wiki, /<MarkdownContent source=\{markdown\} density="document" enableMermaid/);
   const forwarded = read("src/components/message/ForwardedBundleCard.tsx");
   assert.match(forwarded, /<MarkdownContent source=\{content\} density="compact" enableMermaid/);
-  assert.match(forwarded, /max-h-\[144px\] overflow-clip/, "collapsed forwards must clip without becoming a sticky scroll root");
+  // The clamp used to be pinned here with its rationale: a collapsed forward
+  // must clip without becoming a sticky scroll root, because mermaid action
+  // bars are position: sticky (slock #5595 switched that line to
+  // overflow-clip for exactly this). The clamp now lives in raft-ui, which
+  // pins the behaviour itself: the rui browser suite asserts the collapsed
+  // container's computed overflow is "clip" (raft-ui #347). The app keeps the
+  // delegation pin so a local re-implementation cannot creep back.
+  assert.match(forwarded, /<MessageForwardedBundleItems/, "the fold renders through raft-ui");
+  assert.doesNotMatch(
+    forwarded,
+    /max-h-\[144px\]/,
+    "the clamp lives in raft-ui now and is asserted there; the app card must not re-implement it",
+  );
   const comments = read("src/components/message/AttachmentCommentsPanel.tsx");
   assert.match(comments, /<MarkdownContent source=\{c\.content\} density="compact" enableMermaid/);
   const collapsible = read("src/components/message/CollapsibleMessageContent.tsx");
@@ -304,7 +335,7 @@ test("shared mermaid renderer is explicitly enabled on message and document surf
 });
 
 test("readMermaidSource lives in a standalone pure module (cheap unit guard)", () => {
-  const src = read("src/components/markdown/mermaid/mermaidSource.ts");
+  const src = read("src/components/mermaid/mermaidSource.ts");
   assert.match(src, /export function readMermaidSource\(children: ReactNode\): string \| null/);
   // Pure: must not import the renderer or react-markdown (only `react`).
   assert.doesNotMatch(src, /from\s+["'](?:beautiful-mermaid|mermaid)["']/);

@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
 import fc from "fast-check";
 
-import { buildApmFreshnessDecisionProducerFactId } from "./apmStateMachine.js";
+import { buildApmFreshnessDecisionProducerFactId } from "./apmStateMachine";
 import {
+  normalizeInboxVisibleMessage,
   planAgentInboxSideEffect,
   type AgentInboxFreshnessDecision,
   type AgentInboxStateMachineEffect,
   type AgentInboxStateMachineMessage,
-} from "./agentInboxStateMachine.js";
+} from "./agentInboxStateMachine";
 
 function message(seq: number, input: Partial<AgentInboxStateMachineMessage> = {}): AgentInboxStateMachineMessage {
   return {
@@ -48,6 +48,17 @@ function latestMessages(
   const sorted = [...messages].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
   return sorted.slice(Math.max(0, sorted.length - limit));
 }
+
+test("inbox message normalization carries the sender time zone from either key casing", () => {
+  assert.equal(normalizeInboxVisibleMessage(message(1, { sender_timezone: "Asia/Shanghai" })).sender_timezone, "Asia/Shanghai");
+  assert.equal(normalizeInboxVisibleMessage(message(2, { senderTimezone: "Europe/Berlin" })).sender_timezone, "Europe/Berlin");
+  assert.equal(
+    normalizeInboxVisibleMessage(message(3, { sender_timezone: "Asia/Tokyo", senderTimezone: "Europe/Berlin" })).sender_timezone,
+    "Asia/Tokyo",
+    "snake_case wins like the other sender fields",
+  );
+  assert.equal(normalizeInboxVisibleMessage(message(4)).sender_timezone, null);
+});
 
 test("agent inbox state machine locally holds exact-target pending messages", () => {
   const pendingMessages = [40, 41, 42, 43, 44].map((seq) => message(seq));
@@ -754,4 +765,34 @@ test("agent inbox state machine trace captures continue-anyway bypass before pen
       },
     },
   ]);
+});
+
+// Glimpse G2-3: the Server holds task writes by the model-seen boundary, as it
+// holds sends, so every gated write forwards it (before, only sends did).
+test("task writes forward the model-seen boundary like a send", () => {
+  for (const action of ["task_claim", "task_update", "task_amend"] as const) {
+    const insideBoundary = planAgentInboxSideEffect({
+      agentId: "agent-1",
+      action,
+      target: "#board",
+      continueAnyway: false,
+      modelSeenSeq: 46,
+      pendingMessages: [message(45, { sender_id: "agent-1" }), message(46, { sender_id: "agent-1" })],
+      recentMessages: [],
+    });
+    assert.equal(insideBoundary.outcome, "forward", action);
+    assert.equal(insideBoundary.forwardSeenUpToSeq, 46, action);
+
+    const boundaryOnly = planAgentInboxSideEffect({
+      agentId: "agent-1",
+      action,
+      target: "#board",
+      continueAnyway: false,
+      modelSeenSeq: 30,
+      pendingMessages: [],
+      recentMessages: [],
+    });
+    assert.equal(boundaryOnly.outcome, "forward", action);
+    assert.equal(boundaryOnly.forwardSeenUpToSeq, 30, action);
+  }
 });

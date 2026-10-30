@@ -1,34 +1,65 @@
 import { createHash } from "node:crypto";
 
-import { and, asc, eq, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, lte, or, sql } from "drizzle-orm";
 
-import { clearClockInterval, currentDate, setClockInterval } from "@botiverse/raft-shared";
-
-import type { Database, DatabaseExecutor } from "../db/index.js";
 import {
+  clearClockInterval,
+  currentDate,
+  extractRaftMentionHandles,
+  resolveRaftMentionHandle,
+  setClockInterval,
+} from "@botiverse/raft-shared";
+
+import type { Database, DatabaseExecutor } from "../db/index";
+import {
+  agents,
+  channelAgents,
+  channelHumans,
   channels,
+  externalActorProjections,
   externalAttachmentAssets,
   externalAttachmentMessageFacts,
+  externalAddressabilityProjections,
+  externalAppInstalls,
   externalInboundEvents,
   externalMessageLinks,
   jointChannels,
   jointChannelServers,
+  messageMentions,
   messages,
-} from "../db/schema.js";
-import { insertCanonicalExternalMessage } from "./externalProjectionService.js";
-import { resolveExternalConversationTarget } from "./externalConversationTargetService.js";
-import { recordInboxFactsForPersistedMessages } from "./messageService.js";
-import type { JointThreadProjection } from "./channelService.js";
+  users,
+} from "../db/schema";
+import {
+  insertCanonicalExternalMessage,
+  insertExternalMentionFact,
+  resolveExternalMentionFromDurableAuthority,
+} from "./externalProjectionService";
+import { resolveExternalConversationTarget } from "./externalConversationTargetService";
+import { recordInboxFactsForPersistedMessages } from "./messageService";
+import type { JointThreadProjection } from "./channelService";
+import {
+  getActiveJointChannelProjectionsByLocalChannel,
+  getActiveJointThreadProjectionsByCanonicalThread,
+  isChannelAgent,
+  isChannelHuman,
+  startReadPositionAtJoin,
+} from "./channelService";
 import {
   createInboundExternalAttachmentTransferWithExecutor,
-} from "./externalAttachmentTransferService.js";
-import { linkAttachmentsToMessageWithExecutor } from "./attachmentLinkingService.js";
-import { applyExternalReactionObservation } from "./externalReactionSyncService.js";
+} from "./externalAttachmentTransferService";
+import { linkAttachmentsToMessageWithExecutor } from "./attachmentLinkingService";
+import { applyExternalReactionObservation } from "./externalReactionSyncService";
+import {
+  normalizeSlackMentionHandle,
+  renderSlackUsergroupMentions,
+  type SlackUsergroupMention,
+} from "./slackMentionTokens";
 
 const INBOUND_LEASE_MS = 60_000;
 const INBOUND_BLOCKED_RETRY_MS = 30_000;
 const INBOUND_PAYLOAD_SCHEMA_V1 = "external-inbound-normalized-event.v1" as const;
 const INBOUND_PAYLOAD_SCHEMA_V2 = "external-inbound-normalized-event.v2" as const;
+const INBOUND_PAYLOAD_SCHEMA_V3 = "external-inbound-normalized-event.v3" as const;
 const INBOUND_REACTION_PAYLOAD_SCHEMA = "external-inbound-normalized-reaction.v1" as const;
 const ATTACHMENT_UNAVAILABLE_MARKER = "[One or more attachments unavailable]";
 
@@ -73,11 +104,19 @@ type ExternalInboundNormalizedMessageFields = {
 export type ExternalInboundNormalizedMessage = ExternalInboundNormalizedMessageFields & (
   | { schema: typeof INBOUND_PAYLOAD_SCHEMA_V1 }
   | { schema: typeof INBOUND_PAYLOAD_SCHEMA_V2; providerFileIds: string[] }
+  | {
+      schema: typeof INBOUND_PAYLOAD_SCHEMA_V3;
+      providerFileIds: string[];
+      providerAgentMentions: SlackUsergroupMention[];
+    }
 );
 
 type ParsedExternalInboundNormalizedMessage = ExternalInboundNormalizedMessageFields & {
-  schema: typeof INBOUND_PAYLOAD_SCHEMA_V1 | typeof INBOUND_PAYLOAD_SCHEMA_V2;
+  schema: typeof INBOUND_PAYLOAD_SCHEMA_V1
+    | typeof INBOUND_PAYLOAD_SCHEMA_V2
+    | typeof INBOUND_PAYLOAD_SCHEMA_V3;
   providerFileIds: string[];
+  providerAgentMentions: SlackUsergroupMention[];
 };
 
 type ParsedExternalInboundNormalizedReaction = {
@@ -139,6 +178,22 @@ export interface ExternalInboundWorkerDependencies {
     requiredCapabilities?: readonly ("attachment_transfer" | "reaction_sync")[];
     signal?: AbortSignal;
   }): Promise<ExternalInboundRuntimeAuthority | null>;
+  resolveProviderMentionProfiles?(input: {
+    eventId: string;
+    frozenAuthority: ExternalInboundRuntimeAuthority;
+    providerUserIds: readonly string[];
+    signal?: AbortSignal;
+  }): Promise<readonly { providerUserId: string; displayName: string; handle: string | null }[]>;
+  /**
+   * Resolves Slack usergroup ids to the Raft principal whose managed group it
+   * is: an Agent (`raft-agent:` marker) or a human (`raft-user:` marker).
+   */
+  resolveProviderAgentMentionHandles?(input: {
+    eventId: string;
+    frozenAuthority: ExternalInboundRuntimeAuthority;
+    providerUsergroupIds: readonly string[];
+    signal?: AbortSignal;
+  }): Promise<readonly ExternalInboundProviderMentionHandle[] | null>;
   onMessageCommitted?(input: { eventId: string; messageId: string }): Promise<void> | void;
   onMessageCommittedError?(error: unknown): void;
   onReactionCommitted?(input: { eventId: string; messageId: string }): Promise<void> | void;
@@ -205,6 +260,366 @@ function appendAttachmentUnavailableMarker(content: string): string {
   return `${prefix}${suffix}`;
 }
 
+const SLACK_NATIVE_USER_MENTION = /<@([A-Z0-9]{2,160})(?:\|[^>\r\n]{1,160})?>/gu;
+
+function escapeMarkdownLabel(value: string): string {
+  return value.replace(/[\\`*_{}\[\]()<>#+.!|~-]/gu, "\\$&");
+}
+
+function slackMentionLabel(
+  providerUserId: string,
+  actor: Pick<typeof externalActorProjections.$inferSelect, "displayName" | "handles">,
+): string {
+  const opaqueId = providerUserId.trim().toLocaleLowerCase("en-US");
+  const handle = actor.handles.find((candidate) => (
+    /^[\p{L}\p{N}._-]{1,80}$/u.test(candidate)
+    && candidate.trim().toLocaleLowerCase("en-US") !== opaqueId
+  ));
+  if (handle) return `@${handle}`;
+  const displayName = actor.displayName.trim().replace(/\s+/gu, " ").slice(0, 80);
+  return displayName && displayName.toLocaleLowerCase("en-US") !== opaqueId
+    ? `@${escapeMarkdownLabel(displayName)}`
+    : "@Slack user";
+}
+
+export function renderSlackInboundMentionLabels(
+  content: string,
+  labelsByProviderUserId: ReadonlyMap<string, string>,
+): string {
+  const rendered = content.replace(SLACK_NATIVE_USER_MENTION, (_token, providerUserId: string) => (
+    labelsByProviderUserId.get(providerUserId) ?? "@Slack user"
+  ));
+  if (Buffer.byteLength(rendered, "utf8") <= 40_000) return rendered;
+  // A pathological body can contain thousands of short mention tokens. Keep
+  // the accepted content bound without restoring opaque provider identifiers.
+  return content.replace(SLACK_NATIVE_USER_MENTION, "@user");
+}
+
+async function renderProviderInboundMentions(
+  executor: DatabaseExecutor,
+  event: InboundEvent,
+  content: string,
+  providerProfiles: readonly { providerUserId: string; displayName: string; handle: string | null }[] = [],
+): Promise<string> {
+  if (event.provider !== "slack") return content;
+  const providerUserIds = [...new Set(
+    [...content.matchAll(SLACK_NATIVE_USER_MENTION)].map((match) => match[1]!),
+  )];
+  if (providerUserIds.length === 0) return content;
+  const actors = await executor.select({
+    externalActorId: externalActorProjections.externalActorId,
+    displayName: externalActorProjections.displayName,
+    handles: externalActorProjections.handles,
+  }).from(externalActorProjections).where(and(
+    eq(externalActorProjections.provider, "slack"),
+    eq(externalActorProjections.appRegistrationId, event.appRegistrationId),
+    eq(externalActorProjections.installId, event.installId),
+    eq(externalActorProjections.workspaceId, event.workspaceId),
+    inArray(externalActorProjections.externalActorId, providerUserIds),
+    eq(externalActorProjections.state, "active"),
+    eq(externalActorProjections.deactivated, false),
+  ));
+  const labels = new Map(providerProfiles.map((profile) => [
+    profile.providerUserId,
+    slackMentionLabel(profile.providerUserId, {
+      displayName: profile.displayName,
+      handles: profile.handle ? [profile.handle] : [],
+    }),
+  ]));
+  for (const actor of actors) {
+    labels.set(actor.externalActorId, slackMentionLabel(actor.externalActorId, actor));
+  }
+  return renderSlackInboundMentionLabels(content, labels);
+}
+
+/**
+ * The handle a Slack member's inbound `<@U…>` token was rendered as, when it is
+ * one. `slackMentionLabel` falls back to a display name or "Slack user"; those
+ * are not handles, so they carry no structured mention.
+ */
+function slackMentionHandle(
+  providerUserId: string,
+  actor: Pick<typeof externalActorProjections.$inferSelect, "displayName" | "handles">,
+): string | null {
+  const label = slackMentionLabel(providerUserId, actor);
+  const handle = label.slice(1);
+  return actor.handles.includes(handle) ? handle : null;
+}
+
+/**
+ * Display-only structured mentions for Slack members picked in Slack.
+ *
+ * The outbound path already records a picked Slack member as an
+ * `external_mention_facts` row, which is what makes Raft render the mention
+ * styled. Inbound messages rendered `<@U…>` to `@handle` text but recorded
+ * nothing, so the same person showed styled when mentioned from Raft and as
+ * plain text when mentioned from Slack (yezizp, #wg-slack-bridge:54ae7275).
+ *
+ * This writes the fact only: never a `message_mentions` row. A Slack member is
+ * not a Raft principal and is never notified (msg d6f3bb0d). Resolution goes
+ * through the same durable addressability authority as the outbound path, so
+ * only members this binding currently observes in the conversation are recorded; anyone else
+ * stays plain text. Best effort: a fact that cannot be resolved is skipped,
+ * never a reason to refuse the provider message.
+ */
+async function recordSlackInboundExternalMentionFacts(input: {
+  executor: DatabaseExecutor;
+  event: InboundEvent;
+  messageId: string;
+  providerUserIds: readonly string[];
+  botUserId: string | null;
+  now: Date;
+}): Promise<void> {
+  const { executor, event } = input;
+  if (event.provider !== "slack") return;
+  const memberIds = input.providerUserIds.filter((id) => id !== input.botUserId);
+  if (memberIds.length === 0) return;
+  const actors = await executor.select({
+    id: externalActorProjections.id,
+    externalActorId: externalActorProjections.externalActorId,
+    displayName: externalActorProjections.displayName,
+    handles: externalActorProjections.handles,
+  }).from(externalActorProjections).where(and(
+    eq(externalActorProjections.provider, "slack"),
+    eq(externalActorProjections.appRegistrationId, event.appRegistrationId),
+    eq(externalActorProjections.installId, event.installId),
+    eq(externalActorProjections.workspaceId, event.workspaceId),
+    inArray(externalActorProjections.externalActorId, memberIds),
+    eq(externalActorProjections.state, "active"),
+    eq(externalActorProjections.deactivated, false),
+  ));
+  for (const actor of actors) {
+    const handle = slackMentionHandle(actor.externalActorId, actor);
+    if (!handle) continue;
+    // This binding's newest observation of the member. The resolver below
+    // re-checks it (active, unexpired, same binding/epochs), so a member who
+    // left the conversation stays plain text.
+    const [observed] = await executor.select({
+      memberRevision: externalAddressabilityProjections.memberRevision,
+      contextRevision: externalAddressabilityProjections.contextRevision,
+    }).from(externalAddressabilityProjections).where(and(
+      eq(externalAddressabilityProjections.projectionId, actor.id),
+      eq(externalAddressabilityProjections.bindingId, event.bindingId),
+      eq(externalAddressabilityProjections.bindingEpoch, event.bindingEpoch),
+      eq(externalAddressabilityProjections.connectionEpoch, event.connectionEpoch),
+      eq(externalAddressabilityProjections.conversationId, event.providerConversationId),
+      eq(externalAddressabilityProjections.state, "active"),
+      gt(externalAddressabilityProjections.expiresAt, input.now),
+    )).orderBy(desc(externalAddressabilityProjections.memberRevision)).limit(1);
+    if (!observed) continue;
+    const resolution = await resolveExternalMentionFromDurableAuthority({
+      executor,
+      rawHandle: handle,
+      explicitProjectionId: actor.id,
+      raftPrincipalCollision: false,
+      now: input.now,
+      context: {
+        provider: "slack",
+        appRegistrationId: event.appRegistrationId,
+        installId: event.installId,
+        workspaceId: event.workspaceId,
+        connectionEpoch: event.connectionEpoch,
+        bindingId: event.bindingId,
+        bindingEpoch: event.bindingEpoch,
+        conversationId: event.providerConversationId,
+        memberRevision: observed.memberRevision,
+        contextRevision: observed.contextRevision,
+      },
+    });
+    if (resolution.kind !== "resolved") continue;
+    await insertExternalMentionFact({ executor, messageId: input.messageId, fact: resolution.fact });
+  }
+}
+
+export type ExternalInboundProviderMentionHandle =
+  | { agentId: string; providerUsergroupId: string; handle: string }
+  | { userId: string; providerUsergroupId: string; handle: string };
+
+type ResolvedSlackAgentMention = {
+  agentId: string;
+  handle: string;
+  providerUsergroupId: string;
+  label: string;
+};
+
+async function resolveSlackAgentMentions(
+  executor: DatabaseExecutor,
+  event: InboundEvent,
+  mentions: readonly SlackUsergroupMention[],
+  providerHandles: readonly ExternalInboundProviderMentionHandle[],
+): Promise<ResolvedSlackAgentMention[]> {
+  const requestedIds = new Set(mentions.map((mention) => mention.providerUsergroupId));
+  if (event.provider !== "slack" || requestedIds.size === 0) return [];
+  const rows = await executor.select({
+    agentId: agents.id,
+    name: agents.name,
+  }).from(channelAgents)
+    .innerJoin(channels, eq(channels.id, channelAgents.channelId))
+    .innerJoin(agents, and(
+      eq(agents.id, channelAgents.agentId),
+      eq(agents.serverId, channels.serverId),
+      isNull(agents.deletedAt),
+    ))
+    .where(eq(channelAgents.channelId, event.raftChannelId));
+  const channelAgentsById = new Map(rows.map((row) => [row.agentId, row]));
+  const byProviderId = new Map(providerHandles
+    .filter((handle) => requestedIds.has(handle.providerUsergroupId))
+    .flatMap((handle) => ("agentId" in handle ? [[handle.providerUsergroupId, handle] as const] : [])));
+  const resolved = new Map<string, ResolvedSlackAgentMention>();
+  for (const mention of mentions) {
+    const providerHandle = byProviderId.get(mention.providerUsergroupId);
+    if (!providerHandle) continue;
+    const agent = channelAgentsById.get(providerHandle.agentId);
+    if (!agent) continue;
+    resolved.set(agent.agentId, {
+      agentId: agent.agentId,
+      handle: agent.name,
+      providerUsergroupId: mention.providerUsergroupId,
+      label: `@${agent.name}`,
+    });
+  }
+  return [...resolved.values()].sort((left, right) => left.agentId.localeCompare(right.agentId));
+}
+
+// Every Slack-encoded entity: user/usergroup/channel mentions, links, specials.
+const SLACK_ANGLE_TOKEN = /<[^<>\r\n]*>/gu;
+
+type SlackPlainTextMentionTarget = {
+  targetType: "user" | "agent";
+  targetId: string;
+  handle: string;
+};
+
+/**
+ * Typed `@name` text that names a Raft member (Agent or human) of the mention
+ * scope. Slack sends typed text unchanged when the author does not pick from
+ * autocomplete — the only way to reach Raft-only humans, and Agents in
+ * workspaces where Slack refuses the Agent usergroups. Slack's own `<…>`
+ * tokens are removed first, so a picked Slack user or usergroup is never
+ * matched a second time by its label; a target reached both ways keeps one
+ * row (unique mention index). Matching follows Raft free-text mentions (word
+ * boundary, code spans ignored, CJK suffix rule). Slack handles are
+ * lower-case, so a case-insensitive match is accepted when exactly one scope
+ * member has that name; any name shared by two members stays text.
+ */
+async function resolveSlackPlainTextMentions(
+  executor: DatabaseExecutor,
+  content: string,
+  scopeChannelIds: readonly string[],
+): Promise<SlackPlainTextMentionTarget[]> {
+  const tokens = extractRaftMentionHandles(content.replace(SLACK_ANGLE_TOKEN, " ")).slice(0, 50);
+  if (tokens.length === 0 || scopeChannelIds.length === 0) return [];
+  const [agentRows, humanRows] = await Promise.all([
+    executor.select({ id: agents.id, name: agents.name })
+      .from(channelAgents)
+      .innerJoin(channels, eq(channels.id, channelAgents.channelId))
+      .innerJoin(agents, and(
+        eq(agents.id, channelAgents.agentId),
+        eq(agents.serverId, channels.serverId),
+        isNull(agents.deletedAt),
+      ))
+      .where(inArray(channelAgents.channelId, [...scopeChannelIds])),
+    executor.select({ id: users.id, name: users.name })
+      .from(channelHumans)
+      .innerJoin(users, eq(users.id, channelHumans.userId))
+      .where(inArray(channelHumans.channelId, [...scopeChannelIds])),
+  ]);
+  const members = new Map<string, SlackPlainTextMentionTarget>();
+  for (const row of agentRows) {
+    members.set(`agent:${row.id}`, { targetType: "agent", targetId: row.id, handle: row.name });
+  }
+  for (const row of humanRows) {
+    members.set(`user:${row.id}`, { targetType: "user", targetId: row.id, handle: row.name });
+  }
+  const index = (key: (name: string) => string) => {
+    const byName = new Map<string, SlackPlainTextMentionTarget | null>();
+    for (const member of members.values()) {
+      const name = key(member.handle);
+      byName.set(name, byName.has(name) ? null : member);
+    }
+    return byName;
+  };
+  const byName = index((name) => name);
+  const byFoldedName = index((name) => name.toLocaleLowerCase("en-US"));
+  const resolved = new Map<string, SlackPlainTextMentionTarget>();
+  for (const token of tokens) {
+    const exact = resolveRaftMentionHandle(token, (name) => byName.has(name));
+    const member = exact
+      ? byName.get(exact.handle)
+      : (() => {
+        const folded = resolveRaftMentionHandle(
+          token.toLocaleLowerCase("en-US"),
+          (name) => byFoldedName.has(name),
+        );
+        return folded ? byFoldedName.get(folded.handle) : null;
+      })();
+    if (member) resolved.set(`${member.targetType}:${member.targetId}`, member);
+  }
+  return [...resolved.values()];
+}
+
+type ResolvedSlackHumanMention = {
+  userId: string;
+  handle: string;
+  providerUsergroupId: string;
+  label: string;
+};
+
+/**
+ * A picked human usergroup resolves to its Raft user only when that user is a
+ * member of the mention scope (bound channel, parent channel for threads,
+ * every active face for Joint targets) — the same membership that makes a
+ * native Slack user mention notifiable. Out-of-scope humans mint nothing and
+ * the token keeps the author's own label.
+ */
+async function resolveSlackHumanMentions(
+  executor: DatabaseExecutor,
+  event: InboundEvent,
+  mentions: readonly SlackUsergroupMention[],
+  providerHandles: readonly ExternalInboundProviderMentionHandle[],
+  mentionScopeChannelIds: readonly string[],
+): Promise<ResolvedSlackHumanMention[]> {
+  const requestedIds = new Set(mentions.map((mention) => mention.providerUsergroupId));
+  if (event.provider !== "slack" || requestedIds.size === 0) return [];
+  const byProviderId = new Map(providerHandles
+    .filter((handle) => requestedIds.has(handle.providerUsergroupId))
+    .flatMap((handle) => ("userId" in handle ? [[handle.providerUsergroupId, handle] as const] : [])));
+  if (byProviderId.size === 0) return [];
+  const userIds = [...new Set([...byProviderId.values()].map((handle) => handle.userId))];
+  const rows = await executor.select({ id: users.id, name: users.name })
+    .from(users)
+    .where(and(inArray(users.id, userIds), isNull(users.retiredAt)));
+  const usersById = new Map(rows.map((row) => [row.id, row]));
+  const inScope = new Map<string, boolean>();
+  const resolved = new Map<string, ResolvedSlackHumanMention>();
+  for (const mention of mentions) {
+    const providerHandle = byProviderId.get(mention.providerUsergroupId);
+    if (!providerHandle) continue;
+    const user = usersById.get(providerHandle.userId);
+    if (!user) continue;
+    let member = inScope.get(user.id);
+    if (member === undefined) {
+      member = false;
+      for (const scopeChannelId of mentionScopeChannelIds) {
+        if (await isChannelHuman(scopeChannelId, user.id, executor)) {
+          member = true;
+          break;
+        }
+      }
+      inScope.set(user.id, member);
+    }
+    if (!member) continue;
+    if (resolved.has(user.id)) continue;
+    resolved.set(user.id, {
+      userId: user.id,
+      handle: user.name,
+      providerUsergroupId: mention.providerUsergroupId,
+      label: `@${user.name}`,
+    });
+  }
+  return [...resolved.values()].sort((left, right) => left.userId.localeCompare(right.userId));
+}
+
 function parseNormalizedMessage(
   plaintext: string,
   expectedDigest: string,
@@ -227,15 +642,23 @@ function parseNormalizedMessage(
     "providerMessageId",
     "providerThreadId",
   ];
-  const expectedKeys = message.schema === INBOUND_PAYLOAD_SCHEMA_V2
-    ? [...commonKeys, "providerFileIds", "schema"].sort()
-    : [...commonKeys, "schema"].sort();
+  const expectedKeys = message.schema === INBOUND_PAYLOAD_SCHEMA_V3
+    ? [...commonKeys, "providerAgentMentions", "providerFileIds", "schema"].sort()
+    : message.schema === INBOUND_PAYLOAD_SCHEMA_V2
+      ? [...commonKeys, "providerFileIds", "schema"].sort()
+      : [...commonKeys, "schema"].sort();
   if (Object.keys(message).sort().join("\0") !== expectedKeys.join("\0")) return null;
   const providerFileIds = message.schema === INBOUND_PAYLOAD_SCHEMA_V2
+    || message.schema === INBOUND_PAYLOAD_SCHEMA_V3
     ? message.providerFileIds
     : [];
+  const providerAgentMentions = message.schema === INBOUND_PAYLOAD_SCHEMA_V3
+    ? message.providerAgentMentions
+    : [];
   if (
-    (message.schema !== INBOUND_PAYLOAD_SCHEMA_V1 && message.schema !== INBOUND_PAYLOAD_SCHEMA_V2)
+    (message.schema !== INBOUND_PAYLOAD_SCHEMA_V1
+      && message.schema !== INBOUND_PAYLOAD_SCHEMA_V2
+      && message.schema !== INBOUND_PAYLOAD_SCHEMA_V3)
     || !nonEmpty(message.projectionId)
     || !positive(message.actorProjectionRevision)
     || !nonEmpty(message.externalActorId)
@@ -249,8 +672,28 @@ function parseNormalizedMessage(
     || providerFileIds.length > 10
     || providerFileIds.some((fileId) => !nonEmpty(fileId, 320))
     || new Set(providerFileIds).size !== providerFileIds.length
+    || !Array.isArray(providerAgentMentions)
+    || providerAgentMentions.length > 50
+    || providerAgentMentions.some((mention) => {
+      if (!mention || typeof mention !== "object" || Array.isArray(mention)) return true;
+      const record = mention as Record<string, unknown>;
+      return Object.keys(record).sort().join("\0") !== "handle\0providerUsergroupId"
+        || !nonEmpty(record.providerUsergroupId, 160)
+        || !/^S[A-Z0-9]{2,}$/u.test(record.providerUsergroupId as string)
+        || !(record.handle === null || (
+          nonEmpty(record.handle, 80)
+          && normalizeSlackMentionHandle(record.handle as string) === record.handle
+        ));
+    })
+    || new Set(providerAgentMentions.map((mention) => (
+      (mention as SlackUsergroupMention).providerUsergroupId
+    ))).size !== providerAgentMentions.length
   ) return null;
-  return { ...message, providerFileIds } as unknown as ParsedExternalInboundNormalizedMessage;
+  return {
+    ...message,
+    providerFileIds,
+    providerAgentMentions,
+  } as unknown as ParsedExternalInboundNormalizedMessage;
 }
 
 function parseNormalizedReaction(
@@ -391,10 +834,34 @@ async function resolveTargetChannel(
     authorityChannelId: event.raftChannelId,
   });
   if (!conversationTarget) return null;
+  // Channel rows are only serialized and revalidated here, never re-keyed, so
+  // every channel lock in this resolver is FOR NO KEY UPDATE: it still
+  // excludes Raft send admission and archive/delete writes, but not the FOR KEY
+  // SHARE that foreign-key checks (inbox facts, push outbox, mentions) take on
+  // the same rows. Rows are also taken in the Raft send path's order, so the
+  // two cannot form a cycle: Joint parent projections (local parents) ->
+  // canonical parent -> local thread projections -> canonical thread. A Raft
+  // Joint-thread send locks local parent -> its local thread -> canonical
+  // thread; a Joint channel send locks local parent -> canonical parent.
   const [authorityChannel] = await executor.select().from(channels)
-    .where(eq(channels.id, conversationTarget.authorityChannelId)).for("update").limit(1);
+    .where(eq(channels.id, conversationTarget.authorityChannelId)).for("no key update").limit(1);
+  if (conversationTarget.kind === "joint" && payload.providerThreadId) {
+    // The host's local parent (authority) was taken above, ahead of this sorted
+    // set; that is safe only because a host's local channel is never the
+    // canonical one, so no locker can hold the canonical parent and want it.
+    // A thread reply freezes every active parent projection below; take their
+    // rows before the canonical parent, as a Joint channel send does.
+    await executor.select({ id: channels.id }).from(jointChannelServers)
+      .innerJoin(channels, eq(channels.id, jointChannelServers.localChannelId))
+      .where(and(
+        eq(jointChannelServers.jointChannelId, conversationTarget.jointChannelId),
+        eq(jointChannelServers.status, "active"),
+      ))
+      .orderBy(asc(jointChannelServers.serverId))
+      .for("no key update", { of: channels });
+  }
   const [parentChannel] = await executor.select().from(channels)
-    .where(eq(channels.id, conversationTarget.storageChannelId)).for("update").limit(1);
+    .where(eq(channels.id, conversationTarget.storageChannelId)).for("no key update").limit(1);
   if (
     !authorityChannel
     || !parentChannel
@@ -462,7 +929,7 @@ async function resolveTargetChannel(
         eq(jointChannelServers.status, "active"),
       ))
       .orderBy(asc(jointChannelServers.serverId))
-      .for("update");
+      .for("no key update");
     if (
       parentProjections.length === 0
       || parentProjections.some((projection) =>
@@ -481,10 +948,16 @@ async function resolveTargetChannel(
     lockedJointParentProjections = parentProjections;
   }
 
-  let [threadChannel] = await executor.select().from(channels).where(and(
+  // The root message row locked above serializes every creator of this
+  // canonical thread (inbound replies here; Raft thread creation takes its
+  // foreign-key share on the same root), so finding or creating the thread
+  // needs no thread-row lock yet. The canonical thread row itself is locked
+  // last, after any local thread projection, matching Raft send admission.
+  const findCanonicalThread = () => executor.select().from(channels).where(and(
     eq(channels.type, "thread"),
     eq(channels.parentMessageId, rootMessage.id),
-  )).for("update").limit(1);
+  )).limit(1);
+  let [threadChannel] = await findCanonicalThread();
   if (!threadChannel) {
     [threadChannel] = await executor.insert(channels).values({
       serverId: parentChannel.serverId,
@@ -492,16 +965,24 @@ async function resolveTargetChannel(
       type: "thread",
       parentMessageId: rootMessage.id,
     }).onConflictDoNothing().returning();
-    if (!threadChannel) {
-      [threadChannel] = await executor.select().from(channels).where(and(
-        eq(channels.type, "thread"),
-        eq(channels.parentMessageId, rootMessage.id),
-      )).for("update").limit(1);
-    }
+    if (!threadChannel) [threadChannel] = await findCanonicalThread();
   }
   if (!threadChannel || threadChannel.serverId !== parentChannel.serverId || threadChannel.deletedAt) {
     throw new ExternalInboundTargetUnavailableError();
   }
+  const canonicalThreadId = threadChannel.id;
+  const lockCanonicalThread = async () => {
+    const [locked] = await executor.select().from(channels)
+      .where(eq(channels.id, canonicalThreadId)).for("no key update").limit(1);
+    if (
+      !locked
+      || locked.type !== "thread"
+      || locked.parentMessageId !== rootMessage.id
+      || locked.serverId !== parentChannel.serverId
+      || locked.deletedAt
+    ) throw new ExternalInboundTargetUnavailableError();
+    return locked;
+  };
   if (rootMessage.threadId !== threadChannel.id) {
     await executor.update(messages).set({ threadId: threadChannel.id })
       .where(eq(messages.id, rootMessage.id));
@@ -509,7 +990,7 @@ async function resolveTargetChannel(
 
   if (conversationTarget.kind === "ordinary") {
     return {
-      channel: threadChannel,
+      channel: await lockCanonicalThread(),
       canonicalRootMessageId: rootMessage.id,
       jointThreadProjection: null,
     };
@@ -548,7 +1029,7 @@ async function resolveTargetChannel(
     let localThreadChannel: typeof channels.$inferSelect | undefined;
     if (threadProjection) {
       [localThreadChannel] = await executor.select().from(channels)
-        .where(eq(channels.id, threadProjection.localChannelId)).for("update").limit(1);
+        .where(eq(channels.id, threadProjection.localChannelId)).for("no key update").limit(1);
     } else {
       [localThreadChannel] = await executor.insert(channels).values({
         serverId: parentProjection.serverId,
@@ -593,8 +1074,9 @@ async function resolveTargetChannel(
     }
   }
   if (!hostThreadProjection) throw new ExternalInboundTargetUnavailableError();
+  const lockedCanonicalThread = await lockCanonicalThread();
   return {
-    channel: threadChannel,
+    channel: lockedCanonicalThread,
     canonicalRootMessageId: rootMessage.id,
     jointThreadProjection: hostThreadProjection,
   };
@@ -823,6 +1305,59 @@ export async function processExternalInboundEventOnce(input: {
     return { kind: "blocked", eventId: claim.id, reason: "runtime_authority_inactive_or_mismatched" };
   }
 
+  let providerMentionProfiles: readonly {
+    providerUserId: string;
+    displayName: string;
+    handle: string | null;
+  }[] = [];
+  if (payload && frozen.provider === "slack" && input.dependencies.resolveProviderMentionProfiles) {
+    const mentionedIds = [...new Set(
+      [...payload.content.matchAll(SLACK_NATIVE_USER_MENTION)].map((match) => match[1]!),
+    )].slice(0, 50);
+    const currentActors = mentionedIds.length === 0 ? [] : await input.db.select({
+      externalActorId: externalActorProjections.externalActorId,
+    }).from(externalActorProjections).where(and(
+      eq(externalActorProjections.provider, "slack"),
+      eq(externalActorProjections.appRegistrationId, claim.appRegistrationId),
+      eq(externalActorProjections.installId, claim.installId),
+      eq(externalActorProjections.workspaceId, claim.workspaceId),
+      inArray(externalActorProjections.externalActorId, mentionedIds),
+      eq(externalActorProjections.state, "active"),
+      eq(externalActorProjections.deactivated, false),
+    ));
+    const currentIds = new Set(currentActors.map((actor) => actor.externalActorId));
+    const missingIds = mentionedIds.filter((providerUserId) => !currentIds.has(providerUserId));
+    providerMentionProfiles = missingIds.length === 0
+      ? []
+      : await input.dependencies.resolveProviderMentionProfiles({
+        eventId: claim.id,
+        frozenAuthority: frozen,
+        providerUserIds: missingIds,
+        signal: input.signal,
+      }).catch(() => []);
+  }
+
+  let providerAgentMentionHandles: readonly ExternalInboundProviderMentionHandle[] = [];
+  if (payload && payload.providerAgentMentions.length > 0) {
+    if (!input.dependencies.resolveProviderAgentMentionHandles) {
+      await releaseClaim("provider_agent_mention_unavailable");
+      return { kind: "blocked", eventId: claim.id, reason: "provider_agent_mention_unavailable" };
+    }
+    const resolved = await input.dependencies.resolveProviderAgentMentionHandles({
+      eventId: claim.id,
+      frozenAuthority: frozen,
+      providerUsergroupIds: payload.providerAgentMentions.map((mention) => (
+        mention.providerUsergroupId
+      )),
+      signal: input.signal,
+    }).catch(() => null);
+    if (resolved === null) {
+      await releaseClaim("provider_agent_mention_unavailable");
+      return { kind: "blocked", eventId: claim.id, reason: "provider_agent_mention_unavailable" };
+    }
+    providerAgentMentionHandles = resolved;
+  }
+
   if (reactionPayload) {
     const reactionAt = input.dependencies.now?.() ?? currentDate();
     try {
@@ -1018,6 +1553,21 @@ export async function processExternalInboundEventOnce(input: {
 
       const target = await resolveTargetChannel(executor, event, payload);
       if (!target) return null;
+      // Joint commits store on the canonical channel/thread, which carries no
+      // member rows of its own — facts fan out per active local projection
+      // (each face's own channel id as sourceChannelId). Threads resolve
+      // their faces inside recordInboxFacts via jointThreadProjection; a
+      // top-level Joint target needs its channel projections frozen here,
+      // matching the send path's executor requirement.
+      const jointChannelProjections = target.channel.type !== "thread"
+        ? await getActiveJointChannelProjectionsByLocalChannel(target.channel.id, executor)
+        : [];
+      const jointThreadFaces = target.jointThreadProjection
+        ? await getActiveJointThreadProjectionsByCanonicalThread(
+            target.jointThreadProjection.canonicalThreadChannelId,
+            executor,
+          )
+        : [];
       const attachmentFacts = payload.providerFileIds.length === 0
         ? []
         : await executor.select().from(externalAttachmentMessageFacts)
@@ -1036,22 +1586,278 @@ export async function processExternalInboundEventOnce(input: {
       const unavailableAttachment = attachmentFacts.some(
         (fact) => fact.state === "unavailable" || fact.state === "revoked",
       );
+      // Mention scope mirrors resolveMentionScopeForChannel: for a thread it
+      // is the parent channel — every active face for a Joint thread — and
+      // for a channel it is every active local projection (or the channel
+      // itself when ordinary). Only members of a scope channel are mention
+      // targets (typed names and picked Raft usergroups); a picked Slack
+      // user never mints a Raft mention.
+      const mentionScopeChannelIds = target.channel.type === "thread"
+        ? target.jointThreadProjection
+          ? jointThreadFaces.map((face) => face.localParentChannelId)
+          : [((await executor.select({ channelId: messages.channelId })
+              .from(messages)
+              .where(eq(messages.id, target.channel.parentMessageId!))
+              .limit(1))[0]?.channelId ?? target.channel.id)]
+        : jointChannelProjections.length > 0
+          ? jointChannelProjections.map((projection) => projection.localChannelId)
+          : [target.channel.id];
+
+      const resolvedAgentMentions = await resolveSlackAgentMentions(
+        executor,
+        event,
+        payload.providerAgentMentions,
+        providerAgentMentionHandles,
+      );
+      const resolvedHumanMentions = await resolveSlackHumanMentions(
+        executor,
+        event,
+        payload.providerAgentMentions,
+        providerAgentMentionHandles,
+        mentionScopeChannelIds,
+      );
+      const providerRenderedContent = await renderProviderInboundMentions(
+        executor,
+        event,
+        payload.content,
+        providerMentionProfiles,
+      );
+      const agentRenderedContent = renderSlackUsergroupMentions(
+        providerRenderedContent,
+        new Map([...resolvedAgentMentions, ...resolvedHumanMentions].map((mention) => [
+          mention.providerUsergroupId,
+          mention.label,
+        ])),
+      );
+      const [sourceInstall] = await executor
+        .select({ workspaceName: externalAppInstalls.workspaceName, botUserId: externalAppInstalls.botUserId })
+        .from(externalAppInstalls)
+        .where(and(
+          eq(externalAppInstalls.id, event.installId),
+          eq(externalAppInstalls.registrationId, event.appRegistrationId),
+          eq(externalAppInstalls.providerAuthorityId, event.providerAuthorityId),
+        ))
+        .limit(1);
       const result = await insertCanonicalExternalMessage({
         executor,
         channelId: target.channel.id,
         content: unavailableAttachment
-          ? appendAttachmentUnavailableMarker(payload.content)
-          : payload.content,
+          ? appendAttachmentUnavailableMarker(agentRenderedContent)
+          : agentRenderedContent,
         createdAt: new Date(payload.createdAt),
         projectionId: payload.projectionId,
         provider: event.provider,
         appRegistrationId: event.appRegistrationId,
         installId: event.installId,
         workspaceId: event.workspaceId,
+        workspaceName: sourceInstall?.workspaceName ?? null,
         externalActorId: payload.externalActorId,
         externalConversationId: event.providerConversationId,
         externalMessageId: payload.providerMessageId,
         actorProjectionRevision: payload.actorProjectionRevision,
+      });
+
+      // Mint real Raft mention rows for provider-side mention tokens that
+      // resolve to a Raft principal. Before this, external_projection messages
+      // carried zero message_mentions rows, so Slack-side @-mentions could
+      // never notify a linked human or wake an agent — fail-closed by
+      // omission (task #221, yezizp directive: match normal Raft mention
+      // semantics, no fail-closed).
+      const mentionedProviderUserIds = [...new Set(
+        [...payload.content.matchAll(SLACK_NATIVE_USER_MENTION)].map((match) => match[1]!),
+      )].slice(0, 50);
+
+      // Mention rows carry the sender's local-face coordinates, not the
+      // canonical storage channel (mention-v6 contract): the inbound event
+      // commits on the host side, so the origin face is the joint host
+      // projection — host local thread for Joint threads, host local channel
+      // for Joint channels, the bound channel itself for ordinary targets.
+      const hostJointProjection = jointChannelProjections.find(
+        (projection) => projection.role === "host",
+      );
+      const mentionOriginChannelId = target.jointThreadProjection
+        ? target.jointThreadProjection.localThreadChannelId
+        : hostJointProjection?.localChannelId ?? target.channel.id;
+      const mentionOriginServerId = target.jointThreadProjection
+        ? target.jointThreadProjection.localServerId
+        : hostJointProjection?.serverId ?? target.channel.serverId;
+
+      const mentionTargetRows: {
+        targetType: "user" | "agent";
+        targetId: string;
+        handle: string;
+        notifiableAtSend: boolean;
+      }[] = [];
+      if (event.provider === "slack") {
+        for (const mention of await resolveSlackPlainTextMentions(
+          executor,
+          payload.content,
+          mentionScopeChannelIds,
+        )) {
+          mentionTargetRows.push({ ...mention, notifiableAtSend: true });
+        }
+      }
+      if (event.provider === "slack" && mentionedProviderUserIds.length > 0) {
+        // A picked Slack user is a Slack identity, never a Raft one: even an
+        // installer's linked Slack account does not mint a Raft mention
+        // (yezizp, #wg-slack-bridge:54ae7275 msg d6f3bb0d). Raft people and
+        // Agents are reached through their managed usergroups or typed names.
+        // A mention of the bridge bot itself addresses the bound channel's
+        // agents — that is the only addressable Raft agent set a Slack user
+        // can mean. Agents are minted from the same scope set as humans, so
+        // every Joint face's agents get the mention on their own face.
+        if (sourceInstall?.botUserId && mentionedProviderUserIds.includes(sourceInstall.botUserId)) {
+          const mintedAgentIds = new Set<string>();
+          for (const scopeChannelId of mentionScopeChannelIds) {
+            const scopedAgents = await executor.select({ id: agents.id })
+              .from(channelAgents)
+              .innerJoin(agents, eq(agents.id, channelAgents.agentId))
+              .where(eq(channelAgents.channelId, scopeChannelId));
+            for (const agent of scopedAgents) {
+              if (mintedAgentIds.has(agent.id)) continue;
+              mintedAgentIds.add(agent.id);
+              mentionTargetRows.push({
+                targetType: "agent",
+                targetId: agent.id,
+                handle: sourceInstall.botUserId,
+                notifiableAtSend: true,
+              });
+            }
+          }
+        }
+      }
+
+      // A human picked from Slack's usergroup autocomplete is a Raft mention of
+      // that human — already scope-checked, so always notifiable. A typed
+      // `@name` of the same human may already hold the row.
+      for (const mention of resolvedHumanMentions) {
+        if (mentionTargetRows.some((row) => (
+          row.targetType === "user" && row.targetId === mention.userId
+        ))) continue;
+        mentionTargetRows.push({
+          targetType: "user",
+          targetId: mention.userId,
+          handle: mention.handle,
+          notifiableAtSend: true,
+        });
+      }
+
+      // A reply into a thread authored by a Raft user/agent must make the
+      // parent author a durable thread follower — the same "authored" follow
+      // the Raft send path records for internal replies. For a Joint thread
+      // the follow lands on each local face where the author is a member of
+      // that face's parent channel; ordinary threads have a single face.
+      const authorFollowFaces: { threadChannelId: string; scopeParentChannelId: string }[] =
+        target.channel.type === "thread"
+          ? target.jointThreadProjection
+            ? jointThreadFaces.map((face) => ({
+                threadChannelId: face.localThreadChannelId,
+                scopeParentChannelId: face.localParentChannelId,
+              }))
+            : target.channel.parentMessageId
+              ? [{
+                  threadChannelId: target.channel.id,
+                  scopeParentChannelId: (
+                    await executor.select({ channelId: messages.channelId })
+                      .from(messages)
+                      .where(eq(messages.id, target.channel.parentMessageId))
+                      .limit(1)
+                  )[0]?.channelId,
+                }].filter((face): face is typeof face & { scopeParentChannelId: string } =>
+                  Boolean(face.scopeParentChannelId))
+              : []
+          : [];
+      if (authorFollowFaces.length > 0) {
+        const [parentAuthor] = await executor.select({
+          senderType: messages.senderType,
+          senderId: messages.senderId,
+        }).from(messages).where(eq(messages.id, target.channel.parentMessageId!)).limit(1);
+        if (parentAuthor && (parentAuthor.senderType === "agent" || parentAuthor.senderType === "user")) {
+          for (const face of authorFollowFaces) {
+            const faceMember = parentAuthor.senderType === "agent"
+              ? await isChannelAgent(face.scopeParentChannelId, parentAuthor.senderId, executor)
+              : await isChannelHuman(face.scopeParentChannelId, parentAuthor.senderId, executor);
+            if (!faceMember) continue;
+            const followResult = await executor.execute(sql`
+              INSERT INTO thread_follows (
+                thread_channel_id,
+                follower_type,
+                follower_id,
+                parent_message_id,
+                reason,
+                done_at,
+                unfollowed_at
+              )
+              VALUES (
+                ${face.threadChannelId}::uuid,
+                ${parentAuthor.senderType},
+                ${parentAuthor.senderId}::uuid,
+                ${target.channel.parentMessageId}::uuid,
+                'authored',
+                NULL,
+                NULL
+              )
+              ON CONFLICT (thread_channel_id, follower_type, follower_id) DO UPDATE
+              SET
+                parent_message_id = EXCLUDED.parent_message_id,
+                reason = EXCLUDED.reason,
+                created_at = now(),
+                done_at = NULL
+              WHERE thread_follows.unfollowed_at IS NULL
+              RETURNING xmax = 0 AS inserted
+            `);
+            // Mirror the send path's joinedThroughSeq=reply.seq-1: a fresh
+            // follow must not swallow this reply into born-read.
+            if ((followResult.rows[0] as { inserted?: boolean } | undefined)?.inserted) {
+              await startReadPositionAtJoin(
+                executor,
+                parentAuthor.senderType === "agent" ? "agent" : "human",
+                parentAuthor.senderId,
+                face.threadChannelId,
+                result.message.seq - 1,
+              );
+            }
+          }
+        }
+      }
+
+      if (mentionTargetRows.length > 0) {
+        await executor.insert(messageMentions).values(
+          mentionTargetRows.map((mentionTarget) => ({
+            messageId: result.message.id,
+            messageSeq: result.message.seq,
+            serverId: mentionOriginServerId,
+            channelId: mentionOriginChannelId,
+            targetType: mentionTarget.targetType,
+            targetId: mentionTarget.targetId,
+            handleAtSendTime: mentionTarget.handle,
+            source: "send_path" as const,
+            confidence: "exact" as const,
+            notifiableAtSend: mentionTarget.notifiableAtSend,
+          })),
+        ).onConflictDoNothing();
+      }
+      if (resolvedAgentMentions.length > 0) {
+        await executor.insert(messageMentions).values(resolvedAgentMentions.map((mention) => ({
+          messageId: result.message.id,
+          messageSeq: result.message.seq,
+          serverId: mentionOriginServerId,
+          channelId: mentionOriginChannelId,
+          targetType: "agent" as const,
+          targetId: mention.agentId,
+          handleAtSendTime: mention.handle,
+          source: "send_path" as const,
+          confidence: "exact" as const,
+          notifiableAtSend: true,
+        }))).onConflictDoNothing();
+      }
+      await recordSlackInboundExternalMentionFacts({
+        executor,
+        event,
+        messageId: result.message.id,
+        providerUserIds: mentionedProviderUserIds,
+        botUserId: sourceInstall?.botUserId ?? null,
+        now: commitAt,
       });
       const [messageLink] = await executor.insert(externalMessageLinks).values({
         provider: event.provider,
@@ -1112,6 +1918,10 @@ export async function processExternalInboundEventOnce(input: {
         // canonical storage target, and every active Joint thread projection.
         allowExecutorThread: target.jointThreadProjection === null,
         jointThreadProjection: target.jointThreadProjection,
+        // Top-level Joint commits must fan facts out to every active local
+        // projection — the canonical storage channel has no members, so
+        // without this no face member ever receives a row.
+        jointProjections: jointChannelProjections,
         inboxFactPolicy: {
           mode: "record",
           producer: "external_projection.inbound",
@@ -1225,3 +2035,6 @@ export function createExternalInboundWorkerRuntime(input: {
     tick,
   };
 }
+
+/** Exposes target resolution (and its row-lock order) to the real-PostgreSQL lock-order test. */
+export const __resolveExternalInboundTargetForTests = resolveTargetChannel;

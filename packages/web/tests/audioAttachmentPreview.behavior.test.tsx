@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { resetAttachmentPreviewSummaryCache } from "../src/components/message/attachmentPreviewSummaryCache";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { MemoryRouter } from "react-router-dom";
 import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
@@ -451,6 +450,59 @@ test("i18n: audio attachment preview renders zh chrome", async () => {
     assert.equal(download.getAttribute("aria-label"), "下载 voice.mp3");
     assert.equal(row.querySelector("[data-message-affordance='audio-preview']"), null);
   } finally {
+    api.get = originalGet;
+  }
+});
+
+test("an audio error refreshes the presigned link and resumes where it stopped", async () => {
+  const { default: api } = await import("../src/api/client");
+  const originalGet = api.get;
+  const originalPlay = HTMLMediaElement.prototype.play;
+  const originalWarn = console.warn;
+  const playedAt: number[] = [];
+  let inlineRequests = 0;
+  HTMLMediaElement.prototype.play = function play() {
+    playedAt.push(this.currentTime);
+    return Promise.resolve();
+  };
+  console.warn = () => {};
+  api.get = (async (url: string) => {
+    if (url === "/channels/channel-1/members") {
+      return { data: { agents: [], humans: [] } };
+    }
+    if (url === "/attachments/audio-1/url?disposition=inline") {
+      inlineRequests += 1;
+      return { data: { url: `https://cdn.example.test/voice-${inlineRequests}.mp3` } };
+    }
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+
+  try {
+    const { row } = await renderMessage(makeMessage(makeAudioAttachment({ mimeType: "audio/mpeg" })));
+    const first = await waitFor(() => {
+      const audio = row.querySelector<HTMLAudioElement>("audio[title='Audio preview: voice.mp3']");
+      assert.ok(audio);
+      assert.equal(audio.getAttribute("src"), "https://cdn.example.test/voice-1.mp3");
+      return audio;
+    });
+    fireEvent.play(first);
+    first.currentTime = 33;
+    Object.defineProperty(first, "error", { configurable: true, value: { code: 2, message: "" } });
+    fireEvent.error(first);
+
+    const second = await waitFor(() => {
+      const audio = row.querySelector<HTMLAudioElement>("audio[title='Audio preview: voice.mp3']");
+      assert.ok(audio);
+      assert.equal(audio.getAttribute("src"), "https://cdn.example.test/voice-2.mp3");
+      return audio;
+    });
+    assert.equal(inlineRequests, 2);
+    fireEvent.loadedMetadata(second);
+    assert.equal(second.currentTime, 33);
+    assert.deepEqual(playedAt, [33]);
+  } finally {
+    HTMLMediaElement.prototype.play = originalPlay;
+    console.warn = originalWarn;
     api.get = originalGet;
   }
 });

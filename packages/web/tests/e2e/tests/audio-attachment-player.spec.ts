@@ -2,10 +2,19 @@ import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { expect, test } from "@playwright/test";
-import type { APIRequestContext, Page } from "@playwright/test";
+import type { APIRequestContext, Locator, Page } from "@playwright/test";
 import { loginViaApi } from "../fixtures/auth";
 import { waitForSeedState } from "../fixtures/seedState";
 import { dismissOwnerOnboarding } from "../fixtures/session";
+
+// Raft's focus ring is `focus-ring`: a 2px gap in the surface colour, then
+// 2px of ink, drawn as a box-shadow (DS foundations, Elevation). The hidden
+// native range input drives it on the visible rail.
+async function expectRaftFocusRing(rail: Locator) {
+  await expect
+    .poll(() => rail.evaluate((element) => getComputedStyle(element).boxShadow))
+    .toMatch(/0px 0px 0px 2px.*,.*0px 0px 0px 4px/);
+}
 
 function makeWavFixture(durationSeconds = 4) {
   const sampleRate = 8_000;
@@ -104,8 +113,7 @@ test("audio attachments expose a custom inline player with keyboard-accessible c
   await expect(seek).toHaveAttribute("aria-label", `Seek audio audio-player-${suffix}.wav`);
   await page.keyboard.press("Tab");
   await expect(seek).toBeFocused();
-  await expect(seekRail).toHaveCSS("outline-style", "solid");
-  await expect(seekRail).toHaveCSS("outline-width", "2px");
+  await expectRaftFocusRing(seekRail);
   await seek.evaluate((input) => {
     const range = input as HTMLInputElement;
     range.value = "2";
@@ -119,8 +127,7 @@ test("audio attachments expose a custom inline player with keyboard-accessible c
   await expect(volume).toHaveAttribute("aria-label", `Audio volume audio-player-${suffix}.wav`);
   await page.keyboard.press("Tab");
   await expect(volume).toBeFocused();
-  await expect(volumeRail).toHaveCSS("outline-style", "solid");
-  await expect(volumeRail).toHaveCSS("outline-width", "2px");
+  await expectRaftFocusRing(volumeRail);
   await page.keyboard.press("ArrowLeft");
   await expect(volume).toHaveAttribute("aria-valuetext", /9[0-9]%/);
 

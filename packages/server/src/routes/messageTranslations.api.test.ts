@@ -1,28 +1,29 @@
-import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials.js";
-import { createApiTest } from "../test/integration/apiTest.js";
+import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
+import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
-import { afterEach, beforeEach } from "vitest";
-import { BasicTracer, MemoryTraceSink } from "@botiverse/raft-shared";
+import { BasicTracer, MemoryTraceSink, PUBLIC_SERVER_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { and, eq } from "drizzle-orm";
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   channelHumans,
+  channels,
+  featureFlags,
   jointChannels,
   jointChannelServers,
   messageTranslations,
   serverMembers,
   servers,
   users,
-} from "../db/schema.js";
-import { assignMachine, createAgent } from "../services/agentService.js";
-import { createChannel } from "../services/channelService.js";
-import { registerMachine } from "../services/machineService.js";
+} from "../db/schema";
+import { assignMachine, createAgent } from "../services/agentService";
+import { createChannel, getOrCreateThread } from "../services/channelService";
+import { registerMachine } from "../services/machineService";
 import {
   __resetMessageTranslationServiceDepsForTests,
   __setMessageTranslationServiceDepsForTests,
-} from "../services/messageTranslationService.js";
-import { createMessage } from "../services/messageService.js";
-import { createServer } from "../services/serverService.js";
+} from "../services/messageTranslationService";
+import { createMessage } from "../services/messageService";
+import { createServer } from "../services/serverService";
 import {
   TranslationPlaceholderValidationError,
   TranslationProviderError,
@@ -30,8 +31,8 @@ import {
   type TranslationBatchResult,
   type TranslationProvider,
   type TranslationProviderVersion,
-} from "../services/translation/index.js";
-import { openTestApp } from "../test/integration/app.js";
+} from "../services/translation/index";
+import { openTestApp } from "../test/integration/app";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 
@@ -188,6 +189,51 @@ test("POST /api/message-translations:batch rejects when server translation is di
 
   assert.equal(res.status, 403);
   assert.deepEqual(await res.json(), { error: "Translation is disabled for this server" });
+});
+
+test("public translation generates anonymously only for messages still on the public projection", async ({ app }) => {
+  await withTranslationProviderEnv({ TRANSLATION_PROVIDER: "fake" }, async () => {
+    const { db, owner, server, channel, privateChannel, agent } = await seedFixture("public-anonymous");
+    await db.update(featureFlags).set({ enabled: true, killSwitch: false, defaultEnabled: true })
+      .where(eq(featureFlags.key, PUBLIC_SERVER_FEATURE_FLAG_KEY));
+    await db.update(servers).set({ publiclyVisible: true, translationEnabled: true })
+      .where(eq(servers.id, server.id));
+    await db.update(channels).set({ guestVisible: true }).where(eq(channels.id, channel.id));
+    const publicMessage = await createMessage(channel.id, "agent", agent.id, "你好 anonymous public");
+    const hiddenMessage = await createMessage(privateChannel.id, "user", owner.id, "你好 hidden");
+    const thread = await getOrCreateThread(publicMessage.id, owner.id, "user");
+    const reply = await createMessage(thread.id, "agent", agent.id, "你好 public reply");
+    const url = `${app.baseUrl}/api/public/servers/${server.slug}/message-translations:batch`;
+    const post = (messageIds: string[]) => fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ targetLanguage: "en", mode: "manual", messageIds }),
+    });
+
+    const allowed = await post([publicMessage.id, hiddenMessage.id, reply.id]);
+    assert.equal(allowed.status, 200, await allowed.clone().text());
+    const body = await allowed.json() as { results: Array<{ messageId: string; status: string }> };
+    assert.deepEqual(body.results.map(({ messageId, status }) => ({ messageId, status })), [
+      { messageId: publicMessage.id, status: "translated" },
+      { messageId: hiddenMessage.id, status: "not_found" },
+      { messageId: reply.id, status: "translated" },
+    ]);
+
+    const pageMessages = await Promise.all(Array.from({ length: 50 }, (_, index) =>
+      createMessage(channel.id, "agent", agent.id, `你好 public page ${index}`)));
+    const fullPage = await post(pageMessages.map((message) => message.id));
+    assert.equal(fullPage.status, 200, "a normal fifty-message public page fits in the member-sized batch contract");
+    assert.equal((await fullPage.json() as { results: unknown[] }).results.length, 50);
+
+    await db.update(channels).set({ guestVisible: false }).where(eq(channels.id, channel.id));
+    const revokedChannel = await post([publicMessage.id, reply.id]);
+    assert.equal(revokedChannel.status, 200);
+    assert.deepEqual((await revokedChannel.json() as { results: Array<{ status: string }> }).results.map((row) => row.status), ["not_found", "not_found"]);
+
+    await db.update(servers).set({ publiclyVisible: false }).where(eq(servers.id, server.id));
+    const revokedServer = await post([publicMessage.id]);
+    assert.equal(revokedServer.status, 404);
+  });
 });
 
 test("PATCH /api/auth/me updates account display preferences", async ({ app }) => {

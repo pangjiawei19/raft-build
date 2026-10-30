@@ -1,8 +1,17 @@
+import { AgentProxyBindError } from "./spawnFailureErrors";
 import { randomBytes, randomUUID } from "node:crypto";
 import http from "node:http";
+import { brotliDecompressSync, gunzipSync, inflateSync } from "node:zlib";
 import type { AddressInfo } from "node:net";
 import { URL } from "node:url";
 import {
+  AGENT_API_EVENTS_ACK_HEADER,
+  AGENT_API_EVENTS_ACK_LEASE,
+  agentApiHistoryConsumptionScopeSchema,
+  type AgentApiHistoryConsumptionScope,
+  errorClassOf,
+  isThirdPartyEventId,
+  normalizeThirdPartyEventId,
   formatTraceparent,
   noopTracer,
   parseAgentApiAppSourceAckReject,
@@ -10,22 +19,28 @@ import {
   sourceRefIdentityKey,
   type ActiveSpan,
   type AgentInboxSourceRef,
+  type AgentMessage,
   type TraceStatus,
   type Tracer,
 } from "@botiverse/raft-shared";
-import type { ApmHeldFreshnessEnvelopeBody } from "./apmStateMachine.js";
+import type { ApmHeldFreshnessEnvelopeBody } from "./apmStateMachine";
 import {
   maxInboxMessageSeq,
   normalizeInboxVisibleMessages,
   planAgentInboxSideEffect,
   sortInboxMessagesBySeq,
   type AgentInboxStateMachineEffect,
-} from "./agentInboxStateMachine.js";
-import { projectAgentInboxSnapshot } from "./agentInboxProjection.js";
-import type { AgentInboxTargetRow } from "./agentInboxProjection.js";
-import type { AgentAppInboxStore } from "./agentAppInbox.js";
-import { daemonFetch, type DaemonFetchOptions } from "./daemonFetch.js";
-import { logger } from "./logger.js";
+} from "./agentInboxStateMachine";
+import { projectAgentInboxSnapshot } from "./agentInboxProjection";
+import { formatProxyVisibleMessageTarget } from "./agentVisibleDeliveryLedger";
+import type { AgentInboxTargetRow } from "./agentInboxProjection";
+import type { AgentAppInboxStore } from "./agentAppInbox";
+import { daemonFetch, type DaemonFetchOptions } from "./daemonFetch";
+import { logger } from "./logger";
+import {
+  createThirdPartyEventDeliveryReporter,
+  thirdPartyEventIdsFromEvents,
+} from "./thirdPartyEventDeliveryReporter";
 
 type ProxyRegistration = {
   serverUrl: string;
@@ -39,7 +54,86 @@ type ProxyRegistration = {
   tracer: Tracer;
   daemonVersion: string | null;
   computerVersion: string | null;
+  /** Task #178: third-party events served under lease, keyed by batch id. Lives with the registration, so a relaunch voids them. */
+  thirdPartyLeases?: Map<string, ThirdPartyEventLease>;
+  /** Glimpse G2-3: this agent's recent local holds of a task write, keyed by target and write (see taskWriteRehold). */
+  taskWriteHolds?: Map<string, { seenUpToSeq: number; at: number }>;
 };
+
+/** How long a local hold of a task write covers its rerun: one hold per catch-up (the Server's window too). */
+const TASK_WRITE_REHOLD_WINDOW_MS = 10 * 60_000;
+
+/** A task write's identity on its board: the action and its task(s), so a hold covers only its own rerun. */
+function taskWriteKey(action: AgentProxyFreshnessAction, body: Record<string, unknown>): string {
+  const numbers = (value: unknown) => (Array.isArray(value) ? value : []).filter((n): n is number => typeof n === "number").sort((a, b) => a - b).join(",");
+  const strings = (value: unknown) => (Array.isArray(value) ? value : []).filter((v): v is string => typeof v === "string").sort().join(",");
+  if (action === "task_claim") return `task_claim:${numbers(body.task_numbers)}|${strings(body.message_ids)}`;
+  if (action === "task_update") return `task_update:${String(body.task_number)}:${String(body.status)}`;
+  return `${action}:${String(body.task_number)}`;
+}
+
+// Task #178 — serve = lease, ack = consume + report. A leased event stays in
+// the Local Inbox: a later /events re-serves it under a new batch (voiding the
+// old one) and an expired lease simply rejects a late ack. Leases live only in
+// memory: a daemon restart means "never acked" and the server re-pushes.
+type ThirdPartyEventLease = {
+  batchId: string;
+  eventIds: Set<string>;
+  messages: AgentProxyVisibleMessage[];
+  expiresAt: number;
+  timer: NodeJS.Timeout;
+};
+const THIRD_PARTY_EVENT_LEASE_MS = 60_000;
+let thirdPartyEventLeaseMs = THIRD_PARTY_EVENT_LEASE_MS;
+export function __setThirdPartyEventLeaseMsForTest(ms: number | undefined): void {
+  thirdPartyEventLeaseMs = ms ?? THIRD_PARTY_EVENT_LEASE_MS;
+}
+
+function thirdPartyEventIdOf(message: unknown): string | null {
+  const id = (message as { third_party_event?: { id?: unknown } | null } | null)?.third_party_event?.id;
+  return isThirdPartyEventId(id) ? normalizeThirdPartyEventId(id) : null;
+}
+
+function voidThirdPartyLeasesCovering(registration: ProxyRegistration, eventIds: Iterable<string>): void {
+  const leases = registration.thirdPartyLeases;
+  if (!leases) return;
+  const ids = new Set(eventIds);
+  for (const [batchId, lease] of leases) {
+    for (const id of lease.eventIds) {
+      if (ids.has(id)) {
+        clearTimeout(lease.timer);
+        leases.delete(batchId);
+        break;
+      }
+    }
+  }
+}
+
+function leaseThirdPartyEvents(
+  registration: ProxyRegistration,
+  messages: AgentProxyVisibleMessage[],
+): { batch_id: string; event_ids: string[]; expires_at: string } {
+  const leases = (registration.thirdPartyLeases ??= new Map());
+  const eventIds = new Set<string>();
+  for (const message of messages) {
+    const id = thirdPartyEventIdOf(message);
+    if (id) eventIds.add(id);
+  }
+  voidThirdPartyLeasesCovering(registration, eventIds);
+  const batchId = randomUUID();
+  const expiresAt = Date.now() + thirdPartyEventLeaseMs;
+  const timer = setTimeout(() => {
+    leases.delete(batchId);
+  }, thirdPartyEventLeaseMs);
+  timer.unref?.();
+  leases.set(batchId, { batchId, eventIds, messages, expiresAt, timer });
+  return { batch_id: batchId, event_ids: [...eventIds], expires_at: new Date(expiresAt).toISOString() };
+}
+
+function clearThirdPartyLeases(registration: ProxyRegistration): void {
+  for (const lease of registration.thirdPartyLeases?.values() ?? []) clearTimeout(lease.timer);
+  registration.thirdPartyLeases?.clear();
+}
 
 type ProxyHandle = {
   proxyUrl: string;
@@ -63,9 +157,12 @@ type AppSourceAckAcceptedResponse = {
 };
 
 export type AgentProxyVisibleMessage = {
+  third_party_event?: Pick<NonNullable<AgentMessage["third_party_event"]>, "id">;
   seq?: number;
   id?: string;
   message_id?: string;
+  channel_id?: string;
+  channelId?: string;
   sender_id?: string;
   senderId?: string;
   channel_type?: string;
@@ -75,9 +172,11 @@ export type AgentProxyVisibleMessage = {
   sender_type?: string;
   sender_name?: string;
   sender_description?: string | null;
+  sender_timezone?: string | null;
   senderType?: string;
   senderName?: string;
   senderDescription?: string | null;
+  senderTimezone?: string | null;
   content?: string;
   timestamp?: string;
   createdAt?: string;
@@ -87,6 +186,10 @@ export type AgentProxyInboxCoordinator = {
   getBoundary(target: string): number | undefined;
   getPendingMessages(target: string): AgentProxyVisibleMessage[];
   isMessageModelSeen?(input: { target: string; message: AgentProxyVisibleMessage }): boolean;
+  /** Exact model-seen seqs for a target, ascending (task #360); merged into a send's `seenExactSeqs`. */
+  getExactSeenSeqs?(target: string): number[];
+  /** The id of the model context the agent is in now (new on compaction), or null when none was published. */
+  getContextId?(): string | null;
   /**
    * Local Inbox contract for daemon-managed runners:
    * `/internal/agent-api/events` and `slock message check` MUST drain this
@@ -97,12 +200,15 @@ export type AgentProxyInboxCoordinator = {
   getAllPendingMessages?(): AgentProxyVisibleMessage[];
   recordInboxSnapshot?(input: AgentProxyInboxProjectionTraceInput): void;
   consumeVisibleMessages(input: {
+    historyScope?: AgentApiHistoryConsumptionScope;
     target?: string;
     messages: AgentProxyVisibleMessage[];
     boundarySeq?: number;
     source: "server_held_context" | "agent_api_events_local" | "agent_api_events_server" | "agent_api_history" | "agent_api_send_commit" | "side_effect_preflight_context";
   }): void;
   recordFreshnessDecision?(input: AgentProxyFreshnessDecision): void;
+  /** What the Server said about a forwarded message send: accepted (with its id) or held as a draft. */
+  recordSendOutcome?(input: { state: "sent"; messageId?: string } | { state: "held" }): void;
   recordDrainOutcome?(input: AgentProxyDrainOutcome): void;
   recordProxyFailure?(input: AgentProxyFailure): void;
   recordTransportNormalizedError?(input: AgentProxyTransportNormalizedError): void;
@@ -114,7 +220,7 @@ export type AgentProxyInboxProjectionTraceInput = {
   pendingMessageCount: number;
 };
 
-export type AgentProxyFreshnessAction = "send" | "task_claim" | "task_update";
+export type AgentProxyFreshnessAction = "send" | "task_claim" | "task_update" | "task_amend";
 
 export type AgentProxyFreshnessDecision = {
   action: AgentProxyFreshnessAction;
@@ -170,6 +276,7 @@ export type AgentProxyFailure = {
 export type AgentProxyFailureClass =
   | "pre_response_transport"
   | "mid_response_transport"
+  | "post_response_local"
   | "upstream_http_response";
 
 export type AgentProxyTransportRouteFamily =
@@ -196,11 +303,12 @@ export type AgentProxyTransportRouteFamily =
   | "tasks"
   | "tasks/claim"
   | "tasks/update"
+  | "threads"
   | "threads/unfollow"
   | "unknown";
 
 export type AgentProxyTransportNormalizedError = {
-  normalizedCode: "transport_failure" | "server_5xx" | "local_daemon_state_invalid";
+  normalizedCode: "transport_failure" | "server_5xx" | "local_daemon_state_invalid" | "local_post_response_failure";
   routeFamily: AgentProxyTransportRouteFamily;
   /**
    * Same byte meaning as daemon.proxy.failed: true after any upstream
@@ -229,10 +337,63 @@ export type AgentProxyTransportNormalizedError = {
 };
 
 const registrations = new Map<string, ProxyRegistration>();
+
+const THIRD_PARTY_EVENT_DELIVERY_REPORT_RETRY_BASE_MS = 5_000;
+let thirdPartyEventDeliveryReportRetryBaseMs = THIRD_PARTY_EVENT_DELIVERY_REPORT_RETRY_BASE_MS;
+const thirdPartyEventDeliveryReporter = createThirdPartyEventDeliveryReporter({
+  // The agent's newest registration: a relaunch replaces the runner credential.
+  resolveTarget: (agentId) => {
+    let latest: ProxyRegistration | null = null;
+    for (const registration of registrations.values()) {
+      if (registration.agentId === agentId) latest = registration;
+    }
+    return latest ? { serverUrl: latest.serverUrl, apiKey: latest.apiKey } : null;
+  },
+  fetch: (url, init) => daemonFetch(url, init, process.env, { isolationKey: AGENT_CREDENTIAL_PROXY_FETCH_ISOLATION_KEY }),
+  retryBaseMs: () => thirdPartyEventDeliveryReportRetryBaseMs,
+  onOutcome: (outcome) => {
+    if (outcome.outcome === "reported") return;
+    logger.warn(
+      `[Agent ${outcome.agentId}] Third-party event delivery report ${outcome.outcome} (events=${outcome.eventCount}, pending=${outcome.pendingCount}${outcome.httpStatus ? `, http=${outcome.httpStatus}` : ""})`,
+    );
+  },
+});
 let proxyServerState: ProxyServerState | null = null;
 let proxyServerStartPromise: Promise<ProxyServerState> | null = null;
 let proxyServerFactory: ProxyServerFactory = createProxyServer;
 const DECODED_RESPONSE_HEADERS = new Set(["content-encoding", "content-length", "transfer-encoding"]);
+const GZIP_MAGIC = Buffer.from([0x1f, 0x8b]);
+
+/**
+ * Undici is supposed to decode compressed upstream bodies transparently, but
+ * that does not hold on every Node build (observed on the Node 26 SEA
+ * binaries with an upstream that compresses regardless of accept-encoding).
+ * When it fails, responseHeadersForLocalProxy has already stripped
+ * content-encoding per the decoded-forwarding contract, so the CLI receives
+ * headerless gzip — the 2026-09-10 "INVALID_JSON_RESPONSE / empty body"
+ * fleet incident. Decode here by sniffing: a declared encoding whose magic
+ * bytes are still present means undici did NOT decode; anything else passes
+ * through untouched, so an already-decoded body is never double-inflated.
+ */
+async function decodedUpstreamBuffer(
+  upstream: Response,
+  onDecodeFailed: (encoding: string) => void,
+): Promise<Buffer> {
+  const raw = Buffer.from(await upstream.arrayBuffer());
+  const encoding = (upstream.headers.get("content-encoding") ?? "").trim().toLowerCase();
+  if (!encoding || encoding === "identity") return raw;
+  try {
+    if ((encoding === "gzip" || encoding === "x-gzip") && raw.subarray(0, 2).equals(GZIP_MAGIC)) return gunzipSync(raw);
+    if (encoding === "deflate") return inflateSync(raw);
+    if (encoding === "br") return brotliDecompressSync(raw);
+  } catch {
+    // Usually an already-decoded body under a stale header (harmless). If it
+    // was really encoded, the CLI gets unreadable bytes, so make it countable.
+    onDecodeFailed(encoding);
+    return raw;
+  }
+  return raw;
+}
 const HOP_BY_HOP_REQUEST_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -273,6 +434,10 @@ function agentCredentialProxyFetchOptions(
 
 function shouldRelayAgentAttachmentRedirect(pathname: string): boolean {
   return /^\/internal\/agent-api\/attachments\/[^/]+$/.test(pathname);
+}
+
+export function __setThirdPartyEventDeliveryReportRetryBaseMsForTest(ms: number | undefined): void {
+  thirdPartyEventDeliveryReportRetryBaseMs = ms ?? THIRD_PARTY_EVENT_DELIVERY_REPORT_RETRY_BASE_MS;
 }
 
 export function __agentCredentialProxyFetchOptionsForTest(
@@ -345,7 +510,7 @@ async function startProxyServer(): Promise<ProxyServerState> {
     }
   }
   const detail = lastError instanceof Error ? lastError.message : String(lastError ?? "unknown error");
-  throw new Error(
+  throw new AgentProxyBindError(
     `Agent Credential Proxy local proxy failed to bind ${AGENT_CREDENTIAL_PROXY_HOST} ` +
     `after ${AGENT_CREDENTIAL_PROXY_BIND_MAX_ATTEMPTS} attempts: ${detail}`,
   );
@@ -366,6 +531,8 @@ async function ensureServer(): Promise<ProxyServerState> {
 
 export async function __resetAgentCredentialProxyForTest(): Promise<void> {
   registrations.clear();
+  thirdPartyEventDeliveryReporter.reset();
+  thirdPartyEventDeliveryReportRetryBaseMs = THIRD_PARTY_EVENT_DELIVERY_REPORT_RETRY_BASE_MS;
   const state = proxyServerState;
   proxyServerState = null;
   proxyServerStartPromise = null;
@@ -443,12 +610,21 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     kind: "client",
     attrs: {
       route_family: routeFamilyForPath(localPathname),
+      // route_family folds v1 and v2 send together; keep the version visible
+      // so a client route change cannot hide behind the family (task #360).
+      route_path_version: localPathname.startsWith("/internal/agent-api/v2/") ? "v2" : "v1",
       method: normalizedProxyMethod(method),
       trace_context_state: traceContextState,
       proxy_launch_id_present: registration.launchId !== null,
       correlation_id: correlationId,
     },
   });
+  const noteUpstreamDecodeFailed = (encoding: string): void => {
+    proxySpan.addEvent("daemon.agent_proxy.upstream_decode_failed", {
+      encoding,
+      route_family: routeFamilyForPath(localPathname),
+    });
+  };
   let proxySpanStatus: TraceStatus = "error";
   let proxySpanEndAttrs: Record<string, unknown> = {
     outcome: "proxy_failure",
@@ -459,6 +635,11 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
   };
   let upstreamResponseStarted = false;
   let upstreamResponseComplete = false;
+  // Upload failures are read by size, so the upload span carries a coarse
+  // bucket only (never names or bytes). The declared length covers failures
+  // before the body is read; the buffered length replaces it once known.
+  const sizeTracked = routeFamilyForPath(localPathname) === "attachments/upload";
+  let requestBodyBytes = sizeTracked ? declaredContentLength(req.headers["content-length"]) : undefined;
   try {
     target = new URL(req.url ?? "/", registration.serverUrl);
     // The local bearer authorizes this agent's Raft server only. Absolute,
@@ -481,6 +662,13 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       if (normalizedName === "host") continue;
       if (normalizedName === "authorization") continue;
       if (normalizedName === "content-length") continue;
+      // Never forward the caller's accept-encoding: undici only transparently
+      // decodes compressed responses when IT negotiated the encoding, and a
+      // user-supplied accept-encoding disables that (observed on Node 26).
+      // Forwarding it hands us gzip bytes while responseHeadersForLocalProxy
+      // strips content-encoding per the decoded-forwarding contract — the CLI
+      // then parses raw gzip as JSON (INVALID_JSON_RESPONSE / "empty body").
+      if (normalizedName === "accept-encoding") continue;
       if (HOP_BY_HOP_REQUEST_HEADERS.has(normalizedName)) continue;
       if (Array.isArray(value)) {
         for (const item of value) headers.append(name, item);
@@ -488,8 +676,18 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
         headers.set(name, value);
       }
     }
+    // First line of defense: ask the upstream for an unencoded body outright.
+    // decodedUpstreamBuffer above is the backstop for upstreams that compress
+    // regardless (CloudFront does, for large cached responses).
+    headers.set("accept-encoding", "identity");
     headers.set("Authorization", `Bearer ${registration.apiKey}`);
     headers.set("X-Agent-Id", registration.agentId);
+    // The launch and model context this request belongs to: the server's
+    // agent-context return events (glimpse input duplication) group what it
+    // offered per context; the daemon is the authority on both.
+    if (registration.launchId) headers.set("X-Agent-Launch-Id", registration.launchId);
+    const contextId = registration.inboxCoordinator?.getContextId?.();
+    if (contextId) headers.set("X-Agent-Context-Id", contextId);
     headers.set("X-Raft-Client", "cli");
     headers.set("X-Slock-Agent-Active-Capabilities", registration.activeCapabilities);
     // The caller-supplied context is only a parent. Always create a daemon
@@ -501,6 +699,7 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     let rawBodyBuffer: Buffer | undefined;
     if (method !== "GET" && method !== "HEAD") {
       rawBodyBuffer = await readRequestBody(req);
+      if (sizeTracked) requestBodyBytes = rawBodyBuffer.byteLength;
       const bodyBuffer = new ArrayBuffer(rawBodyBuffer.byteLength);
       new Uint8Array(bodyBuffer).set(rawBodyBuffer);
       body = bodyBuffer;
@@ -508,7 +707,11 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     }
     let sendTarget: string | undefined;
     let sideEffectFreshnessContextMode: "inline" | "withheld" | undefined;
+    // v2 sends feed the ledger from their response but keep the v2 response
+    // unreprojected, so their mode only steers consumption.
+    let sendV2ConsumeFreshnessContextMode: "inline" | "withheld" | undefined;
     const sideEffectAction = agentApiSideEffectAction(target.pathname);
+    const isMessageSendV2 = target.pathname === MESSAGE_SEND_V2_PATH;
 
     if (method === "GET" && target.pathname === "/internal/agent-api/runtime-version") {
       if (!registration.daemonVersion) {
@@ -554,6 +757,26 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       }
     }
 
+    if (method === "POST" && (
+      target.pathname === "/internal/agent-api/inbox/seal"
+      || target.pathname === "/internal/agent-api/inbox/unseal"
+    )) {
+      const localSeal = localAgentApiInboxSealResponse(
+        registration,
+        rawBodyBuffer ?? Buffer.alloc(0),
+        target.pathname.endsWith("/unseal") ? "unseal" : "seal",
+      );
+      proxySpanStatus = localSeal.status < 400 ? "ok" : "error";
+      proxySpanEndAttrs = {
+        outcome: "local_response",
+        local_response_kind: `inbox_${target.pathname.endsWith("/unseal") ? "unseal" : "seal"}`,
+        http_status: localSeal.status,
+      };
+      res.writeHead(localSeal.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(localSeal.body));
+      return;
+    }
+
     // Explicit app-item ack (Phase 1). inbox check itself never consumes.
     // Body was already drained into rawBodyBuffer for non-GET methods above.
     if (method === "POST" && target.pathname === "/internal/agent-api/inbox/ack") {
@@ -569,12 +792,31 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       return;
     }
 
+    // Task #178: the CLI acks a leased batch of third-party events after it
+    // has written them out. Never forwarded: the lease is daemon state.
+    if (method === "POST" && target.pathname === "/internal/agent-api/third-party-events/ack") {
+      const localAck = localAgentApiThirdPartyEventsAckResponse(registration, rawBodyBuffer ?? Buffer.alloc(0));
+      proxySpanStatus = localAck.status < 400 ? "ok" : "error";
+      proxySpanEndAttrs = {
+        outcome: "local_response",
+        local_response_kind: "third_party_events_ack",
+        http_status: localAck.status,
+        ...localAck.attrs,
+      };
+      res.writeHead(localAck.status, { "content-type": "application/json" });
+      res.end(JSON.stringify(localAck.body));
+      return;
+    }
+
     // Local Inbox first: a managed runner's message check is a projection of
     // the daemon's accepted-but-not-yet-visible inbox. Do not forward to the
     // server while local pending exists, or a busy runtime can receive a
     // pending notification and then see "No new messages."
     if (method === "GET" && target.pathname === "/internal/agent-api/events") {
-      const localEvents = await localAgentApiEventsResponse(registration, target);
+      // Task #178: a CLI that will ack after output declares it; only then are
+      // third-party events leased instead of consumed-and-reported on finish.
+      const leaseThirdParty = firstRequestHeader(req.headers[AGENT_API_EVENTS_ACK_HEADER])?.trim().toLowerCase() === AGENT_API_EVENTS_ACK_LEASE;
+      const localEvents = await localAgentApiEventsResponse(registration, target, { leaseThirdPartyEvents: leaseThirdParty });
       if (localEvents) {
         proxySpanStatus = "ok";
         proxySpanEndAttrs = {
@@ -582,6 +824,23 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
           local_response_kind: "events",
           http_status: localEvents.status,
         };
+        const servedThirdPartyEventIds = thirdPartyEventIdsFromEvents(
+          Array.isArray(localEvents.body.events) ? localEvents.body.events : [],
+        );
+        if (servedThirdPartyEventIds.length > 0) {
+          // "lease" (task #178): consumed and reported only when the CLI acks
+          // the batch after writing it out (third-party-events/ack branch).
+          // "finish_fallback" (task #175): for CLIs without the ack, reported
+          // once the response has been written. `finish` means "handed to the
+          // OS", not "the client read it", so a CLI dying mid-read loses the
+          // event; the attr lets that fallback share be read from traces
+          // until every CLI acks and the path is removed.
+          proxySpanEndAttrs.third_party_ack_mode = leaseThirdParty ? "lease" : "finish_fallback";
+          proxySpanEndAttrs.third_party_served_count = servedThirdPartyEventIds.length;
+          if (!leaseThirdParty) {
+            res.once("finish", () => thirdPartyEventDeliveryReporter.report(registration.agentId, servedThirdPartyEventIds));
+          }
+        }
         res.writeHead(localEvents.status, { "content-type": "application/json" });
         res.end(JSON.stringify(localEvents.body));
         return;
@@ -604,8 +863,24 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
         return;
       }
       body = prepared.bodyText;
-      if (sideEffectAction === "send") sendTarget = prepared.target;
+      // The target whose held context (a send's or a task write's) the response books.
+      sendTarget = prepared.target;
       sideEffectFreshnessContextMode = prepared.freshnessContextMode;
+      headers.set("content-type", "application/json");
+      headers.delete("content-length");
+    } else if (method === "POST" && isMessageSendV2) {
+      // task #360 follow-up: the CLI sends through v2 since #7035, which the
+      // side-effect preflight above never matched, so the daemon's model-seen
+      // facts never reached a real send. Forward-only: lift `seenUpToSeq` and
+      // union exact seqs; never answer a v2 send locally (the hold stays the
+      // Server's). Under passive AX the coordinator's facts are scoped to the
+      // model's current context, like the CLI's own (glimpse G0). The response
+      // still feeds the ledger (held context, own commit) exactly as v1 does.
+      const rawBody = rawBodyBuffer?.toString("utf8") ?? "";
+      const prepared = await prepareAgentApiSideEffectForward(registration, headers, rawBody, "send", { localHold: false });
+      body = prepared.bodyText;
+      sendTarget = prepared.target;
+      sendV2ConsumeFreshnessContextMode = prepared.freshnessContextMode;
       headers.set("content-type", "application/json");
       headers.delete("content-length");
     }
@@ -633,7 +908,7 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     ) {
       let responseText: string;
       try {
-        responseText = await upstream.text();
+        responseText = (await decodedUpstreamBuffer(upstream, noteUpstreamDecodeFailed)).toString("utf8");
         upstreamResponseComplete = true;
       } catch (err) {
         const transportError = transportNormalizedErrorForError(target, err, registration.launchId, {
@@ -679,7 +954,23 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
         outcome: "upstream_response",
         http_status: upstream.status,
       };
-      await consumeVisibleResponse(registration, target, sendTarget, sideEffectFreshnessContextMode, responseText);
+      // The ledger is the daemon's own bookkeeping. On a side-effecting route
+      // the Server has already acted, so the agent must get its reply even if
+      // the ledger update fails: a lost "sent" invites a duplicate send, a lost
+      // hold hides the draft and its context (PROXY_5XX on 2026-10-14, thread
+      // alias, see serverResolvedThreadTarget). A read can simply be retried,
+      // so there the failure stays a post_response_local error.
+      try {
+        await consumeVisibleResponse(registration, target, sendTarget, sideEffectFreshnessContextMode ?? sendV2ConsumeFreshnessContextMode, responseText);
+      } catch (err) {
+        if (!sideEffectAction && !isMessageSendV2) throw err;
+        const errorMessage = truncateProxyErrorMessage(err instanceof Error ? err.message : String(err));
+        logger.warn(`[Agent Credential Proxy] visible-delivery ledger update failed; forwarding the upstream response (correlation_id=${correlationId}): ${errorMessage}`);
+        proxySpan.addEvent("daemon.agent_proxy.visible_ledger_failed", {
+          route_family: routeFamilyForPath(target.pathname),
+          error_class: err instanceof Error ? err.name : "Error",
+        });
+      }
       const downstreamResponseText = sideEffectFreshnessContextMode === "withheld"
         ? reprojectReviewerIsolationResponse(responseText, upstream.status, target.pathname)
         : responseText;
@@ -699,7 +990,14 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
       targetHostClass: daemonUpstreamTargetHostClass(target),
       launchId: registration.launchId,
     }));
-    if (upstream.body) {
+    const streamEncoding = (upstream.headers.get("content-encoding") ?? "").trim().toLowerCase();
+    if (upstream.body && streamEncoding && streamEncoding !== "identity") {
+      // Encoded body on the streaming path: buffer-decode so the stripped
+      // content-encoding header stays honest (JSON-ish responses in practice;
+      // attachments are served unencoded and keep the streaming path below).
+      res.end(await decodedUpstreamBuffer(upstream, noteUpstreamDecodeFailed));
+      upstreamResponseComplete = true;
+    } else if (upstream.body) {
       const reader = upstream.body.getReader();
       while (true) {
         const { done, value } = await reader.read();
@@ -730,8 +1028,25 @@ async function handleProxyRequest(req: http.IncomingMessage, res: http.ServerRes
     proxySpanEndAttrs = proxyFailureSpanAttrs(transportError);
     writeProxyFailureResponse(res, failure);
   } finally {
+    if (requestBodyBytes !== undefined) {
+      proxySpanEndAttrs = { ...proxySpanEndAttrs, body_size_bucket: bodySizeBucket(requestBodyBytes) };
+    }
     proxySpan.end(proxySpanStatus, { attrs: proxySpanEndAttrs });
   }
+}
+
+const MIB = 1024 * 1024;
+
+export function bodySizeBucket(bytes: number): "<1MiB" | "1-10MiB" | "10-50MiB" | ">50MiB" {
+  if (bytes < MIB) return "<1MiB";
+  if (bytes < 10 * MIB) return "1-10MiB";
+  if (bytes <= 50 * MIB) return "10-50MiB";
+  return ">50MiB";
+}
+
+function declaredContentLength(value: string | undefined): number | undefined {
+  if (!value || !/^\d+$/.test(value.trim())) return undefined;
+  return Number(value.trim());
 }
 
 function firstRequestHeader(value: string | string[] | undefined): string | undefined {
@@ -848,7 +1163,7 @@ function proxyFailureForError(
     method,
     pathname: target?.pathname ?? "unknown",
     queryKeys,
-    errorName: err instanceof Error ? err.name : typeof err,
+    errorName: errorClassOf(err),
     errorMessage,
   };
   if (context.correlationId) failure.correlationId = context.correlationId;
@@ -982,25 +1297,38 @@ function transportNormalizedErrorForError(
   );
   const responseStarted = phase.responseStarted ?? false;
   const responseComplete = phase.responseComplete ?? false;
-  const sourceFailureClass: AgentProxyFailureClass = responseStarted && !responseComplete
-    ? "mid_response_transport"
-    : "pre_response_transport";
+  // Task #369: once the upstream response has been read in full, nothing the
+  // network or server does can still fail this request. A throw from here on
+  // (consumeVisibleResponse, the visible-delivery ledger, writing downstream)
+  // is a local daemon fault and must not be reported as upstream transport.
+  const localPostResponse = responseComplete;
+  const local = localDaemonStateInvalid || localPostResponse;
+  const sourceFailureClass: AgentProxyFailureClass = localPostResponse
+    ? "post_response_local"
+    : responseStarted && !responseComplete
+      ? "mid_response_transport"
+      : "pre_response_transport";
   const failureClass = proxyFailureClassForPhase(sourceFailureClass);
   return {
-    normalizedCode: localDaemonStateInvalid ? "local_daemon_state_invalid" : "transport_failure",
+    normalizedCode: localDaemonStateInvalid
+      ? "local_daemon_state_invalid"
+      : localPostResponse ? "local_post_response_failure" : "transport_failure",
     routeFamily: routeFamilyForPath(target?.pathname ?? "unknown"),
     responseStarted,
     responseComplete,
     failureClass,
-    causeCode: scrubbedProxyCauseCode(err, localDaemonStateInvalid ? "LOCAL_DAEMON_STATE_INVALID" : undefined),
-    upstreamLayer: localDaemonStateInvalid ? "unknown" : target ? upstreamLayerForProxyError(err) : "unknown",
+    causeCode: scrubbedProxyCauseCode(
+      err,
+      localDaemonStateInvalid ? "LOCAL_DAEMON_STATE_INVALID" : localPostResponse ? "LOCAL_POST_RESPONSE_FAILURE" : undefined,
+    ),
+    upstreamLayer: local ? "unknown" : target ? upstreamLayerForProxyError(err) : "unknown",
     originalMessage: sanitizeTransportOriginalMessage(err instanceof Error ? err.message : String(err)),
     launchId,
-    targetHostClass: localDaemonStateInvalid ? "local_daemon" : target ? daemonUpstreamTargetHostClass(target) : "custom_server",
+    targetHostClass: local ? "local_daemon" : target ? daemonUpstreamTargetHostClass(target) : "custom_server",
     // Today the local credential proxy is only used by CLI wrappers. If runtime
     // or daemon-internal callers use it later, plumb the caller identity here.
     downstreamCaller: "cli",
-    upstream: localDaemonStateInvalid ? "local_daemon" : "server",
+    upstream: local ? "local_daemon" : "server",
   };
 }
 
@@ -1019,9 +1347,10 @@ export function __transportNormalizedErrorForErrorForTest(
 
 export function routeFamilyForPath(pathname: string): AgentProxyTransportRouteFamily {
   if (pathname === "/internal/agent-api/runtime-version") return "runtime-version";
+  if (pathname === "/internal/agent-api/v2/send") return "agent-api/send";
   if (pathname === "/internal/agent-api/send") return "agent-api/send";
   if (pathname === "/internal/agent-api/events") return "agent-api/events";
-  if (pathname === "/internal/agent-api/inbox") return "agent-api/inbox";
+  if (pathname === "/internal/agent-api/inbox" || pathname.startsWith("/internal/agent-api/inbox/")) return "agent-api/inbox";
   if (pathname === "/internal/agent-api/receive-ack") return "agent-api/events";
   if (pathname === "/internal/agent-api/tasks/claim") return "tasks/claim";
   if (pathname === "/internal/agent-api/tasks/update-status") return "tasks/update";
@@ -1039,6 +1368,7 @@ export function routeFamilyForPath(pathname: string): AgentProxyTransportRouteFa
   if (pathname === "/internal/agent-api/integrations" || pathname.startsWith("/internal/agent-api/integrations/")) return "integrations";
   if (pathname === "/internal/agent-api/upload") return "attachments/upload";
   if (pathname === "/internal/agent-api/resolve-channel") return "resolve-channel";
+  if (pathname === "/internal/agent-api/threads") return "threads";
   if (pathname === "/internal/agent-api/threads/unfollow") return "threads/unfollow";
   if (pathname === "/internal/agent-api/prepare-action") return "action/prepare";
   if (pathname === "/internal/agent-api/reminders" || pathname.startsWith("/internal/agent-api/reminders/")) return "reminders";
@@ -1159,6 +1489,7 @@ function localAgentApiInboxResponse(
   const rows = projectAgentInboxSnapshot(pending);
   const appItems = registration.appInbox?.list() ?? [];
   const acknowledgedAppSources = registration.appInbox?.listAcknowledgedSources() ?? [];
+  const seals = registration.appInbox?.listSeals() ?? [];
   const items = [
     ...rows.map((row) => ({ source: "message_target" as const, row })),
     ...appItems,
@@ -1179,6 +1510,7 @@ function localAgentApiInboxResponse(
       pending_messages: pending.length,
       pending_app_items: appItems.length,
       acknowledged_app_sources: acknowledgedAppSources,
+      seals,
     },
   };
 }
@@ -1240,15 +1572,24 @@ async function localAgentApiInboxAckResponse(
   if (!itemId) {
     return { status: 400, body: { error: "itemId required", code: "item_id_required" } };
   }
-  const acked = store.ack(itemId);
-  if (acked) {
-    return { status: 200, body: { ok: true, itemId, remaining_app_items: store.list().length } };
-  }
   const item = store.list().find((entry) => entry.itemId === itemId);
   if (!item) {
     return { status: 404, body: { error: "item not found", code: "item_not_found" } };
   }
-
+  const protectingSeal = store.findProtectingSeal(item);
+  if (protectingSeal) {
+    return {
+      status: 409,
+      body: {
+        error: `Inbox source ${item.sourceRef.id} is sealed by ${protectingSeal.owner} until ${protectingSeal.until}; unseal it explicitly before acknowledging`,
+        code: "item_sealed",
+      },
+    };
+  }
+  const acked = store.ack(itemId);
+  if (acked) {
+    return { status: 200, body: { ok: true, itemId, remaining_app_items: store.list().length } };
+  }
   const intent = store.beginServerAuthorizedAckIntent({
     itemId: item.itemId,
     ackAttemptId: randomUUID(),
@@ -1329,6 +1670,68 @@ async function localAgentApiInboxAckResponse(
   };
 }
 
+function localAgentApiInboxSealResponse(
+  registration: ProxyRegistration,
+  bodyRaw: Buffer,
+  action: "seal" | "unseal",
+): { status: number; body: Record<string, unknown> } {
+  const store = registration.appInbox;
+  if (!store) {
+    return {
+      status: 404,
+      body: { error: "app inbox not available for this runner", code: "app_inbox_unavailable" },
+    };
+  }
+  let parsed: { sources?: unknown; owner?: unknown; until?: unknown };
+  try {
+    parsed = JSON.parse(bodyRaw.toString("utf8") || "{}") as typeof parsed;
+  } catch {
+    return { status: 400, body: { error: "invalid JSON body", code: "invalid_json" } };
+  }
+  const rawSources = Array.isArray(parsed.sources) ? parsed.sources : [];
+  const sources = rawSources.filter((source): source is {
+    appId: string;
+    notificationClass: string;
+    sourceRef: AgentInboxSourceRef;
+  } => {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return false;
+    const value = source as Record<string, unknown>;
+    return typeof value.appId === "string"
+      && value.appId.trim().length > 0
+      && typeof value.notificationClass === "string"
+      && value.notificationClass.trim().length > 0
+      && isAgentInboxSourceRef(value.sourceRef);
+  });
+  const identityKeys = sources.map((source) => `${source.appId}\0${source.notificationClass}\0${sourceRefIdentityKey(source.sourceRef)}`);
+  if (sources.length === 0 || sources.length !== rawSources.length || new Set(identityKeys).size !== sources.length) {
+    return { status: 400, body: { error: "sources must contain at least one exact app source identity", code: "sources_required" } };
+  }
+  if (action === "seal") {
+    const owner = typeof parsed.owner === "string" ? parsed.owner.trim() : "";
+    const until = typeof parsed.until === "string" ? parsed.until.trim() : "";
+    if (!owner || owner.length > 120 || /[\u0000-\u001f\u007f]/.test(owner)) {
+      return { status: 400, body: { error: "owner must be a single-line string of at most 120 characters", code: "invalid_owner" } };
+    }
+    if (!until || until.length > 500 || /[\u0000-\u001f\u007f]/.test(until)) {
+      return { status: 400, body: { error: "until must be a single-line string of at most 500 characters", code: "invalid_until" } };
+    }
+    const sealed = store.sealSources({
+      sources,
+      owner,
+      until,
+    });
+    return sealed
+      ? { status: 200, body: { ok: true, affected: sealed.length } }
+      : { status: 400, body: { error: "one or more seal source identities are invalid", code: "invalid_seal_source" } };
+  }
+  const unsealed = store.unsealSources({
+    sources,
+  });
+  return unsealed
+    ? { status: 200, body: { ok: true, affected: unsealed.length } }
+    : { status: 409, body: { error: "one or more source identities are not sealed", code: "source_not_sealed" } };
+}
+
 function parseAgentApiEventsQuery(target: URL): {
   limit: number;
   sinceSeq: number | null;
@@ -1357,6 +1760,7 @@ function parseAgentApiEventsQuery(target: URL): {
 async function localAgentApiEventsResponse(
   registration: ProxyRegistration,
   target: URL,
+  options: { leaseThirdPartyEvents: boolean } = { leaseThirdPartyEvents: false },
 ): Promise<{ status: number; body: Record<string, unknown> } | undefined> {
   const coordinator = registration.inboxCoordinator;
   if (!coordinator) return undefined;
@@ -1389,13 +1793,24 @@ async function localAgentApiEventsResponse(
   const lastSeenMsgId = newestEvent?.message_id ?? newestEvent?.id ?? null;
   const lastSeenSeq = newestEvent?.seq ?? parsedQuery.sinceSeq;
 
-  if (events.length > 0) {
+  // Task #178: under an ack lease, third-party events are neither consumed nor
+  // reported here; they stay pending until the CLI acks the batch (or are
+  // re-served under a new batch by a later /events). Ordinary messages keep
+  // their existing local consumption.
+  const leasedThirdParty = options.leaseThirdPartyEvents
+    ? events.filter((message) => thirdPartyEventIdOf(message) !== null)
+    : [];
+  const consumable = leasedThirdParty.length > 0
+    ? events.filter((message) => thirdPartyEventIdOf(message) === null)
+    : events;
+  if (consumable.length > 0) {
     // Local drain of the daemon Local Inbox is still an /events projection: it
     // can be sparse and is often reached from a wake/@mention signal. Record
     // exact ids for duplicate suppression, but do not advance model-seen
     // high-water; only verified contiguous content consumption may do that.
-    coordinator.consumeVisibleMessages({ messages: events, source: "agent_api_events_local" });
+    coordinator.consumeVisibleMessages({ messages: consumable, source: "agent_api_events_local" });
   }
+  const thirdPartyLease = leasedThirdParty.length > 0 ? leaseThirdPartyEvents(registration, leasedThirdParty) : null;
   coordinator.recordDrainOutcome?.({
     source: "daemon_pending",
     sinceCursorKind: parsedQuery.sinceCursorKind,
@@ -1414,7 +1829,65 @@ async function localAgentApiEventsResponse(
       pending_notice_ids: [] as string[],
       wake_reason: null as string | null,
       has_more: hasMore,
+      ...(thirdPartyLease ? { third_party_lease: thirdPartyLease } : {}),
     },
+  };
+}
+
+function localAgentApiThirdPartyEventsAckResponse(
+  registration: ProxyRegistration,
+  bodyRaw: Buffer,
+): { status: number; body: Record<string, unknown>; attrs: Record<string, unknown> } {
+  let parsed: { batchId?: unknown; eventIds?: unknown };
+  try {
+    parsed = JSON.parse(bodyRaw.toString("utf8") || "{}") as { batchId?: unknown; eventIds?: unknown };
+  } catch {
+    return { status: 400, body: { error: "invalid JSON body", code: "invalid_json" }, attrs: { third_party_ack_outcome: "invalid" } };
+  }
+  const batchId = typeof parsed.batchId === "string" ? parsed.batchId.trim() : "";
+  const rawIds: unknown[] = Array.isArray(parsed.eventIds) ? parsed.eventIds : [];
+  if (!batchId || rawIds.length === 0 || !rawIds.every(isThirdPartyEventId)) {
+    return {
+      status: 400,
+      body: { error: "batchId and a non-empty array of event ids are required", code: "ack_body_invalid" },
+      attrs: { third_party_ack_outcome: "invalid" },
+    };
+  }
+  const lease = registration.thirdPartyLeases?.get(batchId);
+  if (!lease || lease.expiresAt <= Date.now()) {
+    // Expired, voided by a later /events, or from another registration: the
+    // events are still pending locally and will be served again. Nothing is
+    // consumed or reported.
+    if (lease) {
+      clearTimeout(lease.timer);
+      registration.thirdPartyLeases?.delete(batchId);
+    }
+    return {
+      status: 409,
+      body: { error: "lease is not live; the events will be served again on the next check", code: "lease_not_live" },
+      attrs: { third_party_ack_outcome: "lease_not_live" },
+    };
+  }
+  clearTimeout(lease.timer);
+  registration.thirdPartyLeases?.delete(batchId);
+  const acked = new Set<string>();
+  for (const id of rawIds as string[]) {
+    const normalized = normalizeThirdPartyEventId(id);
+    if (lease.eventIds.has(normalized)) acked.add(normalized);
+  }
+  const messages = lease.messages.filter((message) => {
+    const id = thirdPartyEventIdOf(message);
+    return id !== null && acked.has(id);
+  });
+  if (messages.length > 0) {
+    registration.inboxCoordinator?.consumeVisibleMessages({ messages, source: "agent_api_events_local" });
+  }
+  const ackedIds = [...acked];
+  if (ackedIds.length > 0) thirdPartyEventDeliveryReporter.report(registration.agentId, ackedIds);
+  return {
+    status: 200,
+    body: { ok: true, batchId, acked: ackedIds },
+    attrs: { third_party_ack_outcome: "acked", third_party_ack_count: ackedIds.length },
   };
 }
 
@@ -1425,10 +1898,30 @@ function recordFreshnessDecision(
   coordinator?.recordFreshnessDecision?.(decision);
 }
 
+const MESSAGE_SEND_V2_PATH = "/internal/agent-api/v2/send";
+
+/** Both message send routes; v1 and v2 share the request and response shape. */
+function isAgentApiSendPath(pathname: string): boolean {
+  return pathname === "/internal/agent-api/send" || pathname === MESSAGE_SEND_V2_PATH;
+}
+
+/** Exported for the route-coverage guard test. */
+export function __agentApiSideEffectActionForTest(pathname: string): AgentProxyFreshnessAction | "send_v2_forward_only" | undefined {
+  if (pathname === MESSAGE_SEND_V2_PATH) return "send_v2_forward_only";
+  return agentApiSideEffectAction(pathname);
+}
+
+/** A task write the Server can hold for freshness (glimpse G2): claim, status update, amend. */
+function isAgentApiTaskWritePath(pathname: string): boolean {
+  const action = agentApiSideEffectAction(pathname);
+  return action !== undefined && action !== "send";
+}
+
 function agentApiSideEffectAction(pathname: string): AgentProxyFreshnessAction | undefined {
   if (pathname === "/internal/agent-api/send") return "send";
   if (pathname === "/internal/agent-api/tasks/claim") return "task_claim";
   if (pathname === "/internal/agent-api/tasks/update-status") return "task_update";
+  if (pathname === "/internal/agent-api/tasks/amend") return "task_amend";
   return undefined;
 }
 
@@ -1477,11 +1970,33 @@ async function applyAgentInboxStateMachineEffects(
   }
 }
 
+const MAX_FORWARDED_EXACT_SEEN_SEQS = 2_500;
+
+/**
+ * Task #360: rows the daemon delivered in full but recorded by exact id only
+ * (a wake reply, a thread-join package) sit above the contiguous boundary, so
+ * `seenUpToSeq` alone leaves them counted as unread and the Server holds the
+ * send. Union the daemon's exact seqs above the boundary into the request's
+ * `seenExactSeqs` (keeping the CLI's own), which the Server excludes exactly.
+ */
+function mergeDaemonExactSeenSeqs(body: Record<string, unknown>, daemonSeqs: readonly number[]): void {
+  const boundary = typeof body.seenUpToSeq === "number" && Number.isFinite(body.seenUpToSeq) ? Math.floor(body.seenUpToSeq) : 0;
+  const above = daemonSeqs.filter((seq) => Number.isInteger(seq) && seq > boundary);
+  if (above.length === 0) return;
+  const existing = Array.isArray(body.seenExactSeqs)
+    ? body.seenExactSeqs.map((seq) => Math.floor(Number(seq))).filter((seq) => Number.isInteger(seq) && seq > 0)
+    : [];
+  body.seenExactSeqs = [...new Set([...existing, ...above])]
+    .sort((a, b) => a - b)
+    .slice(-MAX_FORWARDED_EXACT_SEEN_SEQS);
+}
+
 async function prepareAgentApiSideEffectForward(
   registration: ProxyRegistration,
   headers: Headers,
   rawBody: string,
   action: AgentProxyFreshnessAction,
+  options: { localHold: boolean } = { localHold: true },
 ): Promise<
   {
     bodyText: string;
@@ -1532,10 +2047,38 @@ async function prepareAgentApiSideEffectForward(
     isMessageModelSeen: (messageInput) => coordinator.isMessageModelSeen?.(messageInput) === true,
     heldContextLimit: LOCAL_HELD_CONTEXT_LIMIT,
   });
-  await applyAgentInboxStateMachineEffects(coordinator, plan.effects);
-  if (typeof plan.forwardSeenUpToSeq === "number") {
-    if (action === "send") body.seenUpToSeq = plan.forwardSeenUpToSeq;
+  if (!options.localHold && plan.localResponse) {
+    // A hold the agent will not see must not record its context as consumed.
+    mergeDaemonExactSeenSeqs(body, coordinator.getExactSeenSeqs?.(target) ?? []);
+    return { bodyText: JSON.stringify(body), target, freshnessContextMode };
   }
+  // Glimpse G2-3: a task write has no --anyway, so its local hold is at most
+  // one per catch-up, as the Server's is. When the same write was held here
+  // within the window and the model has taken in what that hold showed, newer
+  // messages that reached the daemon meanwhile do not hold the rerun again:
+  // it is forwarded with the model-seen boundary (nothing newer consumed), and
+  // the Server's gate decides by the same rule. Reviewer isolation shows no
+  // messages, so there one hold lets the rerun through.
+  if (plan.localResponse && action !== "send") {
+    const holds = registration.taskWriteHolds ??= new Map();
+    const key = `${target}|${taskWriteKey(action, body)}`;
+    const last = holds.get(key);
+    const now = Date.now();
+    const boundary = coordinator.getBoundary(target) ?? 0;
+    if (last && now - last.at < TASK_WRITE_REHOLD_WINDOW_MS && (freshnessContextMode === "withheld" || boundary >= last.seenUpToSeq)) {
+      holds.delete(key);
+      if (boundary > 0) body.seenUpToSeq = Math.max(existingBoundary ?? 0, boundary);
+      mergeDaemonExactSeenSeqs(body, coordinator.getExactSeenSeqs?.(target) ?? []);
+      return { bodyText: JSON.stringify(body), target, freshnessContextMode };
+    }
+    const shown = (plan.localResponse as { seenUpToSeq?: unknown }).seenUpToSeq;
+    holds.set(key, { seenUpToSeq: typeof shown === "number" ? shown : 0, at: now });
+  }
+  await applyAgentInboxStateMachineEffects(coordinator, plan.effects);
+  // Every gated write carries the model-seen boundary (glimpse G2-3): the
+  // Server holds a task write by it as it holds a send.
+  if (typeof plan.forwardSeenUpToSeq === "number") body.seenUpToSeq = plan.forwardSeenUpToSeq;
+  if (!plan.localResponse) mergeDaemonExactSeenSeqs(body, coordinator.getExactSeenSeqs?.(target) ?? []);
   return {
     bodyText: JSON.stringify(body),
     target,
@@ -1548,10 +2091,42 @@ function shouldBufferJsonResponse(upstream: Response, pathname: string, registra
   if (!registration.inboxCoordinator) return false;
   const contentType = upstream.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) return false;
-  return pathname === "/internal/agent-api/send" ||
+  return isAgentApiSendPath(pathname) ||
+    isAgentApiTaskWritePath(pathname) ||
     pathname === "/internal/agent-api/events" ||
     pathname === "/internal/agent-api/history" ||
     /^\/internal\/agent-api\/messages\/[^/]+\/resolve$/.test(pathname);
+}
+
+/**
+ * A thread has two addresses the Server accepts: its root message's short id
+ * (`#chan:3ae9bd99`, the canonical one) and the thread channel's own id
+ * (`#chan:46a146e8`, the `threadId` in message headers). A send to the second
+ * is resolved by the Server, and the context it returns carries the canonical
+ * target. Those messages are the Server's answer for the target it resolved,
+ * so record them under that target: only when every held message names the
+ * same thread in the same parent channel as the requested one.
+ */
+function serverResolvedThreadTarget(
+  sendTarget: string | undefined,
+  heldMessages: AgentProxyVisibleMessage[],
+): string | undefined {
+  if (!sendTarget) return sendTarget;
+  const threadParent = (target: string): string | null => {
+    const match = /^(#[^:]+|dm:@[^:]+):[^:]+$/.exec(target);
+    return match ? match[1]! : null;
+  };
+  const requestedParent = threadParent(sendTarget);
+  if (!requestedParent) return sendTarget;
+  const resolved = new Set<string>();
+  for (const message of heldMessages) {
+    if (!message || typeof message !== "object" || message.third_party_event) continue;
+    if (message.channel_type !== "thread" || !message.parent_channel_name || !message.channel_name) continue;
+    resolved.add(formatProxyVisibleMessageTarget(message));
+  }
+  if (resolved.size !== 1) return sendTarget;
+  const [only] = resolved;
+  return only && threadParent(only) === requestedParent ? only : sendTarget;
 }
 
 async function consumeVisibleResponse(
@@ -1564,6 +2139,7 @@ async function consumeVisibleResponse(
   const coordinator = registration.inboxCoordinator;
   if (!coordinator) return;
   let parsed: {
+    consumption_scope?: AgentApiHistoryConsumptionScope;
     state?: string;
     seenUpToSeq?: number;
     messageId?: string;
@@ -1578,22 +2154,29 @@ async function consumeVisibleResponse(
   } catch {
     return;
   }
+  if (isAgentApiSendPath(targetUrl.pathname) && (parsed.state === "sent" || parsed.state === "held")) {
+    coordinator.recordSendOutcome?.(parsed.state === "sent"
+      ? { state: "sent", ...(typeof parsed.messageId === "string" ? { messageId: parsed.messageId } : {}) }
+      : { state: "held" });
+  }
   if (
-    targetUrl.pathname === "/internal/agent-api/send"
+    (isAgentApiSendPath(targetUrl.pathname) || isAgentApiTaskWritePath(targetUrl.pathname))
     && parsed.state === "held"
     && requestedFreshnessContextMode !== "withheld"
     && parsed.freshnessContextMode !== "withheld"
     && Array.isArray(parsed.heldMessages)
   ) {
+    // The Server's held context reaches the model with the response, so its
+    // boundary is the model's: the identical rerun attests it and passes.
     coordinator.consumeVisibleMessages({
-      target: sendTarget,
+      target: serverResolvedThreadTarget(sendTarget, parsed.heldMessages),
       messages: normalizeInboxVisibleMessages(parsed.heldMessages, sendTarget),
       boundarySeq: typeof parsed.seenUpToSeq === "number" ? parsed.seenUpToSeq : undefined,
       source: "server_held_context",
     });
     return;
   }
-  if (targetUrl.pathname === "/internal/agent-api/send" && parsed.state === "sent") {
+  if (isAgentApiSendPath(targetUrl.pathname) && parsed.state === "sent") {
     const messageSeq = typeof parsed.messageSeq === "number" && Number.isFinite(parsed.messageSeq)
       ? Math.floor(parsed.messageSeq)
       : undefined;
@@ -1624,7 +2207,10 @@ async function consumeVisibleResponse(
   if (targetUrl.pathname === "/internal/agent-api/history" && Array.isArray(parsed.messages)) {
     const target = targetUrl.searchParams.get("channel") ?? undefined;
     const messages = normalizeInboxVisibleMessages(parsed.messages, target);
-    coordinator.consumeVisibleMessages({ target, messages, boundarySeq: maxInboxMessageSeq(messages), source: "agent_api_history" });
+    const scope = agentApiHistoryConsumptionScopeSchema.safeParse(parsed.consumption_scope);
+    const historyScope = scope.success && scope.data.agent_id === registration.agentId
+      && scope.data.target === target ? scope.data : undefined;
+    coordinator.consumeVisibleMessages({ target, messages, boundarySeq: maxInboxMessageSeq(messages), source: "agent_api_history", ...(historyScope && { historyScope }) });
   }
 }
 
@@ -1709,6 +2295,7 @@ export function unregisterAgentCredentialProxyForLaunch(input: {
   const launchId = input.launchId ?? null;
   for (const [token, registration] of registrations) {
     if (registration.agentId === input.agentId && registration.launchId === launchId) {
+      clearThirdPartyLeases(registration);
       registrations.delete(token);
       removed += 1;
     }
@@ -1720,6 +2307,7 @@ export function unregisterAgentCredentialProxiesForAgent(agentId: string): numbe
   let removed = 0;
   for (const [token, registration] of registrations) {
     if (registration.agentId !== agentId) continue;
+    clearThirdPartyLeases(registration);
     registrations.delete(token);
     removed += 1;
   }

@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
-import { SERVER_VERSION, readBuildIdentityStatus, readServerVersion } from "./version.js";
+import { SERVER_VERSION, readBuildIdentityStatus, readServerVersion } from "./version";
 
 // SERVER_VERSION must match `packages/server/package.json` so traces and any
 // future API responses report the version actually shipped. The constant is
@@ -36,6 +35,7 @@ test("readBuildIdentityStatus accepts complete build-time release identity", () 
       sha: "abcdef1234567890abcdef1234567890abcdef12",
       builtAt: "2026-07-13T04:52:55Z",
       branch: "staging",
+      version: SERVER_VERSION,
     },
   });
 });

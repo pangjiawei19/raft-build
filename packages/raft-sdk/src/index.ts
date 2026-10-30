@@ -1,7 +1,7 @@
 export {
   createRaftClient,
   RaftSdkConfigurationError,
-} from "./client.js";
+} from "./client";
 export type {
   CreateRaftClientOptions,
   RaftClient,
@@ -12,11 +12,11 @@ export type {
   RaftClientThrottleOptions,
   RaftClientTransportRequest,
   RaftSdkConfigurationErrorCode,
-} from "./client.js";
+} from "./client";
 export {
   joinRaftChannelByTarget,
   parseRaftRegularChannelTarget,
-} from "./channelJoin.js";
+} from "./channelJoin";
 export type {
   RaftChannelJoinClient,
   RaftChannelJoinClientResult,
@@ -27,12 +27,12 @@ export type {
   RaftChannelJoinResult,
   RaftChannelJoinSuccess,
   RaftChannelJoinTransportError,
-} from "./channelJoin.js";
+} from "./channelJoin";
 export {
   bootstrapRaftCredential,
   createRaftClientFromStore,
   RaftCredentialError,
-} from "./credential.js";
+} from "./credential";
 export type {
   BootstrapRaftCredentialOptions,
   CreateRaftClientFromStoreOptions,
@@ -40,8 +40,10 @@ export type {
   RaftCredentialIdentity,
   RaftCredentialStore,
   StoredRaftCredential,
-} from "./credential.js";
-export { createFileCredentialStore } from "./fileCredentialStore.js";
+} from "./credential";
+export { createFileCredentialStore } from "./fileCredentialStore";
+export { readLatestReadThread } from "./latestReadThread";
+export type { RaftLatestReadThread, ReadLatestReadThreadOptions } from "./latestReadThread";
 export type {
   RaftEvent,
   RaftEventAttachment,
@@ -50,4 +52,51 @@ export type {
   RaftEventsReceiveError,
   RaftEventsReceiveRequest,
   RaftEventsReceiveResult,
-} from "./events.js";
+} from "./events";
+export type {
+  RaftContextAgent,
+  RaftContextData,
+  RaftContextError,
+  RaftContextResult,
+  RaftContextServer,
+} from "./context";
+export type {
+  RaftActionPrepared,
+  RaftActionPrepareRequest,
+  RaftApiError,
+  RaftApiResult,
+  RaftAppConfig,
+  RaftAppConfigPatch,
+  RaftAvatarUpload,
+  RaftManageClient,
+  RaftProfile,
+  RaftProfileUpdate,
+  RaftServerProfile,
+  RaftServerUpdate,
+} from "./manage";
+export {
+  createRaftRoutes,
+  describeRaftRoute,
+  listRaftRoutes,
+} from "./routes";
+export type {
+  CreateRaftRoutesOptions,
+  RaftRouteAnnotations,
+  RaftRouteInfo,
+  RaftRouteKey,
+  RaftRouteMeta,
+  RaftRouteResult,
+  RaftRouteRetryPolicy,
+  RaftRoutes,
+} from "./routes";
+// Deprecated agent-layer entry points, renamed and moved to
+// `@botiverse/raft-sdk/agent` (`createRaftAgent`, `createRaftAgentFromStore`).
+// Kept here until 1.0.
+export { createRaft } from "./raft";
+export { createRaftFromStore } from "./credential";
+export type { CreateRaftFromStoreOptions } from "./credential";
+export type { CreateRaftOptions, Raft } from "./raft";
+
+// The agent layer's helpers and types, also exported from
+// `@botiverse/raft-sdk/agent`. They stay on the root until 1.0.
+export * from "./agentExports";

@@ -1,4 +1,13 @@
-import { serializeErrorForLog } from "../tracing/safeErrorLog.js";
+import { raftbenchContextQuerySchema, raftbenchReportSchema } from "@botiverse/raft-shared";
+import { readContext as readRaftbenchContext, submitReport as submitRaftbenchReport, RaftbenchError } from "../raftbench/service";
+import { getAppInstallationSetup } from "../services/appSetupService";
+import { issueAgentAudienceJwt, AgentAudienceJwtError } from "../services/agentAudienceJwtService";
+import { respondToTaskWriteError } from "../lib/taskWriteErrorResponse";
+import { sharedSseStreamRegistry } from "../services/sseStreamRegistry";
+import { isReadMutationFenceRefusal } from "../services/readMutationSequencer";
+import { serializeErrorForLog } from "../tracing/safeErrorLog";
+import { refuseIfRemindersMovedToApp } from "./reminderAppRollout";
+import { evaluateFeatureFlags, REMINDER_APP_FEATURE_FLAG_KEY, VAULT_APP_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 // /internal/agent-api/* — RFC v0.8 sk_agent_* runner data-plane surface.
 // New managed-runner daemon builds use this surface for agent data-plane work
 // after successful runner credential mint. If mint fails, startup hard-fails;
@@ -38,13 +47,19 @@ import {
   type Router as RouterType,
 } from "express";
 import multer from "multer";
-import { and, desc, eq, gt, isNotNull, isNull, not, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, not, or, sql } from "drizzle-orm";
 import {
   AGENT_API_ATTACHMENT_DOWNLOAD_UNAVAILABLE_RESPONSE,
+  AGENT_API_ATTACHMENT_DOWNLOAD_URL_TTL_SECONDS,
+  AGENT_API_USER_CHANNELS_DEFAULT_LIMIT,
+  AGENT_API_USER_NOT_FOUND_CODE,
+  AGENT_API_ATTACHMENT_DOWNLOAD_URL_UNAVAILABLE_RESPONSE,
   ATTENTION_HINT_COPY_VERSION,
   ATTENTION_HINT_SCHEMA,
   DAEMON_CAPABILITY_MODEL_SEEN_BOUNDARY,
   EXTERNAL_AGENT_ACTIVITY_INGEST_SCHEMA,
+  RAFT_AGENT_STATUS_DETAIL_LIMIT,
+  RAFT_AGENT_STATUS_VALUES,
   buildApmFreshnessDecisionProducerFactId,
   agentApiContract,
   getAgentApiResponseKind,
@@ -56,9 +71,14 @@ import {
   type AgentApiRequestBodyByRoute,
   type AgentApiRequestParamsByRoute,
   type AgentApiRequestQueryByRoute,
+  type AgentScope,
   type AgentApiResponseByRoute,
   type AgentApiRouteKey,
+  buildRaftCliGuideMarkdown,
+  formatInboxMessageTarget,
+  isExternalAgentActivityLegacyStatus,
   isExternalAgentRuntime,
+  isRaftAgentStatus,
   isReminderStatus,
   isRaftOAuthScope,
   projectApmHeldFreshnessActivity,
@@ -69,101 +89,154 @@ import {
   getServerCapabilities,
   type AgentApiTaskClaimConflict,
   type AgentMessage,
+  type ApmFreshnessSideEffectAction,
   type ExternalAgentActivityEvent,
   type ExternalAgentActivityIngestRequest,
   isTaskStatus,
   renderThirdPartyInertText,
+  isSlackBridgedExternalProvider,
   type ActionCardAction,
   type ReminderStatus,
   type ServerId,
   type TaskStatus,
   failpoints,
+  AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
+  AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+  AGENT_API_INBOX_DEFAULT_LIMIT,
+  AGENT_API_INBOX_MAX_LIMIT,
+  type AgentApiInboxListQuery,
+  AGENT_API_ASSISTANT_INBOX_DEFAULT_LIMIT,
+  AGENT_API_ASSISTANT_INBOX_MAX_LIMIT,
+  AGENT_API_ASSISTANT_MESSAGES_DEFAULT_LIMIT,
+  AGENT_API_ASSISTANT_MESSAGES_MAX_LIMIT,
+  type AgentApiAssistantOwnerInboxQuery,
+  type AgentApiAssistantOwnerMessagesQuery,
+  THIRD_PARTY_EVENT_DELIVERED_REPORT_MAX_IDS,
+  isThirdPartyEventId,
+  buildIntegrationInviteUrl,
+  channelCardRev,
+  peerCardHasContent,
+  type AgentApiChannelCard,
+  type AgentApiPeerCard,
+  type Tracer,
 } from "@botiverse/raft-shared";
-import * as agentService from "../services/agentService.js";
-import { resolveReadableAttachmentAuthorityContext } from "../services/attachmentAuthorityService.js";
-import * as agentMigrationService from "../services/agentMigrationService.js";
-import { emitAgentMigrationUpdated } from "../services/agentMigrationRealtime.js";
-import * as actionCardsService from "../services/actionCardsService.js";
-import * as attachmentCommentService from "../services/attachmentCommentService.js";
-import * as channelService from "../services/channelService.js";
-import { CHANNEL_NOT_FOUND_BODY, threadAnchorNotFoundBody } from "./channelAccessDenial.js";
-import * as messageService from "../services/messageService.js";
+import * as agentService from "../services/agentService";
+import * as assistantService from "../services/assistantService";
+import { resolveReadableAttachmentAuthorityContext } from "../services/attachmentAuthorityService";
+import * as actionCardsService from "../services/actionCardsService";
+import * as idempotentAgentApiService from "../services/agentApiIdempotencyService";
+import * as attachmentCommentService from "../services/attachmentCommentService";
+import { renderAgentCommentScopedContent } from "../services/attachmentCommentAnchorLabel";
+import * as channelService from "../services/channelService";
+import { readPositionSettleMs, scheduleDeferredReadAdvance, settledReadThroughSeq } from "../services/readPositionSettle";
+
+/** Rows the deferred read-advance check scans in (fromSeq, toSeq]; a history page is at most 100. */
+const DEFERRED_READ_ADVANCE_SCAN_LIMIT = 500;
+import { CHANNEL_NOT_FOUND_BODY, threadAnchorNotFoundBody } from "./channelAccessDenial";
+import * as messageService from "../services/messageService";
 import {
   loadCanonicalTaskFactsByMessageId,
   refreshQueuedAgentTaskProjections,
-} from "../services/messageTaskProjection.js";
-import * as mentionDeliveryOccurrenceService from "../services/mentionDeliveryOccurrenceService.js";
-import * as searchService from "../services/searchService.js";
-import { resolveSearchSenderFilter } from "../services/searchSenderFilterService.js";
-import * as serverService from "../services/serverService.js";
-import * as machineService from "../services/machineService.js";
-import * as agentScopesService from "../services/agentScopesService.js";
-import * as oauthService from "../services/oauthService.js";
-import * as integrationAppQueryService from "../services/integrationAppQueryService.js";
-import * as reminderCrud from "../apps/reminder/crud.js";
-import * as reminderService from "../apps/reminder/service.js";
+} from "../services/messageTaskProjection";
+import * as mentionDeliveryOccurrenceService from "../services/mentionDeliveryOccurrenceService";
+import { projectMentionDeliveryForSender } from "../services/senderMentionDeliveryProjection";
+import * as searchService from "../services/searchService";
+import { resolveSearchSenderFilter } from "../services/searchSenderFilterService";
+import * as serverService from "../services/serverService";
+import * as machineService from "../services/machineService";
+import * as agentScopesService from "../services/agentScopesService";
+import * as oauthService from "../services/oauthService";
+import * as integrationAppQueryService from "../services/integrationAppQueryService";
+import * as reminderCrud from "../apps/reminder/crud";
+import * as reminderService from "../apps/reminder/service";
 import {
   ackBuiltInAppSource,
   publishTaskResourceExpiryFollowup,
   taskResourceExpiryFollowups,
-} from "../registry.manifest.js";
+} from "../registry.manifest";
+import { publishReminderEvent } from "../apps/reminder/realtime";
 import {
   getRapAppConfig,
   patchRapAppConfig,
   RapAppConfigError,
-} from "../services/rapAppConfigService.js";
-import { pushBuiltInAppConfigForOwner } from "../services/appConfigTransportComposition.js";
-import * as taskService from "../services/taskService.js";
-import * as wikiService from "../services/wikiService.js";
+} from "../services/rapAppConfigService";
+import { pushBuiltInAppConfigForOwner } from "../services/appConfigTransportComposition";
+import * as taskService from "../services/taskService";
 import {
   getTaskRealtimeSurfaceTargets,
   resolveTaskChannelSurface,
+  resolveTaskChannelSurfaces,
+  isHistoricalJointTaskReadOnly,
   type TaskChannelSurface,
   type TaskSurfaceChannel,
-} from "../services/taskChannelSurface.js";
-import { emitTaskCreated, emitTaskDeleted, emitTaskMessageNew } from "../services/taskRealtimeEvents.js";
+} from "../services/taskChannelSurface";
+import { emitTaskCreated, emitTaskDeleted, emitTaskMessageNew } from "../services/taskRealtimeEvents";
 import {
   describeTaskMutation,
   emitTaskMutationToSurfaces,
-} from "../services/taskMutationBroadcast.js";
-import { projectRichMessageSocketPayload } from "../services/messageRealtimeEvents.js";
-import { mutateMessageReaction } from "../services/messageReactionService.js";
-import { isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService.js";
-import { getAttachmentFileSizeLimitBytes } from "../services/attachmentUploadPolicy.js";
-import { uploadAttachmentBuffers } from "../services/attachmentUploadWriterService.js";
-import type { AttachmentUploadSessionService } from "./attachmentUploadSessions.js";
-import { resolveScheduleInput } from "../services/reminderScheduleInput.js";
-import { computeNextFire, parseRecurrenceString, type Recurrence } from "../services/recurrence.js";
-import * as agentPermalinkRenderService from "../services/agentPermalinkRenderService.js";
-import * as attestedSendService from "../services/attestedSendService.js";
-import { emitScopeReadUpdated } from "../services/readReceiptService.js";
-import { emitThreadFollowersUpdated } from "../services/threadFollowerRealtimeService.js";
-import { paginateHistoryProbe } from "./historyCursor.js";
+} from "../services/taskMutationBroadcast";
+import { projectRichMessageSocketPayload } from "../services/messageRealtimeEvents";
+import { mutateMessageReaction } from "../services/messageReactionService";
+import { ChannelConversionInProgressError } from "../services/channelConversionFenceService";
+import { getHistoryCutoff, getServerPlan, isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
+import { getAttachmentFileSizeLimitBytes } from "../services/attachmentUploadPolicy";
+import { uploadAttachmentBuffers } from "../services/attachmentUploadWriterService";
+import type { AttachmentUploadSessionService } from "./attachmentUploadSessions";
+import { resolveScheduleInput } from "../services/reminderScheduleInput";
+import { computeNextFire, parseRecurrenceString, type Recurrence } from "../services/recurrence";
+import * as agentPermalinkRenderService from "../services/agentPermalinkRenderService";
+import {
+  acknowledgeAgentInboxEventsCursor,
+  canAgentAccessQueuedMessageTarget,
+  normalizeAgentApiWireValue,
+  partitionDeliverableInboxMessages,
+  projectAgentInboxEvents,
+  recordAgentInboxEventsPendingAck,
+} from "../services/agentInboxEvents";
+import {
+  AgentInboxPushError,
+  deleteAgentInboxPushRegistration,
+  getAgentInboxPushStatus,
+  putAgentInboxPushRegistration,
+} from "../services/agentInboxPushService";
+import * as attestedSendService from "../services/attestedSendService";
+import { emitScopeReadUpdated } from "../services/readReceiptService";
+import { emitThreadFollowersUpdated } from "../services/threadFollowerRealtimeService";
+import { paginateHistoryProbe } from "./historyCursor";
 import {
   buildServerInfoAgentSummaries,
+  buildServerInfoHumanSummaries,
+  findServerInfoAgentSummaryByName,
+  findServerInfoHumanSummaryByName,
   buildAgentProfileView,
   filterAgentVisibleHumansForHiddenDirectory,
   messageResolveErrorPayload,
   resolveAgentVisibleMessagePayload,
   resolveProfileViewForAgent,
-} from "./internal.js";
-import { getDb } from "../db/index.js";
+} from "./internal";
+import { getDb } from "../db/index";
+import { managedMcpAgentErrorMessage } from "./managedMcpAgentErrors";
+import { MCP_CALL_INTERNAL_ERROR_TEXT } from "@botiverse/raft-shared";
 import {
+  agents,
   attachments,
   channelAgents,
   channels,
   jointChannels,
   jointChannelServers,
+  managedMcpServers,
+  raftbenchConfigs,
   messageMentions,
   messages,
-} from "../db/schema.js";
-import { messageIdShortPrefixConditions } from "../lib/messageId.js";
-import { forbiddenMessageForTarget, notFoundMessageForTarget, resolveWritableAgentTarget } from "./agentWritableTarget.js";
-import type { AgentOrchestrator } from "../services/agentOrchestrator.js";
+} from "../db/schema";
+import { messageIdShortPrefixConditions, UUID_RE } from "../lib/messageId";
+import { guardUuidPathParams } from "../lib/uuidPathParams";
+import { forbiddenMessageForTarget, notFoundMessageForTarget, resolveWritableAgentTarget } from "./agentWritableTarget";
+import { isDurableAgentInboxMessage, type AgentOrchestrator } from "../services/agentOrchestrator";
 import type { Server as SocketServer } from "socket.io";
-import type { AgentCapability } from "../services/agentCredentialService.js";
-import { getCdnStorage, getStorage, isStorageTimeoutError } from "../services/storageService.js";
-import { streamStorageResponse } from "../services/storageResponseStream.js";
+import type { AgentCapability } from "../services/agentCredentialService";
+import { getCdnStorage, getStorage, isStorageTimeoutError } from "../services/storageService";
+import { streamStorageResponse } from "../services/storageResponseStream";
 import {
   buildAttachmentTooLargeResponse,
   buildAttachmentContentDisposition,
@@ -181,19 +254,24 @@ import {
   resolveAttachmentMimeType,
   resolveRequestAttachmentFileSizeLimitBytes,
   runSingleAttachmentUpload,
-} from "./attachments.js";
-import { addTraceEvent, tracePhase, withTraceChildSpan } from "../tracing/semanticTrace.js";
-import { traceSendRouteFailure, traceSendRouteCatch } from "../tracing/sendRouteFailure.js";
-import { traceQuerySpan } from "../tracing/queryTrace.js";
-import { handleAgentKnowledgeGet, handleAgentKnowledgeSearch } from "./agentKnowledge.js";
-import { AttachmentLinkError } from "../services/attachmentLinkingService.js";
-import { bindRequestAbortSignal } from "./requestAbortSignal.js";
-import { createChannelForAgent } from "./agentChannelCreate.js";
-import { addChannelMemberForAgent, removeChannelMemberForAgent } from "./agentChannelMembers.js";
-import { setChannelArchivedForAgent } from "./agentChannelLifecycle.js";
-import { updateChannelForAgent } from "./agentChannelUpdate.js";
-import { assertAgentCanManageServerProfile, updateServerProfileForAgent } from "./agentServerManage.js";
-import { sendJsonServerError } from "./errorResponse.js";
+} from "./attachments";
+import { addTraceEvent, errorClassOf, getCurrentTraceSpan, recordTraceEvent, tracePhase, withTraceChildSpan, withTraceRoot } from "../tracing/semanticTrace";
+import { agentRequestContextFromHeaders, recordAgentContextReturned } from "../tracing/agentContextReturnTrace";
+import { agentIdHashAttrs, serverIdHashAttrs } from "../tracing/traceIdentity";
+import { traceSendRouteFailure, traceSendRouteCatch } from "../tracing/sendRouteFailure";
+import { traceQuerySpan } from "../tracing/queryTrace";
+import { handleAgentKnowledgeGet, handleAgentKnowledgeSearch } from "./agentKnowledge";
+import { AttachmentLinkError } from "../services/attachmentLinkingService";
+import { bindRequestAbortSignal } from "./requestAbortSignal";
+import { broadcastAgentUpdated } from "./agentUpdatedBroadcast";
+import { createChannelForAgent } from "./agentChannelCreate";
+import { addChannelMemberForAgent, removeChannelMemberForAgent } from "./agentChannelMembers";
+import { setChannelArchivedForAgent } from "./agentChannelLifecycle";
+import { updateChannelForAgent } from "./agentChannelUpdate";
+import { assertAgentCanManageServerProfile, updateServerProfileForAgent } from "./agentServerManage";
+import { respondToDmTargetResolutionError, sendJsonServerError, transientSendConflictBody } from "./errorResponse";
+import { DmTargetResolutionError } from "../services/dmTargetResolutionError";
+import { transientTransactionSqlState } from "../db/transientTransactionRetry";
 import {
   createAvatarUpload,
   MAX_PROFILE_AVATAR_BYTES,
@@ -202,12 +280,12 @@ import {
   runSingleAvatarUpload,
   storeAgentAvatar,
   storeServerAvatar,
-} from "../services/avatarService.js";
+} from "../services/avatarService";
 import {
   FileUploadQuotaExceededError,
   buildFileUploadQuotaExceededResponse,
   getFileUploadQuotaSummary,
-} from "../services/fileUploadQuotaService.js";
+} from "../services/fileUploadQuotaService";
 import {
   buildPendingMentionActionPayload,
   executeMentionActionId,
@@ -215,29 +293,45 @@ import {
   type MentionActionExecutionOptions,
   type MentionActionKind,
   type MentionActionResult,
-} from "../services/mentionActionService.js";
-import { actorHasServerCapabilityInServer, getActorServerRoleInServer } from "../lib/actorPermissions.js";
-import { getAppUrl } from "../config/appUrl.js";
+} from "../services/mentionActionService";
+import { actorHasServerCapabilityInServer, getActorServerRoleInServer, getAgentServerRolesInServer } from "../lib/actorPermissions";
+import { getAppUrl } from "../config/appUrl";
 import {
   getAgentServerLabs,
   patchAgentServerLabsAccess,
   putAgentServerLabEnrollment,
-} from "./serverLabs.js";
+} from "./serverLabs";
 import {
   executeManagedMcpCall,
   getManagedMcpRuntimeSnapshot,
   ManagedMcpServiceError,
-} from "../services/managedMcpService.js";
-import { ManagedMcpCredentialError } from "../services/managedMcpCredentialService.js";
-import { ManagedMcpGatewayError } from "../services/managedMcpGateway.js";
-import { ManagedMcpOAuthError } from "../services/managedMcpOAuthService.js";
+} from "../services/managedMcpService";
+import { ManagedMcpCredentialError } from "../services/managedMcpCredentialService";
+import { recordAgentApiSeen } from "../services/externalAgentPresence";
+import { isAgentCredentialActive } from "../services/agentCredentialService";
+import { subscribeAgentCredentialRevocation } from "../services/agentCredentialRevocationBus";
+import { ManagedMcpGatewayError } from "../services/managedMcpGateway";
+import { ManagedMcpOAuthError } from "../services/managedMcpOAuthService";
+import { getHostedRuntimeSummary } from "../services/agentRuntimeProvisionService";
+import { setRequestTraceErrorCode } from "../middleware/requestObservability";
+import { taskStatusRejectionCode } from "./agentApiErrorTrace";
 import {
   FeedbackLocatorIngestError,
   ingestFeedbackLocator,
   queryFeedbackLocators,
-} from "../services/productFeedbackLocatorService.js";
+} from "../services/productFeedbackLocatorService";
 
 export const internalAgentApiRouter: RouterType = Router();
+
+// Uniform 404 for non-UUID path params (task #12). `labKey` is excluded
+// (string key, not a UUID). `messageId`/`attachmentId` are deliberately NOT
+// guarded here: those routes cloak unknown AND malformed ids behind the same
+// contract bodies (ATTACHMENT_UNAVAILABLE / {status:"NOT_JOINABLE"}) so a
+// malformed id is indistinguishable from a foreign one — guarding would leak
+// the difference (internalAgentApi.auth/senderMentionDeliveries tests).
+guardUuidPathParams(internalAgentApiRouter, {
+  channelId: "Channel",
+});
 
 async function syncReminderToComputer(
   req: Request,
@@ -259,15 +353,12 @@ async function syncReminderToComputer(
 
 const MAX_REACTION_LENGTH = 16;
 const ATTESTED_SEND_HELD_CONTEXT_LIMIT = 3;
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const profileAvatarUpload = createAvatarUpload();
 const serverAvatarUpload = createAvatarUpload();
 const integrationLogoUpload = createAvatarUpload();
 const MAX_AGENT_PROFILE_DESCRIPTION_LENGTH = 3000;
 const MAX_AGENT_PROFILE_DISPLAY_NAME_LENGTH = 80;
 const REMINDER_MAX_TITLE_LEN = 500;
-
-type AgentMigrationSummary = AgentApiResponseByRoute["migrationBegin"]["migration"];
 
 function getFullUuidParam(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
@@ -280,55 +371,6 @@ function sendAttachmentNotFound(res: Response): void {
 
 function sendAttachmentDownloadUnavailable(res: Response): void {
   res.status(404).json(AGENT_API_ATTACHMENT_DOWNLOAD_UNAVAILABLE_RESPONSE);
-}
-
-function serializeAgentMigration(row: agentMigrationService.AgentMigrationRow): AgentMigrationSummary {
-  return {
-    id: row.id,
-    agentId: row.agentId,
-    sourceMachineId: row.sourceMachineId,
-    targetMachineId: row.targetMachineId,
-    state: row.state,
-    manifestPath: row.manifestPath,
-    manifestSha256: row.manifestSha256,
-    arrivalReportPath: row.arrivalReportPath,
-    arrivalReportSha256: row.arrivalReportSha256,
-    abortReason: row.abortReason,
-    failureReason: row.failureReason,
-    prepDeadlineAt: row.prepDeadlineAt.toISOString(),
-    transferDeadlineAt: row.transferDeadlineAt.toISOString(),
-    arrivalDeadlineAt: row.arrivalDeadlineAt.toISOString(),
-    readyAt: row.readyAt?.toISOString() ?? null,
-    flippedAt: row.flippedAt?.toISOString() ?? null,
-    arrivedAt: row.arrivedAt?.toISOString() ?? null,
-    completedAt: row.completedAt?.toISOString() ?? null,
-    abortedAt: row.abortedAt?.toISOString() ?? null,
-    revision: row.revision,
-    createdAt: row.createdAt.toISOString(),
-    updatedAt: row.updatedAt.toISOString(),
-  };
-}
-
-function sendMigrationServiceError(res: Response, err: unknown): void {
-  const message = err instanceof Error ? err.message : String(err);
-  if (message === "MIGRATION_NOT_FOUND") {
-    res.status(404).json({ error: "Migration not found", code: message });
-    return;
-  }
-  if (
-    message === "AGENT_NOT_FOUND" ||
-    message === "AGENT_HAS_NO_SOURCE_MACHINE" ||
-    message === "TARGET_MACHINE_NOT_IN_AGENT_SERVER" ||
-    message === "TARGET_MACHINE_MATCHES_SOURCE"
-  ) {
-    res.status(400).json({ error: message, code: message });
-    return;
-  }
-  if (message.startsWith("MIGRATION_")) {
-    res.status(409).json({ error: message, code: message });
-    return;
-  }
-  throw err;
 }
 
 function thirdPartyEventIdFromMessage(message: AgentMessage): string | null {
@@ -350,7 +392,9 @@ async function rebuildPendingThirdPartyAgentEvents(
     agentId,
     excludeEventIds: pendingEventIds,
   });
+  const serviceOnly = await agentService.isRaftBenchServiceAgent(agentId);
   for (const message of rebuilt) {
+    if (serviceOnly && message.third_party_event?.client_id !== "system.raftbench") continue;
     agentOrchestrator.deliverToLocalInbox(agentId, message, { notifyPendingReceive: false });
   }
 }
@@ -442,30 +486,6 @@ function validateAgentApiQueryMiddleware<K extends AgentApiRouteKey>(routeKey: K
   };
 }
 
-// Agent API response contracts describe the JSON wire payload. Server handlers
-// may still hand us DB/domain objects containing Date instances, which Express
-// would stringify only after this contract check. Normalize that boundary here
-// so shared schemas stay wire-only instead of accepting server-domain values.
-function normalizeAgentApiWireValue(value: unknown): unknown {
-  if (value instanceof Date) {
-    return value.toISOString();
-  }
-  if (Array.isArray(value)) {
-    return value.map(normalizeAgentApiWireValue);
-  }
-  if (value && typeof value === "object") {
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) {
-      return value;
-    }
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .map(([key, nested]) => [key, normalizeAgentApiWireValue(nested)]),
-    );
-  }
-  return value;
-}
-
 function sendAgentApiResponse<K extends AgentApiRouteKey>(
   routeKey: K,
   res: Response,
@@ -489,6 +509,55 @@ function sendAgentApiResponse<K extends AgentApiRouteKey>(
     return;
   }
   res.json(parsed.data);
+}
+
+/**
+ * Idempotency scope for a keyed write, or null when the request carries no
+ * usable key (behaviour then is unchanged: every request writes).
+ */
+function agentApiIdempotencyScope(
+  agentId: string,
+  route: idempotentAgentApiService.AgentApiIdempotentRoute,
+  rawKey: unknown,
+  normalizedRequest: unknown,
+): idempotentAgentApiService.AgentApiIdempotencyScope | null {
+  const idempotencyKey = idempotentAgentApiService.normalizeAgentApiIdempotencyKey(rawKey);
+  if (!idempotencyKey) return null;
+  return {
+    agentId,
+    route,
+    idempotencyKey,
+    requestFingerprint: idempotentAgentApiService.fingerprintAgentApiRequest(route, normalizedRequest),
+  };
+}
+
+/**
+ * Answer a keyed write from its ledger: the first response (status and body)
+ * when the key is bound to this same request, without any side effect.
+ * Returns false when the key is unused. A key bound to a different request
+ * throws AgentApiIdempotencyConflictError (see respondToAgentApiIdempotencyConflict).
+ */
+async function replayAgentApiIdempotentWrite(
+  scope: idempotentAgentApiService.AgentApiIdempotencyScope,
+  res: Response,
+): Promise<boolean> {
+  const stored = await idempotentAgentApiService.findAgentApiIdempotentResponse(scope);
+  if (!stored) return false;
+  res.status(stored.status);
+  sendAgentApiResponse(scope.route, res, stored.body as AgentApiResponseByRoute[typeof scope.route]);
+  return true;
+}
+
+/** Same 409 shape and code as message send's reused-key refusal. */
+function respondToAgentApiIdempotencyConflict(err: unknown, res: Response): boolean {
+  if (!(err instanceof idempotentAgentApiService.AgentApiIdempotencyConflictError)) return false;
+  res.status(err.status).json({
+    error: err.message,
+    code: err.code,
+    mismatch: err.mismatch,
+    suggestedNextAction: err.suggestedNextAction,
+  });
+  return true;
 }
 
 function validateAgentApiResponseMiddleware<K extends AgentApiRouteKey>(routeKey: K) {
@@ -728,11 +797,6 @@ async function loadOwnedReminder(
   return existing;
 }
 
-function emitReminderScheduled(req: Request, row: reminderService.ReminderRow, summary: unknown): void {
-  const io = req.app.get("io") as SocketServer;
-  io?.to(`server:${row.serverId}`).emit("reminder:scheduled", { reminder: summary });
-}
-
 function requireAgentCapability(capability: AgentCapability) {
   return (req: Request, res: Response, next: NextFunction) => {
     const failure = getAgentCapabilityFailure(req, capability);
@@ -795,13 +859,134 @@ function agentApiRequestValidators<K extends AgentApiRouteKey>(routeKey: K): Req
   return validators;
 }
 
+/**
+ * Per-agent grant required by each Agent API operation, in addition to the
+ * credential capability. Grants are the human-managed scope set
+ * (`agentScopesService`, `PUT /internal/agent/:id/scopes`); the credential
+ * capability only says what a token may carry. Both must hold, exactly as on
+ * the legacy `/internal/agent/:id/*` routes, whose `requireAgentScope(...)`
+ * gate is the source of each entry below (`routes/internal.ts`):
+ *
+ *   operation                     legacy route                              grant
+ *   attachmentUpload              POST   /agent/:id/upload                  attachment:upload
+ *   attachmentUploadSessionCreate (chunked form of POST /agent/:id/upload)  attachment:upload
+ *   attachmentUploadSessionComplete (chunked form of POST /agent/:id/upload) attachment:upload
+ *   messageSend / messageSendV2   POST   /agent/:id/send                    message:send
+ *   messageReactionAdd            POST   /agent/:id/messages/:m/reactions   message:send
+ *   messageReactionRemove         DELETE /agent/:id/messages/:m/reactions   message:send
+ *   events                        GET    /agent/:id/receive                 message:read
+ *   messageResolve                GET    /agent/:id/messages/:m/resolve     message:read
+ *   historyRead                   GET    /agent/:id/history                 message:read
+ *   messageSearch                 GET    /agent/:id/search                  message:read
+ *   channelJoin                   POST   /agent/:id/channels/:c/join        channel:join
+ *   channelLeave                  POST   /agent/:id/channels/:c/leave       channel:leave
+ *   threadUnfollow                POST   /agent/:id/threads/unfollow        thread:unfollow
+ *   channelMembers                GET    /agent/:id/channel-members         channel:read
+ *   serverInfo                    GET    /agent/:id/server                  server:read
+ *   serverUpdate                  PATCH  /agent/:id/server                  server:update
+ *   channelCreate                 POST   /agent/:id/channels                channel:create
+ *   channelUpdate                 PATCH  /agent/:id/channels/:c             channel:update
+ *   channelMemberAdd              POST   /agent/:id/channels/:c/members     channel:add_member
+ *   channelMemberRemove           DELETE /agent/:id/channels/:c/members     channel:remove_member
+ *   knowledgeGet                  GET    /agent/:id/knowledge               knowledge:read
+ *   knowledgeSearch               GET    /agent/:id/knowledge/search        knowledge:read
+ *   taskList                      GET    /agent/:id/tasks                   task:read
+ *   taskCreate                    POST   /agent/:id/tasks                   task:write
+ *   taskClaim                     POST   /agent/:id/tasks/claim             task:write
+ *   taskUnclaim                   POST   /agent/:id/tasks/unclaim           task:write
+ *   taskUpdateStatus              POST   /agent/:id/tasks/update-status     task:write
+ *   actionPrepare                 POST   /agent/:id/prepare-action          action:prepare
+ *
+ * userChannels (GET /users/:name/channels, `raft user info`) has no legacy
+ * twin: it replaces serverInfo + channelMembers and requires channel:read here
+ * and server:read inline.
+ *
+ * The server avatar route is not a contract operation (multipart upload); it
+ * carries `requireAgentGrant(...)` inline below.
+ * `internalAgentApi.grantCoverage.test.ts` derives the expected pairs from the
+ * legacy router and fails when a counterpart here lacks the same grant.
+ */
+export const AGENT_API_ROUTE_GRANTS: Partial<Record<AgentApiRouteKey, AgentScope>> = {
+  raftbenchContext: "message:read",
+  attachmentUpload: "attachment:upload",
+  attachmentUploadSessionCreate: "attachment:upload",
+  attachmentUploadSessionComplete: "attachment:upload",
+  messageSend: "message:send",
+  messageSendV2: "message:send",
+  messageReactionAdd: "message:send",
+  messageReactionRemove: "message:send",
+  events: "message:read",
+  messageResolve: "message:read",
+  historyRead: "message:read",
+  messageSearch: "message:read",
+  channelJoin: "channel:join",
+  channelLeave: "channel:leave",
+  threadUnfollow: "thread:unfollow",
+  channelMembers: "channel:read",
+  serverInfo: "server:read",
+  // Plus server:read inline: it replaces serverInfo and channelMembers.
+  userChannels: "channel:read",
+  serverUpdate: "server:update",
+  channelCreate: "channel:create",
+  channelUpdate: "channel:update",
+  channelMemberAdd: "channel:add_member",
+  channelMemberRemove: "channel:remove_member",
+  knowledgeGet: "knowledge:read",
+  knowledgeSearch: "knowledge:read",
+  taskList: "task:read",
+  taskCreate: "task:write",
+  taskClaim: "task:write",
+  taskUnclaim: "task:write",
+  taskUpdateStatus: "task:write",
+  actionPrepare: "action:prepare",
+};
+
+/**
+ * Deny with the legacy `requireAgentScope` 403 shape when the bound agent's
+ * grant set lacks `scope`. Default-mode agents (no `agent_scopes` row) carry
+ * every grantable scope, so this only bites once a human saved a custom set.
+ * Tagged with `__agentScope` like the legacy middleware so route walkers can
+ * read the required grant off the handler chain.
+ */
+function requireAgentGrant(scope: AgentScope): RequestHandler {
+  const handler: RequestHandler = async (req, res, next) => {
+    const agentId = req.actingAgentId;
+    if (!agentId) {
+      res.status(500).json({ error: "Agent credential state missing" });
+      return;
+    }
+    let reason: "missing_scope" | "scope_lookup_failed";
+    try {
+      if (await agentScopesService.agentHasScope(agentId, scope)) {
+        next();
+        return;
+      }
+      reason = "missing_scope";
+    } catch (err) {
+      console.error("agent-api scope lookup failed", serializeErrorForLog(err));
+      reason = "scope_lookup_failed";
+    }
+    req.scopeDenyReason = reason;
+    req.scopeRequired = scope;
+    if (req.raftbenchServiceAgent) {
+      res.status(403).json({ error: "This service agent no longer has the required read permission.", code: "raftbench_read_permission_revoked", requiredScope: scope, suggestedNextAction: "Stop this run. An administrator has to restore its read grants; retrying will not help." });
+      return;
+    }
+    res.status(403).json({ error: "missing required scope", requiredScope: scope, reason });
+  };
+  (handler as RequestHandler & { __agentScope?: AgentScope }).__agentScope = scope;
+  return handler;
+}
+
 function registerAgentApiRoute<K extends AgentApiRouteKey>(
   routeKey: K,
   ...handlers: RequestHandler[]
 ): void {
   const route: AgentApiContractRoute = agentApiContract[routeKey];
+  const grant = AGENT_API_ROUTE_GRANTS[routeKey];
   const routeHandlers: RequestHandler[] = [
     requireAgentCapability(route.capability),
+    ...(grant ? [requireAgentGrant(grant)] : []),
     ...handlers,
   ];
   switch (route.method) {
@@ -810,6 +995,9 @@ function registerAgentApiRoute<K extends AgentApiRouteKey>(
       return;
     case "POST":
       internalAgentApiRouter.post(route.path, ...routeHandlers);
+      return;
+    case "PUT":
+      internalAgentApiRouter.put(route.path, ...routeHandlers);
       return;
     case "PATCH":
       internalAgentApiRouter.patch(route.path, ...routeHandlers);
@@ -941,7 +1129,11 @@ function toAgentApiTimestamp(value: unknown): string | undefined {
   return typeof value === "string" ? value : undefined;
 }
 
-function toAgentApiMessageEnvelope(message: AgentApiMessageSource, content: string): AgentApiMessageEnvelope {
+function toAgentApiMessageEnvelope(
+  message: AgentApiMessageSource,
+  content: string,
+  viewerAgentId: string,
+): AgentApiMessageEnvelope {
   const { senderHandle, ...messageEnvelopeFields } = message;
   const createdAt = toAgentApiTimestamp(message.createdAt);
   const timestamp = toAgentApiTimestamp(message.timestamp);
@@ -954,6 +1146,7 @@ function toAgentApiMessageEnvelope(message: AgentApiMessageSource, content: stri
     return messageService.projectAgentVisibleHttpMessageResponse(
       message as messageService.EnrichedMessageRow,
       content,
+      viewerAgentId,
     ) as AgentApiMessageEnvelope;
   }
   const envelope: AgentApiMessageEnvelope = {
@@ -977,25 +1170,6 @@ function toAgentApiMessageEnvelope(message: AgentApiMessageSource, content: stri
 
 function isHistoryAnchorShape(value: string): boolean {
   return /^\d+$/.test(value) || /^[0-9a-f]{8}$/i.test(value) || UUID_RE.test(value);
-}
-
-async function canAgentAccessQueuedMessageTarget(
-  channelId: string,
-  agentId: string,
-  serverId: string,
-  message?: AgentMessage,
-): Promise<boolean> {
-  if (message?.third_party_event) return true;
-  if (!channelId) return false;
-  try {
-    const channel = await channelService.getChannel(channelId);
-    if (!channel || channel.serverId !== serverId) return false;
-    return channelService.canAgentReceiveChannelDelivery(channelId, agentId, {
-      personalMention: message?.mentioned === true,
-    });
-  } catch {
-    return false;
-  }
 }
 
 function historyAnchorErrorPayload(
@@ -1208,6 +1382,118 @@ async function resolveAgentActivityMuteTarget(req: Request, res: Response) {
   return channel;
 }
 
+/** What a gated write's freshness check found: see {@link evaluateAgentFreshness}. */
+type AgentFreshnessEvaluation = {
+  latestFreshnessSeq: number;
+  latestFreshnessMessageId: string | null;
+  attestedBoundarySeq: number;
+  attestedBoundaryMessageId: string | null;
+  newMessageCount: number;
+  attestedTargetType: attestedSendService.AttestedSendTargetType;
+  boundarySource: string;
+  formalMentionFacts: Awaited<ReturnType<typeof attestedSendService.getFormalMentionFacts>>;
+  useAttentionFacts: boolean;
+  seenExactSeqs: number[];
+};
+
+/**
+ * The freshness check a gated write runs (a send, and a task claim, status
+ * update or amend): the newest message in the conversation the agent did not
+ * write itself, against the model-seen boundary its request attests. One
+ * function, so every gated write holds by the same rule.
+ */
+async function evaluateAgentFreshness(input: {
+  agentId: string;
+  channelId: string;
+  channelType: "channel" | "private" | "joint" | "dm" | "thread";
+  seenUpToSeq: number | undefined;
+  requestedSeenExactSeqs: number[] | undefined;
+}): Promise<AgentFreshnessEvaluation> {
+  const { agentId, channelId, channelType, seenUpToSeq, requestedSeenExactSeqs } = input;
+  const selfSender = { senderType: "agent" as const, senderId: agentId };
+  const useAttentionFacts = channelType !== "thread";
+  const latestAnchor = useAttentionFacts
+    ? await attestedSendService.getLatestAgentAttentionAnchor(agentId, channelId, {
+      excludeSender: selfSender,
+    })
+    : await attestedSendService.getLatestMessageAnchor(channelId, {
+      excludeSender: selfSender,
+    });
+  const hasClientSeenBoundary = typeof seenUpToSeq === "number" && Number.isFinite(seenUpToSeq);
+  const clientSeenUpToSeq = hasClientSeenBoundary
+    ? Math.max(0, Math.floor(seenUpToSeq))
+    : 0;
+  const threadParentAnchor = !hasClientSeenBoundary && channelType === "thread"
+    ? await attestedSendService.getThreadParentAnchor(channelId)
+    : null;
+  // Freshness proof must come from the current model-seen boundary.
+  // Durable legacy read-ish cursors cannot prove the model actually saw
+  // the messages; delivery ack state is volatile inbox state. The only
+  // fallback is a cold thread's parent message.
+  const latestFreshnessSeq = Math.max(latestAnchor.seq, threadParentAnchor?.seq ?? 0);
+  const latestFreshnessMessageId = latestAnchor.seq > 0 && latestAnchor.seq >= (threadParentAnchor?.seq ?? 0)
+    ? latestAnchor.messageId
+    : (threadParentAnchor?.messageId ?? latestAnchor.messageId);
+  const fallbackBoundarySeq = threadParentAnchor?.seq ?? 0;
+  const attestedBoundarySeq = Math.min(
+    hasClientSeenBoundary ? clientSeenUpToSeq : fallbackBoundarySeq,
+    latestFreshnessSeq,
+  );
+  const attestedBoundaryMessageId = attestedBoundarySeq <= 0
+    ? null
+    : attestedBoundarySeq === threadParentAnchor?.seq
+      ? threadParentAnchor.messageId
+      : await attestedSendService.getMessageIdForSeq(channelId, attestedBoundarySeq);
+  const seenExactSeqs = [...new Set((requestedSeenExactSeqs ?? [])
+    .map((seq) => Math.floor(Number(seq)))
+    .filter((seq) => Number.isInteger(seq)
+      && seq > attestedBoundarySeq
+      && seq <= latestFreshnessSeq))]
+    .slice(0, 2_500);
+  const newMessageCount = latestFreshnessSeq > attestedBoundarySeq
+    ? useAttentionFacts
+      ? await attestedSendService.countAgentAttentionMessagesAfterSeq(agentId, channelId, attestedBoundarySeq, {
+        excludeSender: selfSender,
+        latestSeq: latestFreshnessSeq,
+        excludeExactSeqs: seenExactSeqs,
+      })
+      : await attestedSendService.countMessagesAfterSeq(channelId, attestedBoundarySeq, {
+        excludeSender: selfSender,
+        latestSeq: latestFreshnessSeq,
+        excludeExactSeqs: seenExactSeqs,
+      })
+    : 0;
+  const attestedTargetType = toAttestedSendTargetType(channelType);
+  const boundarySource = hasClientSeenBoundary
+    ? "client_seen"
+    : seenExactSeqs.length > 0
+      ? "client_seen_exact"
+    : threadParentAnchor
+      ? "thread_parent"
+      : "none";
+  const formalMentionFacts = latestFreshnessSeq > attestedBoundarySeq
+    ? await attestedSendService.getFormalMentionFacts(
+        agentId,
+        channelId,
+        attestedBoundarySeq,
+        latestFreshnessSeq,
+        seenExactSeqs,
+      )
+    : { count: 0, firstMessageId: null, firstHandle: null };
+  return {
+    latestFreshnessSeq,
+    latestFreshnessMessageId,
+    attestedBoundarySeq,
+    attestedBoundaryMessageId,
+    newMessageCount,
+    attestedTargetType,
+    boundarySource,
+    formalMentionFacts,
+    useAttentionFacts,
+    seenExactSeqs,
+  };
+}
+
 async function listRecentFreshnessMessagesAfterSeq(
   agentId: string,
   agentServerId: string,
@@ -1216,7 +1502,7 @@ async function listRecentFreshnessMessagesAfterSeq(
   limit: number,
   latestSeq: number,
   useAttentionFacts: boolean,
-  options?: attestedSendService.FreshnessMessageAnchorOptions,
+  options?: attestedSendService.FreshnessMessageRangeOptions,
 ): Promise<AgentApiMessageEnvelope[]> {
   const freshnessMessages = useAttentionFacts
     ? await attestedSendService.listRecentAgentAttentionMessagesAfterSeq(
@@ -1237,11 +1523,342 @@ async function listRecentFreshnessMessagesAfterSeq(
     {
       forwardedBundleViewerAgentId: agentId,
       forwardedBundleViewerServerId: agentServerId,
+      includeSenderTimezone: true,
     },
   );
-  return recentMessages.map((message) =>
-    toAgentApiMessageEnvelope(message, typeof message.content === "string" ? message.content : "")
+  if (recentMessages.length === 0) return [];
+  // Message rows carry no conversation identity; without it clients cannot
+  // form a reply target and drop every held message. Resolve the agent-facing
+  // identity of the send target once and label each held envelope with it.
+  const identity = await messageService.resolveAgentConversationIdentity(agentServerId, agentId, channelId);
+  return recentMessages.map((message) => ({
+    ...toAgentApiMessageEnvelope(message, typeof message.content === "string" ? message.content : "", agentId),
+    ...identity,
+  }));
+}
+
+/**
+ * The held response of a gated write (a send, a task claim, status update or
+ * amend) whose freshness check found newer messages: the bounded window of
+ * them, the read position and delivery acknowledgements when every counted
+ * message was shown, the recorded hold (`gate_triggered`, with the board's
+ * channel id so a task write's retry can find it), and the agent's activity.
+ * One function, so every gated write holds with the same envelope.
+ */
+async function renderAgentFreshnessHold(req: Request, hold: {
+  action: ApmFreshnessSideEffectAction;
+  agentId: string;
+  serverId: string;
+  agentServerId: string;
+  channelId: string;
+  channelType: "channel" | "private" | "joint" | "dm" | "thread";
+  target: string;
+  withhold: boolean;
+  agentOrchestrator: AgentOrchestrator;
+  evaluation: AgentFreshnessEvaluation;
+  /** Task writes: which write was held, so only its own rerun is covered by the hold. */
+  writeKey?: string;
+  /** Send only: the draft this send replaced, how often it was held, and whether it is `--send-draft`. */
+  replacedExisting?: boolean;
+  reholdCount?: number;
+  isSendDraft?: boolean;
+}): Promise<AgentApiHeldFreshnessResponse> {
+  const { action, agentId, serverId, agentServerId, channelId, channelType, target, withhold, agentOrchestrator } = hold;
+  const replacedExisting = hold.replacedExisting ?? false;
+  const reholdCount = hold.reholdCount ?? 0;
+  const isSendDraft = hold.isSendDraft ?? false;
+  const {
+    attestedBoundarySeq: boundarySeq,
+    attestedBoundaryMessageId: boundaryMessageId,
+    latestFreshnessSeq: latestSeq,
+    latestFreshnessMessageId: latestMessageId,
+    boundarySource,
+    attestedTargetType,
+    useAttentionFacts,
+    seenExactSeqs,
+  } = hold.evaluation;
+  const mentionCount = hold.evaluation.formalMentionFacts.count;
+  const heldMessages = withhold
+    ? []
+    : await listRecentFreshnessMessagesAfterSeq(
+        agentId,
+        serverId,
+        channelId,
+        boundarySeq,
+        ATTESTED_SEND_HELD_CONTEXT_LIMIT,
+        latestSeq,
+        useAttentionFacts,
+        {
+          excludeSender: { senderType: "agent", senderId: agentId },
+          excludeExactSeqs: seenExactSeqs,
+        },
+      );
+  const heldSeqs = heldMessages
+    .map((message) => Number((message as { seq?: unknown }).seq))
+    .filter((seq) => Number.isInteger(seq) && seq > 0);
+  recordAgentContextReturned({
+    source: "hold",
+    agentId,
+    channelId,
+    ...agentRequestContextFromHeaders(req.headers),
+    seqs: heldSeqs,
+  });
+  const attentionHoldCount = latestSeq > boundarySeq
+    ? useAttentionFacts
+      ? await attestedSendService.countAgentAttentionMessagesAfterSeq(agentId, channelId, boundarySeq, {
+        excludeSender: { senderType: "agent", senderId: agentId },
+        latestSeq,
+        excludeExactSeqs: seenExactSeqs,
+      })
+      : await attestedSendService.countMessagesAfterSeq(channelId, boundarySeq, {
+        excludeSender: { senderType: "agent", senderId: agentId },
+        latestSeq,
+        excludeExactSeqs: seenExactSeqs,
+      })
+    : 0;
+  const shownMessageCount = heldMessages.length;
+  // Without a model-seen boundary, do not present the whole target
+  // history as "new messages"; this is a bounded first-touch context.
+  const hasModelSeenProof = boundarySource === "client_seen" || boundarySource === "client_seen_exact";
+  const firstTouchContextCount = withhold
+    ? Math.min(attentionHoldCount, ATTESTED_SEND_HELD_CONTEXT_LIMIT)
+    : shownMessageCount;
+  const holdCount = hasModelSeenProof ? attentionHoldCount : firstTouchContextCount;
+  const omittedMessageCount = !withhold && hasModelSeenProof
+    ? Math.max(0, attentionHoldCount - shownMessageCount)
+    : 0;
+  // Chat semantics (task #41 final review): the hold's obligation is the honest
+  // in-the-moment sentence: true skipped count (omittedMessageCount,
+  // attention semantics — never a seq span) plus the runnable --before
+  // anchor (minShownSeq). Nothing is persisted or re-surfaced.
+  const minShownSeq = heldSeqs.length > 0 ? Math.min(...heldSeqs) : null;
+  // Thread digest anchor: where this conversation started. Only fetched
+  // for threads, only when context is shown, and only when the parent
+  // is not already inside the displayed window.
+  const threadParentMessage = !withhold && channelType === "thread"
+    ? await attestedSendService.getThreadParentMessage(channelId)
+    : null;
+  // The read position moves to latestSeq only when this hold showed every
+  // message it counts. When some were omitted (the context cap), they
+  // have not been handed to the agent; marking them read would drop them
+  // from its inbox (an external agent never receives them otherwise), so
+  // the position stays and they are delivered as usual.
+  const showedEveryHeldMessage = shownMessageCount >= attentionHoldCount;
+  if (!withhold && showedEveryHeldMessage) {
+    // Task #93 line B: the agent's own read is a side effect of the send; a read-state fence refusal must not fail
+    // the send. Any other error still surfaces.
+    const readState = await channelService.markRead(
+      { kind: "agent", id: agentId },
+      channelId,
+      latestSeq,
+    ).catch((error: unknown) => {
+      if (isReadMutationFenceRefusal(error)) return null;
+      throw error;
+    });
+    if (readState) {
+      await emitScopeReadUpdated({
+        io: req.app.get("io") as SocketServer | undefined,
+        serverId: agentServerId,
+        scopeId: channelId,
+        peerKind: "agent",
+        peerId: agentId,
+        maxReadSeq: readState.maxReadSeq,
+        changed: readState.changed,
+      });
+    }
+  }
+  if (!withhold && latestSeq > boundarySeq) {
+    // Held context is returned inline; do not also redeliver it as unread.
+    // Only what was shown: omitted messages stay queued for delivery.
+    if (showedEveryHeldMessage) {
+      agentOrchestrator.acknowledgeDeliveredMessagesForChannelUpToSeq?.(
+        agentId,
+        channelId,
+        latestSeq,
+      ) ?? agentOrchestrator.acknowledgeDeliveredMessagesForChannel(agentId, channelId, heldSeqs);
+    } else {
+      agentOrchestrator.acknowledgeDeliveredMessagesForChannel(agentId, channelId, heldSeqs);
+    }
+  }
+  await attestedSendService.recordGateTriggered({
+    id: randomUUID(),
+    agentId: agentId,
+    serverId: agentServerId,
+    targetType: attestedTargetType,
+    targetRef: target,
+  }, {
+    lastSeenMessageId: boundaryMessageId,
+    latestMessageId,
+    hasFormalMentionSinceLastSeen: false,
+    draftReplacedExisting: replacedExisting,
+    newMessageCount: holdCount,
+    boundarySource,
+    boundarySeq,
+    latestSeq,
+    action,
+    channelId,
+    writeKey: hold.writeKey,
+  });
+  const freshnessDecision = {
+    action,
+    decision: "syncing_hold" as const,
+    ...(withhold ? { freshnessContextMode: "withheld" as const } : {}),
+    target,
+    reason: hasModelSeenProof ? "server_stale_model_boundary" : "server_first_touch_context",
+    pendingMaxSeq: latestSeq,
+    modelSeenSeq: boundarySource === "client_seen" ? boundarySeq : 0,
+    heldMessageCount: shownMessageCount,
+    omittedMessageCount,
+  };
+  const producerFactId = buildApmFreshnessDecisionProducerFactId(agentId, freshnessDecision);
+  const envelope = projectApmHeldFreshnessEnvelope<AgentApiMessageEnvelope>({
+    producerFactId,
+    action,
+    decision: "syncing_hold",
+    heldMessages,
+    newMessageCount: holdCount,
+    omittedMessageCount,
+    seenUpToSeq: latestSeq,
+    freshnessContextMode: withhold ? "withheld" : undefined,
+  });
+  if (withhold) {
+    await recordAgentRaftAction(req, agentId, {
+      title: "Reviewer-isolation freshness hold",
+      text: `${formatAttestedMessageCount(holdCount)} withheld`,
+    });
+  } else {
+    const activity = projectApmHeldFreshnessActivity({
+      producerFactId,
+      action,
+      decision: "syncing_hold",
+      target,
+      messageCount: shownMessageCount,
+    });
+    const title = action === "send" && (reholdCount > 0 || isSendDraft) ? "Send draft held" : activity.entry.title;
+    await recordAgentRaftAction(req, agentId, {
+      title,
+      text: activity.entry.text,
+      producerFactId,
+      activity: activity.statusEntry.activity,
+      activityDetail: title,
+    });
+  }
+  return {
+    ...(!withhold ? { ok: true } : {}),
+    ...envelope.body,
+    ...(!withhold
+      ? { mentionAnnotation: { formalMentionCount: mentionCount } }
+      : {}),
+    ...(!withhold && action === "send"
+      ? { continueAnywaySuggested: reholdCount >= 3 }
+      : {}),
+    ...(!withhold
+      ? { seenUpToMessageId: latestMessageId }
+      : {}),
+    ...(!withhold && minShownSeq !== null
+      ? { firstShownSeq: minShownSeq }
+      : {}),
+    ...(!withhold
+      && threadParentMessage
+      && (minShownSeq === null || threadParentMessage.seq < minShownSeq)
+      ? {
+        threadParentMessage: {
+          seq: threadParentMessage.seq,
+          messageId: threadParentMessage.messageId,
+          senderName: threadParentMessage.senderName,
+          createdAt: threadParentMessage.createdAt?.toISOString() ?? null,
+          content: threadParentMessage.content,
+        },
+      }
+      : {}),
+  };
+}
+
+type TaskWriteFreshnessAction = "task_claim" | "task_update" | "task_amend";
+
+/**
+ * Glimpse G2: the freshness gate on a task write (claim, status update,
+ * amend), by the same check and hold as a send.
+ *
+ * - It runs only when the request attests what its model context has seen
+ *   (`seenUpToSeq`, or a non-empty `seenExactSeqs`). A request without them,
+ *   as every client before G2 sends, is never held.
+ * - The conversation is the task's board channel (the daemon's hold target
+ *   too); a task's thread is not checked.
+ * - No draft and no `--anyway`: the write is not applied, and rerunning it
+ *   after reading passes.
+ * - At most one hold per catch-up: when this same write (`writeKey`: the
+ *   action and its task) was held on this board within
+ *   TASK_WRITE_REHOLD_WINDOW_MS and the rerun's boundary covers that hold,
+ *   newer messages that arrived meanwhile do not hold it again, or a busy
+ *   board would hold every retry. Another write on the board is checked as
+ *   usual. The hold is a row, so a rerun on any replica finds it; it is looked
+ *   up only when about to hold. Reviewer isolation shows no messages, so its
+ *   rerun cannot catch up: there, a recent hold of the write lets it pass.
+ *
+ * Returns the held response, or null to apply the write.
+ */
+async function holdTaskWriteForFreshness(req: Request, input: {
+  action: TaskWriteFreshnessAction;
+  /** The write's identity on the board: the action and its task(s). */
+  writeKey: string;
+  agentId: string;
+  serverId: string;
+  ctx: AgentApiTaskChannelContext;
+  /** The board as the client spelled it, echoed in the hold. */
+  target: string;
+  seenUpToSeq: number | undefined;
+  seenExactSeqs: number[] | undefined;
+  freshnessContextMode: string | undefined;
+}): Promise<AgentApiHeldFreshnessResponse | null> {
+  const { action, agentId, serverId, ctx } = input;
+  const attested = typeof input.seenUpToSeq === "number" || (input.seenExactSeqs?.length ?? 0) > 0;
+  if (!attested || !isSendFreshnessEnabled(ctx.agent.serverId, agentId)) return null;
+  const withhold = input.freshnessContextMode === "withheld";
+  const gate = await tracePhase(
+    async () => {
+      const evaluation = await evaluateAgentFreshness({
+        agentId,
+        channelId: ctx.channelId,
+        channelType: ctx.channelType,
+        seenUpToSeq: input.seenUpToSeq,
+        requestedSeenExactSeqs: input.seenExactSeqs,
+      });
+      if (evaluation.newMessageCount === 0) return { evaluation, outcome: "passed" as const };
+      const lastHold = await attestedSendService.getRecentGateTriggered(
+        agentId,
+        ctx.channelId,
+        input.writeKey,
+        attestedSendService.TASK_WRITE_REHOLD_WINDOW_MS,
+      );
+      const caughtUp = lastHold !== null && (withhold || evaluation.attestedBoundarySeq >= lastHold.latestSeq);
+      return { evaluation, outcome: caughtUp ? "repeat_passed" as const : "held" as const };
+    },
+    (_durationMs, result) => ({
+      name: "agent_api_task.freshness.evaluated",
+      attrs: {
+        action,
+        outcome: result.outcome,
+        boundary_source: result.evaluation.boundarySource,
+        new_message_count: result.evaluation.newMessageCount,
+        freshness_context_mode: withhold ? "withheld" : "inline",
+      },
+    }),
   );
+  if (gate.outcome !== "held") return null;
+  return renderAgentFreshnessHold(req, {
+    action,
+    agentId,
+    serverId,
+    agentServerId: ctx.agent.serverId,
+    channelId: ctx.channelId,
+    channelType: ctx.channelType,
+    target: input.target,
+    withhold,
+    agentOrchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator,
+    evaluation: gate.evaluation,
+    writeKey: input.writeKey,
+  });
 }
 
 async function recordAgentRaftAction(
@@ -1252,6 +1869,19 @@ async function recordAgentRaftAction(
   const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
   if (typeof agentOrchestrator?.recordAgentRaftAction !== "function") return;
   await agentOrchestrator.recordAgentRaftAction(agentId, event);
+}
+
+/**
+ * Closed-set client label for send traces: `cli` (raft CLI, also via the
+ * daemon credential proxy), `daemon`, `other`, or `absent` (no header: SDK and
+ * hosted runtimes do not send one today).
+ */
+function agentApiClientKind(req: Request): "cli" | "daemon" | "other" | "absent" {
+  const client = req.header("X-Raft-Client") ?? req.header("X-Slock-Client");
+  if (!client) return "absent";
+  if (client === "cli") return "cli";
+  if (client.startsWith("daemon")) return "daemon";
+  return "other";
 }
 
 function isRaftCliRequest(req: Request): boolean {
@@ -1272,8 +1902,9 @@ function recordRaftCliActivity(
   agentOrchestrator?.recordRaftCliAction?.(agentId, event);
 }
 
-function serializeOAuthClientForAgentApi(
+async function serializeOAuthClientForAgentApi(
   client: Awaited<ReturnType<typeof oauthService.listOAuthClients>>[number],
+  serverId: string,
 ) {
   const isThirdPartyGlobal = client.appType === "third_party_global";
   const agentManifest = oauthService.resolveAgentManifest(client);
@@ -1287,16 +1918,28 @@ function serializeOAuthClientForAgentApi(
     description: isThirdPartyGlobal && client.description
       ? renderThirdPartyInertText({ field: "description", value: client.description })
       : (client.description ?? null),
+    // whenToUse is rendered verbatim into an agent system prompt; always run
+    // it through the inert renderer, for every app type, so a bare @name can
+    // never reach a daemon as a reference token.
+    whenToUse: client.whenToUse
+      ? renderThirdPartyInertText({ field: "when_to_use", value: client.whenToUse })
+      : null,
     homepageUrl: client.homepageUrl ?? null,
     returnUrl: client.returnUrl ?? null,
+    ...(client.setupUrl ? {
+      setupUrl: client.setupUrl,
+      setupDescription: client.setupDescription ? renderThirdPartyInertText({ field: "description", value: client.setupDescription }) : null,
+      setup: await getAppInstallationSetup({ clientId: client.id, serverId }),
+    } : {}),
     agentManifestUrl: agentManifest.url,
     agentManifestUrlSource: agentManifest.source ?? null,
     createdAt: client.createdAt.toISOString(),
     updatedAt: client.updatedAt.toISOString(),
+    ...await oauthService.projectOfficialAppDiscoveryForAgent(client),
   };
 }
 
-function serializeMarketplaceOAuthClientForAgentApi(
+async function serializeMarketplaceOAuthClientForAgentApi(
   client: Awaited<ReturnType<typeof oauthService.searchPublicMarketplaceOAuthClients>>[number],
 ) {
   const agentManifest = oauthService.resolveAgentManifest(client);
@@ -1312,12 +1955,14 @@ function serializeMarketplaceOAuthClientForAgentApi(
       ? renderThirdPartyInertText({ field: "data_access", value: client.dataAccessSummary })
       : null,
     homepageUrl: client.homepageUrl ?? null,
+    ...(client.setupUrl ? { setupUrl: client.setupUrl, setupDescription: client.setupDescription ? renderThirdPartyInertText({ field: "description", value: client.setupDescription }) : null } : {}),
     agentManifestUrl: agentManifest.url,
     agentManifestUrlSource: agentManifest.source ?? null,
     allowedScopes: client.allowedScopes ?? [],
     logoUrl: client.logoUrl ?? null,
     installedOnServer: client.installedAt !== null,
     updatedAt: client.updatedAt.toISOString(),
+    ...await oauthService.projectOfficialAppDiscoveryForAgent(client),
   };
 }
 
@@ -1382,35 +2027,6 @@ function resolveAgentLoginClient(
   return { ok: false, status: 404, error: "Registered service not found" };
 }
 
-async function requireBoundAgentScope(
-  req: Request,
-  res: Response,
-  agentId: string,
-  scope: "action:prepare",
-): Promise<boolean> {
-  try {
-    if (await agentScopesService.agentHasScope(agentId, scope)) return true;
-    req.scopeDenyReason = "missing_scope";
-    req.scopeRequired = scope;
-    res.status(403).json({
-      error: "missing required scope",
-      requiredScope: scope,
-      reason: "missing_scope",
-    });
-    return false;
-  } catch (err) {
-    console.error("agent-api scope lookup failed", serializeErrorForLog(err));
-    req.scopeDenyReason = "scope_lookup_failed";
-    req.scopeRequired = scope;
-    res.status(403).json({
-      error: "missing required scope",
-      requiredScope: scope,
-      reason: "scope_lookup_failed",
-    });
-    return false;
-  }
-}
-
 type AgentApiTaskChannelContext = {
   agent: NonNullable<Awaited<ReturnType<typeof agentService.getAgent>>>;
   channelId: string;
@@ -1420,17 +2036,28 @@ type AgentApiTaskChannelContext = {
   surface: TaskChannelSurface;
 };
 
+/** Null when the channel can't be used for tasks; the reason goes on the request span (o11y T1), the body stays "Agent or channel not found". */
 async function resolveAgentApiTaskChannel(
   agentId: string,
   serverId: string,
   channelRef: string,
+  res: Response,
 ): Promise<AgentApiTaskChannelContext | null> {
   const agent = await agentService.getAgent(agentId);
-  if (!agent || agent.serverId !== serverId) return null;
+  if (!agent || agent.serverId !== serverId) {
+    setRequestTraceErrorCode(res, "agent_not_found");
+    return null;
+  }
   const resolved = await channelService.resolveChannelByName(serverId, agentId, channelRef);
-  if (!resolved) return null;
+  if (!resolved) {
+    setRequestTraceErrorCode(res, "channel_not_found");
+    return null;
+  }
   const surface = await resolveTaskChannelSurface(serverId, resolved.channelId);
-  if (!surface) return null;
+  if (!surface) {
+    setRequestTraceErrorCode(res, "task_channel_unavailable");
+    return null;
+  }
   return {
     agent,
     channelId: surface.localChannel.id,
@@ -1443,10 +2070,24 @@ async function resolveAgentApiTaskChannel(
 
 function rejectAgentApiTaskWriteIfNeeded(canPost: boolean, res: Response): boolean {
   if (!canPost) {
+    setRequestTraceErrorCode(res, "channel_membership_required");
     res.status(403).json({ error: "Agent must join this channel to modify tasks" });
     return true;
   }
   return false;
+}
+
+function rejectHistoricalJointTaskWriteIfNeeded(
+  surface: TaskChannelSurface,
+  createdAt: Date | string,
+  res: Response,
+): boolean {
+  if (!isHistoricalJointTaskReadOnly(surface, createdAt)) return false;
+  res.status(403).json({
+    error: "Historical tasks are read-only from a participant workspace",
+    code: "joint_task_read_only",
+  });
+  return true;
 }
 
 async function assertAgentApiTaskWritableChannel(
@@ -1480,10 +2121,16 @@ const ALLOWED_EXTERNAL_ACTIVITY_KEYS = new Set([
   "toolName",
   "tool_name",
   "status",
+  "detail",
   "occurredAt",
   "occurred_at",
   "durationMs",
   "duration_ms",
+  "toolUseId",
+  "tool_use_id",
+  "exitCode",
+  "exit_code",
+  "ok",
   "errorClass",
   "error_class",
   "toolInput",
@@ -1495,9 +2142,18 @@ const ALLOWED_EXTERNAL_ACTIVITY_KEYS = new Set([
   "toolOutputTruncated",
   "tool_output_truncated",
   "truncated",
+  // A subagent's event (ids and enums; validated at ingest).
+  "subagent",
 ]);
 
-function parseExternalAgentActivityIngest(body: unknown): ExternalAgentActivityIngestRequest | { error: string; code: string } {
+const EXTERNAL_ACTIVITY_IGNORED_FIELD_REPORT_LIMIT = 20;
+
+type ParsedExternalAgentActivityIngest = ExternalAgentActivityIngestRequest & {
+  /** Unknown event field names stripped before ingest (bounded, for logs). */
+  ignoredFields: string[];
+};
+
+function parseExternalAgentActivityIngest(body: unknown): ParsedExternalAgentActivityIngest | { error: string; code: string } {
   if (!body || typeof body !== "object") {
     return { error: "Request body is required", code: "body_required" };
   }
@@ -1511,22 +2167,44 @@ function parseExternalAgentActivityIngest(body: unknown): ExternalAgentActivityI
   if (candidate.events.length > EXTERNAL_ACTIVITY_EVENT_LIMIT) {
     return { error: `events cannot exceed ${EXTERNAL_ACTIVITY_EVENT_LIMIT}`, code: "events_too_many" };
   }
+  const events: ExternalAgentActivityEvent[] = [];
+  const ignoredFields = new Set<string>();
   for (const event of candidate.events) {
     if (!event || typeof event !== "object" || Array.isArray(event)) {
       return { error: "events must contain objects", code: "event_invalid" };
     }
-    for (const key of Object.keys(event)) {
+    // Unknown fields are stripped, not rejected: a 400 fails the whole batch and
+    // stalls the sender's cursor, so a newer bridge adding a field would stop
+    // all its activity. Only allowlisted fields reach ingest.
+    const known: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(event)) {
       if (FORBIDDEN_EXTERNAL_ACTIVITY_KEYS.has(key)) {
         return { error: "transcript_path is not accepted on activity ingest", code: "transcript_path_forbidden" };
       }
-      if (!ALLOWED_EXTERNAL_ACTIVITY_KEYS.has(key)) {
-        return { error: `unknown activity event field: ${key}`, code: "event_field_unknown" };
+      if (ALLOWED_EXTERNAL_ACTIVITY_KEYS.has(key)) {
+        known[key] = value;
+      } else if (ignoredFields.size < EXTERNAL_ACTIVITY_IGNORED_FIELD_REPORT_LIMIT) {
+        ignoredFields.add(key.slice(0, 64));
       }
+    }
+    events.push(known as ExternalAgentActivityEvent);
+    // raft-agent-status.v1 fields. Legacy hook-outcome `status` values are
+    // still accepted (and ignored for status) so existing bridges keep working.
+    const { status, detail } = event as { status?: unknown; detail?: unknown };
+    if (status !== undefined && !isRaftAgentStatus(status) && !isExternalAgentActivityLegacyStatus(status)) {
+      return { error: `status must be one of ${RAFT_AGENT_STATUS_VALUES.join(", ")}`, code: "status_invalid" };
+    }
+    if (detail !== undefined && typeof detail !== "string") {
+      return { error: "detail must be a string", code: "detail_invalid" };
+    }
+    if (typeof detail === "string" && detail.length > RAFT_AGENT_STATUS_DETAIL_LIMIT) {
+      return { error: `detail cannot exceed ${RAFT_AGENT_STATUS_DETAIL_LIMIT} characters`, code: "detail_too_long" };
     }
   }
   return {
     schema: EXTERNAL_AGENT_ACTIVITY_INGEST_SCHEMA,
-    events: candidate.events as ExternalAgentActivityEvent[],
+    events,
+    ignoredFields: [...ignoredFields],
     ...(typeof candidate.coreSessionId === "string" ? { coreSessionId: candidate.coreSessionId } : {}),
     ...(typeof candidate.adapterInstance === "string" ? { adapterInstance: candidate.adapterInstance } : {}),
     ...(typeof candidate.dropped === "number" ? { dropped: candidate.dropped } : {}),
@@ -1539,7 +2217,13 @@ interface AgentApiWakeHint {
   event_id: string;
   seq: number | null;
   message_id: string | null;
-  target: string;
+  /**
+   * Canonical send target of the pending message (`#name`, `#name:<8hex>`,
+   * `dm:@peer[~kind]`, `dm:@peer:<8hex>`), the same string `/events`
+   * `reply_target` and the CLI print and `/send` resolves. Null when the queued
+   * message carries no conversation name to derive it from.
+   */
+  target: string | null;
   channel_id: string;
   channel_name: string;
   channel_type: AgentMessage["channel_type"];
@@ -1574,7 +2258,9 @@ function buildWakeHint(message: AgentMessage): AgentApiWakeHint | null {
     event_id: `wake-hint:${eventAnchor}`,
     seq,
     message_id: messageId,
-    target: `channelId:${channelId}`,
+    // Derived from the routing fields the queued message already carries
+    // (channel/parent names, DM peer ref) -- no per-hint DB read.
+    target: formatInboxMessageTarget(message),
     channel_id: channelId,
     channel_name: message.channel_name,
     channel_type: message.channel_type,
@@ -1585,22 +2271,34 @@ function buildWakeHint(message: AgentMessage): AgentApiWakeHint | null {
   return hint;
 }
 
-function sendManagedMcpAgentApiError(error: unknown, res: Response): void {
+function sendManagedMcpAgentApiError(error: unknown, res: Response, context: { serverName?: string | null; toolName?: string | null; mcpServerId?: string | null; isCall?: boolean } = {}): void {
+  // The agent-facing words for the common failures (managedMcpAgentErrors),
+  // also as suggestedNextAction, which raft-sdk shows as the next action (it
+  // never shows a raw `error`); anything else keeps its original message.
+  const body = (code: string, message: string) => {
+    const agentText = managedMcpAgentErrorMessage(code, context);
+    return agentText ? { error: agentText, code, suggestedNextAction: agentText } : { error: message, code };
+  };
   if (error instanceof ManagedMcpServiceError) {
     const status = error.code.endsWith("not_found") ? 404 : 409;
-    res.status(status).json({ error: error.message, code: error.code });
+    res.status(status).json(body(error.code, error.message));
     return;
   }
   if (error instanceof ManagedMcpCredentialError) {
-    res.status(503).json({ error: error.message, code: error.code });
+    res.status(503).json(body(error.code, error.message));
     return;
   }
   if (error instanceof ManagedMcpGatewayError) {
-    res.status(error.code === "managed_mcp_unreachable" ? 502 : 409).json({ error: error.message, code: error.code });
+    res.status(error.code === "managed_mcp_unreachable" ? 502 : 409).json(body(error.code, error.message));
     return;
   }
   if (error instanceof ManagedMcpOAuthError) {
-    res.status(error.code === "managed_mcp_oauth_busy" ? 503 : 409).json({ error: error.message, code: error.code });
+    res.status(error.code === "managed_mcp_oauth_busy" ? 503 : 409).json(body(error.code, error.message));
+    return;
+  }
+  // On a call, an unexpected failure can come after the remote tool ran: say so (same words as raft-sdk).
+  if (context.isCall) {
+    res.status(500).json({ error: MCP_CALL_INTERNAL_ERROR_TEXT, code: "managed_mcp_internal_error", suggestedNextAction: MCP_CALL_INTERNAL_ERROR_TEXT });
     return;
   }
   res.status(500).json({ error: "Managed MCP request failed", code: "managed_mcp_internal_error" });
@@ -1648,7 +2346,12 @@ registerAgentApiRoute(
       },
     ));
   } catch (error) {
-    sendManagedMcpAgentApiError(error, res);
+    const request = req.body as AgentApiRequestBodyByRoute["managedMcpCall"];
+    const [named] = await getDb().select({ name: managedMcpServers.name }).from(managedMcpServers)
+      .where(and(eq(managedMcpServers.id, request.mcpServerId), eq(managedMcpServers.serverId, req.serverId!)))
+      .limit(1)
+      .catch(() => []);
+    sendManagedMcpAgentApiError(error, res, { serverName: named?.name ?? null, toolName: request.toolName, mcpServerId: request.mcpServerId, isCall: true });
   }
   },
 );
@@ -1691,8 +2394,11 @@ internalAgentApiRouter.get("/", async (req, res) => {
       scopes,
     });
   } catch (err) {
-    console.error("internal.agent-api.whoami error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to load agent identity" });
+    sendJsonServerError(req, res, {
+      error: "Failed to load agent identity",
+      logPrefix: "internal.agent-api.whoami error:",
+      err,
+    });
   }
 });
 
@@ -1703,6 +2409,82 @@ internalAgentApiRouter.get("/", async (req, res) => {
  * The acting agent is the credential-bound runner principal; there is no
  * URL `:id` to spoof.
  */
+/**
+ * The rollout flags a managed agent's Computer gets at start (AgentConfig
+ * reminderApp / vaultApp), for agents that build their own prompt. An
+ * evaluation failure reads as off, as it does at agent start.
+ */
+async function agentContextFeatures(serverId: string): Promise<{ reminderApp: boolean; vaultApp: boolean }> {
+  try {
+    const [reminderApp, vaultApp] = await evaluateFeatureFlags([
+      { key: REMINDER_APP_FEATURE_FLAG_KEY, serverId },
+      { key: VAULT_APP_FEATURE_FLAG_KEY, serverId },
+    ]);
+    return { reminderApp: reminderApp?.enabled === true, vaultApp: vaultApp?.enabled === true };
+  } catch (error) {
+    console.warn("[agent-context] app rollout flag evaluation failed; reporting both off", serializeErrorForLog(error));
+    return { reminderApp: false, vaultApp: false };
+  }
+}
+
+// Identity bootstrap. A managed agent learns who it is from the standing
+// system prompt its daemon builds; an external agent has no daemon, so it asks
+// here. The prompt is the self-hosted-runner guide rendered by the same shared
+// builder the daemon uses for the `raft-cli-overview` manual, filled with this
+// agent's identity.
+registerAgentApiRoute("agentContext", async (req, res) => {
+  try {
+    const actingAgentId = req.actingAgentId!;
+    const serverId = req.serverId!;
+    const agent = await agentService.getAgent(actingAgentId);
+    if (!agent || agent.serverId !== serverId) {
+      res.status(401).json({ error: "Agent no longer exists" });
+      return;
+    }
+    const server = await serverService.getServer(serverId);
+    if (!server) {
+      res.status(401).json({ error: "Server no longer exists" });
+      return;
+    }
+    const external = isExternalAgentRuntime(agent.runtime);
+    const serverRole = await getActorServerRoleInServer(serverId, "agent", actingAgentId);
+    const prompt = external
+      ? {
+          audience: "self-hosted-runner" as const,
+          text: buildRaftCliGuideMarkdown({
+            handle: agent.name,
+            displayName: agent.displayName || agent.name,
+            description: agent.description,
+            serverName: server.name,
+            serverRole,
+          }),
+        }
+      : null;
+    sendAgentApiResponse("agentContext", res, {
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        displayName: agent.displayName ?? null,
+        description: agent.description ?? null,
+        runtime: agent.runtime,
+        external,
+        assistantOf: agent.assistantOwnerUserId ? { userId: agent.assistantOwnerUserId } : null,
+        serverRole,
+      },
+      server: { id: server.id, slug: server.slug, name: server.name },
+      credential: { capabilities: [...(req.agentCredentialScopes ?? [])] },
+      prompt,
+      features: await agentContextFeatures(serverId),
+    });
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to load agent context",
+      logPrefix: "internal.agent-api.context error:",
+      err,
+    });
+  }
+});
+
 registerAgentApiRoute("serverInfo", async (req, res) => {
   try {
     const actingAgentId = req.actingAgentId!;
@@ -1720,13 +2502,7 @@ registerAgentApiRoute("serverInfo", async (req, res) => {
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     const allAgents = await buildServerInfoAgentSummaries(serverId, agentOrchestrator);
 
-    const members = await serverService.getServerMembers(serverId, null);
-    const visibleMembers = await filterAgentVisibleHumansForHiddenDirectory(serverId, actingAgentId, members);
-    const humans = visibleMembers.map((m) => ({
-      name: m.name,
-      description: m.description,
-      role: m.role,
-    }));
+    const humans = await buildServerInfoHumanSummaries(serverId, actingAgentId);
     const machine = agent.machineId ? await machineService.getMachine(asMachineId(agent.machineId)) : null;
     const serverRole = await getActorServerRoleInServer(serverId, "agent", actingAgentId);
     const runtimeContext = {
@@ -1746,12 +2522,97 @@ registerAgentApiRoute("serverInfo", async (req, res) => {
 
     sendAgentApiResponse("serverInfo", res, { runtimeContext, serverRole, serverCapabilities: getServerCapabilities(serverRole), channels, agents: allAgents, humans });
   } catch (err) {
-    console.error("internal.agent-api.server error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to get server info" });
+    sendJsonServerError(req, res, {
+      error: "Failed to get server info",
+      logPrefix: "internal.agent-api.server error:",
+      err,
+    });
   }
 });
 
-internalAgentApiRouter.patch("/server", requireAgentCapability("server"), async (req, res) => {
+// `raft user info`: one user's serverInfo entry and their memberships among one
+// window of the caller's serverInfo channels, each decided exactly as the
+// caller's roster read (`channelMembers` on `#<name>`) would decide it, except
+// that a joint channel's roster, which spans every server's projection, is
+// matched by the user's identity rather than by name, and that the caller's
+// built-in app conversations are inspected and list no one. Each membership
+// row is the channel's own facts plus the user's membership (`joined`, and
+// their `channelRole` where channel roles exist), none of the caller's. It
+// replaces serverInfo plus one roster per channel, so it is gated by both:
+// the contract's `channels` capability and `channel:read` grant (channelMembers),
+// and serverInfo's `read` capability and `server:read` grant, below.
+registerAgentApiRoute(
+  "userChannels",
+  requireAgentCapability("read"),
+  requireAgentGrant("server:read"),
+  ...agentApiRequestValidators("userChannels"),
+  async (req, res) => {
+    try {
+      const actingAgentId = req.actingAgentId!;
+      const serverId = req.serverId!;
+      const agent = await agentService.getAgent(actingAgentId);
+      if (!agent || agent.serverId !== serverId) {
+        res.status(401).json({ error: "Agent no longer exists" });
+        return;
+      }
+      const params = req.params as AgentApiRequestParamsByRoute["userChannels"];
+      const query = req.query as AgentApiRequestQueryByRoute["userChannels"];
+      const name = params.name.startsWith("@") ? params.name.slice(1) : params.name;
+      const offset = Number(query.offset ?? 0);
+      const limit = Number(query.limit ?? AGENT_API_USER_CHANNELS_DEFAULT_LIMIT);
+
+      // serverInfo's lookup: exact name, agents before humans, the caller's directory.
+      const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+      const agentMatch = await findServerInfoAgentSummaryByName(serverId, name, agentOrchestrator);
+      const humanMatch = agentMatch ? null : await findServerInfoHumanSummaryByName(serverId, actingAgentId, name);
+      const subjectId = agentMatch?.id ?? humanMatch?.id;
+      if (!subjectId) {
+        res.status(404).json({ error: "User not found or not visible", code: AGENT_API_USER_NOT_FOUND_CODE });
+        return;
+      }
+      const kind = agentMatch ? "agent" as const : "human" as const;
+
+      const channels = (await channelService.listChannelsForAgent(serverId, actingAgentId)).map((channel) => ({
+        ...channel,
+        id: asChannelId(channel.id),
+      }));
+      const window = channels.slice(offset, offset + limit);
+      const rosters = await channelService.getChannelRosterNameMatchesForAgentWindow(serverId, actingAgentId, window, { kind, name, id: subjectId });
+      // The roster route's human filter: the caller's hidden directory.
+      const visibleHumans = new Set(await filterAgentVisibleHumansForHiddenDirectory(
+        serverId,
+        actingAgentId,
+        rosters.flatMap((roster) => roster?.humans ?? []),
+      ));
+      // A membership row describes the channel and the subject's membership,
+      // never the caller's (see userChannelMembershipRow).
+      const uncheckedCount = rosters.filter((roster) => !roster).length;
+      const memberships = window.flatMap((channel, index) => {
+        const roster = rosters[index];
+        if (!roster) return [];
+        const listed = kind === "agent"
+          ? roster.agents[0]
+          : roster.humans.find((human) => visibleHumans.has(human));
+        return listed ? [channelService.userChannelMembershipRow(channel, listed.channelRole)] : [];
+      });
+
+      const page = { total: channels.length, offset, limit };
+      if (agentMatch) {
+        sendAgentApiResponse("userChannels", res, { user: agentMatch.summary, kind: "agent", memberships, uncheckedCount, page });
+      } else {
+        sendAgentApiResponse("userChannels", res, { user: humanMatch!.summary, kind: "human", memberships, uncheckedCount, page });
+      }
+    } catch (err) {
+      sendJsonServerError(req, res, {
+        error: "Failed to get user channels",
+        logPrefix: "internal.agent-api.user-channels error:",
+        err,
+      });
+    }
+  },
+);
+
+registerAgentApiRoute("serverUpdate", async (req, res) => {
   try {
     const actingAgentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -1768,19 +2629,24 @@ internalAgentApiRouter.patch("/server", requireAgentCapability("server"), async 
     });
     res.status(result.status).json(result.body);
   } catch (err) {
-    console.error("internal.agent-api.server.update error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to update server" });
+    sendJsonServerError(req, res, {
+      error: "Failed to update server",
+      logPrefix: "internal.agent-api.server.update error:",
+      err,
+    });
   }
 });
 
 // Server Labs uses the same transactional service and role policy as the
 // human Settings API. The credential scope is an additional transport gate;
 // it never substitutes for owner/admin membership authorization.
-internalAgentApiRouter.get("/labs", requireAgentCapability("read"), getAgentServerLabs);
-internalAgentApiRouter.patch("/labs/access", requireAgentCapability("server"), patchAgentServerLabsAccess);
-internalAgentApiRouter.put("/labs/:labKey", requireAgentCapability("server"), putAgentServerLabEnrollment);
+// Labs keep their own body checks (stable codes such as invalid_enabled and
+// invalid_lab_key); the contract supplies the capability and the response shape.
+registerAgentApiRoute("serverLabs", validateAgentApiResponseMiddleware("serverLabs"), getAgentServerLabs);
+registerAgentApiRoute("serverLabsAccess", validateAgentApiResponseMiddleware("serverLabsAccess"), patchAgentServerLabsAccess);
+registerAgentApiRoute("serverLabEnrollment", validateAgentApiResponseMiddleware("serverLabEnrollment"), putAgentServerLabEnrollment);
 
-internalAgentApiRouter.post("/server/avatar", requireAgentCapability("server"), async (req, res) => {
+internalAgentApiRouter.post("/server/avatar", requireAgentCapability("server"), requireAgentGrant("server:update"), async (req, res) => {
   try {
     const actingAgentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -1833,12 +2699,15 @@ internalAgentApiRouter.post("/server/avatar", requireAgentCapability("server"), 
       });
       return;
     }
-    console.error("internal.agent-api.server.avatar error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to upload avatar" });
+    sendJsonServerError(req, res, {
+      error: "Failed to upload avatar",
+      logPrefix: "internal.agent-api.server.avatar error:",
+      err,
+    });
   }
 });
 
-internalAgentApiRouter.get("/knowledge", requireAgentCapability("knowledge"), async (req, res) => {
+registerAgentApiRoute("knowledgeGet", async (req, res) => {
   const actingAgentId = req.actingAgentId;
   const serverId = req.serverId;
   if (!actingAgentId || !serverId) {
@@ -1848,7 +2717,7 @@ internalAgentApiRouter.get("/knowledge", requireAgentCapability("knowledge"), as
   await handleAgentKnowledgeGet(req, res, { agentId: actingAgentId, serverId });
 });
 
-internalAgentApiRouter.get("/knowledge/search", requireAgentCapability("knowledge"), async (req, res) => {
+registerAgentApiRoute("knowledgeSearch", async (req, res) => {
   const actingAgentId = req.actingAgentId;
   const serverId = req.serverId;
   if (!actingAgentId || !serverId) {
@@ -1858,73 +2727,40 @@ internalAgentApiRouter.get("/knowledge/search", requireAgentCapability("knowledg
   await handleAgentKnowledgeSearch(req, res, { agentId: actingAgentId, serverId });
 });
 
-function sendWikiAgentApiError(res: Response, error: unknown): void {
-  if (error instanceof wikiService.WikiError) {
-    const status = error.code === "forbidden"
-      ? 403
-      : error.code === "not_found"
-        ? 404
-        : error.code === "conflict"
-          ? 409
-          : error.code === "storage_unavailable"
-            ? 503
-            : 400;
-    res.status(status).json({ error: error.message, code: error.code });
-    return;
-  }
-  console.error("internal.agent-api.wiki error:", serializeErrorForLog(error));
-  res.status(500).json({ error: "Failed to handle Wiki Agent request" });
+/** Channel types that have a card (passive-AX `channel` resource): the listable ones, not DMs or threads. */
+const CHANNEL_CARD_TYPES: ReadonlySet<string> = new Set(channelService.LISTABLE_CHANNEL_TYPES);
+
+type ChannelCardRow = { id: string; name: string; type: string; description: string | null; archivedAt: Date | null };
+
+function channelCardOf(row: ChannelCardRow): AgentApiChannelCard {
+  return {
+    id: row.id,
+    name: row.name,
+    type: row.type,
+    description: row.description ?? null,
+    archived: row.archivedAt != null,
+  };
 }
 
-registerAgentApiRoute(
-  "wikiManifestGet",
-  validateAgentApiResponseMiddleware("wikiManifestGet"),
-  async (req, res) => {
-    try {
-      res.json(await wikiService.getWikiAgentManifest(req.serverId!, req.actingAgentId!));
-    } catch (error) {
-      sendWikiAgentApiError(res, error);
-    }
-  },
-);
-
-registerAgentApiRoute(
-  "wikiArtifactRead",
-  ...agentApiRequestValidators("wikiArtifactRead"),
-  validateAgentApiResponseMiddleware("wikiArtifactRead"),
-  async (req, res) => {
-    try {
-      const params = req.params as AgentApiRequestParamsByRoute["wikiArtifactRead"];
-      res.json(await wikiService.getWikiAgentArtifact(
-        req.serverId!,
-        req.actingAgentId!,
-        params.artifactId,
-      ));
-    } catch (error) {
-      sendWikiAgentApiError(res, error);
-    }
-  },
-);
-
-registerAgentApiRoute(
-  "wikiManifestPublish",
-  ...agentApiRequestValidators("wikiManifestPublish"),
-  validateAgentApiResponseMiddleware("wikiManifestPublish"),
-  async (req, res) => {
-    try {
-      const body = req.body as AgentApiRequestBodyByRoute["wikiManifestPublish"];
-      res.json(await wikiService.publishWikiAgentManifest({
-        serverId: req.serverId!,
-        agentId: req.actingAgentId!,
-        expectedEtag: body.expectedEtag,
-        manifest: body.manifest,
-        revisionBodies: body.revisionBodies,
-      }));
-    } catch (error) {
-      sendWikiAgentApiError(res, error);
-    }
-  },
-);
+/**
+ * The channel whose card goes with `channel`: the channel itself, a thread's
+ * parent channel, or a joint thread's local parent projection (its projection
+ * has no parent message). Null for DMs and threads under them. The one rule
+ * for both history reads and sends, so a card recorded on read passes a send.
+ */
+async function resolveChannelCardRow(
+  channel: (ChannelCardRow & { parentMessageId?: string | null }) | null | undefined,
+  serverId: string,
+): Promise<ChannelCardRow | null> {
+  if (!channel) return null;
+  if (CHANNEL_CARD_TYPES.has(channel.type)) return channel;
+  if (channel.type !== "thread") return null;
+  const parentChannelId = channel.parentMessageId
+    ? (await messageService.getMessage(channel.parentMessageId))?.channelId ?? null
+    : (await channelService.getJointThreadProjectionByLocalThread(channel.id, serverId))?.localParentChannelId ?? null;
+  const parent = parentChannelId ? await channelService.getChannel(parentChannelId) : null;
+  return parent && CHANNEL_CARD_TYPES.has(parent.type) ? parent : null;
+}
 
 /**
  * GET /internal/agent-api/history?channel=<ref>&limit=<n>&before=<id|seq>&after=<id|seq>&around=<id|seq>
@@ -1942,6 +2778,9 @@ registerAgentApiRoute("historyRead", async (req, res) => {
     if (!historyQuery) return;
     const channelRef = historyQuery.channel;
     const limit = Math.min(Number(historyQuery.limit) || 50, 100);
+    // `consume=false`: return the page without marking it read, for reads
+    // whose output may never reach the model.
+    const consume = historyQuery.consume !== "false";
 
     if (!channelRef) {
       res.status(400).json({ error: "channel query param is required (e.g. #all, dm:@richard)" });
@@ -1987,7 +2826,8 @@ registerAgentApiRoute("historyRead", async (req, res) => {
       if (found.kind === "absent") {
         // Deliberately the SAME neutral body used for an invisible channel, and a
         // CONSTANT: echoing the requested id here would make two ids distinguishable
-        // even while errorCode stayed identical.
+        // even while errorCode stayed identical. The span (never the caller) says which.
+        setRequestTraceErrorCode(res, "third_party_event_not_found");
         res.status(404).json(CHANNEL_NOT_FOUND_BODY);
         return;
       }
@@ -2022,6 +2862,7 @@ registerAgentApiRoute("historyRead", async (req, res) => {
           if (anchored) {
             // The anchor is genuinely here and genuinely has no replies -- the only
             // case where we may say so, because we checked.
+            setRequestTraceErrorCode(res, "thread_has_no_replies");
             res.status(404).json({
               error: `No thread on message ${threadShortId} in ${baseRef}: the message is here, but it has no replies yet.`,
               errorCode: "NOT_FOUND",
@@ -2031,12 +2872,14 @@ registerAgentApiRoute("historyRead", async (req, res) => {
           }
           // No anchor here. Covers both "no such message anywhere" and "it lives in
           // another channel" -- one body for both, so they cannot be told apart.
+          setRequestTraceErrorCode(res, "thread_anchor_not_found");
           res.status(404).json(threadAnchorNotFoundBody(baseRef));
           return;
         }
       }
       // The parent channel itself is missing or invisible. Shared neutral body:
       // it must not distinguish "does not exist" from "you cannot see it".
+      setRequestTraceErrorCode(res, threadShortId ? "thread_parent_channel_not_found" : "channel_not_found");
       res.status(404).json(CHANNEL_NOT_FOUND_BODY);
       return;
     }
@@ -2044,6 +2887,7 @@ registerAgentApiRoute("historyRead", async (req, res) => {
     const channelId = resolved.channelId;
     const hasAccess = await channelService.canAgentAccessChannel(channelId, actingAgentId);
     if (!hasAccess) {
+      setRequestTraceErrorCode(res, "history_not_accessible");
       res.status(403).json({ error: "You do not have access to this history" });
       return;
     }
@@ -2062,6 +2906,17 @@ registerAgentApiRoute("historyRead", async (req, res) => {
     const beforeAnchor = historyQuery.before?.trim();
     const afterAnchor = historyQuery.after?.trim();
     const around = historyQuery.around?.trim();
+    // `unread=true` (`raft message read --unread`): start right after the
+    // agent's read position, the one `raft inbox check` counts unread from.
+    const unread = historyQuery.unread === "true";
+    if (unread && (beforeAnchor || afterAnchor || around)) {
+      res.status(400).json({
+        error: "--unread cannot be combined with --before, --after, or --around.",
+        errorCode: "INVALID_ARG",
+        suggestedNextAction: `raft message read --target '${channelRef}' --unread`,
+      });
+      return;
+    }
     if (beforeAnchor && !isHistoryAnchorShape(beforeAnchor)) {
       const failure = historyAnchorErrorPayload(channelRef, beforeAnchor, "invalid");
       res.status(failure.status).json(failure.body);
@@ -2089,8 +2944,9 @@ registerAgentApiRoute("historyRead", async (req, res) => {
       return;
     }
     const beforeSeq = beforeResolution?.ok ? beforeResolution.seq : undefined;
-    const afterSeq = afterResolution?.ok ? afterResolution.seq : undefined;
     const lastReadSeq = await channelService.getAgentLegacyReadCursor(actingAgentId, channelId);
+    const unreadAfterSeq = unread ? Math.max(0, Number(lastReadSeq) || 0) : undefined;
+    const afterSeq = afterResolution?.ok ? afterResolution.seq : unreadAfterSeq;
     let rawMsgs;
     let hasOlder = false;
     let hasNewer = false;
@@ -2117,6 +2973,7 @@ registerAgentApiRoute("historyRead", async (req, res) => {
         {
           forwardedBundleViewerAgentId: actingAgentId,
           forwardedBundleViewerServerId: serverId,
+          includeSenderTimezone: true,
         },
       );
       if (!context || context.channelId !== storageChannelId) {
@@ -2131,6 +2988,7 @@ registerAgentApiRoute("historyRead", async (req, res) => {
       rawMsgs = await messageService.listMessages(storageChannelId, limit + 1, beforeSeq, afterSeq, undefined, {
         forwardedBundleViewerAgentId: actingAgentId,
         forwardedBundleViewerServerId: serverId,
+        includeSenderTimezone: true,
       });
     }
     const msgs = jointThreadProjection || resolvedAccess?.kind === "joint"
@@ -2147,45 +3005,161 @@ registerAgentApiRoute("historyRead", async (req, res) => {
     hasOlder = page.hasOlder;
     hasNewer = page.hasNewer;
 
-    if (!around && pageMsgs.length > 0) {
-      const maxSeq = Math.max(...pageMsgs.map((m) => m.seq ?? 0));
-      if (maxSeq > 0) {
-        channelService.markRead({ kind: "agent", id: actingAgentId }, channelId, maxSeq).then((readState) =>
-          emitScopeReadUpdated({
-            io: req.app.get("io") as SocketServer | undefined,
-            serverId,
-            scopeId: channelId,
-            peerKind: "agent",
-            peerId: actingAgentId,
-            maxReadSeq: readState.maxReadSeq,
-            changed: readState.changed,
-          })
-        ).catch(() => {});
+    let modelSeenUpToSeq: number | null = null;
+    let readThroughSeq: number | null = null;
+    if (consume && !around && pageMsgs.length > 0) {
+      const pageSeqs = pageMsgs
+        .map((message) => Number(message.seq))
+        .filter((seq) => Number.isInteger(seq) && seq > 0);
+      const minSeq = pageSeqs.length > 0 ? Math.min(...pageSeqs) : 0;
+      const maxSeq = pageSeqs.length > 0 ? Math.max(...pageSeqs) : 0;
+      const priorReadSeq = Math.max(0, Number(lastReadSeq) || 0);
+      // A read window may advance a high-water boundary only when it joins the
+      // prior boundary without a hidden gap. Latest/before pages are safe when
+      // they include the oldest row or overlap the prior cursor. An `after`
+      // page is safe only when its exclusive anchor is at/below that cursor.
+      // Otherwise the returned bodies remain useful exact-seq observations,
+      // but must not consume earlier unseen messages outside the window.
+      const canAdvanceModelSeen = afterSeq !== undefined
+        ? afterSeq <= priorReadSeq
+        : !hasOlder || minSeq <= priorReadSeq;
+      if (maxSeq > 0 && canAdvanceModelSeen) {
+        modelSeenUpToSeq = maxSeq;
+        // Seq order is not commit order: a transaction holding seq 100 can
+        // commit after one holding 101. Moving the read position to 101 the
+        // moment 101 is visible would skip 100 forever (the next `--unread`
+        // and `inbox check` both count from the read position). So the read
+        // position only moves through the settled prefix of the page: rows
+        // older than readPositionSettleMs(). Newer rows are still returned and
+        // stay unread for now; a deferred check (below) moves the position
+        // over them once the window has passed and no late lower seq appeared.
+        readThroughSeq = settledReadThroughSeq(pageMsgs, Date.now() - readPositionSettleMs());
+      }
+      const markAgentRead = (seq: number) => channelService.markRead({ kind: "agent", id: actingAgentId }, channelId, seq).then((readState) =>
+        emitScopeReadUpdated({
+          io: req.app.get("io") as SocketServer | undefined,
+          serverId,
+          scopeId: channelId,
+          peerKind: "agent",
+          peerId: actingAgentId,
+          maxReadSeq: readState.maxReadSeq,
+          changed: readState.changed,
+        })
+      );
+      if (readThroughSeq !== null && readThroughSeq > priorReadSeq) {
+        // An unread read is awaited: the next `--unread` must start after this
+        // page, not race the write and return the same messages again.
+        const marking = markAgentRead(readThroughSeq).catch(() => {});
+        if (unread) await marking;
+      }
+      if (maxSeq > 0 && canAdvanceModelSeen && maxSeq > Math.max(priorReadSeq, readThroughSeq ?? 0)) {
+        scheduleDeferredReadAdvance({
+          agentId: actingAgentId,
+          channelId,
+          fromSeq: Math.max(priorReadSeq, readThroughSeq ?? 0),
+          returnedSeqs: pageSeqs,
+          listSeqs: async (fromSeq, toSeq) => (
+            await messageService.listMessages(storageChannelId, DEFERRED_READ_ADVANCE_SCAN_LIMIT, toSeq + 1, fromSeq)
+          ).map((message) => Number(message.seq)).filter((seq) => Number.isInteger(seq) && seq > fromSeq && seq <= toSeq),
+          advance: async (seq) => { await markAgentRead(seq); },
+          record: (outcome, attrs) => recordTraceEvent("server.agent_api.history_read.deferred_advance", {
+            outcome,
+            agent_id: actingAgentId,
+            channel_id: channelId,
+            ...attrs,
+          }),
+        });
       }
     }
 
+    // The agent's own messages are never unread for it: the inbox count and the
+    // `/events` pull leave them out, and a send can leave the read position
+    // below them (markAgentOwnSendRead). So `--unread` prints only others'
+    // messages, while the read position above moved over the whole window, own
+    // messages included, so the next `--unread` starts after them. A full page
+    // followed only by own messages has no more unread.
+    const ownSender = { senderType: "agent" as const, senderId: actingAgentId };
+    const shownMsgs = unread
+      ? pageMsgs.filter((message) => !(message.senderType === ownSender.senderType && message.senderId === ownSender.senderId))
+      : pageMsgs;
+    if (unread && hasNewer && pageMsgs.length > 0) {
+      const pageLastSeq = Math.max(...pageMsgs.map((message) => Number(message.seq)));
+      hasNewer = (await messageService.listMessages(storageChannelId, 1, undefined, pageLastSeq, undefined, { excludeSender: ownSender })).length > 0;
+    }
+
     const renderedContents = await agentPermalinkRenderService.renderAgentReadablePermalinksInTexts(
-      pageMsgs.map((message) => message.content),
+      shownMsgs.map((message) => message.content),
       serverId,
     );
+    // Resolve the evidence key from the same authority that resolved this
+    // request. Message envelopes intentionally omit channel identity fields,
+    // so reconstructing a target from a rendered row can only guess (and in
+    // CLI 0.0.28 guessed `#undefined`, collapsing every target together).
+    let resolvedHistoryTarget = await channelService.resolveAgentFacingChannelRef(
+      serverId,
+      actingAgentId,
+      projectionChannelId,
+    );
+    let dmHistoryScope = channel?.type === "dm";
+    const cardChannel = await resolveChannelCardRow(channel, serverId);
+    if (channel?.type === "thread" && channel.parentMessageId) {
+      const parent = await messageService.getMessage(channel.parentMessageId);
+      const parentChannel = parent ? await channelService.getChannel(parent.channelId) : null;
+      dmHistoryScope = parentChannel?.type === "dm";
+      const parentTarget = parent
+        ? await channelService.resolveAgentFacingChannelRef(serverId, actingAgentId, parent.channelId)
+        : null;
+      if (parentTarget) {
+        resolvedHistoryTarget = `${parentTarget}:${channel.parentMessageId.slice(0, 8)}`;
+      }
+    }
+    const peerCard = dmHistoryScope ? await resolvePeerCard(serverId, actingAgentId, channel) : null;
+    recordAgentContextReturned({
+      source: "history",
+      agentId: actingAgentId,
+      channelId: projectionChannelId,
+      ...agentRequestContextFromHeaders(req.headers),
+      seqs: shownMsgs.map((message) => message.seq),
+    });
     sendAgentApiResponse("historyRead", res, {
-      messages: pageMsgs.map((message: Record<string, unknown>, index: number) =>
+      target: resolvedHistoryTarget ?? channelRef,
+      ...(dmHistoryScope && channel && { consumption_scope: {
+        agent_id: actingAgentId,
+        channel_id: projectionChannelId,
+        channel_type: channel.type as "dm" | "thread",
+        target: resolvedHistoryTarget ?? channelRef,
+      } }),
+      messages: shownMsgs.map((message, index: number) =>
         toAgentApiMessageEnvelope(
           message,
           messageService.appendAgentFacingForwardedSnapshot(
-            renderedContents[index] ?? "",
+            renderAgentCommentScopedContent(
+              renderedContents[index] ?? "",
+              message.commentRef,
+            ),
             message.actionMetadata,
           ),
+          actingAgentId,
         )
       ),
       has_more: hasOlder || hasNewer,
       has_older: hasOlder,
       has_newer: hasNewer,
       last_read_seq: lastReadSeq,
+      model_seen_up_to_seq: modelSeenUpToSeq,
+      ...(unreadAfterSeq !== undefined && {
+        unread_after_seq: unreadAfterSeq,
+        read_through_seq: Math.max(unreadAfterSeq, readThroughSeq ?? 0),
+      }),
+      ...(cardChannel && { channel_card: channelCardOf(cardChannel) }),
+      ...(peerCard && { peer_card: peerCard }),
     });
   } catch (err) {
-    console.error("internal.agent-api.history error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to read history" });
+    sendJsonServerError(req, res, {
+      error: "Failed to read history",
+      logPrefix: "internal.agent-api.history error:",
+      err,
+    });
   }
 });
 
@@ -2200,7 +3174,7 @@ registerAgentApiRoute("historyRead", async (req, res) => {
  * outsider rows remain sender-side actions until they were notifiable at send
  * time or an explicit notify/add action sets notified_at.
  */
-internalAgentApiRouter.get("/mentions", requireAgentCapability("mentions"), async (req, res) => {
+registerAgentApiRoute("mentionsList", async (req, res) => {
   try {
     const actingAgentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -2254,8 +3228,11 @@ internalAgentApiRouter.get("/mentions", requireAgentCapability("mentions"), asyn
       has_more: filteredRows.length > limit,
     });
   } catch (err) {
-    console.error("internal.agent-api.mentions error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to load mentions" });
+    sendJsonServerError(req, res, {
+      error: "Failed to load mentions",
+      logPrefix: "internal.agent-api.mentions error:",
+      err,
+    });
   }
 });
 
@@ -2292,6 +3269,76 @@ internalAgentApiRouter.get("/mentions/:messageId/delivery", requireAgentCapabili
 });
 
 /**
+ * task #153 — GET /internal/agent-api/messages/:messageId/mention-deliveries
+ *
+ * The AUTHOR's view: for a message I sent, what happened to each target I
+ * mentioned. This is the counterpart of `/mentions/:messageId/delivery`, which
+ * is receiver-bound by design; without this the server knows a mention was
+ * permanently lost and the only party who cannot find out is the one who sent it.
+ *
+ * Authority is authorship, and a non-author gets the SAME `404 NOT_JOINABLE`
+ * shape a non-participant gets, so this cannot be used to probe whether someone
+ * else's message exists.
+ */
+internalAgentApiRouter.get("/messages/:messageId/mention-deliveries", requireAgentCapability("mentions"), async (req, res) => {
+  try {
+    const messageId = typeof req.params.messageId === "string" ? req.params.messageId : "";
+    if (!UUID_RE.test(messageId)) {
+      res.status(404).json({ status: "NOT_JOINABLE" });
+      return;
+    }
+    const [message] = await getDb()
+      .select({ senderType: messages.senderType, senderId: messages.senderId, channelId: messages.channelId })
+      .from(messages)
+      .where(eq(messages.id, messageId))
+      .limit(1);
+    // Same body for "no such message" and "not yours": a distinguishable
+    // response here would answer a question the caller is not entitled to ask.
+    if (!message || message.senderType !== "agent" || message.senderId !== req.actingAgentId) {
+      res.status(404).json({ status: "NOT_JOINABLE" });
+      return;
+    }
+    const rows = await mentionDeliveryOccurrenceService.listMentionDeliveryOccurrencesForMessage(messageId);
+    // @Stone finding 1: identify the target by the handle the AUTHOR actually
+    // wrote, not by whatever the agent is called today. The sender is
+    // diagnosing a token they typed; if the target was renamed after the send,
+    // the current name is a different string from the one they are looking for.
+    // occurrenceId IS messageMentions.id, so this is an exact join, and
+    // handleAtSendTime is notNull — no fallback to the live name is needed.
+    const handles = new Map<string, string>();
+    if (rows.length > 0) {
+      const authored = await getDb()
+        .select({ id: messageMentions.id, handleAtSendTime: messageMentions.handleAtSendTime })
+        .from(messageMentions)
+        .where(inArray(messageMentions.id, rows.map((row) => row.occurrenceId)));
+      for (const mention of authored) handles.set(mention.id, mention.handleAtSendTime);
+    }
+    const serviceTargets = await getDb().select({ agentId: agents.id }).from(agents)
+      .innerJoin(raftbenchConfigs, eq(raftbenchConfigs.agentId, agents.id))
+      .where(inArray(agents.id, rows.map(row => row.agentId)));
+    const serviceIds = new Set(serviceTargets.map(row => row.agentId));
+    const deliveries = rows.map((row) => serviceIds.has(row.agentId)
+      ? { targetHandle: handles.get(row.occurrenceId) ?? "", outcome: "lost" as const, reasonCategory: "unclassified" as const }
+      : projectMentionDeliveryForSender(handles.get(row.occurrenceId) ?? "", mentionDeliveryOccurrenceService.evaluateMentionDeliveryOccurrence(row)));
+    const dmPeers = await getDb().select({ agentId: agents.id, name: agents.name }).from(channels)
+      .innerJoin(channelAgents, eq(channelAgents.channelId, channels.id))
+      .innerJoin(agents, eq(agents.id, channelAgents.agentId))
+      .innerJoin(raftbenchConfigs, eq(raftbenchConfigs.agentId, agents.id))
+      .where(and(eq(channels.id, message.channelId), eq(channels.type, "dm")));
+    for (const peer of dmPeers) {
+      if (!serviceIds.has(peer.agentId)) deliveries.push({ targetHandle: peer.name, outcome: "lost", reasonCategory: "unclassified" });
+    }
+    res.status(200).json({ messageId, deliveries });
+  } catch (err) {
+    console.error("internal.agent-api.sender-mention-deliveries error:", serializeErrorForLog(err));
+    // LOOKUP_FAILED, not a verdict: "the query did not run" and "I read the rows
+    // and they are broken" have opposite next actions. Same split the sibling
+    // route already records.
+    res.status(500).json({ status: "LOOKUP_FAILED" });
+  }
+});
+
+/**
  * GET /internal/agent-api/mention-actions/pending
  *
  * Sender-side mention-AX action query. These are outsider mentions emitted by
@@ -2311,8 +3358,11 @@ registerAgentApiRoute("mentionActionsPending", async (req, res) => {
       has_more: rows.length > limit,
     });
   } catch (err) {
-    console.error("internal.agent-api.mention-actions.pending error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to load pending mention actions" });
+    sendJsonServerError(req, res, {
+      error: "Failed to load pending mention actions",
+      logPrefix: "internal.agent-api.mention-actions.pending error:",
+      err,
+    });
   }
 });
 
@@ -2400,8 +3450,11 @@ registerAgentApiRoute("mentionActionsExecute", ...agentApiRequestValidators("men
     }
     sendAgentApiResponse("mentionActionsExecute", res, { ok: true, action, results });
   } catch (err) {
-    console.error("internal.agent-api.mention-actions.execute error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to execute mention action" });
+    sendJsonServerError(req, res, {
+      error: "Failed to execute mention action",
+      logPrefix: "internal.agent-api.mention-actions.execute error:",
+      err,
+    });
   }
 });
 
@@ -2419,6 +3472,7 @@ async function handleReaction(
   const serverId = req.serverId!;
   const emoji = parseReactionEmoji(req.body?.emoji);
   if (!emoji) {
+    setRequestTraceErrorCode(res, "emoji_invalid");
     res.status(400).json({ error: "A valid emoji is required" });
     return;
   }
@@ -2426,31 +3480,37 @@ async function handleReaction(
   const msgId = typeof req.params.msgId === "string" ? req.params.msgId : "";
   const resolvedMessageId = await messageService.resolveMessageIdVisibleToAgent(serverId, actingAgentId, msgId);
   if (!resolvedMessageId.ok) {
+    setRequestTraceErrorCode(res, resolvedMessageId.status === 404 ? "message_not_found" : "message_id_invalid");
     res.status(resolvedMessageId.status).json({ error: resolvedMessageId.error });
     return;
   }
   const message = await messageService.getMessage(resolvedMessageId.messageId);
   if (!message) {
+    setRequestTraceErrorCode(res, "message_not_found");
     res.status(404).json({ error: "Message not found" });
     return;
   }
 
   const channel = await channelService.getChannel(message.channelId);
   if (!channel || channel.serverId !== serverId) {
+    setRequestTraceErrorCode(res, "channel_not_found");
     res.status(404).json({ error: "Channel not found" });
     return;
   }
   const canAccess = await channelService.canAgentAccessChannel(message.channelId, actingAgentId);
   if (!canAccess) {
+    setRequestTraceErrorCode(res, "message_not_found");
     res.status(404).json({ error: "Message not found" });
     return;
   }
   if (message.messageType === "system") {
+    setRequestTraceErrorCode(res, "system_message_not_reactable");
     res.status(400).json({ error: "System messages cannot receive reactions" });
     return;
   }
   const canPost = await channelService.canAgentPostToChannel(message.channelId, actingAgentId);
   if (!canPost) {
+    setRequestTraceErrorCode(res, "channel_membership_required");
     res.status(403).json({ error: "Agent must join this channel to react to messages" });
     return;
   }
@@ -2464,15 +3524,18 @@ async function handleReaction(
     throw err;
   }
   if (await isChannelReadOnlyByBillingFeature(message.channelId, serverId)) {
-    res.status(403).json({ error: "Joint Channels require the Pro plan. Upgrade to continue." });
+    setRequestTraceErrorCode(res, "channel_read_only");
+    res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
     return;
   }
   if (await isChannelReadOnlyByQuota(message.channelId, serverId)) {
+    setRequestTraceErrorCode(res, "channel_read_only");
     res.status(403).json({ error: "This channel is read-only on your current plan. Upgrade to continue." });
     return;
   }
 
   await mutateMessageReaction({
+    channelId: message.channelId,
     messageId: message.id,
     emoji,
     actor: { kind: "agent", id: actingAgentId },
@@ -2482,6 +3545,7 @@ async function handleReaction(
   const context = await messageService.getMessageContext(message.id, 0, 0, undefined, {
     forwardedBundleViewerAgentId: actingAgentId,
     forwardedBundleViewerServerId: serverId,
+    includeSenderTimezone: true,
   });
   const enriched = context?.messages[0];
   if (!enriched) {
@@ -2494,15 +3558,22 @@ async function handleReaction(
     "message:updated",
     projectRichMessageSocketPayload(messageService.stripViewerScopedAttachmentCommentMetadata(enriched)),
   );
-  res.json(toAgentApiMessageEnvelope(enriched, enriched.content));
+  res.json(toAgentApiMessageEnvelope(enriched, enriched.content, actingAgentId));
 }
 
 registerAgentApiRoute("messageReactionAdd", ...agentApiRequestValidators("messageReactionAdd"), validateAgentApiResponseMiddleware("messageReactionAdd"), async (req, res) => {
   try {
     await handleReaction(req, res, "add");
   } catch (err) {
-    console.error("internal.agent-api.reactions.add error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to add reaction" });
+    if (err instanceof ChannelConversionInProgressError) {
+      res.status(err.status).json({ error: err.message, code: err.code, conversionEpoch: err.conversionEpoch });
+      return;
+    }
+    sendJsonServerError(req, res, {
+      error: "Failed to add reaction",
+      logPrefix: "internal.agent-api.reactions.add error:",
+      err,
+    });
   }
 });
 
@@ -2510,8 +3581,15 @@ registerAgentApiRoute("messageReactionRemove", ...agentApiRequestValidators("mes
   try {
     await handleReaction(req, res, "remove");
   } catch (err) {
-    console.error("internal.agent-api.reactions.remove error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to remove reaction" });
+    if (err instanceof ChannelConversionInProgressError) {
+      res.status(err.status).json({ error: err.message, code: err.code, conversionEpoch: err.conversionEpoch });
+      return;
+    }
+    sendJsonServerError(req, res, {
+      error: "Failed to remove reaction",
+      logPrefix: "internal.agent-api.reactions.remove error:",
+      err,
+    });
   }
 });
 
@@ -2576,9 +3654,9 @@ registerAgentApiRoute("channelJoin", ...agentApiRequestValidators("channelJoin")
               mode: "record",
               producer: "agent.join_channel",
               reason: "agent joining a channel is shared channel activity",
+              causalActor: { type: "agent", id: actingAgentId },
             },
             // The joining agent should not see its own join as unread.
-            causalActor: { type: "agent", id: actingAgentId },
           },
         );
       }
@@ -2586,6 +3664,10 @@ registerAgentApiRoute("channelJoin", ...agentApiRequestValidators("channelJoin")
     req.app.get("io")?.to(`server:${serverId}`).emit("channel:members-updated", { channelId: channel.id });
     sendAgentApiResponse("channelJoin", res, { ok: true });
   } catch (err: any) {
+    if (err instanceof Error && err.message === channelService.ASSISTANT_CHANNEL_FORBIDDEN_MESSAGE) {
+      res.status(403).json({ error: err.message, code: channelService.ASSISTANT_CHANNEL_FORBIDDEN_CODE });
+      return;
+    }
     sendJsonServerError(req, res, {
       error: "Failed to join channel",
       code: "agent_api_channel_join_failed",
@@ -2611,13 +3693,16 @@ registerAgentApiRoute("channelLeave", ...agentApiRequestValidators("channelLeave
       res.status(404).json({ error: "Channel not found" });
       return;
     }
-    if (channel.type !== "channel" && channel.type !== "private") {
-      res.status(403).json({ error: "Agents can only leave regular channels" });
+    // Joint channels carry ordinary membership: a human can leave one, so an
+    // agent can too. Leaving only removes this agent's row on this server's
+    // projection; other servers' members are untouched.
+    if (channel.type !== "channel" && channel.type !== "private" && channel.type !== "joint") {
+      res.status(403).json({ error: "Agents can only leave regular or joint channels" });
       return;
     }
     const hasAccess = await channelService.canAgentAccessChannel(channel.id, actingAgentId);
     if (!hasAccess) {
-      res.status(403).json({ error: "Agents can only leave visible regular channels" });
+      res.status(403).json({ error: "Agents can only leave channels they can see" });
       return;
     }
     if (channel.archivedAt) {
@@ -2649,7 +3734,7 @@ registerAgentApiRoute("channelLeave", ...agentApiRequestValidators("channelLeave
   }
 });
 
-internalAgentApiRouter.post("/channels", requireAgentCapability("channels"), async (req, res) => {
+registerAgentApiRoute("channelCreate", ...agentApiRequestValidators("channelCreate"), validateAgentApiResponseMiddleware("channelCreate"), async (req, res) => {
   try {
     const actingAgentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -2667,12 +3752,15 @@ internalAgentApiRouter.post("/channels", requireAgentCapability("channels"), asy
     });
     res.status(result.status).json(result.body);
   } catch (err) {
-    console.error("internal.agent-api.channels.create error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to create channel" });
+    sendJsonServerError(req, res, {
+      error: "Failed to create channel",
+      logPrefix: "internal.agent-api.channels.create error:",
+      err,
+    });
   }
 });
 
-internalAgentApiRouter.patch("/channels/:channelId", requireAgentCapability("channels"), async (req, res) => {
+registerAgentApiRoute("channelUpdate", ...agentApiRequestValidators("channelUpdate"), validateAgentApiResponseMiddleware("channelUpdate"), async (req, res) => {
   try {
     const actingAgentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -2688,11 +3776,15 @@ internalAgentApiRouter.patch("/channels/:channelId", requireAgentCapability("cha
       channelId: String(req.params.channelId),
       body: req.body,
       io: req.app.get("io") as SocketServer | undefined,
+      agentOrchestrator: req.app.get("agentOrchestrator") as AgentOrchestrator | undefined,
     });
     res.status(result.status).json(result.body);
   } catch (err) {
-    console.error("internal.agent-api.channels.update error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to update channel" });
+    sendJsonServerError(req, res, {
+      error: "Failed to update channel",
+      logPrefix: "internal.agent-api.channels.update error:",
+      err,
+    });
   }
 });
 
@@ -2725,8 +3817,11 @@ function agentChannelLifecycleHandler(archived: boolean): RequestHandler {
       });
       res.status(result.status).json(result.body);
     } catch (err) {
-      console.error(`internal.agent-api.channels.${action} error:`, serializeErrorForLog(err));
-      res.status(500).json({ error: `Failed to ${action} channel` });
+      sendJsonServerError(req, res, {
+        error: `Failed to ${action} channel`,
+        logPrefix: `internal.agent-api.channels.${action} error:`,
+        err,
+      });
     }
   };
 }
@@ -2744,7 +3839,7 @@ registerAgentApiRoute(
   agentChannelLifecycleHandler(false),
 );
 
-internalAgentApiRouter.post("/channels/:channelId/members", requireAgentCapability("channels"), async (req, res) => {
+registerAgentApiRoute("channelMemberAdd", ...agentApiRequestValidators("channelMemberAdd"), validateAgentApiResponseMiddleware("channelMemberAdd"), async (req, res) => {
   try {
     const actingAgentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -2764,12 +3859,15 @@ internalAgentApiRouter.post("/channels/:channelId/members", requireAgentCapabili
     });
     res.status(result.status).json(result.body);
   } catch (err) {
-    console.error("internal.agent-api.channels.add-member error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to add member" });
+    sendJsonServerError(req, res, {
+      error: "Failed to add member",
+      logPrefix: "internal.agent-api.channels.add-member error:",
+      err,
+    });
   }
 });
 
-internalAgentApiRouter.delete("/channels/:channelId/members", requireAgentCapability("channels"), async (req, res) => {
+registerAgentApiRoute("channelMemberRemove", ...agentApiRequestValidators("channelMemberRemove"), validateAgentApiResponseMiddleware("channelMemberRemove"), async (req, res) => {
   try {
     const actingAgentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -2789,8 +3887,11 @@ internalAgentApiRouter.delete("/channels/:channelId/members", requireAgentCapabi
     });
     res.status(result.status).json(result.body);
   } catch (err) {
-    console.error("internal.agent-api.channels.remove-member error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to remove member" });
+    sendJsonServerError(req, res, {
+      error: "Failed to remove member",
+      logPrefix: "internal.agent-api.channels.remove-member error:",
+      err,
+    });
   }
 });
 
@@ -2836,8 +3937,11 @@ registerAgentApiRoute("channelMute", ...agentApiRequestValidators("channelMute")
     }
     sendAgentApiResponse("channelMute", res, buildAgentChannelMuteResponse(channel, state));
   } catch (err) {
-    console.error("internal.agent-api.channels.mute error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to mute channel activity" });
+    sendJsonServerError(req, res, {
+      error: "Failed to mute channel activity",
+      logPrefix: "internal.agent-api.channels.mute error:",
+      err,
+    });
   }
 });
 
@@ -2867,8 +3971,11 @@ registerAgentApiRoute("channelUnmute", ...agentApiRequestValidators("channelUnmu
     });
     sendAgentApiResponse("channelUnmute", res, buildAgentChannelMuteResponse(channel, state));
   } catch (err) {
-    console.error("internal.agent-api.channels.unmute error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to unmute channel activity" });
+    sendJsonServerError(req, res, {
+      error: "Failed to unmute channel activity",
+      logPrefix: "internal.agent-api.channels.unmute error:",
+      err,
+    });
   }
 });
 
@@ -2887,14 +3994,49 @@ registerAgentApiRoute("channelUnmute", ...agentApiRequestValidators("channelUnmu
  * task #72). Never drains, never acks, never advances cursors; inaccessible
  * queued messages are discarded exactly as the poll route always did.
  */
+/**
+ * An external agent's persisted messages from its durable inbox (see
+ * messageService.pullExternalAgentInbox). A failed or unavailable pull yields
+ * none: they are still unread and come on a later call.
+ */
+async function pullExternalAgentInboxMessages(
+  agentOrchestrator: AgentOrchestrator,
+  agentId: string,
+  opts: Parameters<typeof messageService.pullExternalAgentInbox>[2],
+): Promise<Extract<messageService.ExternalAgentInboxPull, { status: "pulled" }> | null> {
+  try {
+    const pulled = await messageService.pullExternalAgentInbox(agentOrchestrator, agentId, opts);
+    return pulled.status === "pulled" ? pulled : null;
+  } catch (err) {
+    console.error(`internal.agent-api external agent inbox pull failed (${opts.route}):`, serializeErrorForLog(err));
+    return null;
+  }
+}
+
+/**
+ * The pending items to serve. For an external agent (`durable` given):
+ * persisted messages come only from the durable inbox pull, and the buffer
+ * contributes only items with no durable row. Otherwise the buffer as is.
+ */
+function pendingAgentItems(
+  buffered: AgentMessage[],
+  durable: AgentMessage[] | undefined,
+): { items: AgentMessage[]; staleBuffered: AgentMessage[] } {
+  if (!durable) return { items: buffered, staleBuffered: [] };
+  const bufferOnly = buffered.filter((message) => !isDurableAgentInboxMessage(message));
+  const staleBuffered = buffered.filter((message) => isDurableAgentInboxMessage(message));
+  return { items: [...bufferOnly, ...durable], staleBuffered };
+}
+
 async function collectDeliverableWakeHints(
   agentOrchestrator: AgentOrchestrator,
   actingAgentId: string,
   serverId: string,
   sinceSeq: number | null,
   limit: number,
+  durable?: AgentMessage[],
 ): Promise<{ wakeHints: AgentApiWakeHint[]; hasMore: boolean }> {
-  const queued = agentOrchestrator.peekPendingMessages(actingAgentId);
+  const { items: queued } = pendingAgentItems(agentOrchestrator.peekPendingMessages(actingAgentId), durable);
   const deliverableQueued: AgentMessage[] = [];
   const undeliverableQueued: AgentMessage[] = [];
   for (const message of queued) {
@@ -2950,14 +4092,11 @@ internalAgentApiRouter.get("/wake-hints", requireAgentCapability("read"), async 
     }
 
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-    if (isExternalAgentRuntime(agent.runtime)) {
-      // CS-4: refill the volatile inbox from the durable per-channel ack
-      // watermark so a server restart/deploy cannot make undrained messages
-      // permanently invisible. Failure degrades to buffer-only (pre-CS-4
-      // behavior) rather than failing the read. No cursor moves here.
-      await messageService.rebuildExternalAgentPendingFromAckCursors(agentOrchestrator, actingAgentId, "wake_hints")
-        .catch((err) => console.error("internal.agent-api cursor rebuild failed:", serializeErrorForLog(err)));
-    }
+    // External agents: persisted messages are peeked from the durable inbox
+    // (rate-limited per agent). No cursor moves here.
+    const durable = isExternalAgentRuntime(agent.runtime)
+      ? (await pullExternalAgentInboxMessages(agentOrchestrator, actingAgentId, { route: "wake_hints", slot: "wake_hints" }))?.messages ?? []
+      : undefined;
     await rebuildPendingThirdPartyAgentEvents(agentOrchestrator, actingAgentId)
       .catch((err) => console.error("internal.agent-api third-party event rebuild failed:", serializeErrorForLog(err)));
     const { wakeHints, hasMore } = await collectDeliverableWakeHints(
@@ -2966,6 +4105,7 @@ internalAgentApiRouter.get("/wake-hints", requireAgentCapability("read"), async 
       serverId,
       sinceSeq,
       limit,
+      durable,
     );
     const newestHint = wakeHints[wakeHints.length - 1];
 
@@ -2975,8 +4115,11 @@ internalAgentApiRouter.get("/wake-hints", requireAgentCapability("read"), async 
       has_more: hasMore,
     });
   } catch (err) {
-    console.error("internal.agent-api.wake-hints error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to load wake hints" });
+    sendJsonServerError(req, res, {
+      error: "Failed to load wake hints",
+      logPrefix: "internal.agent-api.wake-hints error:",
+      err,
+    });
   }
 });
 
@@ -3005,11 +4148,68 @@ internalAgentApiRouter.post("/activity", requireAgentCapability("read"), async (
       return;
     }
 
-    const result = await agentOrchestrator.recordExternalAgentActivity(actingAgentId, parsed, serverId);
-    res.json({ ok: true, ...result });
+    const { ignoredFields, ...ingest } = parsed;
+    if (ignoredFields.length > 0) {
+      console.warn(`[internal.agent-api.activity] agent ${actingAgentId}: ignored unknown event fields: ${ignoredFields.join(", ")}`);
+    }
+    const result = await agentOrchestrator.recordExternalAgentActivity(actingAgentId, ingest, serverId);
+    res.json({ ok: true, ...result, ...(ignoredFields.length > 0 ? { ignoredFields } : {}) });
   } catch (err) {
-    console.error("internal.agent-api.activity error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to ingest activity" });
+    sendJsonServerError(req, res, {
+      error: "Failed to ingest activity",
+      logPrefix: "internal.agent-api.activity error:",
+      err,
+    });
+  }
+});
+
+/**
+ * POST /internal/agent-api/third-party-events/delivered — task #175.
+ *
+ * A managed daemon answers `/events` from its Local Inbox and never forwards
+ * that request, so the `/events` ack below never runs for the third-party
+ * events it served. After writing such a response to the runtime, the daemon
+ * reports the served event ids here. Idempotent by id (only queued/delivering
+ * rows move to delivered) and scoped to the acting agent's own events.
+ */
+internalAgentApiRouter.post("/third-party-events/delivered", requireAgentCapability("read"), async (req, res) => {
+  try {
+    const actingAgentId = req.actingAgentId!;
+    const serverId = req.serverId!;
+    const rawIds: unknown = req.body?.eventIds;
+    if (
+      !Array.isArray(rawIds)
+      || rawIds.length === 0
+      || rawIds.length > THIRD_PARTY_EVENT_DELIVERED_REPORT_MAX_IDS
+      || !rawIds.every(isThirdPartyEventId)
+    ) {
+      res.status(400).json({
+        error: `eventIds must be a non-empty array of at most ${THIRD_PARTY_EVENT_DELIVERED_REPORT_MAX_IDS} event ids`,
+        code: "event_ids_invalid",
+      });
+      return;
+    }
+    const eventIds = [...new Set((rawIds as string[]).map((id) => id.toLowerCase()))];
+
+    const agent = await agentService.getAgent(actingAgentId);
+    if (!agent || agent.serverId !== serverId) {
+      res.status(401).json({ error: "Agent no longer exists" });
+      return;
+    }
+
+    const delivered = await oauthService.markThirdPartyAgentEventsDelivered(eventIds, { agentId: actingAgentId });
+    // The server buffer may still hold these seq-less entries (the daemon's
+    // delivery ack carries seq 0, which clears nothing); drop them so they are
+    // not served again by a later forwarded `/events`.
+    const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+    agentOrchestrator?.acknowledgeDeliveredMessages?.(actingAgentId, [], eventIds);
+    res.json({ ok: true, delivered });
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to record third-party event delivery",
+      logPrefix: "internal.agent-api.third-party-events.delivered error:",
+      err,
+    });
   }
 });
 
@@ -3052,16 +4252,55 @@ internalAgentApiRouter.get("/wake-hints/stream", requireAgentCapability("read"),
     }
 
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-    if (isExternalAgentRuntime(agent.runtime)) {
-      // CS-4: refill the volatile inbox from the durable per-channel ack
-      // watermark so a server restart/deploy cannot make undrained messages
-      // permanently invisible. Failure degrades to buffer-only (pre-CS-4
-      // behavior) rather than failing the read. No cursor moves here.
-      await messageService.rebuildExternalAgentPendingFromAckCursors(agentOrchestrator, actingAgentId, "wake_hints_stream_open")
-        .catch((err) => console.error("internal.agent-api cursor rebuild failed:", serializeErrorForLog(err)));
-    }
-    await rebuildPendingThirdPartyAgentEvents(agentOrchestrator, actingAgentId)
-      .catch((err) => console.error("internal.agent-api third-party event rebuild failed:", serializeErrorForLog(err)));
+
+    // The stream lives for hours; its request span covers only the connection.
+    // Each pull (the open one, every heartbeat, every wake) is its own root
+    // trace that names the stream it came from: hanging them all on the
+    // request span folded thousands of pulls into one trace (#proj-o11y task
+    // #6). Wake and revocation callbacks also run in the context of whoever
+    // fired them, so without their own root they would land in the sender's
+    // or revoker's trace.
+    const streamSpan = getCurrentTraceSpan();
+    const streamContext = streamSpan?.context ?? null;
+    const streamTracer = req.app.get("serverTracer") as Tracer | undefined;
+    let tickOrdinal = 0;
+    type StreamTickTrigger = "open" | "heartbeat" | "wake" | "wake_follow_up" | "revocation";
+    const inStreamTickTrace = <T>(trigger: StreamTickTrigger, work: () => Promise<T>): Promise<T> =>
+      withTraceRoot(streamTracer, "server.agent_api.wake_hints_stream.tick", {
+        parent: null,
+        surface: "server",
+        kind: "internal",
+        attrs: {
+          trigger,
+          tick_ordinal: ++tickOrdinal,
+          ...(streamContext ? { stream_trace_id: streamContext.traceId, stream_span_id: streamContext.spanId } : {}),
+          ...agentIdHashAttrs(actingAgentId),
+          ...serverIdHashAttrs(serverId),
+        },
+      }, work);
+    // A failed tick is already recorded on its own span; log it like the
+    // flush does and keep the stream (and the process) running.
+    const runStreamTick = (trigger: StreamTickTrigger, work: () => Promise<unknown>): void => {
+      void inStreamTickTrace(trigger, work).catch((err) => {
+        console.error("internal.agent-api.wake-hints-stream tick error:", serializeErrorForLog(err));
+      });
+    };
+
+    // External agents: persisted messages are peeked from the durable inbox;
+    // the latest pull is kept for this stream's flushes. No cursor moves here.
+    const isExternal = isExternalAgentRuntime(agent.runtime);
+    let durablePending: AgentMessage[] | undefined;
+    const pullDurable = async (route: "wake_hints_stream_open" | "wake_hints_stream_flush", force: boolean) => {
+      if (!isExternal) return;
+      const pulled = await pullExternalAgentInboxMessages(agentOrchestrator, actingAgentId, { route, slot: "stream", force });
+      if (pulled) durablePending = pulled.messages;
+      durablePending ??= [];
+    };
+    await inStreamTickTrace("open", async () => {
+      await pullDurable("wake_hints_stream_open", false);
+      await rebuildPendingThirdPartyAgentEvents(agentOrchestrator, actingAgentId)
+        .catch((err) => console.error("internal.agent-api third-party event rebuild failed:", serializeErrorForLog(err)));
+    });
 
     res.writeHead(200, {
       "content-type": "text/event-stream",
@@ -3070,6 +4309,7 @@ internalAgentApiRouter.get("/wake-hints/stream", requireAgentCapability("read"),
       "x-accel-buffering": "no",
     });
     res.write(": connected\n\n");
+    sharedSseStreamRegistry.register(res);
 
     let closed = false;
     let flushing = false;
@@ -3091,6 +4331,7 @@ internalAgentApiRouter.get("/wake-hints/stream", requireAgentCapability("read"),
             serverId,
             lastSentSeq,
             200,
+            durablePending,
           );
           for (const hint of wakeHints) {
             if (closed) return;
@@ -3107,47 +4348,103 @@ internalAgentApiRouter.get("/wake-hints/stream", requireAgentCapability("read"),
       }
     };
 
-    // Every flush audits durable truth first (CS-4 rebuild, external agents
-    // only): the flush trigger may be a cross-replica signal for a delivery
-    // this process never buffered (option C, #wg-external-agent 2026-06-11),
-    // a heartbeat tick, or a local emit (where the rebuild candidate query
-    // is a cheap indexed no-op because the buffer already holds the rows).
-    const auditAndFlush = async (): Promise<void> => {
-      if (isExternalAgentRuntime(agent.runtime)) {
-        await messageService.rebuildExternalAgentPendingFromAckCursors(agentOrchestrator, actingAgentId, "wake_hints_stream_flush")
-          .catch((err) => console.error("internal.agent-api.wake-hints-stream durable audit failed:", serializeErrorForLog(err)));
-      }
+    // Every flush pulls the durable inbox first (external agents only). A wake
+    // signal (`force`) means something was just delivered — here or on
+    // another replica (option C, #wg-external-agent 2026-06-11) — so it skips
+    // the per-agent pull interval; heartbeat ticks respect it.
+    const auditAndFlush = async (force: boolean): Promise<void> => {
+      await pullDurable("wake_hints_stream_flush", force);
       await rebuildPendingThirdPartyAgentEvents(agentOrchestrator, actingAgentId)
         .catch((err) => console.error("internal.agent-api.wake-hints-stream third-party event rebuild failed:", serializeErrorForLog(err)));
       await flushHints();
     };
 
+    // After a wake signal the chain may not have the message yet (see
+    // EXTERNAL_WAKE_FOLLOW_UP_PULL_DELAYS_MS): pull again a bounded number of
+    // times. A new signal replaces the pending follow-ups rather than stacking.
+    let followUpTimers: ReturnType<typeof setTimeout>[] = [];
+    const clearFollowUps = () => {
+      for (const timer of followUpTimers) clearTimeout(timer);
+      followUpTimers = [];
+    };
     const onDelivered = (agentId: string) => {
       if (agentId !== actingAgentId) return;
-      void auditAndFlush();
+      runStreamTick("wake", () => auditAndFlush(true));
+      if (!isExternal) return;
+      clearFollowUps();
+      followUpTimers = messageService.externalWakeFollowUpPullDelaysMs().map((delayMs) => {
+        const timer = setTimeout(() => {
+          if (!closed) runStreamTick("wake_follow_up", () => auditAndFlush(true));
+        }, delayMs);
+        timer.unref?.();
+        return timer;
+      });
     };
     agentOrchestrator.on("external-inbox-delivered", onDelivered);
 
     // Heartbeat doubles as a server-side reconcile tick (field incident
     // 2026-06-11, #wg-external-agent:00fcc8f7): the live push path depends on
-    // an IN-PROCESS orchestrator event (now also fed cross-replica via the
-    // Redis wake signal), and the periodic durable re-peek remains the
+    // an IN-PROCESS orchestrator event (also fed cross-replica via the Redis
+    // wake signal), and the periodic durable inbox pull remains the
     // correctness floor when both event layers miss. flushHints dedupes via
     // lastSentSeq and stays non-draining / zero-cursor, so a quiet tick
     // writes nothing.
     const heartbeatMs = Math.min(Math.max(Number(process.env.SLOCK_WAKE_STREAM_HEARTBEAT_MS) || 25_000, 250), 60_000);
+    //
+    // The credential was authenticated once, at open. Every tick re-validates
+    // it (not revoked, agent and server not deleted) before doing anything
+    // on its behalf, and ends the stream when it no longer holds — so a
+    // revoked credential or deleted agent loses the stream within one
+    // heartbeat even if the revocation broadcast below is missed. A failed
+    // check also ends the stream (fail closed); the client reconnects and
+    // re-authenticates.
+    const credentialId = req.agentCredentialId!;
+    let unsubscribeRevocation: () => void = () => {};
+    const cleanup = () => {
+      closed = true;
+      sharedSseStreamRegistry.unregister(res);
+      clearInterval(heartbeat);
+      clearFollowUps();
+      agentOrchestrator.off("external-inbox-delivered", onDelivered);
+      unsubscribeRevocation();
+    };
+    const credentialStillValid = async (): Promise<boolean> => {
+      if (closed) return false;
+      const active = await isAgentCredentialActive(credentialId).catch((err) => {
+        console.error("internal.agent-api.wake-hints-stream credential check failed:", serializeErrorForLog(err));
+        return false;
+      });
+      if (active || closed) return active && !closed;
+      cleanup();
+      // Connection-level: it ends the stream, so it stays on the stream's span.
+      streamSpan?.addEvent("agent_api.wake_hints_stream.credential_invalidated", { agent_id: actingAgentId, credential_id: credentialId });
+      res.write(`event: credential-revoked\ndata: {"code":"credential_revoked"}\n\n`);
+      res.end();
+      return false;
+    };
+    // Each valid tick also counts as "seen" for presence (the open itself
+    // already did, via the auth middleware), so a quiet but connected agent
+    // stays online. Throttled per credential inside the recorder.
     const heartbeat = setInterval(() => {
       if (closed) return;
-      res.write(": ka\n\n");
-      void auditAndFlush();
+      runStreamTick("heartbeat", async () => {
+        if (!(await credentialStillValid())) return;
+        res.write(": ka\n\n");
+        recordAgentApiSeen(req);
+        await auditAndFlush(false);
+      });
     }, heartbeatMs);
     heartbeat.unref?.();
 
-    req.on("close", () => {
-      closed = true;
-      clearInterval(heartbeat);
-      agentOrchestrator.off("external-inbox-delivered", onDelivered);
+    // Prompt close on revoke / agent delete: the writer broadcasts the
+    // agentId to every replica after commit (replicaRouter
+    // `broadcastAgentCredentialRevocation`); re-check this stream's
+    // credential now instead of waiting for the next tick.
+    unsubscribeRevocation = subscribeAgentCredentialRevocation(actingAgentId, () => {
+      runStreamTick("revocation", credentialStillValid);
     });
+
+    req.on("close", cleanup);
 
     // Initial replay of currently pending hints.
     await flushHints();
@@ -3181,16 +4478,19 @@ internalAgentApiRouter.get("/wake-hints/stream", requireAgentCapability("read"),
  * }
  */
 /**
- * GET /internal/agent-api/events?since=<seq|latest>&limit=<n>
+ * GET /internal/agent-api/events?since=<seq|latest>&limit=<n>[&ack=cursor]
  *
  * RFC v0.8 — catch-up envelope. Returns messages delivered to the
  * bound agent since the given anchor, plus per-turn awareness fields:
  *   - last_seen_msgId      : delivery-batch tail id for client paging/debugging;
  *                            NOT a model-seen boundary for send freshness
  *   - last_seen_seq        : numeric cursor to pass back as `since`
- *   - reply_target         : default target hint (most recent channel)
+ *   - reply_target         : canonical send target of the newest event
+ *                            (e.g. `#general`, `#general:1a2b3c4d`, `dm:@alice`);
+ *                            null when the batch is empty
  *   - pending_notice_ids   : transient system events queued for delivery
  *   - wake_reason          : placeholder until #164 lifecycle event RFC lands
+ *   - ack_mode             : "cursor" | "immediate" — how this batch is acknowledged
  *
  * Slice-1 minimal contract: aggregates undelivered inbox entries via the
  * AgentOrchestrator. Designed to be the external-runtime equivalent of
@@ -3200,6 +4500,16 @@ internalAgentApiRouter.get("/wake-hints/stream", requireAgentCapability("read"),
  * the special string `"latest"` (return whatever is currently queued
  * without claiming an anchor). If a UUID/short id is passed, v0.8
  * returns 400; msg-id resolution is a later slice.
+ *
+ * Acknowledgement. By default (`ack_mode: "immediate"`, every published
+ * client) the returned batch is acknowledged before the response is sent, so a
+ * response lost in transit loses its messages. With `ack=cursor` (external
+ * agents), durable inbox rows are acknowledged on the NEXT request instead: a
+ * cursor-mode request with `since=<seq>` acknowledges the rows the previous
+ * cursor-mode response handed over with seq <= since, then returns the next
+ * batch unacknowledged. A client that did not get a response repeats its old
+ * `since` and receives the same rows again. Items with no durable row
+ * (third-party app events) are still acknowledged immediately.
  */
 registerAgentApiRoute("events", async (req, res) => {
   try {
@@ -3209,6 +4519,11 @@ registerAgentApiRoute("events", async (req, res) => {
     if (!eventsQuery) return;
     const sinceRaw = eventsQuery.since?.trim() ?? "";
     const limit = Math.min(Math.max(Number(eventsQuery.limit) || 50, 1), 200);
+    const ackRaw = typeof eventsQuery.ack === "string" ? eventsQuery.ack.trim() : "";
+    if (ackRaw && ackRaw !== "cursor" && ackRaw !== "immediate") {
+      res.status(400).json({ error: "ack must be 'cursor' or 'immediate'", code: "ack_invalid" });
+      return;
+    }
 
     let sinceSeq: number | null = null;
     if (sinceRaw && sinceRaw !== "latest") {
@@ -3230,14 +4545,28 @@ registerAgentApiRoute("events", async (req, res) => {
     }
 
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
-    if (isExternalAgentRuntime(agent.runtime)) {
-      // CS-4: refill the volatile inbox from the durable per-channel ack
-      // watermark so a server restart/deploy cannot make undrained messages
-      // permanently invisible. Failure degrades to buffer-only (pre-CS-4
-      // behavior) rather than failing the read. No cursor moves here.
-      await messageService.rebuildExternalAgentPendingFromAckCursors(agentOrchestrator, actingAgentId, "events")
-        .catch((err) => console.error("internal.agent-api cursor rebuild failed:", serializeErrorForLog(err)));
+    const isExternal = isExternalAgentRuntime(agent.runtime);
+    // Cursor acknowledgement applies to the durable inbox, which only external
+    // agents are served from.
+    const cursorAck = isExternal && ackRaw === "cursor";
+    // The previous cursor-mode response's rows up to `since` were received:
+    // acknowledge them before pulling, so the pull starts after them.
+    const cursorAckedSeqs = new Set<number>();
+    if (cursorAck && sinceSeq !== null) {
+      const acked = await acknowledgeAgentInboxEventsCursor(agentOrchestrator, actingAgentId, sinceSeq);
+      for (const seq of acked) cursorAckedSeqs.add(seq);
     }
+    // External agents: persisted messages come only from the durable inbox
+    // pull (oldest first per conversation); the buffer serves only items with
+    // no durable row. The pull itself moves no cursor; the ack below does.
+    const pulled = isExternal
+      ? await pullExternalAgentInboxMessages(agentOrchestrator, actingAgentId, { route: "events", slot: "events" })
+      : null;
+    // A pull already in flight may predate the cursor ack above.
+    const durable = isExternal
+      ? (pulled?.messages ?? []).filter((m) => !cursorAckedSeqs.has(m.seq ?? -1))
+      : undefined;
+    const durableSeqs = new Set((durable ?? []).map((m) => m.seq));
     await rebuildPendingThirdPartyAgentEvents(agentOrchestrator, actingAgentId)
       .catch((err) => console.error("internal.agent-api third-party event rebuild failed:", serializeErrorForLog(err)));
 
@@ -3246,106 +4575,85 @@ registerAgentApiRoute("events", async (req, res) => {
     // this surface; the external runtime is expected to poll on its own
     // cadence or layer a WS/SSE transport on top in a later slice.
     const abortController = new AbortController();
-    const queued = await agentOrchestrator.receiveMessages(
+    const buffered = await agentOrchestrator.receiveMessages(
       actingAgentId,
       false,
       0,
       abortController.signal,
     );
-    const deliverableQueued: typeof queued = [];
-    const undeliverableQueued: typeof queued = [];
-    for (const message of queued) {
-      const channelId = (message as { channel_id?: string; channelId?: string }).channel_id
-        ?? (message as { channel_id?: string; channelId?: string }).channelId
-        ?? "";
-      const canAccess = await canAgentAccessQueuedMessageTarget(channelId, actingAgentId, serverId, message);
-      if (canAccess) {
-        deliverableQueued.push(message);
-      } else {
-        undeliverableQueued.push(message);
-      }
+    const { items: queued, staleBuffered } = pendingAgentItems(buffered, durable);
+    // A persisted message left in an external agent's buffer (queued before
+    // it was pulled-only) is dropped: the inbox pull is its only source.
+    if (staleBuffered.length > 0) {
+      agentOrchestrator.discardUndeliverableMessages(actingAgentId, staleBuffered);
     }
+    const { deliverable: deliverableQueued, undeliverable: undeliverableQueued } =
+      await partitionDeliverableInboxMessages(queued, actingAgentId, serverId);
     if (undeliverableQueued.length > 0) {
       agentOrchestrator.discardUndeliverableMessages(actingAgentId, undeliverableQueued);
     }
+    // Pulled rows that cannot be handed over are acked with the batch, as live
+    // delivery would have dropped them; left unread they would be pulled again
+    // on every call.
+    const droppedDurableSeqs = [
+      ...(pulled?.droppedSeqs ?? []).filter((seq) => !cursorAckedSeqs.has(seq)),
+      ...undeliverableQueued.filter((m) => durableSeqs.has(m.seq)).map((m) => m.seq!),
+    ];
 
     // Apply `since` filter in memory. Slice-1 simplicity — once we have
-    // a typed inbox cursor on the orchestrator we'll push this down.
+    // a typed inbox cursor on the orchestrator we'll push this down. In cursor
+    // mode `since` is an acknowledgement, not a filter, for durable rows: what
+    // the pull returns is exactly what is unacknowledged, including older rows
+    // of other conversations.
     const filtered = sinceSeq !== null
       ? deliverableQueued.filter((m) => {
+          if (cursorAck && durableSeqs.has(m.seq)) return true;
           const seq = Number((m as { seq?: unknown }).seq);
           if ((!Number.isFinite(seq) || seq <= 0) && thirdPartyEventIdFromMessage(m) !== null) return true;
           return Number.isFinite(seq) && seq > sinceSeq!;
         })
       : deliverableQueued;
     const trimmed = filtered.slice(0, limit);
-    // Queue payloads are enqueue-time snapshots. A task may be amended (or a
-    // plain message converted into a task) before this drain. Refresh every
-    // persisted message id now, before rendering or acknowledging. The helper
-    // throws on canonical/provenance failure so this whole request exits with
-    // zero ack and the orchestrator keeps the batch for retry.
-    const refreshed = await refreshQueuedAgentTaskProjections(trimmed);
-
-    const renderedContents = await agentPermalinkRenderService.renderAgentReadablePermalinksInTexts(
-      refreshed.map((m) => m.content ?? ""),
-      serverId,
-    );
-
-    type QueuedAgentEventMessage = AgentMessage & {
-      channelId?: string;
-      channel_id?: string;
-      id?: string;
-      message_id?: string;
-      messageType?: string;
-      senderType?: string;
-      sender_type?: string;
-      seq?: number;
-    };
-    const queuedEvents = refreshed as QueuedAgentEventMessage[];
-    const events = queuedEvents.map((m, index) => {
-      const fallbackSenderType = m.messageType === "system"
-        ? "system"
-        : m.senderType === "user" || m.senderType === "agent" || m.senderType === "external_projection"
-          ? toAgentFacingActorType(m.senderType)
-          : "agent";
-      return {
-        ...m,
-        // Buffer entries are snake_case AgentMessage: `sender_type` is already
-        // agent-facing ("human" | "agent" | "system" | "third_party_app"). The previous mapping read
-        // camelCase `m.senderType` (always undefined here), so this echo field
-        // was stuck at "agent" for every event regardless of the real sender.
-        senderType: m.sender_type ?? fallbackSenderType,
-        content: m.sender_type === "third_party_app"
-          ? m.external_message
-            ? m.content
-            : renderThirdPartyInertText({ field: "tool_result", value: m.content })
-          : renderedContents[index],
-      };
-    });
-    const ackSeqs = refreshed
+    // Refresh every persisted message id now, before rendering or
+    // acknowledging. The projection throws on canonical/provenance failure so
+    // this whole request exits with zero ack and the batch is kept for retry.
+    const events = await projectAgentInboxEvents(trimmed, serverId);
+    const ackSeqs = events
       .map((m) => Number((m as { seq?: unknown }).seq))
       .filter((seq): seq is number => Number.isInteger(seq) && seq > 0);
-    const ackMessageIds = queuedEvents
+    // Only when the whole pull was returned: the ack takes the highest seq per
+    // conversation, so a dropped row above a trimmed one would skip it.
+    if (filtered.length === trimmed.length) ackSeqs.push(...droppedDurableSeqs);
+    const ackMessageIds = events
       .filter((m) => !Number.isInteger(Number(m.seq)) || Number(m.seq) <= 0)
       .map((m) => typeof m.message_id === "string" ? m.message_id : "")
       .filter(Boolean);
-    const ackedThirdPartyEventIds = queuedEvents
+    const ackedThirdPartyEventIds = events
       .map(thirdPartyEventIdFromMessage)
       .filter((id): id is string => id !== null);
-    if (ackSeqs.length > 0 || ackMessageIds.length > 0) {
+    // Cursor mode: durable rows wait for the next request's `since`; the rest
+    // (non-durable items) is acknowledged now, as before.
+    const cursorPendingSeqs = cursorAck ? ackSeqs.filter((seq) => durableSeqs.has(seq) || droppedDurableSeqs.includes(seq)) : [];
+    const immediateAckSeqs = cursorAck ? ackSeqs.filter((seq) => !cursorPendingSeqs.includes(seq)) : ackSeqs;
+    if (cursorAck) {
+      await recordAgentInboxEventsPendingAck(actingAgentId, cursorPendingSeqs);
+    }
+    if (immediateAckSeqs.length > 0 || ackMessageIds.length > 0) {
       // `/events` is the agent-api equivalent of legacy receive+receive-ack:
       // claim exactly the returned batch so `slock message check` does not
       // replay the same inbox forever when using an sk_agent_* credential.
-      agentOrchestrator.acknowledgeDeliveredMessages(actingAgentId, ackSeqs, ackMessageIds);
-      // Pre-model-seen daemon compatibility: delivery ack also advances the
-      // legacy usability checkpoint until a daemon explicitly advertises true
-      // model-seen boundary support. This remains distinct from freshness
-      // proof; send still requires `seenUpToSeq`.
-      const hasModelSeenBoundaryCapability =
-        typeof agentOrchestrator.hasMachineCapability === "function"
+      agentOrchestrator.acknowledgeDeliveredMessages(actingAgentId, immediateAckSeqs, ackMessageIds);
+      // Handing messages over advances the agent's read position — the agent
+      // counterpart of a human reading them — unless a daemon tracks what its
+      // model actually saw (model-seen boundary) and reports that instead. An
+      // external agent has no daemon: for it, receiving IS reading, by rule
+      // (not by the absence of a machine). Freshness proof is separate; send
+      // still requires `seenUpToSeq`.
+      const readPositionFollowsModelSeen = !isExternal
+        && typeof agentOrchestrator.hasMachineCapability === "function"
         && agentOrchestrator.hasMachineCapability(agent.machineId, DAEMON_CAPABILITY_MODEL_SEEN_BOUNDARY);
-      if (!hasModelSeenBoundaryCapability && ackSeqs.length > 0) {
-        await channelService.markAgentLegacyAckCheckpoint(actingAgentId, ackSeqs);
+      if (!readPositionFollowsModelSeen && immediateAckSeqs.length > 0) {
+        await channelService.markAgentLegacyAckCheckpoint(actingAgentId, immediateAckSeqs);
       }
     }
     if (ackedThirdPartyEventIds.length > 0) {
@@ -3356,15 +4664,24 @@ registerAgentApiRoute("events", async (req, res) => {
     // batch; if empty, return null. This is a delivery cursor/debug echo,
     // NOT a model-seen boundary. Do not feed it into send freshness;
     // `/internal/agent-api/send` requires runtime-maintained `seenUpToSeq`.
-    const newestEvent = events[events.length - 1] as QueuedAgentEventMessage | undefined;
+    const newestEvent = events[events.length - 1];
     const lastSeenMsgId = newestEvent?.id ?? null;
-    const lastSeenSeq = newestEvent?.seq ?? sinceSeq;
+    // In cursor mode the cursor must cover every pending row (the batch is
+    // not in seq order across the buffer and the inbox, and dropped rows ride
+    // along), so passing it back acknowledges the whole batch.
+    const lastSeenSeq = cursorAck
+      ? (cursorPendingSeqs.length > 0 ? Math.max(...cursorPendingSeqs, sinceSeq ?? 0) : sinceSeq)
+      : newestEvent?.seq ?? sinceSeq;
 
-    // reply_target hint: newest event's channelId is a reasonable default
-    // for the external runtime's first action. Null when the batch is empty.
-    const replyChannelId = newestEvent?.channelId ?? newestEvent?.channel_id;
-    const replyTarget = replyChannelId
-      ? `channelId:${replyChannelId}`
+    // reply_target hint: the canonical send target of the newest event (the
+    // same `#name` / `#name:<8hex>` / `dm:@peer` / `dm:@peer:<8hex>` string the
+    // CLI prints for it and `/send` resolves). Null when the batch is empty or
+    // the newest event has no conversation (third-party app events).
+    const replyTarget = newestEvent ? formatInboxMessageTarget(newestEvent) : null;
+
+    // Conversations still unread beyond this batch; present while any remain.
+    const inboxHint = pulled && pulled.remainingConversations > 0
+      ? { unread_conversations: pulled.remainingConversations, command: "raft inbox check" as const }
       : null;
 
     addTraceEvent("external_agent.events.check.finished", {
@@ -3373,8 +4690,11 @@ registerAgentApiRoute("events", async (req, res) => {
       queued_count: queued.length,
       filtered_count: filtered.length,
       undeliverable_count: undeliverableQueued.length,
-      is_external: isExternalAgentRuntime(agent.runtime),
+      is_external: isExternal,
+      pulled_count: durable?.length ?? 0,
       since_seq: sinceSeq,
+      ack_mode: cursorAck ? "cursor" : "immediate",
+      cursor_acked_count: cursorAckedSeqs.size,
     });
 
     sendAgentApiResponse("events", res, {
@@ -3382,56 +4702,200 @@ registerAgentApiRoute("events", async (req, res) => {
       last_seen_msgId: lastSeenMsgId,
       last_seen_seq: lastSeenSeq,
       reply_target: replyTarget,
-      // Slice-1 placeholders — populated once the corresponding subsystems land.
+      // Deprecated, always empty/null and read by no client. Still sent
+      // because published CLIs/SDKs parse them as required; the contract
+      // marks them optional so a later release can drop them.
       pending_notice_ids: [] as string[],
       wake_reason: null as string | null,
-      has_more: filtered.length > trimmed.length,
+      // More to page: this response was trimmed to `limit`, or the durable
+      // inbox pull itself stopped at one of its caps (per conversation, total,
+      // conversations) with unread left behind.
+      has_more: filtered.length > trimmed.length || pulled?.truncated === true,
+      inbox_hint: inboxHint,
+      ack_mode: cursorAck ? "cursor" : "immediate",
     });
   } catch (err) {
-    console.error("internal.agent-api.events error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to load events" });
+    sendJsonServerError(req, res, {
+      error: "Failed to load events",
+      logPrefix: "internal.agent-api.events error:",
+      err,
+    });
   }
 });
 
-registerAgentApiRoute("attachmentDownload", ...agentApiRequestValidators("attachmentDownload"), async (req, res) => {
-  let attachmentForLog: typeof attachments.$inferSelect | null = null;
+/**
+ * Inbox push registration for the bound External Agent (raft-agent-inbox.v2;
+ * see services/agentInboxPushService). Gated on `read`: a push hands over
+ * exactly what `GET /events` (a `read` route) would, and acknowledges it the
+ * same way, so a credential that may drain its inbox may also have it pushed.
+ * The receiver supplies the signing secret; it is stored encrypted and never
+ * returned by any route.
+ */
+function sendAgentInboxPushError(res: Response, error: AgentInboxPushError): void {
+  const status = error.code === "AGENT_NOT_EXTERNAL"
+    ? 403
+    : error.code === "AGENT_NOT_FOUND" || error.code === "CREDENTIAL_INACTIVE"
+      ? 401
+      : error.code === "PUSH_UNAVAILABLE"
+        ? 503
+        : 400;
+  res.status(status).json({ error: error.message, code: error.code });
+}
+
+registerAgentApiRoute("pushWebhookStatus", async (req, res) => {
   try {
-    const actingAgentId = req.actingAgentId!;
-    const serverId = req.serverId!;
-    const attachmentId = getFullUuidParam(req.params.attachmentId);
-    if (!attachmentId) {
-      sendAttachmentDownloadUnavailable(res);
+    res.json(await getAgentInboxPushStatus({ agentId: req.actingAgentId!, serverId: req.serverId! }));
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to load push webhook",
+      logPrefix: "internal.agent-api.push-webhook.get error:",
+      err,
+    });
+  }
+});
+
+registerAgentApiRoute("pushWebhookRegister", async (req, res) => {
+  const body = req.body as unknown;
+  if (!body || typeof body !== "object" || Array.isArray(body)
+    || Object.keys(body).some((key) => key !== "url" && key !== "secret")) {
+    res.status(400).json({ error: "Body must be {url, secret}", code: "INVALID_BODY" });
+    return;
+  }
+  const { url, secret } = body as { url?: unknown; secret?: unknown };
+  try {
+    const status = await putAgentInboxPushRegistration({
+      agentId: req.actingAgentId!,
+      serverId: req.serverId!,
+      credentialId: req.agentCredentialId!,
+      url,
+      secret,
+    });
+    res.json(status);
+  } catch (err) {
+    if (err instanceof AgentInboxPushError) {
+      sendAgentInboxPushError(res, err);
       return;
     }
-    const db = getDb();
-    const [projection] = await db
-      .select()
-      .from(attachments)
-      .where(eq(attachments.id, attachmentId))
-      .limit(1);
-    if (!projection) {
-      sendAttachmentDownloadUnavailable(res);
-      return;
-    }
-    attachmentForLog = projection;
-    const attachment = await resolveAgentReadableAttachment(projection, serverId, actingAgentId);
-    if (!attachment) {
-      sendAttachmentDownloadUnavailable(res);
-      return;
-    }
-    const storage = getStorage();
-    if (!storage) {
-      res.status(503).json({ error: "File storage is not configured on this server" });
-      return;
-    }
-    const contentType = buildAttachmentResponseContentType(attachment.mimeType);
-    const contentDisposition = buildAttachmentContentDisposition(attachment.filename, attachment.mimeType);
-    if (storage.getPresignedUrl) {
-      const presignedUrl = await storage.getPresignedUrl(attachment.storageKey, {
-        expiresIn: 300,
-        responseContentDisposition: contentDisposition,
-        responseContentType: contentType,
-      });
+    sendJsonServerError(req, res, {
+      error: "Failed to store push webhook",
+      logPrefix: "internal.agent-api.push-webhook.put error:",
+      err,
+    });
+  }
+});
+
+registerAgentApiRoute("pushWebhookDelete", async (req, res) => {
+  try {
+    await deleteAgentInboxPushRegistration({ agentId: req.actingAgentId!, serverId: req.serverId! });
+    res.status(204).end();
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to delete push webhook",
+      logPrefix: "internal.agent-api.push-webhook.delete error:",
+      err,
+    });
+  }
+});
+
+type AgentApiAttachmentDownloadTarget = {
+  attachment: typeof attachments.$inferSelect;
+  storage: NonNullable<ReturnType<typeof getStorage>>;
+  contentType: string;
+  contentDisposition: string;
+};
+
+/**
+ * The one auth + visibility resolution behind both agent attachment download
+ * routes (`attachmentDownload` streams/redirects the bytes,
+ * `attachmentDownloadUrl` returns the presigned URL), so they cannot diverge.
+ * Both routes are registered with the same contract capability. A malformed,
+ * missing, or unreadable id answers the same uniform 404; missing storage
+ * answers 503. Returns null once it has answered. `logContext.attachment` is
+ * the row the caller's error log may describe.
+ */
+async function resolveAgentApiAttachmentDownloadTarget(
+  req: Request,
+  res: Response,
+  logContext: { attachment: typeof attachments.$inferSelect | null },
+): Promise<AgentApiAttachmentDownloadTarget | null> {
+  const attachmentId = getFullUuidParam(req.params.attachmentId);
+  if (!attachmentId) {
+    sendAttachmentDownloadUnavailable(res);
+    return null;
+  }
+  const [projection] = await getDb()
+    .select()
+    .from(attachments)
+    .where(eq(attachments.id, attachmentId))
+    .limit(1);
+  if (!projection) {
+    sendAttachmentDownloadUnavailable(res);
+    return null;
+  }
+  logContext.attachment = projection;
+  const attachment = await resolveAgentReadableAttachment(projection, req.serverId!, req.actingAgentId!);
+  if (!attachment) {
+    sendAttachmentDownloadUnavailable(res);
+    return null;
+  }
+  const storage = getStorage();
+  if (!storage) {
+    res.status(503).json({ error: "File storage is not configured on this server" });
+    return null;
+  }
+  return {
+    attachment,
+    storage,
+    contentType: buildAttachmentResponseContentType(attachment.mimeType),
+    contentDisposition: buildAttachmentContentDisposition(attachment.filename, attachment.mimeType),
+  };
+}
+
+/**
+ * Presigned GET for the target, valid AGENT_API_ATTACHMENT_DOWNLOAD_URL_TTL_SECONDS,
+ * or null when the storage backend cannot presign (local disk). The URL is a
+ * bearer capability: never log or trace it.
+ */
+function presignAgentApiAttachmentDownload(target: AgentApiAttachmentDownloadTarget): Promise<string> | null {
+  if (!target.storage.getPresignedUrl) return null;
+  return target.storage.getPresignedUrl(target.attachment.storageKey, {
+    expiresIn: AGENT_API_ATTACHMENT_DOWNLOAD_URL_TTL_SECONDS,
+    responseContentDisposition: target.contentDisposition,
+    responseContentType: target.contentType,
+  });
+}
+
+/**
+ * Error log for the agent attachment routes: ids and row metadata plus the
+ * error class only. The error message is left out on purpose because a
+ * storage/presign failure may carry the signed URL.
+ */
+function logAgentApiAttachmentError(
+  logPrefix: string,
+  req: Request,
+  attachment: typeof attachments.$inferSelect | null,
+  err: unknown,
+): void {
+  console.error(logPrefix, {
+    attachmentId: attachment?.id ?? req.params.attachmentId ?? null,
+    channelId: attachment?.channelId ?? null,
+    storageKey: attachment?.storageKey ?? null,
+    sizeBytes: attachment?.sizeBytes ?? null,
+    mimeType: attachment?.mimeType ?? null,
+    filename: attachment?.filename ?? null,
+    errorClass: errorClassOf(err),
+  });
+}
+
+registerAgentApiRoute("attachmentDownload", ...agentApiRequestValidators("attachmentDownload"), async (req, res) => {
+  const logContext: { attachment: typeof attachments.$inferSelect | null } = { attachment: null };
+  try {
+    const target = await resolveAgentApiAttachmentDownloadTarget(req, res, logContext);
+    if (!target) return;
+    const { attachment, storage, contentType, contentDisposition } = target;
+    const presigning = presignAgentApiAttachmentDownload(target);
+    if (presigning) {
+      const presignedUrl = await presigning;
       res.status(302);
       res.setHeader("Cache-Control", "private, no-store");
       res.setHeader("Location", presignedUrl);
@@ -3453,18 +4917,50 @@ registerAgentApiRoute("attachmentDownload", ...agentApiRequestValidators("attach
     await streamStorageResponse(stream, res);
   } catch (err) {
     if (res.destroyed || res.headersSent) return;
-    console.error("internal.agent-api.attachments error:", {
-      attachmentId: attachmentForLog?.id ?? req.params.attachmentId ?? null,
-      channelId: attachmentForLog?.channelId ?? null,
-      storageKey: attachmentForLog?.storageKey ?? null,
-      sizeBytes: attachmentForLog?.sizeBytes ?? null,
-      mimeType: attachmentForLog?.mimeType ?? null,
-      filename: attachmentForLog?.filename ?? null,
-      errorClass: err instanceof Error ? err.name : typeof err,
-    });
+    logAgentApiAttachmentError("internal.agent-api.attachments error:", req, logContext.attachment, err);
     res.status(500).json({ error: "Failed to serve attachment" });
   }
 });
+
+// Download URL for runtimes that cannot take binary tool results (hosted
+// agents): same resolution as attachmentDownload above, then the URL in a JSON
+// body instead of a 302. A storage backend that cannot presign (local disk)
+// answers 409 download_url_unavailable: the request is fine and the
+// attachment readable, but this Server can only stream it, so the caller
+// should switch to the binary route rather than retry (a 5xx would invite
+// retries under the read retry policy).
+registerAgentApiRoute(
+  "attachmentDownloadUrl",
+  ...agentApiRequestValidators("attachmentDownloadUrl"),
+  async (req, res) => {
+    const logContext: { attachment: typeof attachments.$inferSelect | null } = { attachment: null };
+    try {
+      const target = await resolveAgentApiAttachmentDownloadTarget(req, res, logContext);
+      if (!target) return;
+      // Stamp the expiry before minting so expiresAt never overstates the
+      // URL's real lifetime.
+      const expiresAt = new Date(Date.now() + AGENT_API_ATTACHMENT_DOWNLOAD_URL_TTL_SECONDS * 1000);
+      const presigning = presignAgentApiAttachmentDownload(target);
+      if (!presigning) {
+        res.status(409).json(AGENT_API_ATTACHMENT_DOWNLOAD_URL_UNAVAILABLE_RESPONSE);
+        return;
+      }
+      const url = await presigning;
+      const { attachment } = target;
+      res.setHeader("Cache-Control", "private, no-store");
+      sendAgentApiResponse("attachmentDownloadUrl", res, {
+        url,
+        expiresAt: expiresAt.toISOString(),
+        filename: attachment.filename,
+        mimeType: attachment.mimeType,
+      });
+    } catch (err) {
+      if (res.destroyed || res.headersSent) return;
+      logAgentApiAttachmentError("internal.agent-api.attachments.url error:", req, logContext.attachment, err);
+      res.status(500).json({ error: "Failed to mint attachment download URL" });
+    }
+  },
+);
 
 // --- Attachment comments (attachment-comments MVP spec, PR3 agent transport) ---
 // Mirrors the user routes on /api/attachments/:id/comments. Both transports
@@ -3534,8 +5030,11 @@ registerAgentApiRoute("attachmentCommentsList", ...agentApiRequestValidators("at
     };
     sendAgentApiResponse("attachmentCommentsList", res, body);
   } catch (err) {
-    console.error("internal.agent-api.attachment-comments.list error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to load comments" });
+    sendJsonServerError(req, res, {
+      error: "Failed to load comments",
+      logPrefix: "internal.agent-api.attachment-comments.list error:",
+      err,
+    });
   }
 });
 
@@ -3580,10 +5079,55 @@ internalAgentApiRouter.post("/attachments/:attachmentId/comments", requireAgentC
       res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
-    console.error("internal.agent-api.attachment-comments.create error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to create comment" });
+    sendJsonServerError(req, res, {
+      error: "Failed to create comment",
+      logPrefix: "internal.agent-api.attachment-comments.create error:",
+      err,
+    });
   }
 });
+
+/**
+ * The other side of the DM `channel` is in (a DM, or a thread under one) as
+ * the agent sees them: kind, handle, description, and the zone their latest
+ * message there carried. Null when not a DM, for the agent's own or an app
+ * DM, and for a peer with nothing to show (no description and no zone).
+ */
+async function resolvePeerCard(
+  serverId: string,
+  agentId: string,
+  channel: { id: string; type: string; parentMessageId?: string | null } | null | undefined,
+): Promise<AgentApiPeerCard | null> {
+  if (!channel) return null;
+  let dmChannelId: string | null = channel.type === "dm" ? channel.id : null;
+  if (!dmChannelId && channel.type === "thread" && channel.parentMessageId) {
+    const parent = await messageService.getMessage(channel.parentMessageId);
+    const parentChannel = parent ? await channelService.getChannel(parent.channelId) : null;
+    if (parentChannel?.type === "dm") dmChannelId = parentChannel.id;
+  }
+  if (!dmChannelId) return null;
+  const peer = await channelService.getDmPeerForAgent(serverId, agentId, dmChannelId);
+  if (!peer) return null;
+  const timezone = peer.kind === "human"
+    ? await messageService.getLatestSenderTimezone([...new Set([dmChannelId, channel.id])], "user", peer.id)
+    : null;
+  const card: AgentApiPeerCard = { kind: peer.kind, name: peer.name, description: peer.description, timezone };
+  return peerCardHasContent(card) ? card : null;
+}
+
+/** Whether this agent already committed a send with this idempotency key. */
+async function isAgentSendKeyCommitted(agentId: string, idempotencyKey: string): Promise<boolean> {
+  const [committed] = await getDb()
+    .select({ id: messages.id })
+    .from(messages)
+    .where(and(
+      eq(messages.senderType, "agent"),
+      eq(messages.senderId, agentId),
+      eq(messages.agentSendKey, idempotencyKey),
+    ))
+    .limit(1);
+  return Boolean(committed);
+}
 
 async function handleAgentApiMessageSend(
   req: Request,
@@ -3600,12 +5144,15 @@ async function handleAgentApiMessageSend(
       content,
       attachmentIds,
       idempotencyKey,
+      reconcileOnly,
       continue: deprecatedContinue,
       sendDraft,
       continueAnyway,
       draftReholdCount,
       draftReplacedExisting,
       seenUpToSeq,
+      seenExactSeqs: requestedSeenExactSeqs,
+      seenCards,
       freshnessContextMode,
     } = sendBody;
     const mentions = routeKey === "messageSendV2" && "mentions" in sendBody
@@ -3621,29 +5168,28 @@ async function handleAgentApiMessageSend(
     const requestedSendFreshness = isSendDraft ||
       isContinueAnyway ||
       typeof seenUpToSeq === "number" ||
+      (Array.isArray(requestedSeenExactSeqs) && requestedSeenExactSeqs.length > 0) ||
       typeof draftReholdCount === "number" ||
       draftReplacedExisting === true ||
       withholdFreshnessContext;
 
     addTraceEvent("agent_api_send.request.started", {
       target_kind: inferAgentApiSendTargetKind(target),
+      client_kind: agentApiClientKind(req),
       content_chars: typeof content === "string" ? content.length : 0,
       attachment_count: attachmentCount,
       idempotency_key_present: typeof idempotencyKey === "string" && idempotencyKey.length > 0,
+      reconcile_only: reconcileOnly === true,
       send_draft: isSendDraft,
       continue_anyway: isContinueAnyway,
       freshness_requested: requestedSendFreshness,
+      freshness_exact_seen_count: requestedSeenExactSeqs?.length ?? 0,
       freshness_context_mode: freshnessContextMode ?? "inline",
     });
 
     if (!target || typeof target !== "string") {
       traceSendRouteFailure("bad_request", 400);
       res.status(400).json({ error: "target is required" });
-      return;
-    }
-    if (!content || typeof content !== "string") {
-      traceSendRouteFailure("bad_request", 400);
-      res.status(400).json({ error: "Content is required" });
       return;
     }
     if (deprecatedContinue === true) {
@@ -3672,6 +5218,49 @@ async function handleAgentApiMessageSend(
     if (!agent || agent.serverId !== serverId) {
       traceSendRouteFailure("agent_not_found", 401);
       res.status(401).json({ error: "Agent no longer exists" });
+      return;
+    }
+    if (reconcileOnly === true) {
+      if (typeof idempotencyKey !== "string" || idempotencyKey.length === 0) {
+        traceSendRouteFailure("bad_request", 400);
+        res.status(400).json({ error: "idempotencyKey is required for reconciliation" });
+        return;
+      }
+      if (content !== undefined) {
+        traceSendRouteFailure("bad_request", 400);
+        res.status(400).json({ error: "Reconciliation requests must not include content" });
+        return;
+      }
+      const [committed] = await getDb()
+        .select({ id: messages.id, seq: messages.seq })
+        .from(messages)
+        .where(and(
+          eq(messages.senderType, "agent"),
+          eq(messages.senderId, actingAgentId),
+          eq(messages.agentSendKey, idempotencyKey),
+        ))
+        .limit(1);
+      if (!committed) {
+        sendAgentApiResponse(routeKey, res, {
+          ok: true,
+          state: "not_found",
+          reconciliation: true,
+        });
+        return;
+      }
+      sendAgentApiResponse(routeKey, res, {
+        ok: true,
+        state: "committed",
+        messageId: committed.id,
+        messageSeq: committed.seq,
+        reconciliation: true,
+        receiptComplete: false,
+      });
+      return;
+    }
+    if (!content || typeof content !== "string") {
+      traceSendRouteFailure("bad_request", 400);
+      res.status(400).json({ error: "Content is required" });
       return;
     }
     const sendFreshnessEnabled = isSendFreshnessEnabled(agent.serverId, actingAgentId);
@@ -3738,6 +5327,57 @@ async function handleAgentApiMessageSend(
       throw err;
     }
 
+    // Cards (passive AX): the target's channel card (`seenCards.channel`) and
+    // a DM target's peer card (`seenCards.peer`), each only for a client that
+    // names the version its model context has (null: not seen). Never seen in
+    // this context: held once, like unread messages. Seen an older version:
+    // sent, with the new card in the reply. Reviewer isolation sends no new
+    // context, so it carries no card either.
+    const seenChannelCard = withholdFreshnessContext ? undefined : seenCards?.channel;
+    const seenPeerCard = withholdFreshnessContext ? undefined : seenCards?.peer;
+    const targetChannel = seenChannelCard === undefined && seenPeerCard === undefined
+      ? null
+      : await channelService.getChannel(resolved.channelId);
+    const channelCardCheck = seenChannelCard === undefined
+      ? null
+      : await (async () => {
+        const row = await resolveChannelCardRow(targetChannel, serverId);
+        if (!row) return null;
+        const card = channelCardOf(row);
+        return channelCardRev(card) === seenChannelCard ? null : { card, changed: seenChannelCard !== null };
+      })();
+    // The peer is checked for "seen in this context" only: their zone travels
+    // with each message, so a version compare would call every message from
+    // another place a change. A changed description reaches the agent with
+    // their next message.
+    const peerCardCheck = seenPeerCard !== null
+      ? null
+      : await (async () => {
+        const card = await resolvePeerCard(serverId, actingAgentId, targetChannel);
+        return card ? { card, changed: false } : null;
+      })();
+    const unseenCardReasons = [
+      ...(channelCardCheck && !channelCardCheck.changed ? ["channel_card"] : []),
+      ...(peerCardCheck && !peerCardCheck.changed ? ["peer_card"] : []),
+    ];
+    // A retry of a send that already committed replays its receipt below; it
+    // is not held for a card the original send was not held for.
+    const holdForCards = unseenCardReasons.length > 0
+      && !isContinueAnyway
+      && !(typeof idempotencyKey === "string" && idempotencyKey.length > 0
+        && await isAgentSendKeyCommitted(actingAgentId, idempotencyKey));
+    const cardFields = {
+      ...(channelCardCheck ? { channelCard: channelCardCheck.card, ...(channelCardCheck.changed ? { channelCardChanged: true } : {}) } : {}),
+      ...(peerCardCheck ? { peerCard: peerCardCheck.card } : {}),
+    };
+    for (const [name, seen, check] of [["channel", seenChannelCard, channelCardCheck], ["peer", seenPeerCard, peerCardCheck]] as const) {
+      if (seen === undefined) continue;
+      addTraceEvent(`agent_api_send.${name}_card.evaluated`, {
+        outcome: check === null ? "seen" : check.changed ? "changed" : holdForCards ? "held" : "unseen_not_held",
+        target_type: resolved.type,
+      });
+    }
+
     const io = req.app.get("io");
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator;
     let attestedSendActivityContext: {
@@ -3749,72 +5389,14 @@ async function handleAgentApiMessageSend(
     if (shouldRunSendFreshness) {
       const freshness = await tracePhase(
         async () => {
-          const selfSender = { senderType: "agent" as const, senderId: actingAgentId };
-          const useAttentionFacts = resolved.type !== "thread";
-          const latestAnchor = useAttentionFacts
-            ? await attestedSendService.getLatestAgentAttentionAnchor(actingAgentId, resolved.channelId, {
-              excludeSender: selfSender,
-            })
-            : await attestedSendService.getLatestMessageAnchor(resolved.channelId, {
-              excludeSender: selfSender,
-            });
-          const hasClientSeenBoundary = typeof seenUpToSeq === "number" && Number.isFinite(seenUpToSeq);
-          const clientSeenUpToSeq = hasClientSeenBoundary
-            ? Math.max(0, Math.floor(seenUpToSeq))
-            : 0;
-          const threadParentAnchor = !hasClientSeenBoundary && resolved.type === "thread"
-            ? await attestedSendService.getThreadParentAnchor(resolved.channelId)
-            : null;
-          // Freshness proof must come from the current model-seen boundary.
-          // Durable legacy read-ish cursors cannot prove the model actually saw
-          // the messages; delivery ack state is volatile inbox state. The only
-          // fallback is a cold thread's parent message.
-          const latestFreshnessSeq = Math.max(latestAnchor.seq, threadParentAnchor?.seq ?? 0);
-          const latestFreshnessMessageId = latestAnchor.seq > 0 && latestAnchor.seq >= (threadParentAnchor?.seq ?? 0)
-            ? latestAnchor.messageId
-            : (threadParentAnchor?.messageId ?? latestAnchor.messageId);
-          const fallbackBoundarySeq = threadParentAnchor?.seq ?? 0;
-          const attestedBoundarySeq = Math.min(
-            hasClientSeenBoundary ? clientSeenUpToSeq : fallbackBoundarySeq,
-            latestFreshnessSeq,
-          );
-          const attestedBoundaryMessageId = attestedBoundarySeq <= 0
-            ? null
-            : attestedBoundarySeq === threadParentAnchor?.seq
-              ? threadParentAnchor.messageId
-              : await attestedSendService.getMessageIdForSeq(resolved.channelId, attestedBoundarySeq);
-          const newMessageCount = latestFreshnessSeq > attestedBoundarySeq
-            ? useAttentionFacts
-              ? await attestedSendService.countAgentAttentionMessagesAfterSeq(actingAgentId, resolved.channelId, attestedBoundarySeq, {
-                excludeSender: selfSender,
-                latestSeq: latestFreshnessSeq,
-              })
-              : await attestedSendService.countMessagesAfterSeq(resolved.channelId, attestedBoundarySeq, {
-                excludeSender: selfSender,
-                latestSeq: latestFreshnessSeq,
-              })
-            : 0;
-          const attestedTargetType = toAttestedSendTargetType(resolved.type);
-          const boundarySource = hasClientSeenBoundary
-            ? "client_seen"
-            : threadParentAnchor
-              ? "thread_parent"
-              : "none";
-          const formalMentionFacts = attestedBoundarySeq > 0 && latestFreshnessSeq > attestedBoundarySeq
-            ? await attestedSendService.getFormalMentionFacts(actingAgentId, resolved.channelId, attestedBoundarySeq, latestFreshnessSeq)
-            : { count: 0, firstMessageId: null, firstHandle: null };
-          return {
-            latestFreshnessSeq,
-            latestFreshnessMessageId,
-            attestedBoundarySeq,
-            attestedBoundaryMessageId,
-            newMessageCount,
-            attestedTargetType,
-            boundarySource,
-            formalMentionFacts,
-            useAttentionFacts,
-            shouldHoldForFreshness: !isContinueAnyway && newMessageCount > 0,
-          };
+          const evaluation = await evaluateAgentFreshness({
+            agentId: actingAgentId,
+            channelId: resolved.channelId,
+            channelType: resolved.type,
+            seenUpToSeq,
+            requestedSeenExactSeqs,
+          });
+          return { ...evaluation, shouldHoldForFreshness: !isContinueAnyway && evaluation.newMessageCount > 0 };
         },
         (_durationMs, result) => ({
           name: "agent_api_send.freshness.evaluated",
@@ -3835,200 +5417,24 @@ async function handleAgentApiMessageSend(
         newMessageCount: freshness.newMessageCount,
       };
 
-      const renderHeldResponse = async (
-        replacedExisting: boolean,
-        reholdCount: number,
-        boundarySeq: number,
-        boundaryMessageId: string | null,
-        latestSeq: number,
-        latestMessageId: string | null,
-        mentionCount: number,
-        boundarySource: string,
-        attestedTargetType: attestedSendService.AttestedSendTargetType,
-        useAttentionFacts: boolean,
-      ): Promise<AgentApiHeldFreshnessResponse> => {
-        const heldMessages = withholdFreshnessContext
-          ? []
-          : await listRecentFreshnessMessagesAfterSeq(
-              actingAgentId,
-              serverId,
-              resolved.channelId,
-              boundarySeq,
-              ATTESTED_SEND_HELD_CONTEXT_LIMIT,
-              latestSeq,
-              useAttentionFacts,
-              { excludeSender: { senderType: "agent", senderId: actingAgentId } },
-            );
-        const heldSeqs = heldMessages
-          .map((message) => Number((message as { seq?: unknown }).seq))
-          .filter((seq) => Number.isInteger(seq) && seq > 0);
-        const attentionHoldCount = latestSeq > boundarySeq
-          ? useAttentionFacts
-            ? await attestedSendService.countAgentAttentionMessagesAfterSeq(actingAgentId, resolved.channelId, boundarySeq, {
-              excludeSender: { senderType: "agent", senderId: actingAgentId },
-              latestSeq,
-            })
-            : await attestedSendService.countMessagesAfterSeq(resolved.channelId, boundarySeq, {
-              excludeSender: { senderType: "agent", senderId: actingAgentId },
-              latestSeq,
-            })
-          : 0;
-        const shownMessageCount = heldMessages.length;
-        // Without a model-seen boundary, do not present the whole target
-        // history as "new messages"; this is a bounded first-touch context.
-        const hasModelSeenBoundary = boundarySource === "client_seen";
-        const firstTouchContextCount = withholdFreshnessContext
-          ? Math.min(attentionHoldCount, ATTESTED_SEND_HELD_CONTEXT_LIMIT)
-          : shownMessageCount;
-        const holdCount = hasModelSeenBoundary ? attentionHoldCount : firstTouchContextCount;
-        const omittedMessageCount = !withholdFreshnessContext && hasModelSeenBoundary
-          ? Math.max(0, attentionHoldCount - shownMessageCount)
-          : 0;
-        // Chat semantics (task #41 final review): the boundary advances to
-        // latestSeq below and skipped messages are silently read through,
-        // like a human opening a conversation — that behavior is correct and
-        // deliberately unchanged. The hold's only obligation is the honest
-        // in-the-moment sentence: true skipped count (omittedMessageCount,
-        // attention semantics — never a seq span) plus the runnable --before
-        // anchor (minShownSeq). Nothing is persisted or re-surfaced.
-        const minShownSeq = heldSeqs.length > 0 ? Math.min(...heldSeqs) : null;
-        // Thread digest anchor: where this conversation started. Only fetched
-        // for threads, only when context is shown, and only when the parent
-        // is not already inside the displayed window.
-        const threadParentMessage = !withholdFreshnessContext && resolved.type === "thread"
-          ? await attestedSendService.getThreadParentMessage(resolved.channelId)
-          : null;
-        if (!withholdFreshnessContext) {
-          const readState = await channelService.markRead(
-            { kind: "agent", id: actingAgentId },
-            resolved.channelId,
-            latestSeq,
-          );
-          await emitScopeReadUpdated({
-            io: req.app.get("io") as SocketServer | undefined,
-            serverId: agent.serverId,
-            scopeId: resolved.channelId,
-            peerKind: "agent",
-            peerId: actingAgentId,
-            maxReadSeq: readState.maxReadSeq,
-            changed: readState.changed,
-          });
-          if (latestSeq > boundarySeq) {
-            const ack = agentOrchestrator.acknowledgeDeliveredMessagesForChannelUpToSeq?.(
-              actingAgentId,
-              resolved.channelId,
-              latestSeq,
-            ) ?? agentOrchestrator.acknowledgeDeliveredMessagesForChannel(actingAgentId, resolved.channelId, heldSeqs);
-            if (ack.removedCount > 0) {
-              // Held context is returned inline; do not also redeliver it as unread.
-            }
-          }
-        }
-        await attestedSendService.recordGateTriggered({
-          id: randomUUID(),
-          agentId: actingAgentId,
-          serverId: agent.serverId,
-          targetType: attestedTargetType,
-          targetRef: target,
-        }, {
-          lastSeenMessageId: boundaryMessageId,
-          latestMessageId,
-          hasFormalMentionSinceLastSeen: false,
-          draftReplacedExisting: replacedExisting,
-          newMessageCount: holdCount,
-          boundarySource,
-          boundarySeq,
-          latestSeq,
-        });
-        const freshnessDecision = {
-          action: "send" as const,
-          decision: "syncing_hold" as const,
-          ...(withholdFreshnessContext ? { freshnessContextMode: "withheld" as const } : {}),
-          target,
-          reason: hasModelSeenBoundary ? "server_stale_model_boundary" : "server_first_touch_context",
-          pendingMaxSeq: latestSeq,
-          modelSeenSeq: hasModelSeenBoundary ? boundarySeq : 0,
-          heldMessageCount: shownMessageCount,
-          omittedMessageCount,
-        };
-        const producerFactId = buildApmFreshnessDecisionProducerFactId(actingAgentId, freshnessDecision);
-        const envelope = projectApmHeldFreshnessEnvelope<AgentApiMessageEnvelope>({
-          producerFactId,
-          action: "send",
-          decision: "syncing_hold",
-          heldMessages,
-          newMessageCount: holdCount,
-          omittedMessageCount,
-          seenUpToSeq: latestSeq,
-          freshnessContextMode: withholdFreshnessContext ? "withheld" : undefined,
-        });
-        if (withholdFreshnessContext) {
-          await recordAgentRaftAction(req, actingAgentId, {
-            title: "Reviewer-isolation freshness hold",
-            text: `${formatAttestedMessageCount(holdCount)} withheld`,
-          });
-        } else {
-          const activity = projectApmHeldFreshnessActivity({
-            producerFactId,
-            action: "send",
-            decision: "syncing_hold",
-            target,
-            messageCount: shownMessageCount,
-          });
-          const title = reholdCount > 0 || isSendDraft ? "Send draft held" : activity.entry.title;
-          await recordAgentRaftAction(req, actingAgentId, {
-            title,
-            text: activity.entry.text,
-            producerFactId,
-            activity: activity.statusEntry.activity,
-            activityDetail: title,
-          });
-        }
-        return {
-          ...(!withholdFreshnessContext ? { ok: true } : {}),
-          ...envelope.body,
-          ...(!withholdFreshnessContext
-            ? { mentionAnnotation: { formalMentionCount: mentionCount } }
-            : {}),
-          ...(!withholdFreshnessContext
-            ? { continueAnywaySuggested: reholdCount >= 3 }
-            : {}),
-          ...(!withholdFreshnessContext
-            ? { seenUpToMessageId: latestMessageId }
-            : {}),
-          ...(!withholdFreshnessContext && minShownSeq !== null
-            ? { firstShownSeq: minShownSeq }
-            : {}),
-          ...(!withholdFreshnessContext
-            && threadParentMessage
-            && (minShownSeq === null || threadParentMessage.seq < minShownSeq)
-            ? {
-              threadParentMessage: {
-                seq: threadParentMessage.seq,
-                messageId: threadParentMessage.messageId,
-                senderName: threadParentMessage.senderName,
-                createdAt: threadParentMessage.createdAt?.toISOString() ?? null,
-                content: threadParentMessage.content,
-              },
-            }
-            : {}),
-        };
-      };
 
       if (freshness.shouldHoldForFreshness) {
         const response = await tracePhase(
-          () => renderHeldResponse(
-            draftReplacedExisting === true,
-            parsedDraftReholdCount,
-            freshness.attestedBoundarySeq,
-            freshness.attestedBoundaryMessageId,
-            freshness.latestFreshnessSeq,
-            freshness.latestFreshnessMessageId,
-            freshness.formalMentionFacts.count,
-            freshness.boundarySource,
-            freshness.attestedTargetType,
-            freshness.useAttentionFacts,
-          ),
+          () => renderAgentFreshnessHold(req, {
+            action: "send",
+            agentId: actingAgentId,
+            serverId,
+            agentServerId: agent.serverId,
+            channelId: resolved.channelId,
+            channelType: resolved.type,
+            target,
+            withhold: withholdFreshnessContext,
+            agentOrchestrator,
+            evaluation: freshness,
+            replacedExisting: draftReplacedExisting === true,
+            reholdCount: parsedDraftReholdCount,
+            isSendDraft,
+          }),
           (_durationMs, result) => ({
             name: "agent_api_send.held_response.rendered",
             attrs: {
@@ -4045,9 +5451,34 @@ async function handleAgentApiMessageSend(
           held_message_count: response.heldMessages?.length ?? 0,
           new_message_count: response.newMessageCount ?? 0,
         });
-        sendAgentApiResponse(routeKey, res, response);
+        sendAgentApiResponse(routeKey, res, {
+          ...response,
+          ...(holdForCards ? { holdReasons: ["unread_messages", ...unseenCardReasons] } : {}),
+          ...cardFields,
+        });
         return;
       }
+    }
+
+    if (holdForCards) {
+      // No unread messages: the cards alone hold the send. Nothing was shown
+      // from the conversation, so read positions do not move.
+      await recordAgentRaftAction(req, actingAgentId, {
+        title: unseenCardReasons.includes("channel_card") ? "Send held for the channel card" : "Send held for the DM peer's card",
+        text: `target: ${target}\nreason: ${unseenCardReasons.join(", ")} not in the agent's current context`,
+      });
+      addTraceEvent("response.ready", { status_code: 200, state: "held", held_message_count: 0, new_message_count: 0 });
+      sendAgentApiResponse(routeKey, res, {
+        ok: true,
+        state: "held",
+        holdReasons: unseenCardReasons,
+        heldMessages: [],
+        newMessageCount: 0,
+        shownMessageCount: 0,
+        omittedMessageCount: 0,
+        ...cardFields,
+      });
+      return;
     }
 
     const sendAttention = await buildDriveByJoinedToPostAttention(actingAgentId, resolved, target);
@@ -4063,7 +5494,7 @@ async function handleAgentApiMessageSend(
         mentionContract: routeKey === "messageSendV2" ? "v2" : "v1",
         attachmentIds: Array.isArray(attachmentIds) ? attachmentIds : [],
         ...(typeof idempotencyKey === "string" && idempotencyKey.length > 0
-          ? { agentSendKey: idempotencyKey }
+          ? { agentSendKey: idempotencyKey, rejectMismatchedAgentSendReplay: true }
           : {}),
       }),
       (_durationMs, result) => ({
@@ -4135,6 +5566,7 @@ async function handleAgentApiMessageSend(
       ...(sendAttention ? { attention: sendAttention } : {}),
       ...(pendingMentionActions.length > 0 ? { pendingMentionActions } : {}),
       ...(unresolvedMentionHandles.length > 0 ? { unresolvedMentionHandles } : {}),
+      ...cardFields,
     });
   } catch (err) {
     if (routeKey === "messageSendV2" && err instanceof messageService.MentionValidationError && err.code) {
@@ -4142,9 +5574,36 @@ async function handleAgentApiMessageSend(
       res.status(400).json({ error: err.message, code: err.code });
       return;
     }
+    if (err instanceof messageService.AgentSendIdempotencyConflictError) {
+      // Closed-set subkind: a reused idempotency key is request misuse.
+      traceSendRouteFailure("bad_request", err.status);
+      res.status(err.status).json({
+        error: err.message,
+        code: err.code,
+        mismatch: err.mismatch,
+        suggestedNextAction: err.suggestedNextAction,
+      });
+      return;
+    }
     if (err instanceof AttachmentLinkError) {
       traceSendRouteFailure("bad_request", err.status);
       res.status(err.status).json({ error: err.message, code: err.code });
+      return;
+    }
+    if (err instanceof DmTargetResolutionError) {
+      // An ambiguous same-name DM peer (409) or unknown peer kind (400) is a
+      // target the caller can fix, not a server fault.
+      traceSendRouteFailure("bad_request", err.status);
+      res.status(err.status).json(err.toResponseBody());
+      return;
+    }
+    if (transientTransactionSqlState(err)) {
+      // The send transaction lost a deadlock/serialization race on every
+      // bounded retry and rolled back: nothing was committed. The same
+      // idempotencyKey is safe to resend.
+      traceSendRouteCatch(err, 503);
+      res.setHeader("Retry-After", "1");
+      res.status(503).json(transientSendConflictBody());
       return;
     }
     // #79: classify the failure into a closed-set error_subkind (+ bounded
@@ -4333,7 +5792,7 @@ registerAgentApiRoute("attachmentUpload", parseAgentApiAttachmentUpload, async (
       return;
     }
     if (await isChannelReadOnlyByBillingFeature(channelId, serverId)) {
-      res.status(403).json({ error: "Joint Channels require the Pro plan. Upgrade to continue." });
+      res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
       return;
     }
 
@@ -4403,26 +5862,33 @@ registerAgentApiRoute("resolveChannel", ...agentApiRequestValidators("resolveCha
 
     const resolved = await resolveWritableAgentTarget(serverId, agentId, target);
     if (resolved === "forbidden") {
+      setRequestTraceErrorCode(res, "target_forbidden");
       res.status(403).json({ error: forbiddenMessageForTarget(target) });
       return;
     }
     if (resolved === "peer-not-found") {
+      setRequestTraceErrorCode(res, "peer_not_found");
       res.status(404).json({ error: `User or agent not found: @${target.slice(4)}` });
       return;
     }
     if (resolved === "self-dm") {
+      setRequestTraceErrorCode(res, "self_dm");
       res.status(400).json({ error: "Cannot create a DM with yourself" });
       return;
     }
     if (!resolved) {
+      setRequestTraceErrorCode(res, "channel_not_found");
       res.status(404).json({ error: notFoundMessageForTarget(target) });
       return;
     }
 
     sendAgentApiResponse("resolveChannel", res, { channelId: resolved.channelId });
   } catch (err) {
-    console.error("internal.agent-api.resolve-channel error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to resolve channel" });
+    sendJsonServerError(req, res, {
+      error: "Failed to resolve channel",
+      logPrefix: "internal.agent-api.resolve-channel error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("messageSearch", async (req, res) => {
@@ -4445,7 +5911,10 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
       channelId = resolved.channelId;
     }
 
-    const limit = Math.min(Number(queryInput.limit) || 20, 50);
+    const limit = Math.min(
+      Number(queryInput.limit) || AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
+      AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+    );
     const offset = Math.max(Number(queryInput.offset) || 0, 0);
     const senderFilter = await resolveSearchSenderFilter(
       serverId,
@@ -4464,6 +5933,11 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
       return;
     }
     const sort = queryInput.sort === "recent" ? "recent" : "relevance";
+    const cursor = queryInput.cursor ? searchService.parseMessageSearchWalkCursor(queryInput.cursor) : undefined;
+    if (cursor === null || (cursor && (!query || sort !== "recent"))) {
+      res.status(400).json({ error: "Invalid search cursor: pass back nextCursor unchanged, with the same query and --sort recent" });
+      return;
+    }
     const hasMeaningfulFilter = Boolean(channelId || senderFilter.senderId || after || before);
     if (!query && !hasMeaningfulFilter) {
       sendAgentApiResponse("messageSearch", res, { results: [], hasMore: false });
@@ -4481,9 +5955,10 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
       sort: query ? sort : "recent",
       limit,
       offset,
+      cursor,
       signal: requestAbort.signal,
     });
-    const [renderedContents, renderedSnippets, taskFacts] = await Promise.all([
+    const [renderedContents, renderedSnippets, taskFacts, commentScopes] = await Promise.all([
       agentPermalinkRenderService.renderAgentReadablePermalinksInTexts(
         searchResponse.results.map((result) => result.content),
         serverId,
@@ -4493,6 +5968,14 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
         serverId,
       ),
       loadCanonicalTaskFactsByMessageId(searchResponse.results.map((result) => result.id)),
+      // Search rows are intentionally lean. Load only the returned ids' scope
+      // projections. Agent comment access is evaluated at the server level,
+      // exactly like the dedicated Agent comment routes; user-targeted rules
+      // remain human-viewer policy.
+      messageService.loadAgentCommentScopesForMessages(
+        searchResponse.results.map((result) => result.id),
+        serverId,
+      ),
     ]);
 
     sendAgentApiResponse("messageSearch", res, {
@@ -4500,6 +5983,8 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
       results: searchResponse.results.map((result, index) => {
         const { externalMessage, ...visibleResult } = result;
         const external = result.senderType === "external_projection";
+        // Slack-bridged rows read like ordinary messages; other external content stays inert.
+        const inert = external && !isSlackBridgedExternalProvider(externalMessage?.provider);
         const taskFact = external ? undefined : taskFacts.get(result.id);
         const taskProjectionFields = taskFact ? {
           taskStatus: taskFact.taskStatus,
@@ -4513,10 +5998,13 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
           ...visibleResult,
           senderType: toAgentFacingActorType(result.senderType),
           ...(externalMessage ? { external_message: externalMessage } : {}),
-          content: external
+          content: inert
             ? renderThirdPartyInertText({ field: "tool_result", value: result.content })
-            : renderedContents[index] ?? result.content,
-          snippet: external
+            : renderAgentCommentScopedContent(
+                renderedContents[index] ?? result.content,
+                commentScopes.get(result.id),
+              ),
+          snippet: inert
             ? renderThirdPartyInertText({ field: "tool_result", value: result.snippet })
             : renderedSnippets[index] ?? result.snippet,
           ...taskProjectionFields,
@@ -4531,6 +6019,7 @@ registerAgentApiRoute("messageSearch", async (req, res) => {
     if (requestAbort.signal.aborted || searchService.isSearchQueryAbortedError(err)) {
       return;
     }
+    if (respondToDmTargetResolutionError(err, res)) return;
     console.error("internal.agent-api.search error:", serializeErrorForLog(err));
     if (!res.headersSent) {
       res.status(500).json({ error: "Failed to search messages" });
@@ -4569,8 +6058,11 @@ registerAgentApiRoute("messageResolve", ...agentApiRequestValidators("messageRes
       },
     });
   } catch (err) {
-    console.error("internal.agent-api.message-resolve error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to resolve message" });
+    sendJsonServerError(req, res, {
+      error: "Failed to resolve message",
+      logPrefix: "internal.agent-api.message-resolve error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("channelMembers", async (req, res) => {
@@ -4587,11 +6079,12 @@ registerAgentApiRoute("channelMembers", async (req, res) => {
     }
 
     const members = await channelService.getChannelMembers(resolved.channelId);
-    const visibleAgents = await Promise.all(members.agents.map(async (agent) => ({
+    const agentRoles = await getAgentServerRolesInServer(serverId, members.agents.map((agent) => agent.id));
+    const visibleAgents = members.agents.map((agent) => ({
       name: agent.name,
       status: agent.status,
-      role: await getActorServerRoleInServer(serverId, "agent", agent.id),
-    })));
+      role: agentRoles.get(agent.id) ?? null,
+    }));
     const visibleHumans = await filterAgentVisibleHumansForHiddenDirectory(
       serverId,
       agentId,
@@ -4600,11 +6093,17 @@ registerAgentApiRoute("channelMembers", async (req, res) => {
     sendAgentApiResponse("channelMembers", res, {
       channel: { ref: channelRef, type: resolved.type },
       agents: visibleAgents,
-      humans: visibleHumans.map((human) => ({ name: human.name, description: human.description, role: human.role })),
+      humans: visibleHumans.map((human) => {
+        const servers = channelService.agentVisibleMemberServers(human, serverId);
+        return { name: human.name, description: human.description, role: human.role, ...(servers ? { servers } : {}) };
+      }),
     });
   } catch (err) {
-    console.error("internal.agent-api.channel-members error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to get channel members" });
+    sendJsonServerError(req, res, {
+      error: "Failed to get channel members",
+      logPrefix: "internal.agent-api.channel-members error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("threadUnfollow", ...agentApiRequestValidators("threadUnfollow"), async (req, res) => {
@@ -4652,7 +6151,15 @@ registerAgentApiRoute("threadUnfollow", ...agentApiRequestValidators("threadUnfo
     await emitThreadFollowersUpdated(io, threadChannelId);
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     if (agent && io && agentOrchestrator) {
-      await messageService.broadcastSystemMessage(
+      // Joint threads: the local projection is not where reads resolve.
+      // broadcastSystemMessage persists against the channelId it is handed,
+      // so a receipt for a joint thread landed in the LOCAL projection while
+      // every read (permalink, thread parent lookup) resolves to the
+      // CANONICAL thread -- the message became unreachable, and the local
+      // projection has no parent linkage, so Activity rendered a blank row.
+      // ...ToLocalSurfaces resolves the projection first and falls back to
+      // this exact call when there is no joint mapping.
+      await messageService.broadcastSystemMessageToLocalSurfaces(
         io,
         agentOrchestrator,
         threadChannelId,
@@ -4687,22 +6194,302 @@ registerAgentApiRoute("threadUnfollow", ...agentApiRequestValidators("threadUnfo
     });
   }
 });
+registerAgentApiRoute("threadList", ...agentApiRequestValidators("threadList"), async (req, res) => {
+  try {
+    const agentId = req.actingAgentId!;
+    const serverId = req.serverId!;
+    const threads = await channelService.listAgentFollowedThreads(serverId, agentId);
+    sendAgentApiResponse("threadList", res, { threads });
+  } catch (err: unknown) {
+    sendJsonServerError(req, res, {
+      error: "Failed to list followed threads",
+      code: "agent_api_thread_list_failed",
+      logPrefix: "[AgentAPI] Failed to list followed threads",
+      err,
+    });
+  }
+});
+/**
+ * GET /internal/agent-api/inbox/conversations?view=unread|mentions&before_seq=<n>&limit=<n>
+ *
+ * `raft inbox check`: the agent's durable unread conversations, newest activity
+ * first (the agent counterpart of the human Activity panel). Not `/inbox`: the
+ * managed-runner daemon proxy answers GET /inbox locally with its pending buffer.
+ */
+registerAgentApiRoute("inboxList", ...agentApiRequestValidators("inboxList"), async (req, res) => {
+  const query = req.query as AgentApiInboxListQuery;
+  const limit = Math.min(Number(query.limit ?? AGENT_API_INBOX_DEFAULT_LIMIT), AGENT_API_INBOX_MAX_LIMIT);
+  try {
+    const list = await channelService.listAgentInbox(req.actingAgentId!, req.serverId!, {
+      view: query.view ?? "unread",
+      beforeSeq: query.before_seq === undefined ? undefined : Number(query.before_seq),
+      limit,
+    });
+    sendAgentApiResponse("inboxList", res, list);
+  } catch (err: unknown) {
+    if (err instanceof channelService.AgentInboxUnavailableError) {
+      console.error("[AgentAPI] inbox list unavailable", serializeErrorForLog(err.cause ?? err));
+      res.status(503).json({ error: "Inbox is temporarily unavailable", code: err.code });
+      return;
+    }
+    sendJsonServerError(req, res, {
+      error: "Failed to list inbox",
+      code: "agent_api_inbox_list_failed",
+      logPrefix: "[AgentAPI] Failed to list inbox",
+      err,
+    });
+  }
+});
+/**
+ * RFC 074 §2 personal assistant (v0) reads. The assistant calls with its own
+ * credential and the Server answers AS ITS OWNER, minus DMs. Every request
+ * re-resolves the owner (`resolveAssistantOwner`: flag on, live assistant,
+ * owner still a member), and every way that fails gets the same
+ * `403 assistant_not_enabled` so the reason is not observable. A DM, a thread
+ * under a DM, and a channel the owner cannot see all get the same neutral 404.
+ *
+ * Neither read changes anyone's state: no read cursor, no activity, no
+ * product event. Both reuse the human read paths (`getInboxItems`,
+ * `filterUserAccessibleChannelIds`, `canUserAccessChannel`, `listMessages`).
+ */
+async function requireAssistantOwner(req: Request, res: Response): Promise<string | null> {
+  const ownerUserId = await assistantService.resolveAssistantOwner(req.actingAgentId!, req.serverId!);
+  if (!ownerUserId) {
+    res.status(403).json({
+      error: "Only a personal assistant can use this, and only where personal assistants are enabled.",
+      code: assistantService.ASSISTANT_NOT_ENABLED_CODE,
+    });
+    return null;
+  }
+  return ownerUserId;
+}
+
+const ASSISTANT_CHANNEL_NOT_FOUND_BODY = { ...CHANNEL_NOT_FOUND_BODY, code: "channel_not_found" } as const;
+
+registerAgentApiRoute("assistantOwnerInbox", ...agentApiRequestValidators("assistantOwnerInbox"), async (req, res) => {
+  try {
+    const serverId = req.serverId!;
+    const ownerUserId = await requireAssistantOwner(req, res);
+    if (!ownerUserId) return;
+    const query = req.query as AgentApiAssistantOwnerInboxQuery;
+    const filter = query.filter ?? "unread";
+    const limit = Math.min(Number(query.limit ?? AGENT_API_ASSISTANT_INBOX_DEFAULT_LIMIT), AGENT_API_ASSISTANT_INBOX_MAX_LIMIT);
+    const offset = Number(query.offset ?? 0);
+    const historyCutoff = getHistoryCutoff(await getServerPlan(serverId));
+    const loaded = await channelService.getInboxItems(serverId, ownerUserId, {
+      filter,
+      limit,
+      offset,
+      scope: "no_dms",
+      historyCutoff,
+    });
+    // Re-check every row against the owner's access right now. The inbox
+    // projection can trail a membership change; a borrowed read must not.
+    const accessChannelIds = loaded.items.map((item) => item.kind === "thread" ? item.threadChannelId : item.channelId);
+    const visible = await channelService.filterUserAccessibleChannelIds(accessChannelIds, ownerUserId, serverId);
+    const items = loaded.items
+      .filter((item) => !channelService.isDmScopedInboxItem(item))
+      .filter((item) => visible.has(item.kind === "thread" ? item.threadChannelId : item.channelId))
+      .map((item) => item.kind === "thread"
+        ? {
+            kind: "thread" as const,
+            channelId: item.threadChannelId,
+            channelName: item.parentChannelName,
+            channelType: item.parentChannelType,
+            parentChannelId: item.parentChannelId,
+            parentMessageId: item.parentMessageId,
+            unread: item.unreadCount,
+            hasMention: item.hasMention,
+            latestAt: item.lastActivityAt ?? null,
+            latestSenderName: item.latestActivitySenderName ?? null,
+            latestPreview: item.latestActivityPreview ?? null,
+            firstUnreadMessageId: item.firstUnreadMessageId ?? null,
+          }
+        : {
+            kind: "channel" as const,
+            channelId: item.channelId,
+            channelName: item.channelName,
+            channelType: item.channelType,
+            parentChannelId: null,
+            parentMessageId: null,
+            unread: item.unreadCount,
+            hasMention: item.hasMention,
+            latestAt: item.lastMessageAt ?? null,
+            latestSenderName: item.lastMessageSenderName ?? null,
+            latestPreview: item.lastMessagePreview ?? null,
+            firstUnreadMessageId: item.firstUnreadMessageId ?? null,
+          });
+    recordTraceEvent("server.agent_api.assistant.owner_inbox", {
+      agent_id: req.actingAgentId!,
+      subject_user_id: ownerUserId,
+      filter,
+      row_count: loaded.items.length,
+      returned_count: items.length,
+    });
+    sendAgentApiResponse("assistantOwnerInbox", res, {
+      owner: { userId: ownerUserId },
+      filter,
+      items,
+      hasMore: loaded.hasMore,
+      nextOffset: loaded.hasMore ? offset + loaded.items.length : null,
+    });
+  } catch (err: unknown) {
+    sendJsonServerError(req, res, {
+      error: "Failed to list the owner's inbox",
+      code: "agent_api_assistant_owner_inbox_failed",
+      logPrefix: "[AgentAPI] Failed to list assistant owner inbox",
+      err,
+    });
+  }
+});
+
+registerAgentApiRoute("assistantOwnerMessages", ...agentApiRequestValidators("assistantOwnerMessages"), async (req, res) => {
+  try {
+    const serverId = req.serverId!;
+    const ownerUserId = await requireAssistantOwner(req, res);
+    if (!ownerUserId) return;
+    const query = req.query as AgentApiAssistantOwnerMessagesQuery;
+    const channelId = query.channelId;
+    const anchors = [query.before, query.after, query.around].filter((value) => value !== undefined && value.trim() !== "");
+    if (anchors.length > 1) {
+      res.status(400).json({ error: "Use at most one of before, after, or around.", code: "invalid_message_page_cursor" });
+      return;
+    }
+    const channel = await channelService.getChannel(channelId);
+    if (
+      !channel
+      || channel.serverId !== serverId
+      || await assistantService.isDmScopedChannel(channel)
+      || !await channelService.canUserAccessChannel(channelId, ownerUserId, serverId)
+    ) {
+      res.status(404).json(ASSISTANT_CHANNEL_NOT_FOUND_BODY);
+      return;
+    }
+    const limit = Math.min(Number(query.limit ?? AGENT_API_ASSISTANT_MESSAGES_DEFAULT_LIMIT), AGENT_API_ASSISTANT_MESSAGES_MAX_LIMIT);
+    const historyCutoff = getHistoryCutoff(await getServerPlan(serverId));
+    const jointThreadProjection = channel.type === "thread"
+      ? await channelService.getJointThreadProjectionByLocalThread(channelId, serverId)
+      : null;
+    const resolvedAccess = channel.type === "joint"
+      ? await channelService.resolveChannelAccess({ serverId, channelId })
+      : null;
+    const storageChannelId = jointThreadProjection?.canonicalThreadChannelId
+      ?? (resolvedAccess?.kind === "joint" ? resolvedAccess.canonicalChannelId : channelId);
+    const projectionChannelId = jointThreadProjection?.localThreadChannelId
+      ?? (resolvedAccess?.kind === "joint" ? resolvedAccess.localChannelId : channelId);
+    const viewer = {
+      attachmentCommentViewerUserId: ownerUserId,
+      forwardedBundleViewerUserId: ownerUserId,
+      forwardedBundleViewerServerId: serverId,
+      includeSenderTimezone: true,
+    };
+    const anchorNotFound = () => res.status(404).json({ error: "No such message in this conversation.", code: "message_not_found" });
+    const around = query.around?.trim();
+    const before = query.before?.trim();
+    const after = query.after?.trim();
+    for (const anchor of [around, before, after]) {
+      if (anchor && !isHistoryAnchorShape(anchor)) {
+        res.status(400).json({ error: "An anchor is a message id, an 8-character short id, or a seq.", code: "invalid_message_page_cursor" });
+        return;
+      }
+    }
+    let rawMsgs;
+    let hasOlder = false;
+    let hasNewer = false;
+    if (around) {
+      const resolution = await messageService.resolveMessageSeqAnchor(storageChannelId, around, "around", historyCutoff);
+      if (!resolution.ok) {
+        anchorNotFound();
+        return;
+      }
+      const beforeCount = Math.floor((limit - 1) / 2);
+      const context = await messageService.getMessageContextBySeq(
+        storageChannelId,
+        resolution.seq,
+        beforeCount,
+        limit - beforeCount - 1,
+        historyCutoff,
+        viewer,
+      );
+      if (!context || context.channelId !== storageChannelId) {
+        anchorNotFound();
+        return;
+      }
+      rawMsgs = context.messages;
+      hasOlder = context.hasOlder;
+      hasNewer = context.hasNewer;
+    } else {
+      const anchor = before ?? after;
+      const resolution = anchor
+        ? await messageService.resolveMessageSeqAnchor(storageChannelId, anchor, "pagination", historyCutoff)
+        : undefined;
+      if (resolution && !resolution.ok) {
+        anchorNotFound();
+        return;
+      }
+      const beforeSeq = before && resolution?.ok ? resolution.seq : undefined;
+      const afterSeq = after && resolution?.ok ? resolution.seq : undefined;
+      rawMsgs = await messageService.listMessages(storageChannelId, limit + 1, beforeSeq, afterSeq, historyCutoff, viewer);
+      const probed = paginateHistoryProbe(
+        rawMsgs,
+        limit,
+        afterSeq !== undefined ? "after" : beforeSeq !== undefined ? "before" : "latest",
+      );
+      rawMsgs = probed.messages;
+      hasOlder = probed.hasOlder;
+      hasNewer = probed.hasNewer;
+    }
+    const pageMsgs = jointThreadProjection || resolvedAccess?.kind === "joint"
+      ? await messageService.projectJointMessagesToLocalChannel(rawMsgs, projectionChannelId, serverId)
+      : rawMsgs;
+    const renderedContents = await agentPermalinkRenderService.renderAgentReadablePermalinksInTexts(
+      pageMsgs.map((message) => message.content),
+      serverId,
+    );
+    recordTraceEvent("server.agent_api.assistant.owner_messages", {
+      agent_id: req.actingAgentId!,
+      subject_user_id: ownerUserId,
+      channel_id: channelId,
+      channel_type: channel.type,
+      message_count: pageMsgs.length,
+    });
+    sendAgentApiResponse("assistantOwnerMessages", res, {
+      owner: { userId: ownerUserId },
+      channelId,
+      messages: pageMsgs.map((message, index: number) =>
+        toAgentApiMessageEnvelope(
+          message,
+          messageService.appendAgentFacingForwardedSnapshot(
+            renderAgentCommentScopedContent(renderedContents[index] ?? "", message.commentRef),
+            message.actionMetadata,
+          ),
+          req.actingAgentId!,
+        )
+      ),
+      hasMore: hasOlder || hasNewer,
+      hasOlder,
+      hasNewer,
+    });
+  } catch (err: unknown) {
+    sendJsonServerError(req, res, {
+      error: "Failed to read the owner's messages",
+      code: "agent_api_assistant_owner_messages_failed",
+      logPrefix: "[AgentAPI] Failed to read assistant owner messages",
+      err,
+    });
+  }
+});
+
 registerAgentApiRoute("profileShow", async (req, res) => {
   try {
     const agentId = req.actingAgentId!;
     const serverId = req.serverId!;
     const query = validateAgentApiQuery("profileShow", req, res);
     if (!query) return;
-    // Reading YOUR OWN profile is identity introspection for ordinary
-    // read-capable runners. Looking up OTHERS stays server-grade while
-    // preserving the contract's single id-less GET /profile route.
-    if (query.target) {
-      const failure = getAgentCapabilityFailure(req, "server");
-      if (failure) {
-        res.status(failure.status).json(failure.body);
-        return;
-      }
-    }
+    // Both reading your own profile and looking up another member's need
+    // only `read` (the route capability): a target lookup returns only
+    // profiles this agent can already see (visibility is enforced by
+    // resolveProfileViewForAgent), and member listing is already `read`.
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     const resolved = await resolveProfileViewForAgent(serverId, agentId, query.target, agentOrchestrator);
     if (!resolved.ok) {
@@ -4711,8 +6498,11 @@ registerAgentApiRoute("profileShow", async (req, res) => {
     }
     sendAgentApiResponse("profileShow", res, resolved.profile);
   } catch (err) {
-    console.error("internal.agent-api.profile-show error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to load profile" });
+    sendJsonServerError(req, res, {
+      error: "Failed to load profile",
+      logPrefix: "internal.agent-api.profile-show error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("profileUpdate", ...agentApiRequestValidators("profileUpdate"), async (req, res) => {
@@ -4726,6 +6516,18 @@ registerAgentApiRoute("profileUpdate", ...agentApiRequestValidators("profileUpda
       res.status(400).json({
         error: "Provide at least one of avatarUrl, displayName, or description",
         errorCode: "PROFILE_UPDATE_NO_FIELDS",
+      });
+      return;
+    }
+    // A hosted agent's description IS its instructions on the provider
+    // (providerAgentInstructions), and the next human profile edit pushes the
+    // current description there. Letting the agent write it would let it
+    // rewrite its own instructions, so only a human may change it.
+    if (hasDescription && await getHostedRuntimeSummary(agentId)) {
+      res.status(403).json({
+        error: "A cloud agent's description is its instructions and only a human can change it",
+        code: "hosted_agent_description_human_only",
+        suggestedNextAction: "Your description is your instructions, so only a human can change it: ask one to edit it in your Profile tab in Raft. Nothing was changed; to update your display name or avatar, retry without the description.",
       });
       return;
     }
@@ -4794,6 +6596,7 @@ registerAgentApiRoute("profileUpdate", ...agentApiRequestValidators("profileUpda
       res.status(404).json({ error: "Agent not found" });
       return;
     }
+    broadcastAgentUpdated(req, updated.serverId, agentId);
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     agentOrchestrator?.evictCache(agentId);
     const profile = await buildAgentProfileView(agentId, agentId, agentOrchestrator);
@@ -4808,8 +6611,11 @@ registerAgentApiRoute("profileUpdate", ...agentApiRequestValidators("profileUpda
       target: `@${profile.name}`,
     });
   } catch (err) {
-    console.error("internal.agent-api.profile-update error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to update profile" });
+    sendJsonServerError(req, res, {
+      error: "Failed to update profile",
+      logPrefix: "internal.agent-api.profile-update error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("profileAvatarUpdate", async (req, res) => {
@@ -4831,6 +6637,7 @@ registerAgentApiRoute("profileAvatarUpdate", async (req, res) => {
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     agentOrchestrator?.evictCache(agentId);
     await agentService.updateAgent(agentId, { avatarUrl });
+    broadcastAgentUpdated(req, serverId, agentId);
 
     const profile = await buildAgentProfileView(agentId, agentId, agentOrchestrator);
     if (!profile) {
@@ -4860,8 +6667,11 @@ registerAgentApiRoute("profileAvatarUpdate", async (req, res) => {
       });
       return;
     }
-    console.error("internal.agent-api.profile-avatar-update error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to update avatar" });
+    sendJsonServerError(req, res, {
+      error: "Failed to update avatar",
+      logPrefix: "internal.agent-api.profile-avatar-update error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("integrationList", async (req, res) => {
@@ -4896,12 +6706,15 @@ registerAgentApiRoute("integrationList", async (req, res) => {
       });
 
     sendAgentApiResponse("integrationList", res, {
-      services: clients.map(serializeOAuthClientForAgentApi),
+      services: await Promise.all(clients.map((client) => serializeOAuthClientForAgentApi(client, serverId))),
       activeLogins,
     });
   } catch (err) {
-    console.error("internal.agent-api.integrations-list error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to list agent integrations" });
+    sendJsonServerError(req, res, {
+      error: "Failed to list agent integrations",
+      logPrefix: "internal.agent-api.integrations-list error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute(
@@ -4928,7 +6741,7 @@ registerAgentApiRoute(
         metadataTrust: "untrusted_app_supplied",
         query: normalizedQuery,
         limit,
-        apps: apps.map(serializeMarketplaceOAuthClientForAgentApi),
+        apps: await Promise.all(apps.map(serializeMarketplaceOAuthClientForAgentApi)),
       });
       recordRaftCliActivity(req, agentId, {
         command: "integration.marketplace",
@@ -4936,11 +6749,30 @@ registerAgentApiRoute(
         target: `${apps.length} result${apps.length === 1 ? "" : "s"}`,
       });
     } catch (err) {
-      console.error("internal.agent-api.integrations-marketplace error:", serializeErrorForLog(err));
-      res.status(500).json({ error: "Failed to search public Marketplace apps" });
+      sendJsonServerError(req, res, {
+        error: "Failed to search public Marketplace apps",
+        logPrefix: "internal.agent-api.integrations-marketplace error:",
+        err,
+      });
     }
   },
 );
+registerAgentApiRoute("integrationToken", ...agentApiRequestValidators("integrationToken"), async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const body = req.body as AgentApiRequestBodyByRoute["integrationToken"];
+    const result = await issueAgentAudienceJwt({ serverId: req.serverId!, agentId: req.actingAgentId!, service: body.service });
+    sendAgentApiResponse("integrationToken", res, result);
+  } catch (error) {
+    if (error instanceof AgentAudienceJwtError) {
+      res.status(403).json({
+        error: error.code, errorCode: error.code,
+      });
+      return;
+    }
+    sendJsonServerError(req, res, { error: "Agent JWT issuance failed", logPrefix: "internal.agent-api.integration-token error:", err: error });
+  }
+});
 registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrationLogin"), async (req, res) => {
   let phase = "agent_lookup";
   let appType: oauthService.OAuthClientAppType | "unresolved" = "unresolved";
@@ -5013,7 +6845,7 @@ registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrat
       const response: AgentApiResponseByRoute["integrationLogin"] = {
         status: "install_required",
         nextAction: "install_from_marketplace",
-        service: serializeOAuthClientForAgentApi(marketplaceResolved.client),
+        service: await serializeOAuthClientForAgentApi(marketplaceResolved.client, serverId),
         scopes,
         installation: {
           serverSlug: server.slug,
@@ -5073,12 +6905,13 @@ registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrat
       serverSlug: server.slug,
       agentName: agent.name,
       scopes,
+      initiatedByAgent: true,
     });
 
     if (requested.grantStatus === "pending") {
       const response: AgentApiResponseByRoute["integrationLogin"] = {
         status: "approval_required",
-        service: serializeOAuthClientForAgentApi(resolved.client),
+        service: await serializeOAuthClientForAgentApi(resolved.client, serverId),
         scopes: requested.request.scopes ?? [],
         requestId: requested.request.id,
         approval: {
@@ -5143,7 +6976,7 @@ registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrat
     const responseStatus = requested.grantStatus === "reused" ? "already_logged_in" : "logged_in";
     sendAgentApiResponse("integrationLogin", res, {
       status: responseStatus,
-      service: serializeOAuthClientForAgentApi(resolved.client),
+      service: await serializeOAuthClientForAgentApi(resolved.client, serverId),
       scopes: requested.request.scopes ?? [],
       requestId: requested.request.id,
     });
@@ -5154,6 +6987,11 @@ registerAgentApiRoute("integrationLogin", ...agentApiRequestValidators("integrat
       grantStatus: requested.grantStatus,
     });
   } catch (err) {
+    if (err instanceof DmTargetResolutionError) {
+      closeTrace({ outcome: "rejected", reason: err.code, httpStatus: err.status });
+      res.status(err.status).json(err.toResponseBody());
+      return;
+    }
     const message = err instanceof Error ? err.message : "Failed to provision agent login";
     if (
       message === "scopes must be an array" ||
@@ -5226,6 +7064,8 @@ registerAgentApiRoute("integrationAppPrepare", ...agentApiRequestValidators("int
     const homepageUrl = optionalIntegrationString(body.homepageUrl);
     const returnUrl = optionalIntegrationString(body.returnUrl);
     const agentManifestUrl = optionalIntegrationString(body.agentManifestUrl);
+    const setupUrl = optionalIntegrationString(body.setupUrl);
+    const setupDescription = optionalIntegrationString(body.setupDescription);
 
     const name = optionalIntegrationString(body.name);
     if (!name) {
@@ -5245,6 +7085,8 @@ registerAgentApiRoute("integrationAppPrepare", ...agentApiRequestValidators("int
       homepageUrl,
       returnUrl,
       agentManifestUrl,
+      setupUrl,
+      setupDescription,
       scopes,
       unsafeDemoUrlOverride,
       draftHint: draftHint ?? `Agent prepared a Login with Raft app registration for ${name}. The requester becomes the app owner after server commit and receives the initial secret through a private transient handoff; only a lost handoff should be recovered with rotate-secret --output <new-private-path>. No secret is stored in this card.`,
@@ -5281,8 +7123,11 @@ registerAgentApiRoute("integrationAppPrepare", ...agentApiRequestValidators("int
       res.status(400).json({ error: err.message });
       return;
     }
-    console.error("internal.agent-api.integrations-app-prepare error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to prepare integration app registration" });
+    sendJsonServerError(req, res, {
+      error: "Failed to prepare integration app registration",
+      logPrefix: "internal.agent-api.integrations-app-prepare error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("integrationAppRotateSecret", ...agentApiRequestValidators("integrationAppRotateSecret"), async (req, res) => {
@@ -5330,8 +7175,11 @@ registerAgentApiRoute("integrationAppRotateSecret", ...agentApiRequestValidators
   } catch (err) {
     // Never surface the secret in logs: the catch path only ran if rotation
     // threw before returning, so no plaintext is in scope here regardless.
-    console.error("internal.agent-api.integrations-app-rotate-secret error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to rotate integration app secret" });
+    sendJsonServerError(req, res, {
+      error: "Failed to rotate integration app secret",
+      logPrefix: "internal.agent-api.integrations-app-rotate-secret error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("integrationAppTransferOwner", ...agentApiRequestValidators("integrationAppTransferOwner"), async (req, res) => {
@@ -5385,8 +7233,11 @@ registerAgentApiRoute("integrationAppTransferOwner", ...agentApiRequestValidator
       correlationId: transferred.value.clientId,
     });
   } catch (err) {
-    console.error("internal.agent-api.integrations-app-transfer-owner error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to transfer integration app ownership" });
+    sendJsonServerError(req, res, {
+      error: "Failed to transfer integration app ownership",
+      logPrefix: "internal.agent-api.integrations-app-transfer-owner error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("integrationAppUpdate"), async (req, res) => {
@@ -5399,7 +7250,7 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
       res.status(400).json({ error: "clientKey is required" });
       return;
     }
-    const updatedFields = ["name", "description", "category", "homepageUrl", "returnUrl", "agentManifestUrl", "scopes"]
+    const updatedFields = ["name", "description", "whenToUse", "category", "homepageUrl", "returnUrl", "agentManifestUrl", "setupUrl", "setupDescription", "scopes"]
       .filter((field) => body[field as keyof typeof body] !== undefined);
     if (updatedFields.length === 0) {
       res.status(400).json({ error: "At least one app field is required" });
@@ -5419,6 +7270,7 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
       actorAgentId: agentId,
       name: body.name,
       description: body.description,
+      whenToUse: body.whenToUse,
       category: body.category,
       homepageUrl: body.homepageUrl === undefined
         ? undefined
@@ -5429,6 +7281,8 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
       agentManifestUrl: body.agentManifestUrl === undefined
         ? undefined
         : actionCardsService.validateIntegrationUrl(body.agentManifestUrl, "agentManifestUrl", unsafeDemoUrlOverride),
+      setupUrl: body.setupUrl === undefined ? undefined : actionCardsService.validateIntegrationUrl(body.setupUrl, "setupUrl", unsafeDemoUrlOverride),
+      setupDescription: body.setupDescription,
       allowedScopes: body.scopes === undefined
         ? undefined
         : (() => {
@@ -5473,8 +7327,9 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
       }
       if (
         err.message.includes("required") ||
-        err.message.includes("agentManifestUrl") ||
-        err.message.includes("scope")
+        err.message.includes("agentManifestUrl") || err.message.includes("setup") ||
+        err.message.includes("scope") ||
+        err.message.includes("whenToUse")
       ) {
         res.status(400).json({ error: err.message, errorCode: "INVALID_APP_METADATA" });
         return;
@@ -5484,8 +7339,11 @@ registerAgentApiRoute("integrationAppUpdate", ...agentApiRequestValidators("inte
       res.status(err.status).json({ error: err.message, errorCode: err.code });
       return;
     }
-    console.error("internal.agent-api.integrations-app-update error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to update integration app" });
+    sendJsonServerError(req, res, {
+      error: "Failed to update integration app",
+      logPrefix: "internal.agent-api.integrations-app-update error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("integrationAppManage", ...agentApiRequestValidators("integrationAppManage"), async (req, res) => {
@@ -5555,7 +7413,7 @@ registerAgentApiRoute("integrationAppManage", ...agentApiRequestValidators("inte
         createdAt: created.link.createdAt.toISOString(),
         updatedAt: created.link.updatedAt.toISOString(),
       };
-      shareUrl = `${getAppUrl()}/integration-invite/${encodeURIComponent(created.token)}`;
+      shareUrl = buildIntegrationInviteUrl(getAppUrl(), created.token);
     } else if (body.action === "share_link_revoke") {
       const revoked = await oauthService.revokeOAuthClientShareLink({
         serverId,
@@ -5640,8 +7498,11 @@ registerAgentApiRoute("integrationAppManage", ...agentApiRequestValidators("inte
       res.status(400).json({ error: message });
       return;
     }
-    console.error("internal.agent-api.integrations-app-manage error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to manage integration app" });
+    sendJsonServerError(req, res, {
+      error: "Failed to manage integration app",
+      logPrefix: "internal.agent-api.integrations-app-manage error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("integrationAppLogoUpdate", async (req, res) => {
@@ -5711,8 +7572,11 @@ registerAgentApiRoute("integrationAppLogoUpdate", async (req, res) => {
       });
       return;
     }
-    console.error("internal.agent-api.integrations-app-logo-update error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to update integration app logo" });
+    sendJsonServerError(req, res, {
+      error: "Failed to update integration app logo",
+      logPrefix: "internal.agent-api.integrations-app-logo-update error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("integrationAppList", async (req, res) => {
@@ -5723,8 +7587,11 @@ registerAgentApiRoute("integrationAppList", async (req, res) => {
     });
     sendAgentApiResponse("integrationAppList", res, { apps });
   } catch (err) {
-    console.error("internal.agent-api.integrations-app-list error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to list integration apps" });
+    sendJsonServerError(req, res, {
+      error: "Failed to list integration apps",
+      logPrefix: "internal.agent-api.integrations-app-list error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("integrationAppStatus", ...agentApiRequestValidators("integrationAppStatus"), async (req, res) => {
@@ -5753,8 +7620,11 @@ registerAgentApiRoute("integrationAppStatus", ...agentApiRequestValidators("inte
     }
     sendAgentApiResponse("integrationAppStatus", res, { app });
   } catch (err) {
-    console.error("internal.agent-api.integrations-app-status error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to load integration app status" });
+    sendJsonServerError(req, res, {
+      error: "Failed to load integration app status",
+      logPrefix: "internal.agent-api.integrations-app-status error:",
+      err,
+    });
   }
 });
 registerAgentApiRoute("taskList", async (req, res) => {
@@ -5780,25 +7650,33 @@ registerAgentApiRoute("taskList", async (req, res) => {
     }
 
     if (mine === "true") {
-      const channelRefs = await channelService.listAgentFacingTaskChannelRefs(serverId, agentId);
       const taskSurfaces = new Map<string, {
         channelRef: string;
         localChannel: TaskSurfaceChannel;
       }>();
-      await Promise.all([...channelRefs].map(async ([localChannelId, channelRef]) => {
-        const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channelRef);
-        if (ctx) {
+      // The visible channels and their refs, then every task surface in one
+      // batch. These ids are already authorized by the ref resolution, so they
+      // are not turned into refs and looked up by name again (that round trip,
+      // per channel under Promise.all, borrowed 172 pool connections for one
+      // agent on prod).
+      const agent = await agentService.getAgent(agentId);
+      if (agent && agent.serverId === serverId) {
+        const channelRefs = await channelService.listAgentFacingTaskChannelRefs(serverId, agentId);
+        const surfaces = await resolveTaskChannelSurfaces(serverId, [...channelRefs.keys()]);
+        for (const [localChannelId, channelRef] of channelRefs) {
+          const resolved = surfaces.get(localChannelId);
+          if (!resolved) continue;
           const surface = {
             channelRef,
-            localChannel: ctx.localChannel,
+            localChannel: resolved.localChannel,
           };
           // Legacy/raw imports may still carry the authorized local joint id,
           // while Task V2 writes the canonical storage id. Both project to the
           // same caller-local surface; neither id is discovered from task rows.
           taskSurfaces.set(localChannelId, surface);
-          taskSurfaces.set(ctx.storageChannelId, surface);
+          taskSurfaces.set(resolved.storageChannelId, surface);
         }
-      }));
+      }
       const assigned = await taskService.listTasksAssignedToAgent(
         [...taskSurfaces.keys()],
         agentId,
@@ -5828,7 +7706,7 @@ registerAgentApiRoute("taskList", async (req, res) => {
       return;
     }
 
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel!);
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel!, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -5840,8 +7718,12 @@ registerAgentApiRoute("taskList", async (req, res) => {
       scope: "channel",
     });
   } catch (err) {
-    console.error("internal.agent-api.task-list error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to list tasks" });
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to list tasks",
+      logPrefix: "internal.agent-api.task-list error:",
+      err,
+    });
   }
 });
 
@@ -5925,6 +7807,37 @@ async function resolveJointTaskCreateAssignee(
   };
 }
 
+/**
+ * The taskCreate response body. One builder for the live response and the
+ * idempotency ledger, so a keyed replay returns exactly the first response.
+ */
+function buildTaskCreateResponse(
+  created: Awaited<ReturnType<typeof taskService.createTasks>>["tasks"],
+  assignmentReceipt?: taskService.TaskAssignmentReceipt,
+): AgentApiResponseByRoute["taskCreate"] {
+  return {
+    tasks: created.map((task) => ({
+      taskNumber: task.taskNumber,
+      messageId: task.messageId,
+      title: task.title,
+      status: task.status,
+      claimedByType: task.claimedByType,
+      claimedById: task.claimedById,
+      claimedByName: task.claimedByName,
+      claimedAt: task.claimedAt,
+      requiresResourceReceipt: task.requiresResourceReceipt,
+    })),
+    ...(assignmentReceipt && {
+      assignmentReceipt: {
+        messageId: assignmentReceipt.message.id,
+        content: assignmentReceipt.content,
+        assignee: assignmentReceipt.assignee,
+        state: assignmentReceipt.state,
+      },
+    }),
+  };
+}
+
 registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), async (req, res) => {
   try {
     const agentId = req.actingAgentId;
@@ -5934,13 +7847,19 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
       return;
     }
 
-    const { channel, tasks: items, assignee: assigneeRef } = req.body as AgentApiRequestBodyByRoute["taskCreate"];
+    const { channel, tasks: items, assignee: assigneeRef, idempotencyKey } = req.body as AgentApiRequestBodyByRoute["taskCreate"];
     if (items.length > 50) {
       res.status(400).json({ error: "Cannot create more than 50 tasks at once" });
       return;
     }
+    const idempotency = agentApiIdempotencyScope(agentId, "taskCreate", idempotencyKey, {
+      channel,
+      tasks: items.map((item) => ({ title: item.title.trim(), createsResource: item.creates_resource === true })),
+      assignee: assigneeRef ?? null,
+    });
+    if (idempotency && await replayAgentApiIdempotentWrite(idempotency, res)) return;
 
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -5972,7 +7891,15 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
           })),
           assignee,
           { assigneeName: assignee.name },
-          ctx.surface.isJoint ? { initiatingLocalChannelId: ctx.channelId } : {},
+          {
+            ...(ctx.surface.isJoint ? { initiatingLocalChannelId: ctx.channelId } : {}),
+            ...(idempotency && {
+              beforeCommit: (executor, result) => idempotentAgentApiService.recordAgentApiIdempotentResponse(executor, idempotency, {
+                status: 200,
+                body: buildTaskCreateResponse(result.tasks, result.assignmentReceipt),
+              }),
+            }),
+          },
         );
         created = result.tasks;
         hostMessages = result.hostMessages;
@@ -5986,11 +7913,25 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
             title: item.title.trim(),
             createsResource: item.creates_resource === true,
           })),
+          idempotency
+            ? {
+              beforeCommit: (executor, result) => idempotentAgentApiService.recordAgentApiIdempotentResponse(executor, idempotency, {
+                status: 200,
+                body: buildTaskCreateResponse(result.tasks),
+              }),
+            }
+            : {},
         );
         created = result.tasks;
         hostMessages = result.hostMessages;
       }
     } catch (err) {
+      if (idempotency && err instanceof idempotentAgentApiService.AgentApiIdempotencyRaceLostError) {
+        // A concurrent request with this key committed first; this request's
+        // creation rolled back. Answer with the committed first response.
+        if (await replayAgentApiIdempotentWrite(idempotency, res)) return;
+        throw err;
+      }
       if (err instanceof taskService.TaskCreationAssigneeEligibilityError) {
         res.status(403).json({ error: err.message, code: err.code });
         return;
@@ -6027,19 +7968,7 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
     const taskList = created
       .map((task) => `task #${task.taskNumber} "${messageService.summarizeForSystemMessage(task.title)}"`)
       .join(", ");
-    let assignmentReceipt: {
-      messageId: string;
-      content: string;
-      assignee: string;
-      state: "started" | "assigned";
-    } | undefined;
     if (assignee && persistedAssignmentReceipt) {
-      assignmentReceipt = {
-        messageId: persistedAssignmentReceipt.message.id,
-        content: persistedAssignmentReceipt.content,
-        assignee: persistedAssignmentReceipt.assignee,
-        state: persistedAssignmentReceipt.state,
-      };
       // The transaction committed the channel's newest durable seq. Advance
       // heartbeat catch-up before any fallible realtime/delivery fanout so a
       // missed emit remains recoverable without waiting for a later message.
@@ -6063,8 +7992,8 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
               mode: "record",
               producer: "task.assignment_receipt",
               reason: "a task assignment is durable directed attention for its assignee",
+              causalActor: { type: "agent", id: agentId },
             },
-            causalActor: { type: "agent", id: agentId },
             personalAttentionTargets: [{ type: assignee.type, id: assignee.id, name: assignee.name }],
             persistedMessage: persistedAssignmentReceipt.message,
           },
@@ -6082,34 +8011,25 @@ registerAgentApiRoute("taskCreate", ...agentApiRequestValidators("taskCreate"), 
           mode: "record",
           producer: "task.created_summary",
           reason: "new shared tasks are channel activity",
+          causalActor: { type: "agent", id: agentId },
         },
         // The agent that created the tasks should not see its own action as unread.
-        causalActor: { type: "agent", id: agentId },
       }).catch(() => {});
     }
 
-    const responseTasks = created.map((task) => ({
-      taskNumber: task.taskNumber,
-      messageId: task.messageId,
-      title: task.title,
-      status: task.status,
-      claimedByType: task.claimedByType,
-      claimedById: task.claimedById,
-      claimedByName: task.claimedByName,
-      claimedAt: task.claimedAt,
-      requiresResourceReceipt: task.requiresResourceReceipt,
-    }));
-    sendAgentApiResponse("taskCreate", res, {
-      tasks: responseTasks,
-      ...(assignmentReceipt && { assignmentReceipt }),
-    });
+    sendAgentApiResponse("taskCreate", res, buildTaskCreateResponse(created, persistedAssignmentReceipt));
     void recordAgentRaftAction(req, agentId, {
       title: `Created ${created.length} task${created.length === 1 ? "" : "s"}`,
       text: `target: ${channel}`,
     });
   } catch (err) {
-    console.error("internal.agent-api.task-create error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to create tasks" });
+    if (respondToAgentApiIdempotencyConflict(err, res)) return;
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to create tasks",
+      logPrefix: "internal.agent-api.task-create error:",
+      err,
+    });
   }
 });
 
@@ -6153,7 +8073,7 @@ registerAgentApiRoute("taskClaim", ...agentApiRequestValidators("taskClaim"), as
       return;
     }
 
-    const { channel, task_numbers, message_ids } = req.body as AgentApiRequestBodyByRoute["taskClaim"];
+    const { channel, task_numbers, message_ids, seenUpToSeq, seenExactSeqs, freshnessContextMode } = req.body as AgentApiRequestBodyByRoute["taskClaim"];
     const hasTaskNumbers = Array.isArray(task_numbers) && task_numbers.length > 0;
     const hasMessageIds = Array.isArray(message_ids) && message_ids.length > 0;
     const claimMode = taskClaimMode(hasTaskNumbers, hasMessageIds);
@@ -6169,7 +8089,7 @@ registerAgentApiRoute("taskClaim", ...agentApiRequestValidators("taskClaim"), as
       return;
     }
 
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       traceTaskClaimFinished({
         outcome: "rejected",
@@ -6202,6 +8122,35 @@ registerAgentApiRoute("taskClaim", ...agentApiRequestValidators("taskClaim"), as
     }[] = [];
     let successfulClaimCount = 0;
 
+    if (hasTaskNumbers) {
+      for (const taskNumber of task_numbers) {
+        const existing = await taskService.getTaskByNumber(ctx.storageChannelId, taskNumber);
+        if (existing && rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, existing.createdAt, res)) return;
+      }
+    }
+
+    const held = await holdTaskWriteForFreshness(req, {
+      action: "task_claim",
+      writeKey: `task_claim:${[...(task_numbers ?? [])].sort((a, b) => a - b).join(",")}|${[...(message_ids ?? [])].sort().join(",")}`,
+      agentId,
+      serverId,
+      ctx,
+      target: channel,
+      seenUpToSeq,
+      seenExactSeqs,
+      freshnessContextMode,
+    });
+    if (held) {
+      traceTaskClaimFinished({
+        outcome: "held",
+        reason: "freshness",
+        claim_mode: claimMode,
+        input_count: inputCount,
+      });
+      sendAgentApiResponse("taskClaim", res, held);
+      return;
+    }
+
     await traceQuerySpan({
       queryName: "tasks.claim",
       phase: "agent_api_task_claim",
@@ -6217,7 +8166,7 @@ registerAgentApiRoute("taskClaim", ...agentApiRequestValidators("taskClaim"), as
     }, async () => {
 
     if (hasTaskNumbers) {
-      const batchResults = await taskService.batchClaimTasks(ctx.storageChannelId, task_numbers, "agent", agentId);
+      const batchResults = await taskService.batchClaimTasks(ctx.storageChannelId, task_numbers, "agent", agentId, ctx.localChannel);
       for (const result of batchResults) {
         let claimedMessageId: string | undefined;
         if (result.success && result.task) {
@@ -6237,6 +8186,14 @@ registerAgentApiRoute("taskClaim", ...agentApiRequestValidators("taskClaim"), as
 
     if (hasMessageIds) {
       for (const rawMsgId of message_ids) {
+        const preflight = await taskService.resolveMessageInChannel(ctx.storageChannelId, rawMsgId);
+        if (preflight && rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, preflight.createdAt, res)) return;
+        if (preflight) {
+          const existing = await taskService.resolveTaskByMessageId(preflight.id);
+          if (existing && rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, existing.row.createdAt, res)) return;
+        }
+      }
+      for (const rawMsgId of message_ids) {
         const resolved = await taskService.resolveMessageInChannel(ctx.storageChannelId, rawMsgId);
         if (!resolved) {
           results.push({ messageId: rawMsgId, success: false, reason: "message not found" });
@@ -6244,11 +8201,13 @@ registerAgentApiRoute("taskClaim", ...agentApiRequestValidators("taskClaim"), as
         }
 
         const msgId = resolved.id;
+        if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, resolved.createdAt, res)) return;
         const converted = await taskService.convertMessageToTask(msgId, "agent", agentId, ctx.storageChannelId);
         if (typeof converted === "string") {
           if (converted === "already converted") {
             const existingOwner = await taskService.resolveTaskByMessageId(msgId);
             if (existingOwner) {
+              if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, existingOwner.row.createdAt, res)) return;
               // P3: both arms of the old ownership ternary read the same field.
               const existingNumber = existingOwner.row.taskNumber;
               const rejection = await taskService.getClaimRejectionForOwner(existingOwner, "agent", agentId);
@@ -6331,10 +8290,11 @@ registerAgentApiRoute("taskClaim", ...agentApiRequestValidators("taskClaim"), as
       });
     }
   } catch (err) {
+    if (respondToTaskWriteError(err, res)) return;
     traceTaskClaimFinished({
       outcome: "internal_error",
       reason: "unexpected_throw",
-      error_class: err instanceof Error ? err.name : typeof err,
+      error_class: errorClassOf(err),
     });
     console.error("internal.agent-api.task-claim error:", serializeErrorForLog(err));
     res.status(500).json({ error: "Failed to claim tasks" });
@@ -6351,7 +8311,7 @@ registerAgentApiRoute("taskUnclaim", ...agentApiRequestValidators("taskUnclaim")
     }
 
     const { channel, task_number } = req.body as AgentApiRequestBodyByRoute["taskUnclaim"];
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -6367,6 +8327,7 @@ registerAgentApiRoute("taskUnclaim", ...agentApiRequestValidators("taskUnclaim")
       res.status(404).json({ error: "Task not found" });
       return;
     }
+    if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, task.createdAt, res)) return;
 
     const result = await taskService.unclaimTask(task.id, "agent", agentId);
     if (typeof result === "string") {
@@ -6384,8 +8345,12 @@ registerAgentApiRoute("taskUnclaim", ...agentApiRequestValidators("taskUnclaim")
       producerFactId: task.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.task-unclaim error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to unclaim task" });
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to unclaim task",
+      logPrefix: "internal.agent-api.task-unclaim error:",
+      err,
+    });
   }
 });
 
@@ -6464,7 +8429,7 @@ registerAgentApiRoute("taskAssign", ...agentApiRequestValidators("taskAssign"), 
 
     const { channel, task_number, assignee: assigneeRef, expected_revision } =
       req.body as AgentApiRequestBodyByRoute["taskAssign"];
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -6480,6 +8445,7 @@ registerAgentApiRoute("taskAssign", ...agentApiRequestValidators("taskAssign"), 
       res.status(404).json({ error: "Task not found" });
       return;
     }
+    if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, task.createdAt, res)) return;
 
     let assignee: taskService.TaskCreationAssignee | null = null;
     if (assigneeRef !== null) {
@@ -6517,8 +8483,12 @@ registerAgentApiRoute("taskAssign", ...agentApiRequestValidators("taskAssign"), 
       producerFactId: task.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.task-assign error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to assign task" });
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to assign task",
+      logPrefix: "internal.agent-api.task-assign error:",
+      err,
+    });
   }
 });
 
@@ -6531,8 +8501,8 @@ registerAgentApiRoute("taskUpdateStatus", ...agentApiRequestValidators("taskUpda
       return;
     }
 
-    const { channel, task_number, status } = req.body as AgentApiRequestBodyByRoute["taskUpdateStatus"];
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const { channel, task_number, status, seenUpToSeq, seenExactSeqs, freshnessContextMode } = req.body as AgentApiRequestBodyByRoute["taskUpdateStatus"];
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -6546,6 +8516,23 @@ registerAgentApiRoute("taskUpdateStatus", ...agentApiRequestValidators("taskUpda
     const task = await taskService.getTaskByNumber(ctx.storageChannelId, task_number);
     if (!task) {
       res.status(404).json({ error: "Task not found" });
+      return;
+    }
+    if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, task.createdAt, res)) return;
+
+    const held = await holdTaskWriteForFreshness(req, {
+      action: "task_update",
+      writeKey: `task_update:${task.id}:${status}`,
+      agentId,
+      serverId,
+      ctx,
+      target: channel,
+      seenUpToSeq,
+      seenExactSeqs,
+      freshnessContextMode,
+    });
+    if (held) {
+      sendAgentApiResponse("taskUpdateStatus", res, held);
       return;
     }
 
@@ -6561,12 +8548,42 @@ registerAgentApiRoute("taskUpdateStatus", ...agentApiRequestValidators("taskUpda
       }
     }
     if (typeof result === "string") {
+      setRequestTraceErrorCode(res, taskStatusRejectionCode(result));
       res.status(409).json({ error: result });
       return;
     }
 
     const io: SocketServer = req.app.get("io");
     await emitTaskMutationToSurfaces(io, ctx.surface, result);
+
+    // Lifecycle system message into the task thread (parity with the human
+    // route): the acting agent should not see its own status change as unread.
+    // No status allow-list here — status is already constrained at route
+    // validation, and buildTaskStatusChangeNotice has the emoji/label fallback.
+    // A hand-written list here would drift from the human path (same bug we just fixed).
+    const taskMessageId = task.messageId;
+    if (taskMessageId) {
+      const content = messageService.buildTaskStatusChangeNotice(ctx.agent.name || "Someone", task.taskNumber, task.title, status);
+      void (async () => {
+        try {
+          const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
+          if (!agentOrchestrator) return;
+          const thread = ctx.localChannel.deletedAt
+            ? await channelService.getOrCreateThread(taskMessageId, agentId, "agent")
+            : await channelService.getOrCreateThreadForChannel(ctx.localChannel.id, taskMessageId, agentId, "agent");
+          await messageService.broadcastSystemMessageToLocalSurfaces(io, agentOrchestrator, thread.id, content, {
+            inboxFactPolicy: {
+              mode: "record",
+              producer: "task.lifecycle_thread",
+              reason: "task status transitions are a collaboration signal for the thread audience",
+              causalActor: { type: "agent", id: agentId },
+            },
+          });
+        } catch (err) {
+          console.error("agent task status: failed to post lifecycle system message:", err);
+        }
+      })();
+    }
 
     sendAgentApiResponse("taskUpdateStatus", res, { ok: true });
     void recordAgentRaftAction(req, agentId, {
@@ -6575,8 +8592,12 @@ registerAgentApiRoute("taskUpdateStatus", ...agentApiRequestValidators("taskUpda
       producerFactId: task.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.task-update-status error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to update task status" });
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to update task status",
+      logPrefix: "internal.agent-api.task-update-status error:",
+      err,
+    });
   }
 });
 
@@ -6591,7 +8612,7 @@ registerAgentApiRoute("taskResourceReceipt", ...agentApiRequestValidators("taskR
 
     const { channel, task_number, receipt } =
       req.body as AgentApiRequestBodyByRoute["taskResourceReceipt"];
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -6607,6 +8628,7 @@ registerAgentApiRoute("taskResourceReceipt", ...agentApiRequestValidators("taskR
       res.status(404).json({ error: "Task not found" });
       return;
     }
+    if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, task.createdAt, res)) return;
     const teardownOwner = await resolveTaskResourceTeardownOwner(
       ctx.surface,
       ctx.channelId,
@@ -6669,8 +8691,12 @@ registerAgentApiRoute("taskResourceReceipt", ...agentApiRequestValidators("taskR
       producerFactId: task.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.task-resource-receipt error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to record task resource receipt" });
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to record task resource receipt",
+      logPrefix: "internal.agent-api.task-resource-receipt error:",
+      err,
+    });
   }
 });
 
@@ -6692,7 +8718,7 @@ registerAgentApiRoute("taskDelete", ...agentApiRequestValidators("taskDelete"), 
     }
 
     const { channel, task_number } = req.body as AgentApiRequestBodyByRoute["taskDelete"];
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -6708,6 +8734,7 @@ registerAgentApiRoute("taskDelete", ...agentApiRequestValidators("taskDelete"), 
       res.status(404).json({ error: "Task not found" });
       return;
     }
+    if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, owner.row.createdAt, res)) return;
 
     const isCreator = owner.row.createdByType === "agent" && owner.row.createdById === agentId;
     if (!isCreator && !await actorHasServerCapabilityInServer(serverId, "agent", agentId, "deleteAnyTask")) {
@@ -6746,8 +8773,12 @@ registerAgentApiRoute("taskDelete", ...agentApiRequestValidators("taskDelete"), 
       producerFactId: owner.row.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.task-delete error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to delete task" });
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to delete task",
+      logPrefix: "internal.agent-api.task-delete error:",
+      err,
+    });
   }
 });
 
@@ -6769,7 +8800,7 @@ registerAgentApiRoute("taskConvert", ...agentApiRequestValidators("taskConvert")
     }
 
     const { channel, message_id } = req.body as AgentApiRequestBodyByRoute["taskConvert"];
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -6785,6 +8816,7 @@ registerAgentApiRoute("taskConvert", ...agentApiRequestValidators("taskConvert")
       res.status(404).json({ error: "Message not found" });
       return;
     }
+    if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, resolved.createdAt, res)) return;
 
     const converted = await taskService.convertMessageToTask(resolved.id, "agent", agentId, ctx.storageChannelId);
     if (typeof converted === "string") {
@@ -6814,8 +8846,8 @@ registerAgentApiRoute("taskConvert", ...agentApiRequestValidators("taskConvert")
           mode: "record",
           producer: "task.converted_summary",
           reason: "newly created task is shared channel activity",
+          causalActor: { type: "agent", id: agentId },
         },
-        causalActor: { type: "agent", id: agentId },
       }).catch(() => {});
 
     sendAgentApiResponse("taskConvert", res, {
@@ -6837,8 +8869,12 @@ registerAgentApiRoute("taskConvert", ...agentApiRequestValidators("taskConvert")
       producerFactId: converted.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.task-convert error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to convert message to task" });
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to convert message to task",
+      logPrefix: "internal.agent-api.task-convert error:",
+      err,
+    });
   }
 });
 
@@ -6851,8 +8887,8 @@ registerAgentApiRoute("taskAmend", ...agentApiRequestValidators("taskAmend"), as
       return;
     }
 
-    const { channel, task_number, title, description } = req.body as AgentApiRequestBodyByRoute["taskAmend"];
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const { channel, task_number, title, description, seenUpToSeq, seenExactSeqs, freshnessContextMode } = req.body as AgentApiRequestBodyByRoute["taskAmend"];
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -6866,6 +8902,23 @@ registerAgentApiRoute("taskAmend", ...agentApiRequestValidators("taskAmend"), as
     const task = await taskService.getTaskByNumber(ctx.storageChannelId, task_number);
     if (!task) {
       res.status(404).json({ error: "Task not found" });
+      return;
+    }
+    if (rejectHistoricalJointTaskWriteIfNeeded(ctx.surface, task.createdAt, res)) return;
+
+    const held = await holdTaskWriteForFreshness(req, {
+      action: "task_amend",
+      writeKey: `task_amend:${task.id}`,
+      agentId,
+      serverId,
+      ctx,
+      target: channel,
+      seenUpToSeq,
+      seenExactSeqs,
+      freshnessContextMode,
+    });
+    if (held) {
+      sendAgentApiResponse("taskAmend", res, held);
       return;
     }
 
@@ -6919,8 +8972,12 @@ registerAgentApiRoute("taskAmend", ...agentApiRequestValidators("taskAmend"), as
       producerFactId: result.event.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.task-amend error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to amend task" });
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to amend task",
+      logPrefix: "internal.agent-api.task-amend error:",
+      err,
+    });
   }
 });
 
@@ -6936,7 +8993,7 @@ registerAgentApiRoute("taskHistory", ...agentApiRequestValidators("taskHistory")
     const query = validateAgentApiQuery("taskHistory", req, res);
     if (!query) return;
     const { channel, task_number } = query;
-    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel);
+    const ctx = await resolveAgentApiTaskChannel(agentId, serverId, channel, res);
     if (!ctx) {
       res.status(404).json({ error: "Agent or channel not found" });
       return;
@@ -6966,82 +9023,46 @@ registerAgentApiRoute("taskHistory", ...agentApiRequestValidators("taskHistory")
       events: history,
     });
   } catch (err) {
-    console.error("internal.agent-api.task-history error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to read task history" });
+    if (respondToTaskWriteError(err, res)) return;
+    sendJsonServerError(req, res, {
+      error: "Failed to read task history",
+      logPrefix: "internal.agent-api.task-history error:",
+      err,
+    });
   }
 });
 
-registerAgentApiRoute("migrationBegin", ...agentApiRequestValidators("migrationBegin"), async (req, res) => {
-  void req;
-  res.status(403).json({
-    error: "Agent-initiated migration is not supported; start migration from the agent profile as its human creator, or with a role that includes `migrateAgents`",
-    code: "not_supported",
-  });
-});
-
-registerAgentApiRoute("migrationStatus", ...agentApiRequestValidators("migrationStatus"), async (req, res) => {
+export const REMINDERS_UNSUPPORTED_FOR_EXTERNAL_AGENTS = "reminders_unsupported_for_external_agents";
+/**
+ * Guards the legacy reminder writes (schedule, update, snooze). Runs before
+ * request validation so the answer does not depend on the payload. Reads
+ * (list, log) and cancel stay available in both cases below, and reminders
+ * already queued keep firing.
+ *
+ * - External agent: reminders are fired by the agent's Computer (the daemon
+ *   schedules them locally); an external agent has none, so a reminder it
+ *   schedules would be stored and never fire.
+ * - `reminder_app` on for the server: reminders moved to the Reminder app
+ *   (see refuseIfRemindersMovedToApp).
+ */
+const refuseLegacyReminderMutation: RequestHandler = async (req, res, next) => {
   try {
-    const agentId = req.actingAgentId;
-    const serverId = req.serverId;
-    if (!agentId || !serverId) {
-      res.status(401).json({ error: "Agent credential required", code: "invalid_principal" });
+    const external = typeof req.actingAgentIsExternal === "boolean"
+      ? req.actingAgentIsExternal
+      : isExternalAgentRuntime((await agentService.getAgent(req.actingAgentId!))?.runtime ?? "");
+    if (external) {
+      res.status(409).json({
+        error: "Reminders are not yet supported for external agents: a reminder is fired by the agent's Raft computer, and an external agent has none. Nothing was scheduled.",
+        code: REMINDERS_UNSUPPORTED_FOR_EXTERNAL_AGENTS,
+      });
       return;
     }
-
-    const migration = await agentMigrationService.getActiveAgentMigration(agentId);
-    sendAgentApiResponse("migrationStatus", res, {
-      migration: migration ? serializeAgentMigration(migration) : null,
-    });
+    if (await refuseIfRemindersMovedToApp(res, req.serverId)) return;
+    next();
   } catch (err) {
-    console.error("internal.agent-api.migration-status error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to get migration status" });
+    next(err);
   }
-});
-
-registerAgentApiRoute("migrationReady", ...agentApiRequestValidators("migrationReady"), async (req, res) => {
-  try {
-    const agentId = req.actingAgentId;
-    const serverId = req.serverId;
-    if (!agentId || !serverId) {
-      res.status(401).json({ error: "Agent credential required", code: "invalid_principal" });
-      return;
-    }
-
-    const current = await agentMigrationService.getActiveAgentMigration(agentId);
-    if (!current) {
-      res.status(404).json({ error: "No active migration", code: "MIGRATION_NOT_FOUND" });
-      return;
-    }
-
-    const body = req.body as AgentApiRequestBodyByRoute["migrationReady"];
-    const migration = await agentMigrationService.markAgentMigrationReady({
-      grantKey: current.grantKey,
-      manifestPath: body.manifestPath,
-      manifestSha256: body.manifestSha256,
-    });
-    await emitAgentMigrationUpdated(req.app.get("io") as SocketServer | undefined, migration);
-    sendAgentApiResponse("migrationReady", res, { migration: serializeAgentMigration(migration) });
-    void recordAgentRaftAction(req, agentId, {
-      title: "Marked migration ready",
-      text: `manifest: ${body.manifestPath}`,
-      producerFactId: migration.id,
-    });
-  } catch (err) {
-    try {
-      sendMigrationServiceError(res, err);
-    } catch (unhandled) {
-      console.error("internal.agent-api.migration-ready error:", unhandled);
-      res.status(500).json({ error: "Failed to mark migration ready" });
-    }
-  }
-});
-
-registerAgentApiRoute("migrationArrived", ...agentApiRequestValidators("migrationArrived"), async (req, res) => {
-  res.status(409).json({
-    error: "Migration arrival must be completed by the target Computer protocol",
-    code: "MIGRATION_REQUIRES_COMPUTER_PROTOCOL",
-  });
-});
+};
 
 registerAgentApiRoute("reminderList", ...agentApiRequestValidators("reminderList"), async (req, res) => {
   try {
@@ -7058,12 +9079,15 @@ registerAgentApiRoute("reminderList", ...agentApiRequestValidators("reminderList
     const summaries = await reminderService.toReminderSummaries(rows, serverId);
     sendAgentApiResponse("reminderList", res, { reminders: summaries });
   } catch (err) {
-    console.error("internal.agent-api.reminder-list error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to list reminders" });
+    sendJsonServerError(req, res, {
+      error: "Failed to list reminders",
+      logPrefix: "internal.agent-api.reminder-list error:",
+      err,
+    });
   }
 });
 
-registerAgentApiRoute("reminderCreate", ...agentApiRequestValidators("reminderCreate"), async (req, res) => {
+registerAgentApiRoute("reminderCreate", refuseLegacyReminderMutation, ...agentApiRequestValidators("reminderCreate"), async (req, res) => {
   try {
     const agentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -7117,6 +9141,7 @@ registerAgentApiRoute("reminderCreate", ...agentApiRequestValidators("reminderCr
       }
       const ctx = await channelService.resolveChannelByName(serverId, agentId, channel);
       if (!ctx) {
+        setRequestTraceErrorCode(res, "channel_not_found");
         res.status(404).json({ error: "Agent or channel not found" });
         return;
       }
@@ -7136,7 +9161,7 @@ registerAgentApiRoute("reminderCreate", ...agentApiRequestValidators("reminderCr
     });
     await syncReminderToComputer(req, row, "upsert");
     const [summary] = await reminderService.toReminderSummaries([row], serverId);
-    emitReminderScheduled(req, row, summary);
+    await publishReminderEvent(req.app.get("io"), row, { type: "reminder:scheduled", reminder: summary });
 
     const response: AgentApiResponseByRoute["reminderCreate"] = { reminder: summary };
     if (warning) response.warning = warning;
@@ -7149,8 +9174,11 @@ registerAgentApiRoute("reminderCreate", ...agentApiRequestValidators("reminderCr
       correlationId: row.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.reminder-create error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to create reminder" });
+    sendJsonServerError(req, res, {
+      error: "Failed to create reminder",
+      logPrefix: "internal.agent-api.reminder-create error:",
+      err,
+    });
   }
 });
 
@@ -7161,10 +9189,12 @@ registerAgentApiRoute("reminderCancel", ...agentApiRequestValidators("reminderCa
     const { reminderId } = req.params as AgentApiRequestParamsByRoute["reminderCancel"];
     const existing = await loadOwnedReminder(reminderId, serverId, agentId);
     if (!existing) {
+      setRequestTraceErrorCode(res, "reminder_not_found");
       res.status(404).json({ error: "Reminder not found" });
       return;
     }
     if (existing.status !== "scheduled" && existing.status !== "fired") {
+      setRequestTraceErrorCode(res, "reminder_not_active");
       res.status(409).json({ error: `Reminder is already ${existing.status}` });
       return;
     }
@@ -7174,17 +9204,14 @@ registerAgentApiRoute("reminderCancel", ...agentApiRequestValidators("reminderCa
       expectedVersion: existing.version,
     });
     if (!canceled) {
+      setRequestTraceErrorCode(res, "reminder_state_conflict");
       res.status(409).json({ error: "Reminder state changed; refresh and retry" });
       return;
     }
     await syncReminderToComputer(req, canceled, "cancel");
 
     const [summary] = await reminderService.toReminderSummaries([canceled], serverId);
-    const io = req.app.get("io") as SocketServer;
-    io?.to(`server:${canceled.serverId}`).emit("reminder:canceled", {
-      reminderId: canceled.id,
-      ownerAgentId: canceled.ownerAgentId,
-    });
+    await publishReminderEvent(req.app.get("io"), canceled, { type: "reminder:canceled" });
 
     sendAgentApiResponse("reminderCancel", res, { reminder: summary });
     recordRaftCliActivity(req, agentId, {
@@ -7194,12 +9221,15 @@ registerAgentApiRoute("reminderCancel", ...agentApiRequestValidators("reminderCa
       correlationId: canceled.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.reminder-cancel error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to cancel reminder" });
+    sendJsonServerError(req, res, {
+      error: "Failed to cancel reminder",
+      logPrefix: "internal.agent-api.reminder-cancel error:",
+      err,
+    });
   }
 });
 
-registerAgentApiRoute("reminderSnooze", ...agentApiRequestValidators("reminderSnooze"), async (req, res) => {
+registerAgentApiRoute("reminderSnooze", refuseLegacyReminderMutation, ...agentApiRequestValidators("reminderSnooze"), async (req, res) => {
   try {
     const agentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -7207,16 +9237,19 @@ registerAgentApiRoute("reminderSnooze", ...agentApiRequestValidators("reminderSn
     const { delaySeconds } = req.body as AgentApiRequestBodyByRoute["reminderSnooze"];
     const schedule = resolveScheduleInput({ delaySeconds }, Date.now());
     if (!schedule.ok) {
+      setRequestTraceErrorCode(res, "reminder_schedule_invalid");
       res.status(400).json({ error: schedule.error });
       return;
     }
 
     const existing = await loadOwnedReminder(reminderId, serverId, agentId);
     if (!existing) {
+      setRequestTraceErrorCode(res, "reminder_not_found");
       res.status(404).json({ error: "Reminder not found" });
       return;
     }
     if (existing.status !== "scheduled" && existing.status !== "fired") {
+      setRequestTraceErrorCode(res, "reminder_not_active");
       res.status(409).json({
         error: `Reminder ${existing.id} is ${existing.status}; only scheduled or fired reminders can be snoozed`,
       });
@@ -7228,13 +9261,14 @@ registerAgentApiRoute("reminderSnooze", ...agentApiRequestValidators("reminderSn
       expectedVersion: existing.version,
     });
     if (!snoozed) {
+      setRequestTraceErrorCode(res, "reminder_state_conflict");
       res.status(409).json({ error: "Reminder state changed; refresh and retry" });
       return;
     }
     await syncReminderToComputer(req, snoozed, "upsert");
 
     const [summary] = await reminderService.toReminderSummaries([snoozed], serverId);
-    emitReminderScheduled(req, snoozed, summary);
+    await publishReminderEvent(req.app.get("io"), snoozed, { type: "reminder:scheduled", reminder: summary });
     sendAgentApiResponse("reminderSnooze", res, { reminder: summary });
     recordRaftCliActivity(req, agentId, {
       command: "reminder.snooze",
@@ -7243,12 +9277,15 @@ registerAgentApiRoute("reminderSnooze", ...agentApiRequestValidators("reminderSn
       correlationId: snoozed.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.reminder-snooze error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to snooze reminder" });
+    sendJsonServerError(req, res, {
+      error: "Failed to snooze reminder",
+      logPrefix: "internal.agent-api.reminder-snooze error:",
+      err,
+    });
   }
 });
 
-registerAgentApiRoute("reminderUpdate", ...agentApiRequestValidators("reminderUpdate"), async (req, res) => {
+registerAgentApiRoute("reminderUpdate", refuseLegacyReminderMutation, ...agentApiRequestValidators("reminderUpdate"), async (req, res) => {
   try {
     const agentId = req.actingAgentId!;
     const serverId = req.serverId!;
@@ -7257,16 +9294,19 @@ registerAgentApiRoute("reminderUpdate", ...agentApiRequestValidators("reminderUp
 
     const existing = await loadOwnedReminder(reminderId, serverId, agentId);
     if (!existing) {
+      setRequestTraceErrorCode(res, "reminder_not_found");
       res.status(404).json({ error: "Reminder not found" });
       return;
     }
     if (existing.status === "fired") {
+      setRequestTraceErrorCode(res, "reminder_not_active");
       res.status(409).json({
         error: `Reminder ${existing.id} is fired; snooze it back to scheduled before updating, or schedule a new reminder`,
       });
       return;
     }
     if (existing.status !== "scheduled") {
+      setRequestTraceErrorCode(res, "reminder_not_active");
       res.status(409).json({ error: `Reminder ${existing.id} is ${existing.status}` });
       return;
     }
@@ -7278,6 +9318,7 @@ registerAgentApiRoute("reminderUpdate", ...agentApiRequestValidators("reminderUp
       title != null ? "title" : null,
     ].filter(Boolean);
     if (mutations.length !== 1) {
+      setRequestTraceErrorCode(res, "reminder_update_invalid");
       res.status(400).json({ error: "update requires exactly one of fireAt/delaySeconds, repeat, or title" });
       return;
     }
@@ -7287,6 +9328,7 @@ registerAgentApiRoute("reminderUpdate", ...agentApiRequestValidators("reminderUp
     if (fireAt != null || delaySeconds != null) {
       const schedule = resolveScheduleInput({ fireAt, delaySeconds }, Date.now());
       if (!schedule.ok) {
+        setRequestTraceErrorCode(res, "reminder_schedule_invalid");
         res.status(400).json({ error: schedule.error });
         return;
       }
@@ -7300,10 +9342,12 @@ registerAgentApiRoute("reminderUpdate", ...agentApiRequestValidators("reminderUp
       patch = { kind: "recurrence", recurrence };
     } else {
       if (typeof title !== "string" || title.trim().length === 0) {
+        setRequestTraceErrorCode(res, "reminder_title_invalid");
         res.status(400).json({ error: "title must be a non-empty string" });
         return;
       }
       if (title.length > REMINDER_MAX_TITLE_LEN) {
+        setRequestTraceErrorCode(res, "reminder_title_invalid");
         res.status(400).json({ error: `title must be at most ${REMINDER_MAX_TITLE_LEN} characters` });
         return;
       }
@@ -7315,13 +9359,14 @@ registerAgentApiRoute("reminderUpdate", ...agentApiRequestValidators("reminderUp
       expectedVersion: existing.version,
     });
     if (!updated) {
+      setRequestTraceErrorCode(res, "reminder_state_conflict");
       res.status(409).json({ error: "Reminder state changed; refresh and retry" });
       return;
     }
     await syncReminderToComputer(req, updated, "upsert");
 
     const [summary] = await reminderService.toReminderSummaries([updated], serverId);
-    emitReminderScheduled(req, updated, summary);
+    await publishReminderEvent(req.app.get("io"), updated, { type: "reminder:scheduled", reminder: summary });
     const response: AgentApiResponseByRoute["reminderUpdate"] = { reminder: summary };
     if (warning) response.warning = warning;
     sendAgentApiResponse("reminderUpdate", res, response);
@@ -7332,8 +9377,11 @@ registerAgentApiRoute("reminderUpdate", ...agentApiRequestValidators("reminderUp
       correlationId: updated.id,
     });
   } catch (err) {
-    console.error("internal.agent-api.reminder-update error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to update reminder" });
+    sendJsonServerError(req, res, {
+      error: "Failed to update reminder",
+      logPrefix: "internal.agent-api.reminder-update error:",
+      err,
+    });
   }
 });
 
@@ -7354,8 +9402,11 @@ registerAgentApiRoute("appSourceAck", ...agentApiRequestValidators("appSourceAck
 
     sendAgentApiResponse("appSourceAck", res, ack.response);
   } catch (err) {
-    console.error("internal.agent-api.app-source-ack error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to acknowledge app source" });
+    sendJsonServerError(req, res, {
+      error: "Failed to acknowledge app source",
+      logPrefix: "internal.agent-api.app-source-ack error:",
+      err,
+    });
   }
 });
 
@@ -7379,8 +9430,11 @@ registerAgentApiRoute("reminderLog", ...agentApiRequestValidators("reminderLog")
       events: reminderService.toReminderEventSummaries(events),
     });
   } catch (err) {
-    console.error("internal.agent-api.reminder-log error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to read reminder log" });
+    sendJsonServerError(req, res, {
+      error: "Failed to read reminder log",
+      logPrefix: "internal.agent-api.reminder-log error:",
+      err,
+    });
   }
 });
 
@@ -7415,8 +9469,11 @@ registerAgentApiRoute("appConfigGet", ...agentApiRequestValidators("appConfigGet
       sendRapAppConfigError(res, error);
       return;
     }
-    console.error("internal.agent-api.app-config-get error:", serializeErrorForLog(error));
-    res.status(500).json({ error: "Failed to read RAP App config" });
+    sendJsonServerError(req, res, {
+      error: "Failed to read RAP App config",
+      logPrefix: "internal.agent-api.app-config-get error:",
+      err: error,
+    });
   }
 });
 
@@ -7460,8 +9517,11 @@ registerAgentApiRoute("appConfigPatch", ...agentApiRequestValidators("appConfigP
       sendRapAppConfigError(res, error);
       return;
     }
-    console.error("internal.agent-api.app-config-patch error:", serializeErrorForLog(error));
-    res.status(500).json({ error: "Failed to update RAP App config" });
+    sendJsonServerError(req, res, {
+      error: "Failed to update RAP App config",
+      logPrefix: "internal.agent-api.app-config-patch error:",
+      err: error,
+    });
   }
 });
 
@@ -7469,9 +9529,13 @@ registerAgentApiRoute("actionPrepare", ...agentApiRequestValidators("actionPrepa
   try {
     const agentId = req.actingAgentId!;
     const serverId = req.serverId!;
-    if (!await requireBoundAgentScope(req, res, agentId, "action:prepare")) return;
 
     const body = req.body as AgentApiRequestBodyByRoute["actionPrepare"];
+    const idempotency = agentApiIdempotencyScope(agentId, "actionPrepare", body.idempotencyKey, {
+      target: body.target,
+      action: body.action,
+    });
+    if (idempotency && await replayAgentApiIdempotentWrite(idempotency, res)) return;
     const actionType = typeof body.action.type === "string" ? body.action.type : null;
     if (
       actionType === "integration:approve_agent_login"
@@ -7506,13 +9570,29 @@ registerAgentApiRoute("actionPrepare", ...agentApiRequestValidators("actionPrepa
     }
 
     const io = (req.app.get("io") ?? null) as Parameters<typeof actionCardsService.prepareActionCard>[0]["io"];
-    const out = await actionCardsService.prepareActionCard({
-      serverId,
-      requesterAgentId: agentId,
-      targetChannelId: resolved.channelId,
-      action: body.action,
-      io: io ?? null,
-    });
+    let out: Awaited<ReturnType<typeof actionCardsService.prepareActionCard>>;
+    try {
+      out = await actionCardsService.prepareActionCard({
+        serverId,
+        requesterAgentId: agentId,
+        targetChannelId: resolved.channelId,
+        action: body.action,
+        io: io ?? null,
+        ...(idempotency && {
+          beforeCommit: (executor, result) => idempotentAgentApiService.recordAgentApiIdempotentResponse(executor, idempotency, {
+            status: 201,
+            body: { messageId: result.messageId, metadata: { ...result.metadata } },
+          }),
+        }),
+      });
+    } catch (err) {
+      if (idempotency && err instanceof idempotentAgentApiService.AgentApiIdempotencyRaceLostError) {
+        // A concurrent request with this key committed first; this card
+        // rolled back. Answer with the committed first response.
+        if (await replayAgentApiIdempotentWrite(idempotency, res)) return;
+      }
+      throw err;
+    }
     res.status(201);
     sendAgentApiResponse("actionPrepare", res, { messageId: out.messageId, metadata: { ...out.metadata } });
     recordRaftCliActivity(req, agentId, {
@@ -7522,11 +9602,40 @@ registerAgentApiRoute("actionPrepare", ...agentApiRequestValidators("actionPrepa
       correlationId: out.messageId,
     });
   } catch (err) {
+    if (respondToAgentApiIdempotencyConflict(err, res)) return;
     if (err instanceof actionCardsService.ActionCardError) {
       res.status(err.status).json({ error: err.message, errorCode: err.code });
       return;
     }
-    console.error("internal.agent-api.prepare-action error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to prepare action card" });
+    sendJsonServerError(req, res, {
+      error: "Failed to prepare action card",
+      logPrefix: "internal.agent-api.prepare-action error:",
+      err,
+    });
   }
+});
+
+function sendRaftbenchError(error: unknown, res: Response): void {
+  if (error instanceof RaftbenchError) {
+    res.status(error.status).json({ error: error.message, code: error.code, suggestedNextAction: error.suggestedNextAction, ...(error.issues ? { issues: error.issues } : {}) });
+  } else {
+    console.error("RaftBench request failed", serializeErrorForLog(error));
+    res.status(503).json({ error: "RaftBench could not confirm this request. An interrupted submission may already have been accepted.", code: "raftbench_unavailable", suggestedNextAction: "Retry the same context request or identical submission after a short delay." });
+  }
+}
+registerAgentApiRoute("raftbenchContext", validateAgentApiResponseMiddleware("raftbenchContext"), async (req, res) => {
+  const parsed = raftbenchContextQuerySchema.safeParse(req.query);
+  if (!parsed.success) {
+    res.status(400).json({ error: "Invalid context request.", code: "raftbench_validation_failed", issues: parsed.error.issues, suggestedNextAction: "Use the assigned run ID and nextCursor returned by context." }); return;
+  }
+  try { sendAgentApiResponse("raftbenchContext", res, await readRaftbenchContext(req.serverId!, req.actingAgentId!, parsed.data)); }
+  catch (error) { sendRaftbenchError(error, res); }
+});
+registerAgentApiRoute("raftbenchSubmit", validateAgentApiResponseMiddleware("raftbenchSubmit"), async (req, res) => {
+  const parsed = raftbenchReportSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(422).json({ error: "Result validation failed; nothing has been saved.", code: "raftbench_validation_failed", issues: parsed.error.issues.map(issue => ({ path: issue.path.join("."), message: issue.message, suggestedFix: "Correct this field to match the result schema. Nothing has been saved." })), suggestedNextAction: "Correct all listed fields once. If still invalid, submit incomplete with the validation failure as its reason." }); return;
+  }
+  try { sendAgentApiResponse("raftbenchSubmit", res, await submitRaftbenchReport(req.serverId!, req.actingAgentId!, parsed.data)); }
+  catch (error) { sendRaftbenchError(error, res); }
 });

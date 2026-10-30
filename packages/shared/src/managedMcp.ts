@@ -96,9 +96,24 @@ export interface ManagedMcpRuntimeTool {
   assignmentVersion: number;
 }
 
+/**
+ * A connector this agent would have tools from, but that is not usable now
+ * (an OAuth connection that is not connected). It contributes no tools; it is
+ * listed so the agent can say "<serverName> is disconnected; someone who
+ * manages this server's integrations has to reconnect it in Raft" instead of
+ * acting as if the connector did not exist.
+ */
+export interface ManagedMcpUnavailableServer {
+  mcpServerId: string;
+  serverName: string;
+  status: "reconnect_required";
+}
+
 export interface ManagedMcpRuntimeSnapshot {
   catalogVersion: 1;
   tools: ManagedMcpRuntimeTool[];
+  /** Additive; absent from older Servers. Never mapped to tools. */
+  unavailable?: ManagedMcpUnavailableServer[];
 }
 
 export interface ManagedMcpCallRequest {
@@ -126,6 +141,32 @@ function stableToolNameHash(value: string): string {
     hash = Math.imul(hash, 0x01000193);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/** How many characters of a connector or tool name an agent sees. */
+export const MANAGED_MCP_PROMPT_NAME_LIMIT = 80;
+
+/** Remote text on one line: control, format and line/paragraph separator characters become spaces. */
+export function flattenManagedMcpPromptText(value: string): string {
+  return value.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * A connector or tool name as agents read it, in prompts and error text.
+ * `toolName` comes from the remote MCP server (and `serverName` from whoever
+ * set the connector up), so neither may break out of the sentence it sits in:
+ * one line, capped, and quoted (`JSON.stringify`). Use this for every name
+ * that goes into model-facing text.
+ */
+export function formatManagedMcpPromptName(value: string): string {
+  const chars = Array.from(flattenManagedMcpPromptText(value));
+  const capped = chars.length > MANAGED_MCP_PROMPT_NAME_LIMIT ? `${chars.slice(0, MANAGED_MCP_PROMPT_NAME_LIMIT).join("")}…` : chars.join("");
+  return JSON.stringify(capped);
+}
+
+/** The prefix every runtime tool name of this connector starts with (`mcp_<id8>_`). */
+export function formatManagedMcpRuntimeToolPrefix(mcpServerId: string): string {
+  return `mcp_${mcpServerId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 8) || "server"}_`;
 }
 
 export function formatManagedMcpRuntimeToolName(mcpServerId: string, toolName: string): string {

@@ -1,0 +1,225 @@
+import { and, desc, eq, inArray, isNull, lte } from "drizzle-orm";
+
+import { getDb, type DatabaseExecutor } from "../db/index";
+import { computerUpgradeRequests } from "../db/schema";
+import type { ComputerLastUpgradeReceipt } from "@botiverse/raft-shared";
+
+/**
+ * Remote upgrade v2 (task #873). One request row per web-triggered upgrade.
+ * The installer guarantees success-or-rollback, so the Server keeps exactly
+ * three facts: what was asked, what version the machine reported when it came
+ * back, and whether it came back in time. Nothing in between is modelled.
+ */
+
+export const UPGRADE_REQUEST_DEADLINE_MS = 30 * 60 * 1000;
+
+export type ComputerUpgradeRequestRow = typeof computerUpgradeRequests.$inferSelect;
+export type ComputerUpgradeRequestOutcome = NonNullable<ComputerUpgradeRequestRow["outcome"]>;
+
+export interface ComputerUpgradeRequestProjection {
+  id: string;
+  targetVersion: string;
+  requestedAt: string;
+  state: "pending" | ComputerUpgradeRequestOutcome;
+  observedVersion: string | null;
+  reason: string | null;
+  resolvedAt: string | null;
+}
+
+export function projectComputerUpgradeRequest(row: ComputerUpgradeRequestRow): ComputerUpgradeRequestProjection {
+  return {
+    id: row.id,
+    targetVersion: row.targetVersion,
+    requestedAt: row.requestedAt.toISOString(),
+    state: row.outcome ?? "pending",
+    observedVersion: row.observedVersion,
+    reason: row.reason,
+    resolvedAt: row.resolvedAt?.toISOString() ?? null,
+  };
+}
+
+/**
+ * A reason as written to traces: the Computer's text can quote local paths
+ * (installer errors name `/Users/<name>/…`), so mask the account segment of
+ * home paths and keep only a short prefix. The row keeps the full reason.
+ */
+export function traceSafeUpgradeReason(reason: string | null | undefined): string {
+  return (reason ?? "")
+    .replace(/(\/Users\/|\/home\/)[^/\s]+/giu, "$1~")
+    // Windows account names may contain spaces; mask up to the next separator.
+    .replace(/([A-Za-z]:\\Users\\)[^\\]+/giu, "$1~")
+    .slice(0, 120);
+}
+
+/**
+ * Trace attributes for a resolved request, shared by every settle path
+ * (done/failed on reconnect, refusal, undelivered, deadline) so one query can
+ * group outcomes by reason and read the click-to-result duration.
+ */
+export function computerUpgradeRequestTraceAttrs(row: ComputerUpgradeRequestRow): Record<string, string | number> {
+  return {
+    request_id: row.id,
+    server_id: row.serverId,
+    machine_id: row.machineId,
+    target_version: row.targetVersion,
+    observed_version: row.observedVersion ?? "",
+    outcome: row.outcome ?? "",
+    reason: traceSafeUpgradeReason(row.reason),
+    ...(row.resolvedAt ? { duration_ms: Math.max(0, row.resolvedAt.getTime() - row.requestedAt.getTime()) } : {}),
+  };
+}
+
+export async function getOpenComputerUpgradeRequest(
+  machineId: string,
+  executor: DatabaseExecutor = getDb(),
+): Promise<ComputerUpgradeRequestRow | null> {
+  const [row] = await executor
+    .select()
+    .from(computerUpgradeRequests)
+    .where(and(eq(computerUpgradeRequests.machineId, machineId), isNull(computerUpgradeRequests.outcome)))
+    .orderBy(desc(computerUpgradeRequests.requestedAt))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Creates the request unless one is already open for the machine, which is returned instead. */
+export async function createComputerUpgradeRequest(input: {
+  serverId: string;
+  machineId: string;
+  targetVersion: string;
+  requestedByUserId: string;
+  now?: Date;
+  deadlineMs?: number;
+}, executor: DatabaseExecutor = getDb()): Promise<{ row: ComputerUpgradeRequestRow; created: boolean }> {
+  const existing = await getOpenComputerUpgradeRequest(input.machineId, executor);
+  if (existing) return { row: existing, created: false };
+  const now = input.now ?? new Date();
+  const [row] = await executor.insert(computerUpgradeRequests).values({
+    serverId: input.serverId,
+    machineId: input.machineId,
+    targetVersion: input.targetVersion,
+    requestedByUserId: input.requestedByUserId,
+    requestedAt: now,
+    deadlineAt: new Date(now.getTime() + (input.deadlineMs ?? UPGRADE_REQUEST_DEADLINE_MS)),
+  }).returning();
+  return { row: row!, created: true };
+}
+
+/**
+ * The only observation: the version a machine reports when it (re)connects.
+ * Equal to the target → done. Different → failed, with the installer's
+ * one-line reason when the successor carried a receipt. No open request →
+ * nothing to do.
+ */
+export async function observeComputerVersionForUpgradeRequests(input: {
+  machineId: string;
+  reportedVersion: string | null | undefined;
+  receipt?: ComputerLastUpgradeReceipt | null;
+  now?: Date;
+}, executor: DatabaseExecutor = getDb()): Promise<ComputerUpgradeRequestRow | null> {
+  const version = input.reportedVersion?.trim();
+  if (!version) return null;
+  const open = await getOpenComputerUpgradeRequest(input.machineId, executor);
+  if (!open) return null;
+  const now = input.now ?? new Date();
+  const done = version === open.targetVersion;
+  const receipt = input.receipt && input.receipt.targetVersion === open.targetVersion ? input.receipt : null;
+  // A `ready` still on the old version is not, by itself, an outcome: the
+  // Computer stays online while it downloads, so a connection blip during the
+  // download reconnects on the old version. Only the target version or the
+  // Computer's own upgrade receipt for this target settles the request; with
+  // neither, it stays pending until the deadline (expireComputerUpgradeRequests).
+  // Every web-upgradable Computer (COMPUTER_REMOTE_UPGRADE_MIN_VERSION; every release since 1.0.37)
+  // sends `lastUpgradeReceipt` on ready.
+  if (!done && !receipt) return null;
+  const reason = done
+    ? null
+    : receipt?.reason ?? `installer_${receipt!.outcome}`;
+  const [row] = await executor
+    .update(computerUpgradeRequests)
+    .set({
+      outcome: done ? "done" : "failed",
+      observedVersion: version,
+      reason,
+      resolvedAt: now,
+    })
+    .where(and(eq(computerUpgradeRequests.id, open.id), isNull(computerUpgradeRequests.outcome)))
+    .returning();
+  return row ?? null;
+}
+
+/**
+ * The upgrade command never reached the machine (it went offline between the
+ * route's check and the send, or this replica had no route to it). Settle the
+ * request now: nothing is running on the machine, and an open row would hold
+ * every retry (`created: false`, nothing sent) until the deadline.
+ */
+export async function failUndeliveredComputerUpgradeRequest(
+  requestId: string,
+  now: Date = new Date(),
+  executor: DatabaseExecutor = getDb(),
+): Promise<ComputerUpgradeRequestRow | null> {
+  const [row] = await executor
+    .update(computerUpgradeRequests)
+    .set({ outcome: "failed", reason: "command_not_delivered", resolvedAt: now })
+    .where(and(eq(computerUpgradeRequests.id, requestId), isNull(computerUpgradeRequests.outcome)))
+    .returning();
+  return row ?? null;
+}
+
+/**
+ * The Computer refused this request before any installer ran
+ * (`computer:upgrade:done` with `ok: false`). Settled by request id, and only for the machine
+ * that sent it: with the same key online twice (#374) the other daemon cannot
+ * settle a request that is not its own.
+ */
+export async function settleRefusedComputerUpgradeRequest(input: {
+  machineId: string;
+  requestId: string;
+  reason: string;
+  now?: Date;
+}, executor: DatabaseExecutor = getDb()): Promise<ComputerUpgradeRequestRow | null> {
+  const reason = input.reason.replace(/[\u0000-\u001f\u007f]+/gu, " ").trim().slice(0, 512) || "computer_refused";
+  const [row] = await executor
+    .update(computerUpgradeRequests)
+    .set({ outcome: "failed", reason, resolvedAt: input.now ?? new Date() })
+    .where(and(
+      eq(computerUpgradeRequests.id, input.requestId),
+      eq(computerUpgradeRequests.machineId, input.machineId),
+      isNull(computerUpgradeRequests.outcome),
+    ))
+    .returning();
+  return row ?? null;
+}
+
+/** Requests whose machine did not come back before the deadline. */
+export async function expireComputerUpgradeRequests(
+  now: Date = new Date(),
+  executor: DatabaseExecutor = getDb(),
+): Promise<ComputerUpgradeRequestRow[]> {
+  return executor
+    .update(computerUpgradeRequests)
+    .set({ outcome: "no_response", reason: "no_reconnect_before_deadline", resolvedAt: now })
+    .where(and(isNull(computerUpgradeRequests.outcome), lte(computerUpgradeRequests.deadlineAt, now)))
+    .returning();
+}
+
+/** Latest request per machine (open first, otherwise the most recent resolved one). */
+export async function listLatestComputerUpgradeRequests(
+  machineIds: string[],
+  executor: DatabaseExecutor = getDb(),
+): Promise<Map<string, ComputerUpgradeRequestRow>> {
+  const result = new Map<string, ComputerUpgradeRequestRow>();
+  if (machineIds.length === 0) return result;
+  const rows = await executor
+    .select()
+    .from(computerUpgradeRequests)
+    .where(inArray(computerUpgradeRequests.machineId, machineIds))
+    .orderBy(desc(computerUpgradeRequests.requestedAt));
+  for (const row of rows) {
+    const current = result.get(row.machineId);
+    if (!current) { result.set(row.machineId, row); continue; }
+    if (current.outcome !== null && row.outcome === null) result.set(row.machineId, row);
+  }
+  return result;
+}

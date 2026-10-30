@@ -1,12 +1,11 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
-import { closeTestDatabase, openTestDatabase } from "../test/integration/database.js";
+import { dbTest as test } from "../test/integration/dbTest";
+import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
-import { afterEach, beforeEach } from "vitest";
 import { eq, sql } from "drizzle-orm";
 
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   agents,
   attachmentObjectCharges,
@@ -17,35 +16,45 @@ import {
   channelHumans,
   channels,
   externalActorProjections,
+  externalAddressabilityProjections,
+  externalAppInstalls,
+  externalAppRegistrations,
+  externalAppServerGrants,
   externalAttachmentAssets,
   externalAttachmentMessageFacts,
   externalAttachmentTransferJobs,
+  externalHumanIdentityLinks,
   externalInboundEvents,
   externalMessageAuthorFacts,
+  externalMentionFacts,
   externalMessageLinks,
   inboxNotificationFacts,
   jointChannels,
   jointChannelServers,
+  messageMentions,
   messages,
+  oauthClients,
   serverMembers,
   servers,
+  threadFollows,
   users,
-} from "../db/schema.js";
+} from "../db/schema";
 import {
   __setExternalInboundCanonicalCommitHookForTests,
   __setExternalInboundEventRowLockHookForTests,
   createExternalInboundWorkerRuntime,
   enqueueExternalInboundEvent,
   processExternalInboundEventOnce,
+  renderSlackInboundMentionLabels,
   type ExternalInboundNormalizedMessage,
   type ExternalInboundRuntimeAuthority,
   type ExternalInboundWorkerDependencies,
-} from "./externalInboundWorkerService.js";
-import { processExternalInboundAttachmentOnce } from "./externalInboundAttachmentWorkerService.js";
-import { externalInboundAttachmentIntentState } from "./externalInboundAttachmentStorageService.js";
-import type { ExternalInboundAttachmentProviderAdapter } from "./externalAttachmentProviderAdapter.js";
-import type { StorageBackend } from "./storageService.js";
-import { slackActorProjectionRevisionAfterRefresh } from "./slackBridgeProvisioningControlPlane.js";
+} from "./externalInboundWorkerService";
+import { processExternalInboundAttachmentOnce } from "./externalInboundAttachmentWorkerService";
+import { externalInboundAttachmentIntentState } from "./externalInboundAttachmentStorageService";
+import type { ExternalInboundAttachmentProviderAdapter } from "./externalAttachmentProviderAdapter";
+import type { StorageBackend } from "./storageService";
+import { slackActorProjectionRevisionAfterRefresh } from "./slackBridgeProvisioningControlPlane";
 
 
 const NOW = new Date("2026-08-03T12:00:00.000Z");
@@ -64,7 +73,10 @@ function digest(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-async function seedFixture(privacyClass: "public" | "private" = "public") {
+async function seedFixture(
+  privacyClass: "public" | "private" = "public",
+  provider = "provider-test",
+) {
   const db = getDb();
   const [owner, member] = await db.insert(users).values([
     {
@@ -106,10 +118,53 @@ async function seedFixture(privacyClass: "public" | "private" = "public") {
     runtime: "codex",
   }).returning();
   await db.insert(channelAgents).values({ channelId: channel.id, agentId: agent.id });
+  const [client] = await db.insert(oauthClients).values({
+    serverId: server.id,
+    clientId: `external-inbound-${randomUUID()}`,
+    clientSecretHash: "test-only",
+    appType: "slock_builtin",
+    name: "External inbound fixture",
+    createdByUserId: owner.id,
+  }).returning();
+  const [registration] = await db.insert(externalAppRegistrations).values({
+    oauthClientId: client.id,
+    provider: "slack",
+    environment: "test",
+    providerAppId: `A_INBOUND_${randomUUID()}`,
+    providerOAuthClientId: `inbound-${randomUUID()}`,
+    capabilityManifestVersion: 1,
+    capabilityManifestHash: "inbound-manifest-v1",
+    requiredCapabilities: ["external_projection", "channel_events"],
+  }).returning();
+  const [grant] = await db.insert(externalAppServerGrants).values({
+    serverId: server.id,
+    registrationId: registration.id,
+    state: "active",
+    grantEpoch: 1,
+    grantedManifestVersion: 1,
+    grantedManifestHash: "inbound-manifest-v1",
+    grantedCapabilities: ["external_projection", "channel_events"],
+    grantedByType: "human",
+    grantedById: owner.id,
+  }).returning();
+  const [install] = await db.insert(externalAppInstalls).values({
+    serverId: server.id,
+    registrationId: registration.id,
+    serverGrantId: grant.id,
+    grantEpoch: 1,
+    state: "active",
+    connectionEpoch: 3,
+    installedScopes: [],
+    providerAppId: registration.providerAppId,
+    providerTeamId: "authority-1",
+    authorityType: "team",
+    providerAuthorityId: "authority-1",
+    workspaceName: "Frozen Test Workspace",
+  }).returning();
   const [actor] = await db.insert(externalActorProjections).values({
-    provider: "provider-test",
-    appRegistrationId: "registration-1",
-    installId: "install-1",
+    provider,
+    appRegistrationId: registration.id,
+    installId: install.id,
     workspaceId: "workspace-1",
     externalActorId: "external-actor-1",
     displayName: "External Alice",
@@ -135,7 +190,7 @@ async function seedFixture(privacyClass: "public" | "private" = "public") {
     raftChannelId: channel.id,
     privacyClass,
   };
-  return { db, owner, member, server, channel, agent, actor, authority };
+  return { db, owner, member, server, channel, agent, actor, install, authority };
 }
 
 async function seedSecondExternalActor(fixture: Awaited<ReturnType<typeof seedFixture>>) {
@@ -257,6 +312,7 @@ function payload(
   fixture: Awaited<ReturnType<typeof seedFixture>>,
   providerMessageId: string,
   providerThreadId: string | null = null,
+  content?: string,
 ): ExternalInboundNormalizedMessage {
   return {
     schema: "external-inbound-normalized-event.v1",
@@ -265,7 +321,7 @@ function payload(
     externalActorId: fixture.actor.externalActorId,
     providerMessageId,
     providerThreadId,
-    content: `provider content ${providerMessageId}`,
+    content: content ?? `provider content ${providerMessageId}`,
     createdAt: "2026-08-03T11:59:00.000Z",
   };
 }
@@ -284,7 +340,8 @@ async function enqueue(
     normalizedPayloadDigest: digest(plaintext),
     encryptedPayload: plaintext,
     envelopeKeyId: "opaque-envelope-key-1",
-    payloadSchemaVersion: body.schema === "external-inbound-normalized-event.v2" ? 2 : 1,
+    payloadSchemaVersion: body.schema === "external-inbound-normalized-event.v2"
+      || body.schema === "external-inbound-normalized-event.v3" ? 2 : 1,
     payloadExpiresAt: new Date(receivedAt.getTime() + 5 * 60_000),
     receivedAt,
   });
@@ -297,6 +354,8 @@ function dependencies(
     now?: () => Date;
     runtime?: ExternalInboundRuntimeAuthority | null;
     decrypt?: ExternalInboundWorkerDependencies["decryptNormalizedPayload"];
+    resolveProviderMentionProfiles?: ExternalInboundWorkerDependencies["resolveProviderMentionProfiles"];
+    resolveProviderAgentMentionHandles?: ExternalInboundWorkerDependencies["resolveProviderAgentMentionHandles"];
     onMessageCommitted?: ExternalInboundWorkerDependencies["onMessageCommitted"];
     onMessageCommittedError?: ExternalInboundWorkerDependencies["onMessageCommittedError"];
     calls?: { decrypt: number; runtime: number };
@@ -314,6 +373,12 @@ function dependencies(
       calls.runtime += 1;
       return input.runtime === undefined ? fixture.authority : input.runtime;
     },
+    ...(input.resolveProviderMentionProfiles
+      ? { resolveProviderMentionProfiles: input.resolveProviderMentionProfiles }
+      : {}),
+    ...(input.resolveProviderAgentMentionHandles
+      ? { resolveProviderAgentMentionHandles: input.resolveProviderAgentMentionHandles }
+      : {}),
     ...(input.onMessageCommitted ? { onMessageCommitted: input.onMessageCommitted } : {}),
     ...(input.onMessageCommittedError ? { onMessageCommittedError: input.onMessageCommittedError } : {}),
   };
@@ -344,14 +409,9 @@ async function createInboundFileHarness(
   const maximumByServer = new Map<string, number>();
   let occurrence = 0;
   const storage: StorageBackend = {
-    async put(key, data) { writes.set(key, Buffer.from(data)); },
-    async putStream(key, data, _contentType, contentLength) {
+    async put(key, data) {
       streamWrites += 1;
-      const chunks: Buffer[] = [];
-      for await (const chunk of data) chunks.push(Buffer.from(chunk));
-      const stored = Buffer.concat(chunks);
-      assert.equal(stored.length, contentLength);
-      writes.set(key, stored);
+      writes.set(key, Buffer.from(data));
       if (revokeAfterPutActorId) {
         revokedActors.add(revokeAfterPutActorId);
         revokeAfterPutActorId = null;
@@ -511,11 +571,401 @@ test("disabled worker is side-effect free and top-level commit is one atomic can
   const projected = await fixture.db.select().from(messages).where(eq(messages.senderType, "external_projection"));
   assert.equal(projected.length, 1);
   assert.equal(projected[0]?.id, event.committedMessageId);
-  assert.equal((await fixture.db.select().from(externalMessageAuthorFacts)).length, 1);
+  const [authorFact] = await fixture.db.select().from(externalMessageAuthorFacts);
+  assert.equal(authorFact.workspaceName, "Frozen Test Workspace");
   const [link] = await fixture.db.select().from(externalMessageLinks);
   assert.equal(link.firstDirection, "provider_inbound");
   assert.equal(link.providerMessageId, "provider-message-1");
   assert.equal((await fixture.db.select().from(inboxNotificationFacts)).length, 3);
+});
+
+test("Slack inbound mention labels use current directory projections without minting Raft mention authority", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await fixture.db.insert(externalActorProjections).values([
+    {
+      provider: "slack",
+      appRegistrationId: fixture.actor.appRegistrationId,
+      installId: fixture.actor.installId,
+      workspaceId: fixture.actor.workspaceId,
+      externalActorId: "UDISPLAYONLY",
+      displayName: "Display [Only]",
+      handles: [],
+      actorKind: "human",
+      state: "active",
+      deactivated: false,
+      projectionRevision: 1,
+      observedAt: NOW,
+    },
+    {
+      provider: "slack",
+      appRegistrationId: fixture.actor.appRegistrationId,
+      installId: fixture.actor.installId,
+      workspaceId: fixture.actor.workspaceId,
+      externalActorId: "UTOMBSTONED",
+      displayName: "Stale Person",
+      handles: ["stale"],
+      actorKind: "human",
+      state: "tombstoned",
+      deactivated: true,
+      projectionRevision: 2,
+      observedAt: NOW,
+    },
+  ]);
+  const body = {
+    ...payload(fixture, "provider-message-native-mentions"),
+    content: "hi <@U0BTXDF3LGY> / <@UDISPLAYONLY> / <@UUNKNOWN> / <@UTOMBSTONED>",
+  };
+  await enqueue(fixture, "event-native-mentions", body);
+  const resolvedIds: string[][] = [];
+  const mentionResult = await process(fixture, dependencies(fixture, {
+    async resolveProviderMentionProfiles(input) {
+      resolvedIds.push([...input.providerUserIds]);
+      return [
+        {
+          providerUserId: "U0BTXDF3LGY",
+          displayName: "August Zhang",
+          handle: "august",
+        },
+        {
+          providerUserId: "UUNKNOWN",
+          displayName: "UUNKNOWN",
+          handle: "UUNKNOWN",
+        },
+      ];
+    },
+  }));
+  assert.equal(mentionResult.kind, "committed", JSON.stringify(mentionResult));
+  assert.deepEqual(resolvedIds, [["U0BTXDF3LGY", "UUNKNOWN", "UTOMBSTONED"]]);
+  const [stored] = await fixture.db.select().from(messages)
+    .where(eq(messages.senderType, "external_projection"));
+  assert.equal(
+    stored?.content,
+    "hi @august / @Display \\[Only\\] / @Slack user / @Slack user",
+  );
+  assert.doesNotMatch(stored?.content ?? "", /U0BTXDF3LGY|UDISPLAYONLY|UUNKNOWN|UTOMBSTONED/u);
+  assert.equal((await fixture.db.select().from(messageMentions)).length, 0);
+});
+
+test("Slack directory mention labels reject opaque provider identifiers as handles", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await fixture.db.insert(externalActorProjections).values({
+    provider: "slack",
+    appRegistrationId: fixture.actor.appRegistrationId,
+    installId: fixture.actor.installId,
+    workspaceId: fixture.actor.workspaceId,
+    externalActorId: "UOPAQUE",
+    displayName: "UOPAQUE",
+    handles: ["UOPAQUE"],
+    actorKind: "human",
+    state: "active",
+    deactivated: false,
+    projectionRevision: 1,
+    observedAt: NOW,
+  });
+  await enqueue(fixture, "event-directory-opaque-mention", {
+    ...payload(fixture, "provider-message-directory-opaque-mention"),
+    content: "hi <@UOPAQUE>",
+  });
+  let providerCalls = 0;
+  assert.equal((await process(fixture, dependencies(fixture, {
+    async resolveProviderMentionProfiles() {
+      providerCalls += 1;
+      return [];
+    },
+  }))).kind, "committed");
+  const [stored] = await fixture.db.select().from(messages)
+    .where(eq(messages.senderType, "external_projection"));
+  assert.equal(stored?.content, "hi @Slack user");
+  assert.equal(providerCalls, 0, "a current directory projection never triggers provider fallback");
+  assert.doesNotMatch(stored?.content ?? "", /UOPAQUE/u);
+  assert.equal((await fixture.db.select().from(messageMentions)).length, 0);
+});
+
+test("Slack managed usergroup identity creates one exact Raft Agent mention", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const providerUsergroupId = "SAGENT123";
+  await enqueue(fixture, "event-agent-mention", {
+    ...payload(fixture, "provider-message-agent-mention"),
+    schema: "external-inbound-normalized-event.v3",
+    providerFileIds: [],
+    providerAgentMentions: [{
+      providerUsergroupId,
+      handle: "wrong-display-handle",
+    }],
+    content: `please <!subteam^${providerUsergroupId}|@wrong-display-handle> respond; @alice stays text`,
+  });
+  const result = await process(fixture, dependencies(fixture, {
+    async resolveProviderAgentMentionHandles() {
+      return [{
+        agentId: fixture.agent.id,
+        providerUsergroupId,
+        handle: "managed-agent-handle",
+      }];
+    },
+  }));
+  assert.equal(result.kind, "committed", JSON.stringify(result));
+  const [stored] = await fixture.db.select().from(messages)
+    .where(eq(messages.senderType, "external_projection"));
+  assert.equal(
+    stored?.content,
+    `please @${fixture.agent.name} respond; @alice stays text`,
+    "provider group id, not the display handle, chooses the Agent",
+  );
+  const mentions = await fixture.db.select().from(messageMentions);
+  assert.equal(mentions.length, 1);
+  assert.equal(mentions[0]?.messageId, stored?.id);
+  assert.equal(mentions[0]?.targetType, "agent");
+  assert.equal(mentions[0]?.targetId, fixture.agent.id);
+  assert.equal(mentions[0]?.handleAtSendTime, fixture.agent.name);
+  assert.equal(mentions[0]?.notifiableAtSend, true);
+});
+
+test("Slack managed group for an Agent outside the bound channel stays inert", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const [otherAgent] = await fixture.db.insert(agents).values({
+    serverId: fixture.server.id,
+    name: `outside-agent-${randomUUID().slice(0, 8)}`,
+    runtime: "codex",
+  }).returning();
+  const providerUsergroupId = "SOUTSIDE1";
+  await enqueue(fixture, "event-outside-agent-mention", {
+    ...payload(fixture, "provider-message-outside-agent-mention"),
+    schema: "external-inbound-normalized-event.v3",
+    providerFileIds: [],
+    providerAgentMentions: [{ providerUsergroupId, handle: "outside-agent" }],
+    content: `<!subteam^${providerUsergroupId}|@outside-agent> should stay inert`,
+  });
+  assert.equal((await process(fixture, dependencies(fixture, {
+    async resolveProviderAgentMentionHandles() {
+      return [{ agentId: otherAgent.id, providerUsergroupId, handle: "outside-agent" }];
+    },
+  }))).kind, "committed");
+  const [stored] = await fixture.db.select().from(messages)
+    .where(eq(messages.senderType, "external_projection"));
+  // Inert for mention purposes, but the author's label survives display so
+  // the reader can tell which Slack group was written.
+  assert.equal(stored?.content, "@outside-agent should stay inert");
+  assert.equal((await fixture.db.select().from(messageMentions)).length, 0);
+});
+
+test("Slack managed human usergroup creates one exact notifiable Raft user mention", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const agentUsergroupId = "SAGENT123";
+  const humanUsergroupId = "SHUMAN123";
+  await enqueue(fixture, "event-human-mention", {
+    ...payload(fixture, "provider-message-human-mention"),
+    schema: "external-inbound-normalized-event.v3",
+    providerFileIds: [],
+    providerAgentMentions: [
+      { providerUsergroupId: agentUsergroupId, handle: "managed-agent-handle" },
+      { providerUsergroupId: humanUsergroupId, handle: "wrong-human-handle" },
+    ],
+    content: `<!subteam^${humanUsergroupId}|@wrong-human-handle> and `
+      + `<!subteam^${agentUsergroupId}|@managed-agent-handle> please look`,
+  });
+  const result = await process(fixture, dependencies(fixture, {
+    async resolveProviderAgentMentionHandles() {
+      return [
+        { agentId: fixture.agent.id, providerUsergroupId: agentUsergroupId, handle: "managed-agent-handle" },
+        { userId: fixture.member.id, providerUsergroupId: humanUsergroupId, handle: "managed-human-handle" },
+      ];
+    },
+  }));
+  assert.equal(result.kind, "committed", JSON.stringify(result));
+  const [stored] = await fixture.db.select().from(messages)
+    .where(eq(messages.senderType, "external_projection"));
+  assert.equal(
+    stored?.content,
+    `@${fixture.member.name} and @${fixture.agent.name} please look`,
+    "provider group id, not the display handle, chooses the human",
+  );
+  const mentions = await fixture.db.select().from(messageMentions)
+    .where(eq(messageMentions.messageId, stored!.id));
+  assert.deepEqual(mentions.map((row) => ({
+    targetType: row.targetType,
+    targetId: row.targetId,
+    handleAtSendTime: row.handleAtSendTime,
+    notifiableAtSend: row.notifiableAtSend,
+  })).sort((left, right) => left.targetType.localeCompare(right.targetType)), [
+    {
+      targetType: "agent",
+      targetId: fixture.agent.id,
+      handleAtSendTime: fixture.agent.name,
+      notifiableAtSend: true,
+    },
+    {
+      targetType: "user",
+      targetId: fixture.member.id,
+      handleAtSendTime: fixture.member.name,
+      notifiableAtSend: true,
+    },
+  ]);
+});
+
+test("Slack managed human group for a user outside the mention scope stays inert", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const [outsider] = await fixture.db.insert(users).values({
+    email: `inbound-group-outsider-${randomUUID()}@raft.test`,
+    name: `inbound-group-outsider-${randomUUID().slice(0, 8)}`,
+    displayName: "Inbound Group Outsider",
+    passwordHash: "test",
+    emailVerified: true,
+  }).returning();
+  await fixture.db.insert(serverMembers).values({
+    serverId: fixture.server.id,
+    userId: outsider.id,
+    role: "member",
+  });
+  const providerUsergroupId = "SHUMANOUT1";
+  await enqueue(fixture, "event-outside-human-mention", {
+    ...payload(fixture, "provider-message-outside-human-mention"),
+    schema: "external-inbound-normalized-event.v3",
+    providerFileIds: [],
+    providerAgentMentions: [{ providerUsergroupId, handle: "outside-human" }],
+    content: `<!subteam^${providerUsergroupId}|@outside-human> should stay inert`,
+  });
+  assert.equal((await process(fixture, dependencies(fixture, {
+    async resolveProviderAgentMentionHandles() {
+      return [{ userId: outsider.id, providerUsergroupId, handle: "outside-human" }];
+    },
+  }))).kind, "committed");
+  const [stored] = await fixture.db.select().from(messages)
+    .where(eq(messages.senderType, "external_projection"));
+  assert.equal(stored?.content, "@outside-human should stay inert");
+  assert.equal((await fixture.db.select().from(messageMentions)).length, 0);
+});
+
+test("Slack Agent mention mapping failure retries instead of committing an inert false negative", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const providerUsergroupId = "SRETRY123";
+  await enqueue(fixture, "event-agent-mention-retry", {
+    ...payload(fixture, "provider-message-agent-mention-retry"),
+    schema: "external-inbound-normalized-event.v3",
+    providerFileIds: [],
+    providerAgentMentions: [{ providerUsergroupId, handle: "retry-agent" }],
+    content: `<!subteam^${providerUsergroupId}|@retry-agent> retry me`,
+  });
+  assert.deepEqual(await process(fixture, dependencies(fixture, {
+    async resolveProviderAgentMentionHandles() { return null; },
+  })), {
+    kind: "blocked",
+    eventId: (await fixture.db.select({ id: externalInboundEvents.id })
+      .from(externalInboundEvents))[0]!.id,
+    reason: "provider_agent_mention_unavailable",
+  });
+  assert.equal((await fixture.db.select().from(messages)
+    .where(eq(messages.senderType, "external_projection"))).length, 0);
+
+  assert.equal((await process(fixture, dependencies(fixture, {
+    now: () => new Date(NOW.getTime() + 31_000),
+    async resolveProviderAgentMentionHandles() {
+      return [{ agentId: fixture.agent.id, providerUsergroupId, handle: "retry-agent" }];
+    },
+  }))).kind, "committed");
+  assert.equal((await fixture.db.select().from(messageMentions)).length, 1);
+});
+
+test("Slack typed @name text mentions bound-channel Agents and humans without a usergroup", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const [outsideAgent] = await fixture.db.insert(agents).values({
+    serverId: fixture.server.id,
+    name: `outside-agent-${randomUUID().slice(0, 8)}`,
+    runtime: "codex",
+  }).returning();
+  const content = [
+    `@${fixture.agent.name.toUpperCase()} please look`,
+    `and @${fixture.agent.name}的 note`,
+    `cc @${fixture.member.name}`,
+    `@${outsideAgent.name} is not in this channel`,
+    `\`@${fixture.owner.name}\` in code`,
+    `mail me@${fixture.owner.name}`,
+    "@alice stays text",
+  ].join("; ");
+  await enqueue(fixture, "event-plain-text-mention", {
+    ...payload(fixture, "provider-message-plain-text-mention"),
+    content,
+  });
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "committed");
+  const [stored] = await fixture.db.select().from(messages)
+    .where(eq(messages.senderType, "external_projection"));
+  assert.equal(stored?.content, content, "typed text is stored as written");
+  const mentions = await fixture.db.select().from(messageMentions);
+  assert.deepEqual(mentions.map((mention) => ({
+    messageId: mention.messageId,
+    targetType: mention.targetType,
+    targetId: mention.targetId,
+    handleAtSendTime: mention.handleAtSendTime,
+    notifiableAtSend: mention.notifiableAtSend,
+  })).sort((left, right) => left.targetType.localeCompare(right.targetType)), [{
+    messageId: stored?.id,
+    targetType: "agent",
+    targetId: fixture.agent.id,
+    handleAtSendTime: fixture.agent.name,
+    notifiableAtSend: true,
+  }, {
+    messageId: stored?.id,
+    targetType: "user",
+    targetId: fixture.member.id,
+    handleAtSendTime: fixture.member.name,
+    notifiableAtSend: true,
+  }]);
+});
+
+test("Slack typed @name text shared by two channel members stays text", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const shared = fixture.agent.name;
+  await fixture.db.update(users).set({ name: shared.toUpperCase() })
+    .where(eq(users.id, fixture.member.id));
+  await enqueue(fixture, "event-plain-text-ambiguous", {
+    ...payload(fixture, "provider-message-plain-text-ambiguous"),
+    content: `@${shared.slice(0, 1).toUpperCase()}${shared.slice(1)} who?`,
+  });
+  assert.equal((await process(fixture, dependencies(fixture))).kind, "committed");
+  assert.equal((await fixture.db.select().from(messageMentions)).length, 0);
+});
+
+test("Slack typed @name text never matches Slack-encoded user or usergroup labels", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await enqueue(fixture, "event-slack-labels-not-plain-text", {
+    ...payload(fixture, "provider-message-slack-labels-not-plain-text"),
+    schema: "external-inbound-normalized-event.v3",
+    providerFileIds: [],
+    providerAgentMentions: [{ providerUsergroupId: "SOTHER123", handle: fixture.agent.name }],
+    content: `<@UHUMAN1|${fixture.agent.name}> and <!subteam^SOTHER123|@${fixture.agent.name}>`,
+  });
+  assert.equal((await process(fixture, dependencies(fixture, {
+    async resolveProviderAgentMentionHandles() { return []; },
+  }))).kind, "committed");
+  assert.equal((await fixture.db.select().from(messageMentions)).length, 0);
+});
+
+test("Slack usergroup and typed @name for the same Agent keep one mention", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const providerUsergroupId = "SAGENTDUP1";
+  await enqueue(fixture, "event-agent-mention-both-paths", {
+    ...payload(fixture, "provider-message-agent-mention-both-paths"),
+    schema: "external-inbound-normalized-event.v3",
+    providerFileIds: [],
+    providerAgentMentions: [{ providerUsergroupId, handle: fixture.agent.name }],
+    content: `<!subteam^${providerUsergroupId}|@${fixture.agent.name}> and again @${fixture.agent.name}`,
+  });
+  assert.equal((await process(fixture, dependencies(fixture, {
+    async resolveProviderAgentMentionHandles() {
+      return [{ agentId: fixture.agent.id, providerUsergroupId, handle: fixture.agent.name }];
+    },
+  }))).kind, "committed");
+  const mentions = await fixture.db.select().from(messageMentions);
+  assert.equal(mentions.length, 1);
+  assert.equal(mentions[0]?.targetId, fixture.agent.id);
+});
+
+test("Slack mention rendering is bounded and provider-neutral content remains byte-identical", () => {
+  const labels = new Map([["U1", `@${"x".repeat(80)}`]]);
+  const pathological = "<@U1>".repeat(7_000);
+  const rendered = renderSlackInboundMentionLabels(pathological, labels);
+  assert.ok(Buffer.byteLength(rendered, "utf8") <= 40_000);
+  assert.doesNotMatch(rendered, /U1/u);
+  assert.equal(renderSlackInboundMentionLabels("ordinary provider content", labels), "ordinary provider content");
 });
 
 test("v2 file events stay non-canonical until provider bytes are stored, then link atomically", async () => {
@@ -1828,4 +2278,501 @@ test("lease expiry is sampled after the exact event row lock and stop abort leav
   assert.equal(event.leaseOwner, null);
   assert.equal(event.leaseExpiresAt, null);
   assert.ok(event.encryptedPayload);
+});
+
+test("inbound thread reply on an agent-authored root records the authored thread follow", async () => {
+  const fixture = await seedFixture("public", "slack");
+  // Agent posts the root inside Raft; the bridge then outbound-mirrored it, so
+  // an accepted link rows exists. Provider reply lands on the canonical thread.
+  const [agentRoot] = await fixture.db.insert(messages).values({
+    channelId: fixture.channel.id,
+    content: "agent root",
+    senderType: "agent",
+    senderId: fixture.agent.id,
+    messageType: "chat",
+    createdAt: NOW,
+    updatedAt: NOW,
+  }).returning();
+  await fixture.db.insert(externalMessageLinks).values({
+    provider: "slack",
+    installId: fixture.authority.installId,
+    providerAuthorityId: fixture.authority.providerAuthorityId,
+    providerConversationId: fixture.authority.providerConversationId,
+    providerMessageId: "provider-agent-root",
+    bindingId: fixture.authority.bindingId,
+    bindingEpoch: fixture.authority.bindingEpoch,
+    connectionEpoch: fixture.authority.connectionEpoch,
+    raftMessageId: agentRoot.id,
+    raftCanonicalRootMessageId: agentRoot.id,
+    firstDirection: "raft_outbound",
+    payloadFingerprint: digest("provider-agent-root"),
+    outcomeState: "accepted",
+    authorityState: "active",
+    stateReason: "raft_outbound_committed",
+  });
+
+  await enqueue(
+    fixture,
+    "event-agent-root-reply",
+    payload(fixture, "provider-reply-to-agent", "provider-agent-root"),
+  );
+  const reply = await process(fixture);
+  assert.equal(reply.kind, "committed");
+
+  const [rootMessage] = await fixture.db.select().from(messages)
+    .where(eq(messages.id, agentRoot.id));
+  assert.ok(rootMessage.threadId);
+  const follows = await fixture.db.select().from(threadFollows)
+    .where(eq(threadFollows.threadChannelId, rootMessage.threadId!));
+  assert.equal(follows.length, 1);
+  assert.equal(follows[0]!.followerType, "agent");
+  assert.equal(follows[0]!.followerId, fixture.agent.id);
+  assert.equal(follows[0]!.reason, "authored");
+
+  const facts = await fixture.db.select().from(inboxNotificationFacts)
+    .where(eq(inboxNotificationFacts.messageId, reply.messageId));
+  const agentFact = facts.find((fact) => fact.receiverType === "agent" && fact.receiverId === fixture.agent.id);
+  assert.ok(agentFact, "agent parent author must be an unread-eligible receiver");
+  assert.equal(agentFact!.unreadEligible, true);
+});
+
+test("picked Slack users never mint Raft mentions, even when linked; the bridge bot still addresses agents", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await fixture.db.update(externalAppInstalls)
+    .set({ botUserId: "UBOT" })
+    .where(eq(externalAppInstalls.id, fixture.install.id));
+  await fixture.db.insert(externalHumanIdentityLinks).values({
+    serverId: fixture.server.id,
+    installId: fixture.install.id,
+    userId: fixture.member.id,
+    provider: "slack",
+    providerAuthorityId: fixture.authority.providerAuthorityId,
+    providerUserId: "ULINKEDMEMBER",
+    state: "active",
+    linkEpoch: 1,
+    observedConnectionEpoch: fixture.authority.connectionEpoch,
+  });
+
+  const mentionContent = "hey <@ULINKEDMEMBER> and <@UBOT> take a look <@UUNKNOWN>";
+  await enqueue(
+    fixture,
+    "event-mention",
+    payload(fixture, "provider-mention", null, mentionContent),
+  );
+  const result = await process(fixture);
+  assert.equal(result.kind, "committed");
+
+  const rows = await fixture.db.select().from(messageMentions)
+    .where(eq(messageMentions.messageId, result.messageId!));
+  const targets = rows.map((row) => `${row.targetType}:${row.targetId}`).sort();
+  assert.deepEqual(targets, [
+    `agent:${fixture.agent.id}`,
+  ], "a Slack account is a Slack identity; the linked Raft member is not mentioned");
+  for (const row of rows) {
+    assert.equal(row.notifiableAtSend, true);
+    assert.equal(row.source, "send_path");
+  }
+});
+
+test("a Slack member picked in Slack is recorded as a display-only external mention, never a Raft mention", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const slackActor = (externalActorId: string, displayName: string, handles: string[]) => ({
+    provider: "slack",
+    appRegistrationId: fixture.actor.appRegistrationId,
+    installId: fixture.actor.installId,
+    workspaceId: fixture.actor.workspaceId,
+    externalActorId,
+    displayName,
+    handles,
+    actorKind: "human" as const,
+    state: "active" as const,
+    deactivated: false,
+    projectionRevision: 1,
+    observedAt: NOW,
+  });
+  const [present, departed, unobserved] = await fixture.db.insert(externalActorProjections).values([
+    slackActor("UPRESENT", "Ada Lovelace", ["ada"]),
+    slackActor("UDEPARTED", "Grace Hopper", ["grace"]),
+    slackActor("UUNOBSERVED", "Alan Turing", ["alan"]),
+  ]).returning();
+  const observation = (projectionId: string, state: "active" | "removed") => ({
+    projectionId,
+    provider: "slack",
+    appRegistrationId: fixture.actor.appRegistrationId,
+    installId: fixture.actor.installId,
+    workspaceId: fixture.actor.workspaceId,
+    connectionEpoch: fixture.authority.connectionEpoch,
+    bindingId: fixture.authority.bindingId,
+    bindingEpoch: fixture.authority.bindingEpoch,
+    conversationId: fixture.authority.providerConversationId,
+    memberRevision: 5,
+    contextRevision: 5,
+    state,
+    observedAt: new Date(NOW.getTime() - 60_000),
+    expiresAt: new Date(NOW.getTime() + 60 * 60_000),
+  });
+  await fixture.db.insert(externalAddressabilityProjections).values([
+    observation(present!.id, "active"),
+    observation(departed!.id, "removed"),
+  ]);
+
+  await enqueue(
+    fixture,
+    "event-picked-slack-member",
+    payload(fixture, "provider-picked-slack-member", null, "hi <@UPRESENT>, <@UDEPARTED> and <@UUNOBSERVED>"),
+  );
+  const result = await process(fixture);
+  assert.equal(result.kind, "committed", JSON.stringify(result));
+
+  const [message] = await fixture.db.select().from(messages).where(eq(messages.id, result.messageId!));
+  assert.match(message!.content, /^hi @ada, @grace and @alan$/u);
+  const facts = await fixture.db.select().from(externalMentionFacts)
+    .where(eq(externalMentionFacts.messageId, result.messageId!));
+  assert.deepEqual(
+    facts.map((fact) => [fact.projectionId, fact.externalActorId, fact.handleAtSendTime, fact.resolutionReason]),
+    [[present!.id, "UPRESENT", "ada", "explicit_projection"]],
+    "only a member this binding currently observes is styled; departed and unobserved members stay plain text",
+  );
+  assert.ok(!facts.some((fact) => fact.projectionId === unobserved!.id));
+  const raftMentions = await fixture.db.select().from(messageMentions)
+    .where(eq(messageMentions.messageId, result.messageId!));
+  assert.equal(raftMentions.length, 0, "a Slack member is not a Raft principal and is never notified");
+});
+
+test("inbound mention of an unlinked provider user mints no Raft mention rows", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await enqueue(
+    fixture,
+    "event-unlinked-mention",
+    payload(fixture, "provider-unlinked-mention", null, "hi <@UNOBODY>"),
+  );
+  const result = await process(fixture);
+  assert.equal(result.kind, "committed");
+  const rows = await fixture.db.select().from(messageMentions)
+    .where(eq(messageMentions.messageId, result.messageId!));
+  assert.equal(rows.length, 0);
+});
+
+test("inbound thread reply delivers to a bot-mentioned non-follower exactly once", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await fixture.db.update(externalAppInstalls)
+    .set({ botUserId: "UBOT" })
+    .where(eq(externalAppInstalls.id, fixture.install.id));
+
+  // Provider-authored root (outbound-mirrored identity), agent is a parent
+  // channel member but NOT a thread follower. A bot mention mints the agent
+  // target; the commit's inbox fact marks it personalMention — delivery must
+  // not also fire the non-member wake path (exact-once).
+  const [root] = await fixture.db.insert(messages).values({
+    channelId: fixture.channel.id,
+    senderType: "agent",
+    senderId: fixture.agent.id,
+    messageType: "chat",
+    content: "agent thread root",
+    createdAt: NOW,
+    updatedAt: NOW,
+  }).returning();
+  await fixture.db.insert(externalMessageLinks).values({
+    provider: "slack",
+    installId: fixture.authority.installId,
+    providerAuthorityId: fixture.authority.providerAuthorityId,
+    providerConversationId: fixture.authority.providerConversationId,
+    providerMessageId: "provider-root-exact-once",
+    bindingId: fixture.authority.bindingId,
+    bindingEpoch: fixture.authority.bindingEpoch,
+    connectionEpoch: fixture.authority.connectionEpoch,
+    raftMessageId: root.id,
+    raftCanonicalRootMessageId: root.id,
+    firstDirection: "raft_outbound",
+    payloadFingerprint: digest("provider-root-exact-once"),
+    outcomeState: "accepted",
+    authorityState: "active",
+    stateReason: "raft_outbound_committed",
+  });
+
+  await enqueue(
+    fixture,
+    "event-bot-mention-reply",
+    payload(fixture, "provider-bot-mention-reply", "provider-root-exact-once", "looks good <@UBOT>"),
+  );
+  const reply = await process(fixture);
+  assert.equal(reply.kind, "committed", JSON.stringify(reply));
+
+  const [replyMessage] = await fixture.db.select().from(messages)
+    .where(eq(messages.id, reply.messageId));
+  const minted = await fixture.db.select().from(messageMentions)
+    .where(eq(messageMentions.messageId, reply.messageId!));
+  assert.deepEqual(
+    minted.map((row) => `${row.targetType}:${row.targetId}`),
+    [`agent:${fixture.agent.id}`],
+  );
+  const facts = await fixture.db.select().from(inboxNotificationFacts)
+    .where(eq(inboxNotificationFacts.messageId, reply.messageId!));
+  const agentFact = facts.find((fact) => fact.receiverType === "agent" && fact.receiverId === fixture.agent.id);
+  assert.ok(agentFact, "bot-mention must put the agent in the fact audience");
+  assert.equal(agentFact!.personalMention, true);
+
+  const deliveries: { agentId: string; channelId: string; mentioned?: boolean }[] = [];
+  const orchestrator = {
+    deliverMessage: async (agentId: string, payload: any) => {
+      deliveries.push({ agentId, channelId: payload.channel_id, mentioned: payload.mentioned });
+      return { status: "delivered" as const };
+    },
+  } as any;
+  const { deliverExternalInboundCommittedMessageToAgents } = await import("./messageService");
+  await deliverExternalInboundCommittedMessageToAgents(orchestrator, reply.messageId!);
+  assert.equal(
+    deliveries.filter((delivery) => delivery.agentId === fixture.agent.id).length,
+    1,
+    "a mentioned agent in the fact audience must be delivered exactly once",
+  );
+  assert.equal(deliveries[0]!.channelId, replyMessage!.channelId);
+  assert.equal(deliveries[0]!.mentioned, true);
+});
+
+test("top-level Joint inbound commits fan agent delivery to every active local face", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const jointFixture = await convertFixtureToJointWithParticipant(fixture);
+  const [participantAgent] = await fixture.db.insert(agents).values({
+    serverId: jointFixture.participantServer.id,
+    name: `inbound-joint-agent-${randomUUID().slice(0, 8)}`,
+    runtime: "codex",
+  }).returning();
+  await fixture.db.insert(channelAgents).values({
+    channelId: jointFixture.participant.id,
+    agentId: participantAgent.id,
+  });
+  await fixture.db.update(externalAppInstalls)
+    .set({ botUserId: "UBOT" })
+    .where(eq(externalAppInstalls.id, fixture.install.id));
+
+  await enqueue(
+    fixture,
+    "event-joint-bot-mention",
+    payload(fixture, "provider-joint-bot", null, "hello <@UBOT>"),
+  );
+  const result = await process(fixture);
+  assert.equal(result.kind, "committed");
+
+  // Mention minting fans out per face: the host-channel agent AND the
+  // participant-face agent each get a row.
+  const minted = await fixture.db.select().from(messageMentions)
+    .where(eq(messageMentions.messageId, result.messageId!));
+  assert.deepEqual(
+    minted.map((row) => `${row.targetType}:${row.targetId}`).sort(),
+    [`agent:${fixture.agent.id}`, `agent:${participantAgent.id}`].sort(),
+  );
+  for (const row of minted) assert.equal(row.notifiableAtSend, true);
+
+  // Facts land per face (sourceChannelId = the local channel id), so each
+  // side's agents receive the message under their own local identity.
+  const facts = await fixture.db.select().from(inboxNotificationFacts)
+    .where(eq(inboxNotificationFacts.messageId, result.messageId!));
+  const hostAgentFact = facts.find((fact) =>
+    fact.receiverType === "agent" && fact.receiverId === fixture.agent.id);
+  const participantAgentFact = facts.find((fact) =>
+    fact.receiverType === "agent" && fact.receiverId === participantAgent.id);
+  assert.ok(hostAgentFact);
+  assert.equal(hostAgentFact!.sourceChannelId, fixture.channel.id);
+  assert.ok(participantAgentFact);
+  assert.equal(participantAgentFact!.sourceChannelId, jointFixture.participant.id);
+
+  const deliveries: { agentId: string; channelId: string }[] = [];
+  const orchestrator = {
+    deliverMessage: async (agentId: string, payload: any) => {
+      deliveries.push({ agentId, channelId: payload.channel_id });
+      return { status: "delivered" as const };
+    },
+  } as any;
+  const { deliverExternalInboundCommittedMessageToAgents } = await import("./messageService");
+  await deliverExternalInboundCommittedMessageToAgents(orchestrator, result.messageId!);
+  const byAgent = new Map(deliveries.map((delivery) => [delivery.agentId, delivery.channelId]));
+  assert.equal(byAgent.get(fixture.agent.id), fixture.channel.id);
+  assert.equal(byAgent.get(participantAgent.id), jointFixture.participant.id);
+});
+
+test("private-channel mention of a linked outsider mints no row at all", async () => {
+  const fixture = await seedFixture("private", "slack");
+  const [outsider] = await fixture.db.insert(users).values({
+    email: `inbound-priv-outsider-${randomUUID()}@raft.test`,
+    name: `inbound-priv-outsider-${randomUUID().slice(0, 8)}`,
+    displayName: "Private Outsider",
+    passwordHash: "test",
+    emailVerified: true,
+  }).returning();
+  await fixture.db.insert(serverMembers).values({
+    serverId: fixture.server.id,
+    userId: outsider.id,
+    role: "member",
+  });
+  await fixture.db.insert(externalHumanIdentityLinks).values({
+    serverId: fixture.server.id,
+    installId: fixture.install.id,
+    userId: outsider.id,
+    provider: "slack",
+    providerAuthorityId: fixture.authority.providerAuthorityId,
+    providerUserId: "UPRIVOUT",
+    state: "active",
+    linkEpoch: 1,
+    observedConnectionEpoch: fixture.authority.connectionEpoch,
+  });
+
+  await enqueue(
+    fixture,
+    "event-priv-outsider-mention",
+    payload(fixture, "provider-priv-outsider", null, "cc <@UPRIVOUT>"),
+  );
+  const result = await process(fixture);
+  assert.equal(result.kind, "committed");
+  assert.equal(
+    (await fixture.db.select().from(messageMentions)
+      .where(eq(messageMentions.messageId, result.messageId!))).length,
+    0,
+    "private scope must not record an out-of-scope linked identity",
+  );
+});
+
+test("Joint channel mention of a linked outsider mints no row at all", async () => {
+  const fixture = await seedFixture("public", "slack");
+  await convertFixtureToJointWithParticipant(fixture);
+  const [outsider] = await fixture.db.insert(users).values({
+    email: `inbound-joint-outsider-${randomUUID()}@raft.test`,
+    name: `inbound-joint-outsider-${randomUUID().slice(0, 8)}`,
+    displayName: "Joint Outsider",
+    passwordHash: "test",
+    emailVerified: true,
+  }).returning();
+  await fixture.db.insert(serverMembers).values({
+    serverId: fixture.server.id,
+    userId: outsider.id,
+    role: "member",
+  });
+  await fixture.db.insert(externalHumanIdentityLinks).values({
+    serverId: fixture.server.id,
+    installId: fixture.install.id,
+    userId: outsider.id,
+    provider: "slack",
+    providerAuthorityId: fixture.authority.providerAuthorityId,
+    providerUserId: "UJOINTOUT",
+    state: "active",
+    linkEpoch: 1,
+    observedConnectionEpoch: fixture.authority.connectionEpoch,
+  });
+
+  await enqueue(
+    fixture,
+    "event-joint-outsider-mention",
+    payload(fixture, "provider-joint-outsider", null, "cc <@UJOINTOUT>"),
+  );
+  const result = await process(fixture);
+  assert.equal(result.kind, "committed");
+  assert.equal(
+    (await fixture.db.select().from(messageMentions)
+      .where(eq(messageMentions.messageId, result.messageId!))).length,
+    0,
+    "joint scope must not record an out-of-scope linked identity",
+  );
+});
+
+test("Joint channel inbound writes mention rows at the host local face coordinates", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const jointFixture = await convertFixtureToJointWithParticipant(fixture);
+  await fixture.db.update(externalAppInstalls)
+    .set({ botUserId: "UBOT" })
+    .where(eq(externalAppInstalls.id, fixture.install.id));
+
+  await enqueue(
+    fixture,
+    "event-joint-origin",
+    payload(fixture, "provider-joint-origin", null, "ping <@UBOT>"),
+  );
+  const result = await process(fixture);
+  assert.equal(result.kind, "committed");
+
+  const rows = await fixture.db.select().from(messageMentions)
+    .where(eq(messageMentions.messageId, result.messageId!));
+  assert.ok(rows.length > 0);
+  for (const row of rows) {
+    // mention-v6 contract: message lands on canonical storage, but the
+    // mention row records the sender's local projection — the host face.
+    assert.equal(row.channelId, fixture.channel.id);
+    assert.equal(row.serverId, fixture.server.id);
+  }
+  assert.notEqual(fixture.channel.id, jointFixture.canonical.id);
+});
+
+test("Joint thread inbound delivers per-face parent context and host-face mention coordinates", async () => {
+  const fixture = await seedFixture("public", "slack");
+  const jointFixture = await convertFixtureToJointWithParticipant(fixture);
+  const [participantAgent] = await fixture.db.insert(agents).values({
+    serverId: jointFixture.participantServer.id,
+    name: `inbound-jt-agent-${randomUUID().slice(0, 8)}`,
+    runtime: "codex",
+  }).returning();
+  await fixture.db.insert(channelAgents).values({
+    channelId: jointFixture.participant.id,
+    agentId: participantAgent.id,
+  });
+  await fixture.db.update(externalAppInstalls)
+    .set({ botUserId: "UBOT" })
+    .where(eq(externalAppInstalls.id, fixture.install.id));
+
+  await enqueue(fixture, "event-jt-root", payload(fixture, "provider-jt-root"));
+  const root = await process(fixture);
+  assert.equal(root.kind, "committed");
+  await enqueue(
+    fixture,
+    "event-jt-reply",
+    payload(fixture, "provider-jt-reply", "provider-jt-root", "reply <@UBOT>"),
+  );
+  const reply = await process(fixture);
+  assert.equal(reply.kind, "committed");
+
+  const [rootMessage] = await fixture.db.select().from(messages)
+    .where(eq(messages.id, root.messageId));
+  const [jointThread] = await fixture.db.select().from(jointChannels)
+    .where(eq(jointChannels.canonicalChannelId, rootMessage.threadId!));
+  const threadFaces = await fixture.db.select({
+    mapping: jointChannelServers,
+  }).from(jointChannelServers)
+    .where(eq(jointChannelServers.jointChannelId, jointThread.id));
+  const hostFace = threadFaces.find((face) => face.mapping.role === "host")!;
+  const participantFace = threadFaces.find((face) => face.mapping.role === "participant")!;
+
+  // Mention rows carry the sender's local face coordinates — the host local
+  // thread — never the canonical storage thread.
+  const rows = await fixture.db.select().from(messageMentions)
+    .where(eq(messageMentions.messageId, reply.messageId!));
+  assert.ok(rows.length > 0);
+  for (const row of rows) {
+    assert.equal(row.channelId, hostFace.mapping.localChannelId);
+    assert.equal(row.serverId, fixture.server.id);
+  }
+
+  const deliveries: { agentId: string; channelId: string; parentId?: string; parentType?: string }[] = [];
+  const orchestrator = {
+    deliverMessage: async (agentId: string, payload: any) => {
+      deliveries.push({
+        agentId,
+        channelId: payload.channel_id,
+        parentId: payload.parent_channel_id,
+        parentType: payload.parent_channel_type,
+      });
+      return { status: "delivered" as const };
+    },
+  } as any;
+  const { deliverExternalInboundCommittedMessageToAgents } = await import("./messageService");
+  await deliverExternalInboundCommittedMessageToAgents(orchestrator, reply.messageId!);
+
+  const byAgent = new Map(deliveries.map((delivery) => [delivery.agentId, delivery]));
+  const host = byAgent.get(fixture.agent.id);
+  assert.ok(host);
+  assert.equal(host!.channelId, hostFace.mapping.localChannelId);
+  assert.equal(host!.parentId, fixture.channel.id);
+  assert.equal(host!.parentType, "joint");
+  const participant = byAgent.get(participantAgent.id);
+  assert.ok(participant);
+  assert.equal(participant!.channelId, participantFace.mapping.localChannelId);
+  assert.equal(participant!.parentId, jointFixture.participant.id);
+  assert.equal(participant!.parentType, "joint");
 });

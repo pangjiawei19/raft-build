@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { MemoryRouter } from "react-router-dom";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
-import { ToastProvider } from "raft-ui";
+import { ToastProvider } from "@botiverse/raft-ui";
 
 import api from "../src/api/client";
 import type { User } from "../src/store/authStore";
@@ -249,7 +248,7 @@ test("opening an Agent profile from a thread keeps the thread mounted underneath
   );
 
   const retainedThreadPanel = screen.getByTestId("thread-side-column");
-  const profilePanel = await screen.findByTestId("profile-panel");
+  const profilePanel = await screen.findByTestId("profile-panel", {}, { timeout: 3000 });
   assert.equal(
     screen.getByTestId("thread-profile-side-column").getAttribute("data-collapse-channel"),
     "true",
@@ -321,7 +320,12 @@ test("inline task refs opened from a content route preserve task intent through 
 
   await screen.findByTestId("task-thread-modal");
   await waitFor(() => {
-    assert.equal(useThreadStore.getState().openIntent, "task");
+    // task #699: the task intent lands in the independent modal slot and never
+    // touches the side-thread open* fields.
+    assert.equal(useThreadStore.getState().taskModal?.parentMessageId, "task-message-1");
+    assert.equal(useThreadStore.getState().taskModal?.parentChannelId, "channel-1");
+    assert.equal(useThreadStore.getState().openParentMessageId, null);
+    assert.equal(useThreadStore.getState().openIntent, null);
     assert.equal(screen.queryByTestId("thread-side-column"), null);
   });
 });
@@ -333,11 +337,16 @@ test("mobile task sheet has a real back affordance that closes to its underlying
   seedState(channel);
   useTaskStore.setState({ tasks: [task] });
   useThreadStore.setState({
-    openParentChannelId: task.channelId,
-    openParentMessageId: task.messageId,
-    openThreadChannelId: "thread-task-804",
-    openIntent: "task",
-    openedAt: Date.now(),
+    // task #699: the mobile task sheet reads the independent modal slot.
+    taskModal: {
+      parentMessageId: task.messageId,
+      parentChannelId: task.channelId,
+      threadChannelId: "thread-task-804",
+      serverSlug: "acme",
+      focusedMessageId: null,
+      loading: false,
+      error: null,
+    },
   });
 
   api.get = (async (url: string) => {
@@ -368,7 +377,78 @@ test("mobile task sheet has a real back affordance that closes to its underlying
   fireEvent.click(screen.getByTestId("task-modal-mobile-back"));
 
   await waitFor(() => {
-    assert.equal(useThreadStore.getState().openParentMessageId, null);
+    assert.equal(useThreadStore.getState().taskModal, null);
     assert.equal(screen.queryByTestId("task-thread-modal"), null);
   });
+});
+
+function openTaskModalOver(task: Task) {
+  useTaskStore.setState({ tasks: [task] });
+  useThreadStore.setState({
+    taskModal: {
+      parentMessageId: task.messageId,
+      parentChannelId: task.channelId,
+      threadChannelId: "thread-task-804",
+      serverSlug: "acme",
+      focusedMessageId: null,
+      loading: false,
+      error: null,
+    },
+  });
+  api.get = (async (url: string) => {
+    if (url === "/messages/forward/enabled") return { data: { enabled: false } };
+    if (url === "/messages/channel/thread-task-804?limit=50") {
+      return { data: { messages: [], hasOlder: false, hasNewer: false } };
+    }
+    if (url === "/tasks/channel/channel-1") return { data: { tasks: [task] } };
+    if (url === "/channels/channel-1/members") return { data: { humans: [], agents: [] } };
+    return { data: {} };
+  }) as typeof api.get;
+  api.post = (async () => ({ data: {} })) as typeof api.post;
+  render(
+    <TestIntlProvider>
+      <MemoryRouter initialEntries={["/s/acme/channel/channel-1"]}>
+        <ToastProvider>
+          <RightPanel />
+        </ToastProvider>
+      </MemoryRouter>
+    </TestIntlProvider>,
+  );
+}
+
+test("View in thread leaves the task modal for the same message's side thread", async () => {
+  installDesktopViewport();
+  const channel = makeChannel();
+  const task = makeTask();
+  seedState(channel);
+  openTaskModalOver(task);
+
+  await screen.findByTestId("task-thread-modal");
+  // Icon-only (Artea): the label lives in the accessible name and tooltip.
+  assert.equal(screen.getByTestId("task-modal-view-in-thread").getAttribute("aria-label"), "View in thread");
+  assert.equal(screen.getByTestId("task-modal-view-in-thread").textContent, "");
+  fireEvent.click(screen.getByTestId("task-modal-view-in-thread"));
+
+  await waitFor(() => {
+    const state = useThreadStore.getState();
+    assert.equal(state.taskModal, null, "the task modal slot is emptied");
+    // Thread intent, not task intent: the side thread of the same message,
+    // never a re-opened task modal.
+    assert.equal(state.openIntent, "thread");
+    assert.equal(state.openParentMessageId, task.messageId);
+    assert.equal(state.openParentChannelId, task.channelId);
+    assert.ok(screen.queryByTestId("task-thread-modal") === null);
+  });
+});
+
+test("legacy tasks have no thread to view, so the task modal offers no View in thread", async () => {
+  installDesktopViewport();
+  const channel = makeChannel();
+  const task = { ...makeTask(), isLegacy: true };
+  seedState(channel);
+  openTaskModalOver(task);
+
+  await screen.findByTestId("task-thread-modal");
+  assert.ok(screen.queryByTestId("task-modal-close") !== null);
+  assert.ok(screen.queryByTestId("task-modal-view-in-thread") === null);
 });

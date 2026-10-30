@@ -1,9 +1,9 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { assertOptionFieldLabels } from "./helpers/optionFieldLabels";
 
-import { afterEach, test } from "node:test";
 import type { ComponentProps, ReactElement } from "react";
 import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import type { RenderOptions } from "@testing-library/react";
@@ -12,7 +12,9 @@ import {
   KIMI_SDK_FORM_DEFINITION_REF,
   PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
 } from "@botiverse/raft-shared";
+import { toRuntimeFormV2 } from "@botiverse/raft-runtime-form";
 import type {
+  AgentCreateFormDefinition,
   ResolvedAgentCreateFormDefinition,
   RuntimeFormDefinitionRef,
   RuntimeSelectionOption,
@@ -29,6 +31,7 @@ import { useServerStore } from "../src/store/serverStore";
 import {
   prefetchServerFeatureFlags,
   resetServerFeatureFlagsForTests,
+  RUNTIME_FORM_V2_WEB_FLAG_KEY,
 } from "../src/store/serverFeatureFlags";
 import { writeCreateAgentLastConfig } from "../src/utils/createAgentLastConfig";
 import { TestIntlProvider } from "./helpers/intl";
@@ -498,10 +501,7 @@ test("Kimi create uses the served model-scoped effort metadata without cross-mod
 
   const modelSelect = await screen.findByTestId("schema-runtime-model-select");
   assert.ok(screen.getByTestId("schema-runtime-reasoning-select"));
-  fireEvent.click(modelSelect);
-  const k2Option = await screen.findByRole("option", { name: "Kimi K2" });
-  fireEvent.pointerDown(k2Option);
-  fireEvent.click(k2Option);
+  await pickOption(modelSelect, "Kimi K2");
   await waitFor(() => assert.equal(screen.queryByTestId("schema-runtime-reasoning-select"), null));
 
   fireEvent.click(modelSelect);
@@ -582,7 +582,7 @@ test("Kimi create without a schema ref hides and omits the unmanaged effort fiel
   );
 });
 
-test("a ready provider connection hides inline credentials and submits only its reference", async () => {
+test("a saved provider leads the Provider selector, keeps its schema, and submits only its reference", async () => {
   seedStores(["builtin"]);
   const postBodies: unknown[] = [];
   api.get = (async (url: string) => {
@@ -600,6 +600,7 @@ test("a ready provider connection hides inline credentials and submits only its 
         credentialVersion: 1,
         hasCredential: true,
         assignedAgentCount: 0,
+        latestVerified: null,
         lastCheckedAt: "2026-08-03T08:00:00.000Z",
         lastErrorCategory: null,
         createdAt: "2026-08-03T08:00:00.000Z",
@@ -635,12 +636,39 @@ test("a ready provider connection hides inline credentials and submits only its 
 
   await prefetchServerFeatureFlags("server-1");
   renderDialog();
-  const connectionSelect = await screen.findByTestId("create-agent-provider-connection");
-  fireEvent.click(connectionSelect);
-  const connectionOption = await screen.findByRole("option", { name: "Team DeepSeek" });
+  const providerSelect = await screen.findByTestId("schema-runtime-provider-select");
+  assert.ok(
+    screen.queryByText("Provider connection") === null,
+    "the separate Provider connection field must stay retired",
+  );
+  fireEvent.click(providerSelect);
+  assert.ok(await screen.findByText("Saved providers"));
+  assert.ok(screen.getByText("Direct setup"));
+  const connectionOption = await screen.findByRole("option", { name: "Server DeepSeek · Team DeepSeek" });
+  const providerOptions = screen.getAllByRole("option").map((option) => option.textContent?.trim());
+  assert.ok(
+    providerOptions.indexOf("Server DeepSeek · Team DeepSeek") < providerOptions.indexOf("Server DeepSeek"),
+    "saved providers must appear before direct setup",
+  );
   fireEvent.pointerDown(connectionOption);
   fireEvent.click(connectionOption);
-  await waitFor(() => assert.equal(screen.queryByTestId("schema-runtime-api-key"), null));
+  const apiKey = await screen.findByTestId("schema-runtime-api-key");
+  assert.equal(apiKey.hasAttribute("disabled"), true);
+  assert.equal(apiKey.getAttribute("placeholder"), "Provided by “Team DeepSeek”");
+  assert.equal((apiKey as HTMLInputElement).value, "");
+  assert.ok(screen.getByText("Served Model"), "the saved DeepSeek connection keeps the DeepSeek schema");
+  const editButton = screen.getByRole("button", { name: "Edit saved provider" });
+  fireEvent.click(editButton);
+  const editDialog = await screen.findByTestId("provider-connection-edit-dialog");
+  const editSecret = editDialog.querySelector<HTMLInputElement>('input[type="password"]');
+  assert.ok(editSecret, "the Provider-field action must open the shared connection editor");
+  assert.equal(editSecret.value, "", "editing must not hydrate the stored credential into the DOM");
+  const closeEdit = editDialog.querySelector<HTMLButtonElement>('button[aria-label="Close"]');
+  assert.ok(closeEdit, "the shared connection editor must remain independently closable");
+  fireEvent.click(closeEdit);
+  await waitFor(() =>
+    assert.ok(screen.queryByTestId("provider-connection-edit-dialog") === null),
+  );
   fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "Alice" } });
   fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
 
@@ -653,6 +681,136 @@ test("a ready provider connection hides inline credentials and submits only its 
     connectionId: "11111111-1111-4111-8111-111111111111",
   });
   assert.equal(JSON.stringify(submitted).includes("apiKey"), false);
+});
+
+test("v2 flag on: builtin create uses the v2 form, whose picker natively offers saved providers", async () => {
+  // Phase 2 (task #46): the #8814-era stopgap that pinned builtin create to v1
+  // is gone — the v2 form itself carries the saved/direct picker
+  // (capability provider.saved_connection). This is the flipped guard: create
+  // must now use v2 and must NOT fall back to the v1 definition endpoints.
+  seedStores(["builtin"]);
+  const CONNECTION = "22222222-2222-4222-8222-222222222222";
+  const postBodies: unknown[] = [];
+  const served = toRuntimeFormV2(definitionFixture() as unknown as AgentCreateFormDefinition) as unknown as {
+    dataSchema: { properties: Record<string, Record<string, unknown>> };
+  } & Record<string, unknown>;
+  served.requiredClientCapabilities = ["provider.saved_connection"];
+  served.revision = "rev-create";
+  for (const key of ["apiKey", "baseUrl", "supportsImageInput"]) {
+    served.dataSchema.properties[key]!["x-connectionOwned"] = true;
+  }
+  api.get = (async (url: string) => {
+    if (url === "/provider-connections") {
+      return { data: { connections: [{
+        id: CONNECTION,
+        name: "Team DeepSeek",
+        providerId: "deepseek",
+        authMethod: "api_key",
+        endpointUrl: null,
+        supportsImageInput: false,
+        enabled: true,
+        status: "ready",
+        configVersion: 1,
+        credentialVersion: 1,
+        hasCredential: true,
+        assignedAgentCount: 0,
+        latestVerified: null,
+        lastCheckedAt: "2026-08-03T08:00:00.000Z",
+        lastErrorCategory: null,
+        createdAt: "2026-08-03T08:00:00.000Z",
+        updatedAt: "2026-08-03T08:00:00.000Z",
+      }] } } as never;
+    }
+    if (url.endsWith("/runtime-options")) {
+      return { data: { context: "new_agent", machineId: "machine-1", options: [{
+        ...runtimeOption("builtin", ref),
+        runtimeFormV2: { protocolVersion: 2 },
+      }] } } as never;
+    }
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/builtin") {
+      return { data: served } as never;
+    }
+    if (url.includes("/runtime-forms/v2/builtin/option-sources/provider")) {
+      assert.ok(url.includes("formRevision=rev-create"), `the source request must echo the revision: ${url}`);
+      return {
+        data: {
+          sourceId: "provider", kind: "select", pointer: "/providerId",
+          options: [
+            {
+              value: `connection:${CONNECTION}`, label: "DeepSeek · Team DeepSeek", providerKind: "preset",
+              connectionId: CONNECTION, underlyingProviderId: "deepseek", group: "saved",
+            },
+            { value: "deepseek", label: "DeepSeek", providerKind: "preset", group: "direct" },
+            { value: "openai-compatible", label: "OpenAI compatible", providerKind: "gateway", group: "direct" },
+          ],
+          defaultValue: "deepseek",
+        },
+      } as never;
+    }
+    if (url.includes("/runtime-forms/v2/builtin/option-sources/model")) {
+      assert.ok(url.includes("formRevision=rev-create"), `the source request must echo the revision: ${url}`);
+      return {
+        data: {
+          sourceId: "model", kind: "dependent_select", pointer: "/model", dependsOn: "/providerId",
+          optionsByValue: {
+            [`connection:${CONNECTION}`]: [{ value: "deepseek-v4-pro", label: "V4 Pro" }],
+            deepseek: [{ value: "deepseek-v4-pro", label: "V4 Pro" }],
+            "openai-compatible": [],
+          },
+          defaultValueByValue: { [`connection:${CONNECTION}`]: "deepseek-v4-pro", deepseek: "deepseek-v4-pro" },
+          customValueAllowedByValue: { [`connection:${CONNECTION}`]: false, deepseek: false, "openai-compatible": true },
+        },
+      } as never;
+    }
+    if (url.includes("/runtime-form-definitions/")) {
+      throw new Error(`builtin create must not fall back to the v1 definition endpoints: ${url}`);
+    }
+    if (url.includes("/runtime-models/")) return { data: { models: [] } } as never;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async (url: string, body?: unknown) => {
+    if (url === "/feature-flags/evaluate") {
+      return {
+        data: { evaluations: [
+          { key: PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, enabled: true },
+          { key: RUNTIME_FORM_V2_WEB_FLAG_KEY, enabled: true },
+        ] },
+      } as never;
+    }
+    assert.equal(url, "/agents");
+    postBodies.push(body);
+    return { data: makeAgent("builtin", null) } as never;
+  }) as typeof api.post;
+
+  await prefetchServerFeatureFlags("server-1");
+  renderDialog();
+
+  const provider = await screen.findByTestId("runtime-form-v2-providerId");
+  assert.ok(screen.queryByTestId("schema-runtime-provider-select") === null, "the v1 picker is not rendered");
+  // Open the picker first: the saved group must lead, then take the connection.
+  fireEvent.focus(provider);
+  fireEvent.keyDown(provider, { key: "ArrowDown" });
+  assert.ok(await screen.findByText("Saved providers"), "saved connections lead as their own group");
+  screen.getByText("Direct setup");
+  const savedOption = await screen.findByRole("option", { name: "DeepSeek · Team DeepSeek" });
+  fireEvent.pointerDown(savedOption);
+  fireEvent.click(savedOption);
+  const apiKey = screen.getByTestId("runtime-form-v2-apiKey");
+  assert.equal(apiKey.hasAttribute("disabled"), true, "the connection owns the credential field");
+  assert.match(apiKey.getAttribute("placeholder") ?? "", /Provided by/);
+  assert.equal(screen.getByTestId("runtime-form-v2-edit-provider-connection-providerId") !== null, true, "the authorized pencil is present");
+
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2Conn" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  const submitted = postBodies[0] as Record<string, unknown> & { formValues: Record<string, unknown> };
+  assert.deepEqual(submitted.formDefinitionRef, { protocolVersion: 2, runtimeId: "builtin" });
+  assert.equal(submitted.runtimeConfig, undefined);
+  assert.equal(submitted.formValues.providerId, `connection:${CONNECTION}`);
+  assert.equal(submitted.formValues.model, "deepseek-v4-pro");
+  assert.equal("apiKey" in submitted.formValues, false, "owned fields never enter formValues");
+  assert.equal("baseUrl" in submitted.formValues, false);
+  assert.equal("supportsImageInput" in submitted.formValues, false);
 });
 
 test("gateway image-input checkbox resets on provider switch and submits only when checked", async () => {
@@ -1242,4 +1400,666 @@ test("agent:create ActionCard keeps a first-agent create on the card surface", a
   await new Promise<void>((resolve) => setTimeout(resolve, 0));
   assert.ok(postCalls.includes("/agents"));
   assert.equal(screen.getByTestId("create-agent-location").textContent, "/s/server/channel/channel-1");
+});
+
+test("Built-in v3 advanced plugin checkbox defaults off and submits the user selection", async () => {
+  seedStores(["builtin"]);
+  const nextRef = { ...ref, schemaVersion: "builtin-pi.create.v3" };
+  const definition = definitionResponse();
+  Object.assign(definition, nextRef);
+  definition.dataSchema.properties.loadLocalPlugins = { type: "boolean", title: "Load local Pi extensions" };
+  definition.uiSchema.order.push("loadLocalPlugins");
+  definition.uiSchema.layout.advanced.push("/loadLocalPlugins");
+  for (const source of Object.values(definition.optionSources)) source.schemaVersion = nextRef.schemaVersion;
+  const sources = definitionFixture().optionSources;
+  for (const source of Object.values(sources)) source.schemaVersion = nextRef.schemaVersion;
+  let submitted: { runtimeConfig: { loadLocalPlugins: boolean } } | undefined;
+  api.get = (async (url: string) => {
+    if (url.endsWith("/runtime-options")) return { data: { context: "new_agent", machineId: "machine-1", options: [runtimeOption("builtin", nextRef)] } } as never;
+    if (url.includes("/option-sources/provider?")) return { data: sources.provider } as never;
+    if (url.includes("/option-sources/model?")) return { data: sources.model } as never;
+    if (url.includes("/runtime-form-definitions/builtin?")) return { data: definition } as never;
+    if (url.includes("/runtime-models/")) return { data: { models: [] } } as never;
+    if (url === "/provider-connections") return { data: { connections: [] } } as never;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async (_url: string, body: unknown) => {
+    if (_url !== "/agents") return { data: {} } as never;
+    submitted = body as typeof submitted;
+    return { data: makeAgent("builtin", submitted?.runtimeConfig) } as never;
+  }) as typeof api.post;
+  renderDialog();
+  await screen.findByText("Server DeepSeek");
+  fireEvent.click(screen.getByRole("button", { name: "Advanced" }));
+  const toggle = screen.getByRole("checkbox", { name: "Load local Pi extensions" });
+  assert.equal(toggle.getAttribute("aria-checked"), "false");
+  fireEvent.click(toggle);
+  assert.equal(toggle.getAttribute("aria-checked"), "true");
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "plugin-agent" } });
+  fireEvent.change(screen.getByTestId("schema-runtime-api-key"), { target: { value: "test-key" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
+  await waitFor(() => assert.equal(submitted?.runtimeConfig.loadLocalPlugins, true));
+});
+
+test("with runtime_form_v2_web on, create renders the v2 form by field kind, tolerates new fields, and submits field values", async () => {
+  seedStores(["kimi-sdk"]);
+  const postBodies: unknown[] = [];
+  const served = toRuntimeFormV2(kimiDefinitionResponse() as unknown as AgentCreateFormDefinition) as unknown as {
+    dataSchema: { properties: Record<string, unknown> };
+    uiSchema: { localization: Record<string, unknown> };
+  } & Record<string, unknown>;
+  // Things a newer server may send: an unknown top-level key, a new optional
+  // field of a kind this client cannot render, a new optional boolean.
+  served.somethingNew = { at: "top level" };
+  served.dataSchema.properties.newWidget = { type: "color", title: "Colour" };
+  served.dataSchema.properties.newFlag = { type: "boolean", title: "Brand new flag" };
+  api.get = (async (url: string) => {
+    if (url === "/provider-connections") return { data: { connections: [] } } as never;
+    if (url.endsWith("/runtime-options")) {
+      return { data: { context: "new_agent", machineId: "machine-1", options: [{ ...runtimeOption("kimi-sdk", kimiRef), runtimeFormV2: { protocolVersion: 2 } }] } } as never;
+    }
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/kimi-sdk") return { data: served } as never;
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/kimi-sdk/option-sources/model") {
+      return { data: kimiDefinitionFixture().optionSources.model } as never;
+    }
+    if (url.includes("/runtime-form-definitions/kimi-sdk/option-sources/model?schemaVersion=")) {
+      return { data: kimiDefinitionFixture().optionSources.model } as never;
+    }
+    if (url.includes("/runtime-form-definitions/kimi-sdk?schemaVersion=")) return { data: kimiDefinitionResponse() } as never;
+    if (url.includes("/runtime-models/")) return { data: { models: [] } } as never;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async (url: string, body?: unknown) => {
+    if (url === "/feature-flags/evaluate") {
+      return { data: { evaluations: [{ key: RUNTIME_FORM_V2_WEB_FLAG_KEY, enabled: true }] } } as never;
+    }
+    assert.equal(url, "/agents");
+    postBodies.push(body);
+    return { data: makeAgent("kimi-sdk", null) } as never;
+  }) as typeof api.post;
+
+  await prefetchServerFeatureFlags("server-1");
+  renderDialog();
+
+  const modelSelect = await screen.findByTestId("runtime-form-v2-model");
+  // getBy* throws when absent: labels come from the served localization, effort
+  // choices follow the selected model, and a new optional boolean renders.
+  screen.getByText("Served Kimi model");
+  screen.getByTestId("runtime-form-v2-reasoningEffort");
+  screen.getByText("Brand new flag");
+  assert.ok(screen.queryByText("Colour") === null, "an optional field of an unknown kind is skipped, not fatal");
+  assert.ok(screen.queryByTestId("schema-runtime-model-select") === null, "the v1 renderer is not used");
+
+  await pickOption(modelSelect, "Kimi K2");
+  await waitFor(() => assert.ok(screen.queryByTestId("runtime-form-v2-reasoningEffort") === null));
+
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2Alice" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  const submitted = postBodies[0] as Record<string, unknown> & { formValues: Record<string, unknown> };
+  assert.deepEqual(submitted.formDefinitionRef, { protocolVersion: 2, runtimeId: "kimi-sdk" });
+  assert.equal(submitted.runtimeConfig, undefined, "v2 submits field values, never a client-built runtimeConfig");
+  assert.equal(submitted.formValues.model, "kimi-code/k2");
+  assert.equal(submitted.formValues.reasoningEffort, null);
+  assert.equal(submitted.formValues.newFlag, false);
+});
+
+// v2 create opens by the row's own `runtimeFormV2` marker, not by the v1
+// `formDefinitionRef`: a runtime can have a v2 form and no v1 form at all.
+async function renderV2OnlyCodexCreate(flag: boolean) {
+  seedStores(["codex"]);
+  const getCalls: string[] = [];
+  const postBodies: unknown[] = [];
+  api.get = (async (url: string) => {
+    if (url === "/provider-connections") return { data: { connections: [] } } as never;
+    getCalls.push(url);
+    if (url.endsWith("/runtime-options")) {
+      return {
+        data: { context: "new_agent", machineId: "machine-1", options: [{ ...runtimeOption("codex"), runtimeFormV2: { protocolVersion: 2 } }] },
+      } as never;
+    }
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/codex") {
+      return {
+        data: {
+          protocolVersion: 2,
+          runtimeId: "codex",
+          schemaVersion: "codex.v2-test",
+          dataSchema: { type: "object", required: ["model"], properties: { model: { type: "string", title: "Served codex model" } } },
+        },
+      } as never;
+    }
+    if (url.includes("/runtime-models/")) return { data: { models: [] } } as never;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async (url: string, body?: unknown) => {
+    if (url === "/feature-flags/evaluate") {
+      return { data: { evaluations: [{ key: RUNTIME_FORM_V2_WEB_FLAG_KEY, enabled: flag }] } } as never;
+    }
+    assert.equal(url, "/agents");
+    postBodies.push(body);
+    return { data: makeAgent("codex", null) } as never;
+  }) as typeof api.post;
+  await prefetchServerFeatureFlags("server-1");
+  renderDialog();
+  await waitFor(() => assert.ok(screen.getAllByText("Codex CLI").length > 0));
+  return { getCalls, postBodies };
+}
+
+test("with runtime_form_v2_web on, a runtime with only a v2 form creates through the v2 form", async () => {
+  const { getCalls, postBodies } = await renderV2OnlyCodexCreate(true);
+  const field = await screen.findByTestId("runtime-form-v2-model");
+  screen.getByText("Served codex model");
+  assert.ok(screen.queryByTestId("runtime-model-source-status") === null, "the legacy fields are replaced");
+  assert.equal(getCalls.some((url) => url.includes("runtime-form-definitions")), false, "no v1 definition is fetched");
+  fireEvent.change(field, { target: { value: "gpt-5.5" } });
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2Codex" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  const submitted = postBodies[0] as Record<string, unknown>;
+  assert.deepEqual(submitted.formDefinitionRef, { protocolVersion: 2, runtimeId: "codex" });
+  assert.deepEqual(submitted.formValues, { model: "gpt-5.5" });
+  assert.equal(submitted.runtimeConfig, undefined);
+});
+
+test("with runtime_form_v2_web off, the v2 marker changes nothing: create stays on the legacy form", async () => {
+  const { getCalls, postBodies } = await renderV2OnlyCodexCreate(false);
+  await screen.findByTestId("runtime-model-source-status"); // the legacy Codex model field
+  assert.ok(screen.queryByTestId("runtime-form-v2-model") === null);
+  assert.equal(getCalls.some((url) => url.includes("/runtime-forms/") || url.includes("runtime-form-definitions")), false);
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "Alice" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  const submitted = postBodies[0] as Record<string, unknown> & { runtimeConfig: { runtime: string } };
+  assert.equal(submitted.formDefinitionRef, undefined);
+  assert.equal(submitted.runtimeConfig.runtime, "codex");
+});
+
+// requiredClientCapabilities (packages/runtime-form README, "Protocol v2"):
+// absent or null → usable; an unknown capability or a malformed value → the
+// whole v2 form is unavailable and create falls back to the v1 schema form.
+for (const [label, requiredClientCapabilities, v2Usable] of [
+  ["null", null, true],
+  ["only capabilities this build implements", ["select.custom_value", "choice.labels", "option_source.status"], true],
+  ["an unknown capability", ["select.custom_value", "future.capability"], false],
+  ["a non-array value", "select.custom_value", false],
+  ["a non-string entry", [1], false],
+] as const) {
+  test(`create with a v2 form whose requiredClientCapabilities is ${label} ${v2Usable ? "uses v2" : "falls back to v1"}`, async () => {
+    seedStores(["kimi-sdk"]);
+    const served = { ...toRuntimeFormV2(kimiDefinitionResponse() as unknown as AgentCreateFormDefinition), requiredClientCapabilities };
+    api.get = (async (url: string) => {
+      if (url === "/provider-connections") return { data: { connections: [] } } as never;
+      if (url.endsWith("/runtime-options")) {
+        return { data: { context: "new_agent", machineId: "machine-1", options: [{ ...runtimeOption("kimi-sdk", kimiRef), runtimeFormV2: { protocolVersion: 2 } }] } } as never;
+      }
+      if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/kimi-sdk") return { data: served } as never;
+      if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/kimi-sdk/option-sources/model") {
+        return { data: kimiDefinitionFixture().optionSources.model } as never;
+      }
+      if (url.includes("/runtime-form-definitions/kimi-sdk/option-sources/model?schemaVersion=")) {
+        return { data: kimiDefinitionFixture().optionSources.model } as never;
+      }
+      if (url.includes("/runtime-form-definitions/kimi-sdk?schemaVersion=")) return { data: kimiDefinitionResponse() } as never;
+      if (url.includes("/runtime-models/")) return { data: { models: [] } } as never;
+      throw new Error(`unexpected GET ${url}`);
+    }) as typeof api.get;
+    api.post = (async (url: string) => {
+      if (url === "/feature-flags/evaluate") {
+        return { data: { evaluations: [{ key: RUNTIME_FORM_V2_WEB_FLAG_KEY, enabled: true }] } } as never;
+      }
+      throw new Error(`unexpected POST ${url}`);
+    }) as typeof api.post;
+    await prefetchServerFeatureFlags("server-1");
+    renderDialog();
+    if (v2Usable) {
+      await screen.findByTestId("runtime-form-v2-model");
+      assert.ok(screen.queryByTestId("schema-runtime-model-select") === null);
+    } else {
+      await screen.findByTestId("schema-runtime-model-select");
+      assert.ok(screen.queryByTestId("runtime-form-v2-model") === null);
+      assert.ok(screen.queryByTestId("schema-runtime-unavailable") === null, "a fallback, not an error");
+    }
+  });
+}
+
+// Batch 2: OpenCode has a v2 form (and no v1 form). The server's own shared
+// fixtures stand in for the responses: the form and the non-live fallback
+// option source (packages/runtime-form/fixtures).
+const runtimeFormFixture = (name: string) =>
+  JSON.parse(readFileSync(new URL(`../../runtime-form/fixtures/${name}`, import.meta.url), "utf8")) as unknown;
+
+async function renderOpenCodeCreate(flag: boolean) {
+  seedStores(["opencode"]);
+  const getCalls: string[] = [];
+  const postBodies: unknown[] = [];
+  api.get = (async (url: string) => {
+    if (url === "/provider-connections") return { data: { connections: [] } } as never;
+    getCalls.push(url);
+    if (url.endsWith("/runtime-options")) {
+      return {
+        data: { context: "new_agent", machineId: "machine-1", options: [{ ...runtimeOption("opencode"), runtimeFormV2: { protocolVersion: 2 } }] },
+      } as never;
+    }
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/opencode") return { data: runtimeFormFixture("opencode.form.json") } as never;
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/opencode/option-sources/model") {
+      return { data: runtimeFormFixture("opencode.option-source.fallback.json") } as never;
+    }
+    if (url.includes("/runtime-models/")) return { data: { kind: "missing_config" } } as never;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async (url: string, body?: unknown) => {
+    if (url === "/feature-flags/evaluate") {
+      return { data: { evaluations: [{ key: RUNTIME_FORM_V2_WEB_FLAG_KEY, enabled: flag }] } } as never;
+    }
+    assert.equal(url, "/agents");
+    postBodies.push(body);
+    return { data: makeAgent("opencode", null) } as never;
+  }) as typeof api.post;
+  await prefetchServerFeatureFlags("server-1");
+  renderDialog();
+  await waitFor(() => assert.ok(screen.getAllByText("OpenCode").length > 0));
+  return { getCalls, postBodies };
+}
+
+test("with runtime_form_v2_web on, OpenCode creates through its v2 form: model select plus advanced env vars", async () => {
+  const { getCalls, postBodies } = await renderOpenCodeCreate(true);
+  const model = await screen.findByTestId("runtime-form-v2-model");
+  screen.getByText("Models available from this computer's OpenCode configuration.");
+  assert.ok(screen.queryByTestId("runtime-model-source-status") === null, "the legacy fields are replaced");
+  assert.equal(getCalls.some((url) => url.includes("runtime-form-definitions")), false, "no v1 definition is fetched");
+  // Environment variables sit under Advanced.
+  const advanced = screen.getByRole("button", { name: /Advanced/i });
+  assert.equal(advanced.getAttribute("aria-expanded"), "false");
+  fireEvent.click(advanced);
+  assert.equal(advanced.getAttribute("aria-expanded"), "true");
+  screen.getByText("These will be injected into the runtime command environment.");
+  // The option source's defaultValue preselects; pick another bundled model.
+  await pickOption(model, "DeepSeek V4 Pro · DeepSeek");
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2OpenCode" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  const submitted = postBodies[0] as Record<string, unknown>;
+  assert.deepEqual(submitted.formDefinitionRef, { protocolVersion: 2, runtimeId: "opencode" });
+  assert.equal((submitted.formValues as Record<string, unknown>).model, "deepseek/deepseek-v4-pro");
+  assert.equal(submitted.runtimeConfig, undefined);
+});
+
+test("with runtime_form_v2_web off, OpenCode stays on the legacy form", async () => {
+  const { getCalls, postBodies } = await renderOpenCodeCreate(false);
+  await screen.findByTestId("runtime-model-source-status");
+  assert.ok(screen.queryByTestId("runtime-form-v2-model") === null);
+  assert.equal(getCalls.some((url) => url.includes("/runtime-forms/") || url.includes("runtime-form-definitions")), false);
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "Alice" } });
+  fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  const submitted = postBodies[0] as Record<string, unknown> & { runtimeConfig: { runtime: string } };
+  assert.equal(submitted.formDefinitionRef, undefined);
+  assert.equal(submitted.runtimeConfig.runtime, "opencode");
+});
+
+// Batch 3a: Codex/Grok v2 forms use select.custom_value, choice.labels and
+// option_source.status. The server's shared fixtures stand in for the form and
+// its model source (packages/runtime-form/fixtures).
+async function renderCodexV2Create(sourceResponses: Array<() => unknown>, form: unknown = runtimeFormFixture("codex.form.json")) {
+  seedStores(["codex"]);
+  const sourceCalls: string[] = [];
+  const postBodies: unknown[] = [];
+  api.get = (async (url: string) => {
+    if (url === "/provider-connections") return { data: { connections: [] } } as never;
+    if (url.endsWith("/runtime-options")) {
+      return { data: { context: "new_agent", machineId: "machine-1", options: [{ ...runtimeOption("codex"), runtimeFormV2: { protocolVersion: 2 } }] } } as never;
+    }
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/codex") return { data: form } as never;
+    if (url.startsWith("/servers/server-1/machines/machine-1/runtime-forms/v2/codex/option-sources/model")) {
+      sourceCalls.push(url);
+      const respond = sourceResponses[Math.min(sourceCalls.length - 1, sourceResponses.length - 1)]!;
+      return { data: respond() } as never;
+    }
+    if (url.includes("/runtime-models/")) return { data: { kind: "missing_config" } } as never;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async (url: string, body?: unknown) => {
+    if (url === "/feature-flags/evaluate") {
+      return { data: { evaluations: [{ key: RUNTIME_FORM_V2_WEB_FLAG_KEY, enabled: true }] } } as never;
+    }
+    assert.equal(url, "/agents");
+    postBodies.push(body);
+    return { data: makeAgent("codex", null) } as never;
+  }) as typeof api.post;
+  await prefetchServerFeatureFlags("server-1");
+  renderDialog();
+  return { sourceCalls, postBodies };
+}
+
+const pickOption = async (trigger: HTMLElement, name: RegExp | string) => {
+  // A searchable field (combobox) opens from its input; a select from its trigger.
+  if (trigger instanceof HTMLInputElement) {
+    fireEvent.focus(trigger);
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+  } else {
+    fireEvent.click(trigger);
+  }
+  const option = await screen.findByRole("option", { name });
+  fireEvent.pointerDown(option);
+  fireEvent.click(option);
+};
+
+/** A searchable field that allows custom values: type it, then take the "Use …" row. */
+const typeCustomValue = async (field: HTMLElement, value: string) => {
+  fireEvent.change(field, { target: { value } });
+  const use = await screen.findByTestId(`${field.getAttribute("data-testid")}-use-custom`);
+  fireEvent.pointerDown(use);
+  fireEvent.click(use);
+};
+
+test("codex v2 create: combobox model, labelled reasoning choices, fast mode; a typed custom model is submitted as typed", async () => {
+  const { sourceCalls, postBodies } = await renderCodexV2Create([() => runtimeFormFixture("codex.option-source.live.json")]);
+  const model = await screen.findByTestId("runtime-form-v2-model");
+  assert.ok(screen.queryByTestId("runtime-model-source-status") === null, "the legacy model field is replaced");
+  assert.ok(screen.queryByTestId("runtime-form-v2-model-status") === null, "a live source has no status line");
+  assert.deepEqual(sourceCalls, ["/servers/server-1/machines/machine-1/runtime-forms/v2/codex/option-sources/model"]);
+
+  // Reasoning follows the model and is labelled from `choices`, descriptions included.
+  const reasoning = screen.getByTestId("runtime-form-v2-reasoningEffort");
+  fireEvent.click(reasoning);
+  await screen.findByRole("option", { name: /^Extra High/ });
+  screen.getByText("Balances speed and reasoning depth for everyday tasks");
+  assert.ok(screen.queryByRole("option", { name: /^xhigh$/ }) === null, "raw values are not the labels");
+  const ultra = screen.getByRole("option", { name: /^Ultra/ });
+  fireEvent.pointerDown(ultra);
+  fireEvent.click(ultra);
+
+  // Fast mode is a switch.
+  fireEvent.click(screen.getByTestId("runtime-form-v2-fastMode"));
+
+  // Custom: type the model id, then use it as typed.
+  await typeCustomValue(model, "my-org/typed-model");
+
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2Codex" } });
+  const create = screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement;
+  await waitFor(() => assert.equal(create.disabled, false));
+  fireEvent.click(create);
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  const submitted = postBodies[0] as Record<string, unknown> & { formValues: Record<string, unknown> };
+  assert.deepEqual(submitted.formDefinitionRef, { protocolVersion: 2, runtimeId: "codex" });
+  assert.equal(submitted.runtimeConfig, undefined);
+  assert.equal(submitted.formValues.model, "my-org/typed-model");
+  assert.equal(submitted.formValues.fastMode, true);
+  assert.equal(submitted.formValues.reasoningEffort, null, "a typed model has no effort menu: the runtime default");
+});
+
+test("codex v2 create: a source that fails to load shows status and retry without killing the form; retry sends refresh=1", async () => {
+  const { sourceCalls, postBodies } = await renderCodexV2Create([
+    () => { throw Object.assign(new Error("boom"), { response: { status: 500, data: { error: "boom" } } }); },
+    () => runtimeFormFixture("codex.option-source.live.json"),
+  ]);
+  const status = await screen.findByTestId("runtime-form-v2-model-status");
+  assert.equal(status.getAttribute("data-source-status"), "unavailable");
+  assert.match(status.textContent ?? "", /The options could not be loaded\./);
+  // The rest of the form is there: not an error panel, not the legacy form.
+  screen.getByTestId("runtime-form-v2-fastMode");
+  assert.ok(screen.queryByTestId("schema-runtime-unavailable") === null);
+  assert.ok(screen.queryByTestId("runtime-model-source-status") === null);
+  // Required + unavailable blocks submit.
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2Codex" } });
+  const create = screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement;
+  assert.equal(create.disabled, true);
+
+  fireEvent.click(screen.getByTestId("runtime-form-v2-model-retry"));
+  await waitFor(() => assert.ok(screen.queryByTestId("runtime-form-v2-model-status") === null));
+  assert.deepEqual(sourceCalls, [
+    "/servers/server-1/machines/machine-1/runtime-forms/v2/codex/option-sources/model",
+    "/servers/server-1/machines/machine-1/runtime-forms/v2/codex/option-sources/model?refresh=1",
+  ]);
+  await waitFor(() => assert.equal(create.disabled, false));
+  fireEvent.click(create);
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  assert.equal((postBodies[0] as { formValues: Record<string, unknown> }).formValues.model, "gpt-5.6-sol");
+});
+
+test("codex v2 create: a live model list has a refresh action that re-asks the Computer with refresh=1", async () => {
+  const refreshedSource = runtimeFormFixture("codex.option-source.live.json") as { options: Array<{ value: string; label: string }> };
+  const { sourceCalls } = await renderCodexV2Create([
+    () => runtimeFormFixture("codex.option-source.live.json"),
+    () => ({ ...refreshedSource, options: [{ value: "gpt-7-preview", label: "GPT-7 Preview" }] }),
+  ]);
+  const refresh = await screen.findByTestId("runtime-form-v2-refresh-source-model");
+  assert.equal(refresh.getAttribute("aria-label"), "Refresh this list");
+  // The derived effort list has no source of its own: no refresh action.
+  assert.ok(screen.queryByTestId("runtime-form-v2-refresh-source-reasoningEffort") === null);
+  fireEvent.click(refresh);
+  await waitFor(() => assert.deepEqual(sourceCalls, [
+    "/servers/server-1/machines/machine-1/runtime-forms/v2/codex/option-sources/model",
+    "/servers/server-1/machines/machine-1/runtime-forms/v2/codex/option-sources/model?refresh=1",
+  ]));
+  await pickOption(screen.getByTestId("runtime-form-v2-model"), /GPT-7 Preview/);
+});
+
+test("codex v2 create: a retryable source failure offers Retry below the field, not a second refresh action", async () => {
+  await renderCodexV2Create([() => runtimeFormFixture("codex.option-source.unavailable.json")]);
+  await screen.findByTestId("runtime-form-v2-model-retry");
+  assert.ok(screen.queryByTestId("runtime-form-v2-refresh-source-model") === null);
+  cleanup();
+  // A non-retryable fallback (missing config) has no Retry, so the refresh action stays.
+  await renderCodexV2Create([() => runtimeFormFixture("codex.option-source.fallback.json")]);
+  await screen.findByTestId("runtime-form-v2-model-status");
+  screen.getByTestId("runtime-form-v2-refresh-source-model");
+});
+
+test("codex v2 create: a required field whose source is unavailable shows why, offers retry and blocks submit; fallback is usable", async () => {
+  await renderCodexV2Create([() => runtimeFormFixture("codex.option-source.unavailable.json")]);
+  const status = await screen.findByTestId("runtime-form-v2-model-status");
+  assert.equal(status.getAttribute("data-source-status"), "unavailable");
+  assert.match(status.textContent ?? "", /This Computer is offline\./);
+  screen.getByTestId("runtime-form-v2-model-retry");
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2Codex" } });
+  assert.equal((screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement).disabled, true);
+  cleanup();
+
+  await renderCodexV2Create([() => runtimeFormFixture("codex.option-source.fallback.json")]);
+  const fallback = await screen.findByTestId("runtime-form-v2-model-status");
+  assert.equal(fallback.getAttribute("data-source-status"), "fallback");
+  assert.match(fallback.textContent ?? "", /needs configuration on this Computer.*Showing the standard list instead\./);
+  assert.ok(screen.queryByTestId("runtime-form-v2-model-retry") === null, "missing_config is not retryable");
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2Codex" } });
+  await waitFor(() => assert.equal((screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement).disabled, false));
+});
+
+test("codex v2 create: an optional field whose source is unavailable is hidden", async () => {
+  const form = runtimeFormFixture("codex.form.json") as { dataSchema: { required: string[] } };
+  form.dataSchema.required = [];
+  await renderCodexV2Create([() => runtimeFormFixture("codex.option-source.unavailable.json")], form);
+  await screen.findByTestId("runtime-form-v2-fastMode");
+  assert.ok(screen.queryByTestId("runtime-form-v2-model") === null);
+  assert.ok(screen.queryByTestId("runtime-form-v2-model-status") === null);
+});
+
+// Batch 3b: Claude's v2 form is the first with a second (static) option source
+// and fields shown only for one provider choice. Fixtures: the server's own.
+async function renderClaudeV2Create() {
+  seedStores(["claude"]);
+  const sourceCalls: string[] = [];
+  const postBodies: unknown[] = [];
+  api.get = (async (url: string) => {
+    if (url === "/provider-connections") return { data: { connections: [] } } as never;
+    if (url.endsWith("/runtime-options")) {
+      return { data: { context: "new_agent", machineId: "machine-1", options: [{ ...runtimeOption("claude"), runtimeFormV2: { protocolVersion: 2 } }] } } as never;
+    }
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/claude") return { data: runtimeFormFixture("claude.form.json") } as never;
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/claude/option-sources/provider") {
+      sourceCalls.push(url);
+      return { data: runtimeFormFixture("claude.option-source.provider.json") } as never;
+    }
+    if (url === "/servers/server-1/machines/machine-1/runtime-forms/v2/claude/option-sources/model") {
+      sourceCalls.push(url);
+      return { data: runtimeFormFixture("claude.option-source.fallback.json") } as never;
+    }
+    if (url.includes("/runtime-models/")) return { data: { kind: "missing_config" } } as never;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async (url: string, body?: unknown) => {
+    if (url === "/feature-flags/evaluate") {
+      return { data: { evaluations: [{ key: RUNTIME_FORM_V2_WEB_FLAG_KEY, enabled: true }] } } as never;
+    }
+    assert.equal(url, "/agents");
+    postBodies.push(body);
+    return { data: makeAgent("claude", null) } as never;
+  }) as typeof api.post;
+  await prefetchServerFeatureFlags("server-1");
+  renderDialog();
+  return { sourceCalls, postBodies };
+}
+
+test("claude v2 create: API URL and key appear only for a Custom provider and are submitted as field values", async () => {
+  const { sourceCalls, postBodies } = await renderClaudeV2Create();
+  const provider = await screen.findByTestId("runtime-form-v2-provider");
+  await screen.findByTestId("runtime-form-v2-model");
+  assert.deepEqual([...sourceCalls].sort(), [
+    "/servers/server-1/machines/machine-1/runtime-forms/v2/claude/option-sources/model",
+    "/servers/server-1/machines/machine-1/runtime-forms/v2/claude/option-sources/provider",
+  ]);
+  // Default provider: no API URL or key.
+  assert.ok(screen.queryByTestId("runtime-form-v2-apiUrl") === null);
+  assert.ok(screen.queryByTestId("runtime-form-v2-apiKey") === null);
+  // The model list is the bundled fallback while the Computer is offline, with a retry.
+  const status = screen.getByTestId("runtime-form-v2-model-status");
+  assert.equal(status.getAttribute("data-source-status"), "fallback");
+  screen.getByTestId("runtime-form-v2-model-retry");
+
+  await pickOption(provider, "Custom");
+  const apiUrl = await screen.findByTestId("runtime-form-v2-apiUrl") as HTMLInputElement;
+  const apiKey = screen.getByTestId("runtime-form-v2-apiKey") as HTMLInputElement;
+  assert.equal(apiKey.type, "password");
+  fireEvent.change(apiUrl, { target: { value: "https://gateway.example.test" } });
+  fireEvent.change(apiKey, { target: { value: "sk-typed" } });
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2Claude" } });
+  const create = screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement;
+  await waitFor(() => assert.equal(create.disabled, false));
+  fireEvent.click(create);
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  const submitted = postBodies[0] as Record<string, unknown> & { formValues: Record<string, unknown> };
+  assert.deepEqual(submitted.formDefinitionRef, { protocolVersion: 2, runtimeId: "claude" });
+  assert.equal(submitted.runtimeConfig, undefined);
+  assert.equal(submitted.formValues.provider, "custom");
+  assert.equal(submitted.formValues.apiUrl, "https://gateway.example.test");
+  assert.equal(submitted.formValues.apiKey, "sk-typed");
+  assert.equal(submitted.formValues.model, "opus");
+});
+
+// Batch 4: Pi. Two model fields, one per kind of provider: the Configured
+// provider's Computer list (a combobox) and a built-in provider's own list (a
+// dependent select). Pi has no saved provider connections. Fixtures: the server's own.
+async function renderPiV2Create() {
+  seedStores(["pi"]);
+  const sourceCalls: string[] = [];
+  const connectionCalls: string[] = [];
+  const postBodies: unknown[] = [];
+  const base = "/servers/server-1/machines/machine-1/runtime-forms/v2/pi";
+  api.get = (async (url: string) => {
+    if (url === "/provider-connections") {
+      connectionCalls.push(url);
+      return { data: { connections: [{ id: "conn-1", name: "Team DeepSeek", providerId: "deepseek", enabled: true, hasCredential: true }] } } as never;
+    }
+    if (url.endsWith("/runtime-options")) {
+      return { data: { context: "new_agent", machineId: "machine-1", options: [{ ...runtimeOption("pi"), runtimeFormV2: { protocolVersion: 2 } }] } } as never;
+    }
+    if (url === base) return { data: runtimeFormFixture("pi.form.json") } as never;
+    const sources: Record<string, string> = {
+      [`${base}/option-sources/provider`]: "pi.option-source.provider.json",
+      [`${base}/option-sources/model`]: "pi.option-source.fallback.json",
+      [`${base}/option-sources/providerModel`]: "pi.option-source.provider-model.json",
+    };
+    if (sources[url]) {
+      sourceCalls.push(url);
+      return { data: runtimeFormFixture(sources[url]!) } as never;
+    }
+    if (url.includes("/runtime-models/")) return { data: { kind: "missing_config" } } as never;
+    throw new Error(`unexpected GET ${url}`);
+  }) as typeof api.get;
+  api.post = (async (url: string, body?: unknown) => {
+    if (url === "/feature-flags/evaluate") {
+      // Saved provider connections are on for this server, so their absence below is Pi's own rule.
+      return {
+        data: {
+          evaluations: [
+            { key: RUNTIME_FORM_V2_WEB_FLAG_KEY, enabled: true },
+            { key: PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY, enabled: true },
+          ],
+        },
+      } as never;
+    }
+    assert.equal(url, "/agents");
+    postBodies.push(body);
+    return { data: makeAgent("pi", null) } as never;
+  }) as typeof api.post;
+  await prefetchServerFeatureFlags("server-1");
+  renderDialog();
+  return { sourceCalls, connectionCalls, postBodies, base };
+}
+
+test("pi v2 create: Configured shows the Computer's model list; DeepSeek swaps in its key and its own model list, submitted as field values", async () => {
+  const { sourceCalls, connectionCalls, postBodies, base } = await renderPiV2Create();
+  const provider = await screen.findByTestId("runtime-form-v2-provider");
+  await screen.findByTestId("runtime-form-v2-model");
+  assert.deepEqual([...sourceCalls].sort(), [
+    `${base}/option-sources/model`,
+    `${base}/option-sources/provider`,
+    `${base}/option-sources/providerModel`,
+  ]);
+  // Configured: no key; the Computer's list is the bundled fallback (missing config), no retry.
+  assert.ok(screen.queryByTestId("runtime-form-v2-apiKey") === null);
+  assert.ok(screen.queryByTestId("runtime-form-v2-providerModel") === null);
+  assert.equal(screen.getByTestId("runtime-form-v2-model-status").getAttribute("data-source-status"), "fallback");
+  assert.ok(screen.queryByTestId("runtime-form-v2-model-retry") === null);
+  screen.getByTestId("runtime-form-v2-reasoningEffort");
+
+  await pickOption(provider, "DeepSeek");
+  const apiKey = await screen.findByTestId("runtime-form-v2-apiKey") as HTMLInputElement;
+  assert.equal(apiKey.type, "password");
+  const providerModel = screen.getByTestId("runtime-form-v2-providerModel");
+  assert.ok(screen.queryByTestId("runtime-form-v2-model") === null, "the Configured model field is gone");
+  assert.ok(screen.queryByTestId("runtime-form-v2-reasoningEffort") === null);
+  screen.getByTestId("runtime-form-v2-providerReasoningEffort");
+  assert.ok(screen.queryByTestId("runtime-form-v2-providerModel-status") === null, "a static list has no status line");
+  // The provider's own list, no custom value (legacy locks the picker to it).
+  fireEvent.change(providerModel, { target: { value: "not-a-listed-model" } });
+  assert.ok(screen.queryByTestId("runtime-form-v2-providerModel-use-custom") === null);
+  fireEvent.change(providerModel, { target: { value: "" } });
+  await pickOption(providerModel, "DeepSeek V4.1 Flash");
+
+  fireEvent.change(apiKey, { target: { value: "sk-typed" } });
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2Pi" } });
+  const create = screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement;
+  await waitFor(() => assert.equal(create.disabled, false));
+  fireEvent.click(create);
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  const submitted = postBodies[0] as Record<string, unknown> & { formValues: Record<string, unknown> };
+  assert.deepEqual(submitted.formDefinitionRef, { protocolVersion: 2, runtimeId: "pi" });
+  assert.equal(submitted.runtimeConfig, undefined);
+  assert.deepEqual(submitted.formValues, {
+    provider: "deepseek",
+    apiKey: "sk-typed",
+    providerModel: "deepseek/deepseek-flash",
+    providerReasoningEffort: null,
+    envVars: {},
+  });
+  // Pi has no saved provider connections: the dialog never loads them, and the
+  // provider list is Configured plus the built-in providers only.
+  assert.deepEqual(connectionCalls, []);
+  assert.ok(screen.queryByText(/Team DeepSeek/) === null);
+});
+
+test("pi v2 create: a typed Configured model is submitted as typed and hides the reasoning effort", async () => {
+  const { postBodies } = await renderPiV2Create();
+  const model = await screen.findByTestId("runtime-form-v2-model");
+  await typeCustomValue(model, "anthropic/claude-typed");
+  await waitFor(() => assert.ok(screen.queryByTestId("runtime-form-v2-reasoningEffort") === null));
+  fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "V2PiTyped" } });
+  const create = screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement;
+  await waitFor(() => assert.equal(create.disabled, false));
+  fireEvent.click(create);
+  await waitFor(() => assert.equal(postBodies.length, 1));
+  assert.deepEqual((postBodies[0] as { formValues: Record<string, unknown> }).formValues, {
+    provider: "configured", model: "anthropic/claude-typed", reasoningEffort: null, envVars: {},
+  });
 });

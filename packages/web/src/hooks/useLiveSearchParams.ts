@@ -28,7 +28,14 @@ export function useLiveSearchParams(): ReturnType<typeof useSearchParams> {
   }
 
   const setLiveSearchParams: typeof setSearchParams = useCallback((nextInit, navigateOptions) => {
-    const previous = isBrowserBackedRef.current && typeof window !== "undefined"
+    const browserBacked = isBrowserBackedRef.current && typeof window !== "undefined";
+    // The browser has already left this surface's page (e.g. Escape closed the
+    // search overlay and navigated back to the channel, and a query write from
+    // the closing search page lands after). Merging the new page's params into
+    // this page's path would navigate back to it (/search?msg=…&q=… reopened
+    // the overlay): a page that is no longer current must not write the URL.
+    if (browserBacked && window.location.pathname !== location.pathname) return;
+    const previous = browserBacked
       ? new URLSearchParams(window.location.search)
       : new URLSearchParams(location.search);
     const next = typeof nextInit === "function" ? nextInit(previous) : nextInit;
@@ -36,7 +43,7 @@ export function useLiveSearchParams(): ReturnType<typeof useSearchParams> {
     // Pass a concrete value. Passing the updater through would make React
     // Router evaluate it against the same stale render snapshot again.
     setSearchParams(next, navigateOptions);
-  }, [location.search, setSearchParams]);
+  }, [location.pathname, location.search, setSearchParams]);
 
   return [searchParams, setLiveSearchParams];
 }

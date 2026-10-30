@@ -1,6 +1,16 @@
 #!/usr/bin/env node
-import { DaemonCore, DAEMON_CLI_USAGE, parseDaemonCliArgs } from "./core.js";
+import { DaemonCore, DAEMON_CLI_USAGE, parseDaemonCliArgs } from "./core";
+import { RUNTIME_DETECTION_CHILD_MODE, runRuntimeDetectionChildMain } from "./runtimeDetectionChild";
 
+// task #1268: `<daemon> __detect-runtimes` is the detection child the running
+// daemon spawns for one runtime detection round (streams JSON lines, exits).
+if (process.argv[2] === RUNTIME_DETECTION_CHILD_MODE) {
+  void runRuntimeDetectionChildMain().then((code) => process.exit(code));
+} else {
+  runDaemonMain();
+}
+
+function runDaemonMain(): void {
 const parsedArgs = parseDaemonCliArgs(process.argv.slice(2));
 
 if (!parsedArgs) {
@@ -16,14 +26,15 @@ try {
   process.exit(1);
 }
 
-const shutdown = async () => {
-  await daemon.stop();
+const shutdown = async (signal: NodeJS.Signals) => {
+  await daemon.stop({ source: "external_signal", signal });
   process.exit(0);
 };
 
 process.on("SIGTERM", () => {
-  void shutdown();
+  void shutdown("SIGTERM");
 });
 process.on("SIGINT", () => {
-  void shutdown();
+  void shutdown("SIGINT");
 });
+}

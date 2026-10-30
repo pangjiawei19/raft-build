@@ -6,21 +6,28 @@
 // will be reconciled with that shape when Phase 1 lands.
 //
 // Hot-path auth lookup: prefix-indexed (O(1) by `idx_computers_prefix_active`,
-// the partial index that excludes revoked rows). Argon2id verify follows.
+// the partial index that excludes revoked rows). Verify follows: a
+// constant-time HMAC compare when the row has `api_key_hmac` and
+// AGENT_API_KEY_HMAC_SECRET is set; otherwise, or when that compare fails,
+// argon2id, and an argon2 success stores the current HMAC.
 //
 // Key isolation invariant (base RFC §1.4 runner key isolation): the raw
 // `sk_computer_*` value lives ONLY in the Computer host's private storage.
 // This module returns the raw key exactly once at attach time; subsequent
 // reads return the row WITHOUT it.
 
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import argon2 from "argon2";
+import { timedArgon2Verify, type Argon2VerifyStats } from "./argon2VerifyStats";
 import { and, eq, isNull, isNotNull } from "drizzle-orm";
 import { asMachineId } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
-import { computers, machines, serverMembers, servers, users } from "../db/schema.js";
-import { registerMachine, getMachine } from "./machineService.js";
-import { actorHasServerCapabilityInServer, getActorServerRoleInServer } from "../lib/actorPermissions.js";
+import { getDb } from "../db/index";
+import { computers, machines, serverMembers, servers, users } from "../db/schema";
+import { registerMachine, getMachine, generateMachineKeyMaterial, acquireMachineCreateLock } from "./machineService";
+import { lockActorMembershipRow, ServerMembershipRevokedError } from "../lib/actorMembershipFence";
+import { actorHasServerCapabilityInServer, getActorServerRoleInServer, actorRoleHasServerCapability } from "../lib/actorPermissions";
+import { computeAgentApiKeyHmac } from "./agentCredentialService";
+import { computerCredentialVerifyTotal } from "../metrics";
 
 const COMPUTER_API_KEY_PREFIX_LENGTH = 16;
 const COMPUTER_RAW_KEY_BYTES = 32;
@@ -149,14 +156,15 @@ export type ComputerAuthResolution =
   | { ok: true; computer: ComputerLookupResult }
   | { ok: false; reason: ComputerAuthDenyReason };
 
-/** Prefix lookup + argon2 proof, followed by live authorization. Re-read
- * after argon2 so a deletion/revocation/rotation during verification cannot
+/** Prefix lookup + key proof (HMAC, else argon2 storing the HMAC), followed by live authorization. Re-read
+ * after the proof so a deletion/revocation/rotation during verification cannot
  * resurrect a stale Computer. Orphaned pre-fix keys require user-authenticated
  * reattachment; they cannot retain server-wide credential minting authority.
  * `computer_machine_unlinked` is the wire reason the Computer client already
  * treats as terminal (`packages/computer/src/health.ts`), so it must stay. */
 export async function findComputerByApiKeyWithReason(
   apiKey: string,
+  argon2Stats?: Argon2VerifyStats,
 ): Promise<ComputerAuthResolution> {
   const db = getDb();
   const prefix = extractComputerApiKeyPrefix(apiKey);
@@ -166,6 +174,7 @@ export async function findComputerByApiKeyWithReason(
       serverId: computers.serverId,
       name: computers.name,
       apiKeyHash: computers.apiKeyHash,
+      apiKeyHmac: computers.apiKeyHmac,
       machineId: computers.machineId,
       revokedAt: computers.revokedAt,
     })
@@ -173,13 +182,40 @@ export async function findComputerByApiKeyWithReason(
     .where(eq(computers.apiKeyPrefix, prefix));
   if (candidates.length === 0) return { ok: false, reason: "computer_not_found" };
 
+  // Same secret as sk_agent_* keys (#9577); null when it is unset, and then
+  // every row verifies with argon2 exactly as before.
+  const presentedHmac = computeAgentApiKeyHmac(apiKey);
   let revokedHashMatch = false;
   for (const row of candidates) {
     let verified = false;
-    try {
-      verified = await argon2.verify(row.apiKeyHash, apiKey);
-    } catch {
-      continue;
+    const storedHmac = presentedHmac && row.apiKeyHmac ? Buffer.from(row.apiKeyHmac) : null;
+    if (storedHmac && presentedHmac && storedHmac.length === presentedHmac.length && timingSafeEqual(storedHmac, presentedHmac)) {
+      verified = true;
+      if (argon2Stats) argon2Stats.hmacMatches = (argon2Stats.hmacMatches ?? 0) + 1;
+      computerCredentialVerifyTotal.inc({ path: "hmac", outcome: "matched" });
+    } else {
+      // No HMAC on the row, or it does not match. A mismatch is a wrong key,
+      // or an HMAC written under a secret that has since changed; argon2 tells
+      // them apart, so a changed or re-created secret degrades to argon2 and
+      // heals itself instead of turning every stored HMAC into a 401.
+      try {
+        verified = await timedArgon2Verify(row.apiKeyHash, apiKey, argon2Stats);
+      } catch {
+        verified = false;
+      }
+      // `argon2_rehmac`: the stored HMAC was from an older secret. A burst of
+      // these after a secret change shows the load went back to argon2.
+      const rehmac = verified && storedHmac !== null;
+      if (rehmac && argon2Stats) argon2Stats.hmacRewrites = (argon2Stats.hmacRewrites ?? 0) + 1;
+      computerCredentialVerifyTotal.inc({
+        path: rehmac ? "argon2_rehmac" : "argon2",
+        outcome: verified ? "matched" : "not_matched",
+      });
+      // Store the HMAC right after the proof, before the revoked / unlinked /
+      // deleted-server checks below: a key that keeps getting rejected for
+      // one of those reasons (e.g. its server was deleted) pays argon2 once,
+      // not on every reconnect.
+      if (verified && presentedHmac) await storeComputerApiKeyHmac(row.id, row.apiKeyHash, presentedHmac);
     }
     if (!verified) continue;
     const [current] = await db.select().from(computers).where(and(
@@ -250,6 +286,8 @@ export async function recordComputerUse(input: {
 export async function generateComputerApiKeyMaterial(): Promise<{
   apiKey: string;
   apiKeyHash: string;
+  /** Null when the HMAC secret is unset. Every write of `apiKeyHash` writes this too, so a rotation never leaves the old key's HMAC behind. */
+  apiKeyHmac: Buffer | null;
   apiKeyPrefix: string;
 }> {
   const apiKey = `sk_computer_${randomBytes(COMPUTER_RAW_KEY_BYTES).toString("hex")}`;
@@ -257,8 +295,27 @@ export async function generateComputerApiKeyMaterial(): Promise<{
   return {
     apiKey,
     apiKeyHash,
+    apiKeyHmac: computeAgentApiKeyHmac(apiKey),
     apiKeyPrefix: extractComputerApiKeyPrefix(apiKey),
   };
+}
+
+// A row verified by argon2 stores its HMAC (filling a missing one, or
+// replacing one from an older secret) so later lookups skip argon2. The write
+// is conditional on the hash just verified: a rotation that landed during the
+// verify must not receive the old key's HMAC. Best-effort.
+async function storeComputerApiKeyHmac(computerId: string, apiKeyHash: string, apiKeyHmac: Buffer): Promise<void> {
+  try {
+    await getDb()
+      .update(computers)
+      .set({ apiKeyHmac })
+      .where(and(eq(computers.id, computerId), eq(computers.apiKeyHash, apiKeyHash)));
+  } catch (err) {
+    console.warn("[ComputerCredential] api_key_hmac backfill failed", {
+      computerId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
 }
 
 /**
@@ -308,28 +365,6 @@ export type AttachComputerResult =
  * orchestrator change, no agent-table change: agents bind to a Computer
  * via the normal `agents.machineId = <this machine id>`.
  */
-async function ensureComputerMachine(
-  computerId: string,
-  serverId: string,
-  userId: string,
-  name: string,
-): Promise<string> {
-  const db = getDb();
-  const [c] = await db
-    .select({ machineId: computers.machineId })
-    .from(computers)
-    .where(eq(computers.id, computerId));
-  if (c?.machineId) {
-    const existingMachine = await getMachine(asMachineId(c.machineId));
-    if (existingMachine) return c.machineId;
-  }
-  const { machine } = await registerMachine(serverId, userId, name);
-  await db
-    .update(computers)
-    .set({ machineId: machine.id })
-    .where(eq(computers.id, computerId));
-  return machine.id;
-}
 
 export async function attachComputer(input: {
   userId: string;
@@ -355,45 +390,69 @@ export async function attachComputer(input: {
     return { ok: false, error: "requires_admin" };
   }
 
-  // Name is display-only. A duplicate live display name from the same
-  // attaching user is ambiguous, so fail closed instead of treating the name
-  // as identity proof and rotating the existing credential.
-  const [existing] = await db
-    .select({ id: computers.id })
-    .from(computers)
-    .where(
-      and(
-        eq(computers.serverId, server.id),
-        eq(computers.attachedByUserId, input.userId),
-        eq(computers.name, input.name),
-        isNull(computers.revokedAt),
-      ),
-    );
-
-  if (existing) return { ok: false, error: "computer_name_collision" };
-
+  // Task #93 line G: both keys are generated before any lock (argon2 is slow). The attach then runs as ONE transaction:
+  // machines advisory lock → the attaching human's own `server_members` row (share) → capability re-check → name
+  // collision check → Computer insert → Machine register → link. A removal or demotion that commits first is observed
+  // under the lock and leaves zero Computers and zero Machines; before this, the two inserts ran without a transaction.
   const material = await generateComputerApiKeyMaterial();
+  const machineMaterial = await generateMachineKeyMaterial();
 
-  const [row] = await db
-    .insert(computers)
-    .values({
-      serverId: server.id,
-      name: input.name,
-      apiKeyHash: material.apiKeyHash,
-      apiKeyPrefix: material.apiKeyPrefix,
-      attachedByUserId: input.userId,
-    })
-    .returning({ id: computers.id });
+  try {
+    return await db.transaction(async (tx): Promise<AttachComputerResult> => {
+      const machineCreateLock = await acquireMachineCreateLock(tx, server.id);
+      const lockedRole = await lockActorMembershipRow(tx, server.id, input.userId, "share");
+      if (!actorRoleHasServerCapability(lockedRole, "registerMachines")) {
+        return { ok: false, error: "requires_admin" };
+      }
 
-  const machineId = await ensureComputerMachine(row.id, server.id, input.userId, input.name);
+      // Name is display-only. A duplicate live display name from the same
+      // attaching user is ambiguous, so fail closed instead of treating the name
+      // as identity proof and rotating the existing credential.
+      const [existing] = await tx
+        .select({ id: computers.id })
+        .from(computers)
+        .where(
+          and(
+            eq(computers.serverId, server.id),
+            eq(computers.attachedByUserId, input.userId),
+            eq(computers.name, input.name),
+            isNull(computers.revokedAt),
+          ),
+        );
 
-  return {
-    ok: true,
-    apiKey: material.apiKey,
-    serverMachineId: row.id,
-    machineId,
-    serverId: server.id,
-    serverSlug: server.slug,
-    resumed: false,
-  };
+      if (existing) return { ok: false, error: "computer_name_collision" };
+
+      const [row] = await tx
+        .insert(computers)
+        .values({
+          serverId: server.id,
+          name: input.name,
+          apiKeyHash: material.apiKeyHash,
+          apiKeyHmac: material.apiKeyHmac,
+          apiKeyPrefix: material.apiKeyPrefix,
+          attachedByUserId: input.userId,
+        })
+        .returning({ id: computers.id });
+
+      const { machine } = await registerMachine(server.id, input.userId, input.name, {
+        machineCreateLock,
+        material: machineMaterial,
+      });
+      await tx.update(computers).set({ machineId: machine.id }).where(eq(computers.id, row.id));
+
+      return {
+        ok: true,
+        apiKey: material.apiKey,
+        serverMachineId: row.id,
+        machineId: machine.id,
+        serverId: server.id,
+        serverSlug: server.slug,
+        resumed: false,
+      };
+    });
+  } catch (error) {
+    // Removal committed first: identical to "not a member" before the transaction existed.
+    if (error instanceof ServerMembershipRevokedError) return { ok: false, error: "not_authorized" };
+    throw error;
+  }
 }

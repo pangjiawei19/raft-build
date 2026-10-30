@@ -1,13 +1,16 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
 
-import { shutdownServerRuntime } from "./serverShutdown.js";
+import { shutdownServerRuntime } from "./serverShutdown";
 
-test("HTTP acceptance stops before machine ownership is released", async () => {
+test("HTTP acceptance stops before machine ownership is released; traces flush after workers settle", async () => {
   const events: string[] = [];
   let finishHttpDrain!: () => void;
   const httpDrain = new Promise<void>((resolve) => {
     finishHttpDrain = resolve;
+  });
+  let finishWorkers!: () => void;
+  const workers = new Promise<void>((resolve) => {
+    finishWorkers = resolve;
   });
 
   const shutdown = shutdownServerRuntime({
@@ -17,6 +20,10 @@ test("HTTP acceptance stops before machine ownership is released", async () => {
     },
     releaseMachineOwnership: async () => {
       events.push("owner_release_started");
+    },
+    settleWorkers: () => {
+      events.push("workers_settle_started");
+      return workers;
     },
     flushTraces: async () => {
       events.push("trace_flush_started");
@@ -30,8 +37,11 @@ test("HTTP acceptance stops before machine ownership is released", async () => {
   assert.deepEqual(events, [
     "http_stop_started",
     "owner_release_started",
-    "trace_flush_started",
+    "workers_settle_started",
   ]);
+  finishWorkers();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(events.at(-1), "trace_flush_started", "a worker's last span is flushed");
   assert.equal(events.includes("shared_state_stopped"), false);
 
   finishHttpDrain();
@@ -51,6 +61,7 @@ test("a synchronous HTTP stop failure does not release machine ownership", async
       releaseMachineOwnership: async () => {
         ownerReleased = true;
       },
+      settleWorkers: async () => {},
       flushTraces: async () => {},
       shutdownSharedState: async () => {
         sharedStateStopped = true;

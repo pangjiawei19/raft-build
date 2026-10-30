@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
-import { Archive, ArchiveRestore, GitBranch, Hash, Lock } from "lucide-react";
+import { Archive, GitBranch, Hash, Lock } from "lucide-react";
+import { Card, IconTile } from "@botiverse/raft-ui";
 
 import { useAppNavigate } from "../../hooks/useAppNavigate";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
@@ -9,11 +10,11 @@ import { useChannelStore } from "../../store/channelStore";
 import type { Channel } from "../../store/channelStore";
 import { useServerStore } from "../../store/serverStore";
 import Banner from "../ui/Banner";
-import Button from "../ui/Button";
 import SectionHeader from "../ui/SectionHeader";
-import SurfaceListItem from "../ui/SurfaceListItem";
+import Tooltip from "../ui/Tooltip";
+import { UnarchiveChannelButton } from "./UnarchiveChannelButton";
 
-type ArchivedChannel = Channel & {
+export type ArchivedChannel = Channel & {
   type: "channel" | "private" | "joint";
   archivedAt: string;
 };
@@ -58,22 +59,25 @@ function ArchivedChannelsSectionContent() {
     [channels],
   );
 
+  const handleUnarchive = useCallback(
+    async (channel: ArchivedChannel) => {
+      setError("");
+      setBusyChannelId(channel.id);
+      try {
+        await unarchiveChannel(channel.id);
+      } catch (err: unknown) {
+        const axiosError = err as { response?: { data?: { error?: string } } };
+        setError(axiosError.response?.data?.error || formatMessage({ id: "channel.edit.failedUnarchive" }));
+      } finally {
+        setBusyChannelId(null);
+      }
+    },
+    [formatMessage, unarchiveChannel],
+  );
+
   if (!capabilities.archiveChannels || loading || archivedChannels.length === 0) {
     return null;
   }
-
-  const handleUnarchive = async (channel: ArchivedChannel) => {
-    setError("");
-    setBusyChannelId(channel.id);
-    try {
-      await unarchiveChannel(channel.id);
-    } catch (err: unknown) {
-      const axiosError = err as { response?: { data?: { error?: string } } };
-      setError(axiosError.response?.data?.error || formatMessage({ id: "channel.edit.failedUnarchive" }));
-    } finally {
-      setBusyChannelId(null);
-    }
-  };
 
   return (
     <section className="mb-6" data-testid="archived-channels-section">
@@ -95,7 +99,7 @@ function ArchivedChannelsSectionContent() {
         </Banner>
       ) : null}
 
-      <div className="space-y-2">
+      <Card className="divide-y divide-line-hairline">
         {archivedChannels.map((channel) => {
           const busy = busyChannelId === channel.id;
           const typeLabel = formatMessage({ id: channelTypeMessageId(channel.type) });
@@ -104,25 +108,21 @@ function ArchivedChannelsSectionContent() {
             { name: channel.name },
           );
           return (
-            <SurfaceListItem
+            <div
               key={channel.id}
-              interactive={false}
-              className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"
+              className="flex flex-col gap-3 px-4 py-3 sm:min-h-11 sm:flex-row sm:items-center sm:justify-between"
               data-testid={`archived-channel-row-${channel.id}`}
             >
               <div className="flex min-w-0 flex-1 items-center gap-3">
-                <span
-                  className="flex size-8 shrink-0 items-center justify-center border-2 border-black/30 bg-brutal-stone text-black/65"
-                  aria-label={typeLabel}
-                  title={typeLabel}
-                >
+                <Tooltip content={typeLabel}>
+                <IconTile size="sm" role="img" aria-label={typeLabel}>
                   {channelTypeIcon(channel.type)}
-                </span>
+                </IconTile>
+                </Tooltip>
                 <div className="min-w-0 flex-1">
                   <button
                     type="button"
-                    className="block max-w-full truncate text-left text-sm font-bold text-black underline decoration-2 underline-offset-2 hover:text-black/65"
-                    title={channelName}
+                    className="block max-w-full truncate rounded-sticker text-left text-subhead font-semibold text-foreground-muted underline decoration-[1.5px] underline-offset-[3px] outline-none hover:text-foreground focus-visible:shadow-focus"
                     aria-label={formatMessage(
                       { id: "settings.archivedChannels.openAriaLabel" },
                       { name: channel.name },
@@ -131,7 +131,7 @@ function ArchivedChannelsSectionContent() {
                   >
                     {channelName}
                   </button>
-                  <div className="mt-0.5 truncate text-xs text-black/55">
+                  <div className="mt-0.5 truncate text-footnote text-foreground-muted">
                     {formatMessage(
                       { id: "settings.archivedChannels.metadata" },
                       {
@@ -142,27 +142,16 @@ function ArchivedChannelsSectionContent() {
                   </div>
                 </div>
               </div>
-              <Button
-                size="sm"
-                shape="iconText"
-                tone="lime"
-                className="w-full sm:w-auto"
+              <UnarchiveChannelButton
+                channel={channel}
+                busy={busy}
                 disabled={busyChannelId !== null}
-                aria-label={formatMessage(
-                  { id: "settings.archivedChannels.unarchiveAriaLabel" },
-                  { name: channel.name },
-                )}
-                onClick={() => void handleUnarchive(channel)}
-              >
-                <ArchiveRestore size={14} />
-                {busy
-                  ? formatMessage({ id: "channel.edit.unarchiving" })
-                  : formatMessage({ id: "channel.create.unarchive" })}
-              </Button>
-            </SurfaceListItem>
+                onUnarchive={handleUnarchive}
+              />
+            </div>
           );
         })}
-      </div>
+      </Card>
     </section>
   );
 }

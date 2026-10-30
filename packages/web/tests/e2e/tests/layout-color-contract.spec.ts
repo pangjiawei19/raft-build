@@ -4,30 +4,28 @@ import { loginViaApi } from "../fixtures/auth";
 import { waitForSeedState } from "../fixtures/seedState";
 
 /**
- * Pins the desktop layout color contract from stdrc 2026-05-02
- * #proj-uiux:95e25b5b. After research-driven iteration through
- * paper / yellow / cool-gray / warm-yellow candidates, the chosen
- * three-band hierarchy is:
+ * Pins the desktop layout color contract (stdrc 2026-05-02
+ * #proj-uiux:95e25b5b), which the Raft Design System keeps: colour thins
+ * from the outside in, yellow → cream → white.
  *
- *   LeftRail (yellow #FFD440)
+ *   Rail (the frame, yellow #FFD440)
  *     │
  *     │  Sidebar column (cream #FFFAEF — desktop only)
- *     │    └─ Sidebar header h-[62px] also cream
+ *     │    └─ Sidebar header (56 tall) also cream
  *     │
- *     │  Main panel column (white #FFFFFF)
- *     │    └─ Chat header h-[62px] also white
+ *     │  Main panel column (paper, white #FFFFFF)
+ *     │    └─ Panel header (56 tall) also white
  *     │    └─ Messages scroller white
  *
- * Mobile (<md) flips the rule: every full-screen tab interior is
- * white including the sidebar (since there's no side-by-side to
- * differentiate against).
+ * Mobile (<md) has no cream: every screen sits on paper, including the
+ * channel list (there's no side-by-side to differentiate against).
  *
- * Vertical column dividers are border-r-2 / border-l-2 to match
- * the horizontal border-b-2 used by panel headers.
+ * Areas meet at a single 1px `line-seam`; the side drawn first owns it.
  *
- * This spec asserts the rendered backgroundColor for each region
- * via getComputedStyle, so any regression on the @theme tokens or
- * on the Tailwind class names lights up here. */
+ * This spec asserts the rendered backgroundColor for each region via
+ * getComputedStyle, so any regression on the theme tokens lights up here.
+ * Elements are located by their raft-ui data-slot hooks, not by Tailwind
+ * class names. */
 test.describe("layout color contract (desktop)", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -38,33 +36,24 @@ test.describe("layout color contract (desktop)", () => {
     const seedState = await waitForSeedState();
     await loginViaApi(request, seedState);
     await page.goto(seedState.urls.web);
-    // Wait for the desktop shell to be present.
-    await page.waitForSelector(".bg-soft-signal", { timeout: 10_000 });
+    // Wait for the desktop shell to be present. The layout regions are
+    // addressed by their stable data-slot hooks, not Tailwind class names.
+    await page.waitForSelector('[data-slot="app-rail-root"]', { timeout: 10_000 });
+    await page.waitForSelector('[data-slot="sidebar-root"]', { timeout: 10_000 });
+    await page.waitForSelector('[data-slot="conversation-panel-root"]', { timeout: 10_000 });
 
     const colors = await page.evaluate(() => {
-      // The LeftRail is the only top-level yellow column in the desktop
-      // shell. Match it loosely on the brand-yellow class so this selector
-      // survives width / arbitrary-value adjustments to the rail's outer
-      // div (PR #1281 moved it from `w-14` to `w-[64px]`).
-      const leftRail = Array.from(
-        document.querySelectorAll<HTMLElement>("div.bg-soft-signal"),
-      ).find(
-        (el) =>
-          el.className.toString().includes("border-r-2") &&
-          el.className.toString().includes("flex-col"),
+      // The Rail is raft-ui's AppRail root: the frame, yellow in light.
+      const leftRail = document.querySelector(
+        '[data-slot="app-rail-root"]',
       ) as HTMLElement | null;
+      // The sidebar column: cream paper, desktop only.
       const sidebar = document.querySelector(
-        "div.bg-brutal-cream",
+        '[data-slot="sidebar-root"]',
       ) as HTMLElement | null;
-      // Find the main content wrapper that has md:bg-white. On md+ it
-      // resolves to white; on smaller viewports the class doesn't apply.
-      const mainCandidate = Array.from(
-        document.querySelectorAll<HTMLElement>("div"),
-      ).find(
-        (el) =>
-          el.className &&
-          el.className.toString().includes("md:bg-white") &&
-          el.className.toString().includes("flex-1"),
+      // The main panel: paper.
+      const mainCandidate = document.querySelector(
+        '[data-slot="conversation-panel-root"]',
       ) as HTMLElement | null;
       return {
         leftRail: leftRail ? getComputedStyle(leftRail).backgroundColor : null,
@@ -75,11 +64,13 @@ test.describe("layout color contract (desktop)", () => {
       };
     });
 
-    // brutal-yellow = #FFD440 = rgb(255, 212, 64)
-    await expectCssColor(page, colors.leftRail, "#FFD440");
-    // brutal-cream = #FFFAEF = rgb(255, 250, 239)
+    // frame yellow: #FFD440 = rgb(255, 212, 64). The rail paints raft-ui's
+    // frame token (an oklch value), whose color-space round-trip can land at
+    // [255,212,65] — hence tolerance 1, not a changed contract.
+    await expectCssColor(page, colors.leftRail, "#FFD440", 1);
+    // sidebar cream = #FFFAEF = rgb(255, 250, 239)
     await expectCssColor(page, colors.sidebar, "#FFFAEF");
-    // bg-white = #FFFFFF
+    // paper = #FFFFFF
     await expectCssColor(page, colors.main, "#FFFFFF");
   });
 });

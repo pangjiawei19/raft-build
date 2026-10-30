@@ -1,83 +1,35 @@
-// Canonical freshness-hold reply formatting for agent-facing output (moved
-// from commands/freshnessHold.ts in the error/hold-face AX coverage pass).
-// This is an AX contract, not an implementation detail.
-import { axSurface } from "../../core/renderer.js";
-import { historyCursorText } from "../message/_format.js";
+// Canonical freshness-hold reply formatting for agent-facing output. The
+// text lives in shared (`formatAgentHold`, agentText/hold.ts) so the SDK
+// prints the same bytes; this file keeps the axSurface registrations. This is
+// an AX contract, not an implementation detail.
+import type {
+  AgentHoldData,
+  AgentHoldOptions,
+} from "@botiverse/raft-shared";
+import {
+  formatAgentHold,
+  formatAgentReviewerIsolationHold,
+  redactAgentHoldForReviewerIsolation,
+} from "@botiverse/raft-shared/src/agentCliSurface";
+import { axSurface } from "../../core/renderer";
 
-export interface FreshnessHoldOutputData {
-  producerFactId?: string;
-  decision?: "local_hold" | "syncing_hold";
-  heldMessages?: any[];
-  newMessageCount?: number;
-  shownMessageCount?: number;
-  omittedMessageCount?: number;
-  withheldMessageCount?: number;
-  freshnessContextMode?: "inline" | "withheld";
-  mentionAnnotation?: { formalMentionCount: number };
-  continueAnywaySuggested?: boolean;
-  /** Lowest seq inside the displayed window; --before anchor for browsing older. */
-  firstShownSeq?: number;
-  /** Thread-start anchor for thread targets (digest topic anchor). */
-  threadParentMessage?: {
-    seq: number;
-    messageId?: string;
-    senderName?: string | null;
-    createdAt?: string | null;
-    content?: string;
-  };
-}
-
-// Preview truncation cap for digest lines, counted in code points so CJK and
-// Latin text truncate comparably. The cap is a display budget, not a secret:
-// every truncated line says how much it is hiding.
-const HOLD_PREVIEW_CHARS = 160;
-
-function previewLine(sender: string | null | undefined, timestamp: string | null | undefined, content: string | undefined): string {
-  const raw = (content ?? "").replace(/\s+/g, " ").trim();
-  const points = Array.from(raw);
-  const shown = points.slice(0, HOLD_PREVIEW_CHARS).join("");
-  const hidden = points.length - Math.min(points.length, HOLD_PREVIEW_CHARS);
-  const time = timestamp ? new Date(timestamp).toISOString().slice(11, 16) : "";
-  const head = [sender ? `@${sender}` : "", time].filter(Boolean).join(" ");
-  const marker = hidden > 0 ? `…⟨${hidden} more chars⟩` : "";
-  return `  │ ${head ? `${head}  ` : ""}${shown}${marker}`;
-}
-
-function heldMessagePreview(message: Record<string, unknown>): string {
-  const sender = (message.sender_name ?? message.senderName ?? null) as string | null;
-  const timestamp = (message.timestamp ?? message.createdAt ?? null) as string | null;
-  const content = (message.content ?? "") as string;
-  return previewLine(sender, timestamp, content);
-}
+export type FreshnessHoldOutputData = AgentHoldData;
 
 export function isFreshnessHeldResponse(data: unknown): data is FreshnessHoldOutputData & { state: "held" } {
   return Boolean(data && typeof data === "object" && (data as { state?: unknown }).state === "held");
 }
 
-export function redactFreshnessHoldForReviewerIsolation<T extends FreshnessHoldOutputData>(
-  data: T,
-): {
+export function redactFreshnessHoldForReviewerIsolation<T extends FreshnessHoldOutputData>(data: T): {
   state: "held";
   freshnessContextMode: "withheld";
   withheldMessageCount: number;
 } {
-  const newMessageCount = normalizeWithheldMessageCount(
-    data.withheldMessageCount ?? data.newMessageCount,
-  );
-  return {
-    state: "held",
-    freshnessContextMode: "withheld",
-    withheldMessageCount: newMessageCount,
-  };
+  return redactAgentHoldForReviewerIsolation(data);
 }
 
 export const formatReviewerIsolationFreshnessHold = axSurface(
   "Reviewer-isolation freshness hold: withheld-count-only notice, no context bytes.",
-  (data: FreshnessHoldOutputData): string => {
-    const projected = redactFreshnessHoldForReviewerIsolation(data);
-    const messageNoun = projected.withheldMessageCount === 1 ? "message" : "messages";
-    return `Reviewer-isolation freshness hold: ${projected.withheldMessageCount} newer ${messageNoun} withheld.\n`;
-  },
+  (data: FreshnessHoldOutputData): string => formatAgentReviewerIsolationHold(data),
   {
     examples: [{ args: [{ withheldMessageCount: 3 }] }],
   },
@@ -85,72 +37,7 @@ export const formatReviewerIsolationFreshnessHold = axSurface(
 
 export const formatFreshnessHoldOutput = axSurface(
   "Freshness/syncing hold body: opening count line, omitted note, guidance, mention note, bounded held-message window, and the recovery-path instructions.",
-  (
-  target: string,
-  data: FreshnessHoldOutputData,
-  opts: {
-    heldAction: string;
-    draftInstructions?: string;
-    continueAnywayInstruction?: string;
-    withholdContext?: boolean;
-  },
-): string => {
-  const withholdContext = opts.withholdContext === true || data.freshnessContextMode === "withheld";
-  if (withholdContext) {
-    return formatReviewerIsolationFreshnessHold(data);
-  }
-  const newMessageCount = data.newMessageCount ?? 0;
-  const shownMessageCount = data.shownMessageCount ?? data.heldMessages?.length ?? 0;
-  const heldMessages = data.heldMessages ?? [];
-  const mentionNote = (data.mentionAnnotation?.formalMentionCount ?? 0) > 0
-    ? `\nNote: ${data.mentionAnnotation!.formalMentionCount} of these messages formally @mention you.`
-    : "";
-  const continueAnyway = data.continueAnywaySuggested && opts.continueAnywayInstruction
-    ? opts.continueAnywayInstruction
-    : "";
-  const newMessageNoun = newMessageCount === 1 ? "message" : "messages";
-
-  // ── Digest: the state map the agent decides from (task #41 redesign).
-  // Structure: thread-start anchor (threads) → never-shown debt line →
-  // latest-window truncated previews → full-text pointer. The map is shown;
-  // whether and how deep to read is the agent's decision.
-  const lines: string[] = [];
-  const parent = data.threadParentMessage;
-  const firstShownSeq = data.firstShownSeq
-    ?? (heldMessages.length > 0
-      ? Math.min(...heldMessages.map((m) => Number(m?.seq)).filter((s) => Number.isFinite(s) && s > 0))
-      : undefined);
-  if (parent && (firstShownSeq === undefined || parent.seq < firstShownSeq)) {
-    lines.push(`  ┌ Thread start ${"─".repeat(28)}`);
-    lines.push(previewLine(parent.senderName, parent.createdAt ?? null, parent.content));
-  }
-  // Chat semantics (task #41 final review): opening a conversation shows the
-  // latest window and silently reads through — like a human opening a chat.
-  // The honest sentence is the whole obligation: say how many were skipped
-  // this time and how to browse older. No persistent read-debt bookkeeping.
-  const omittedMessageCount = data.omittedMessageCount ?? 0;
-  if (omittedMessageCount > 0 && firstShownSeq !== undefined) {
-    lines.push(
-      `  ├ ⋯ ${omittedMessageCount} earlier message${omittedMessageCount === 1 ? "" : "s"} skipped in this notice. `
-      + `${historyCursorText("Older", true, "before", firstShownSeq, target)} ⋯`,
-    );
-  }
-  if (heldMessages.length > 0) {
-    lines.push(`  ├ Latest ${shownMessageCount} ${"─".repeat(28)}`);
-    for (const message of heldMessages) lines.push(heldMessagePreview(message));
-  }
-  lines.push(`  └ Previews are truncated. Full text: raft message read --target "${target}"`);
-
-  const openingLine = `Held — ${newMessageCount} unread ${newMessageNoun} in ${target}. ${opts.heldAction}`;
-
-  return (
-    `${openingLine}${mentionNote}\n\n` +
-    lines.join("\n") +
-    `\n\nAfter reviewing the current state of this conversation, choose one path.\n` +
-    (opts.draftInstructions ?? "") +
-    continueAnyway
-  );
-},
+  (target: string, data: FreshnessHoldOutputData, opts: AgentHoldOptions): string => formatAgentHold(target, data, opts, "cli"),
   {
     examples: [
       {
@@ -181,6 +68,36 @@ export const formatFreshnessHoldOutput = axSurface(
         ],
       },
       {
+        title: "held for the channel card alone (first message to the channel in this context)",
+        args: [
+          "#ops",
+          { newMessageCount: 0, heldMessages: [], holdReasons: ["channel_card"], channelCard: { id: "c-ops", name: "ops", type: "channel", description: "Release coordination. Post go/no-go here." } },
+          { heldAction: "Your message has been saved as a draft (kept for 10 minutes).", draftInstructions: "To send the current draft unchanged:\n  raft message send --send-draft --target \"#ops\"\nYou can also choose not to send anything.\n" },
+        ],
+      },
+      {
+        title: "held for the DM peer's card alone (first message to them in this context)",
+        args: [
+          "dm:@richard",
+          { newMessageCount: 0, heldMessages: [], holdReasons: ["peer_card"], peerCard: { kind: "human", name: "richard", description: "Founder. Prefers short updates.", timezone: "Asia/Shanghai" } },
+          { heldAction: "Your message has been saved as a draft (kept for 10 minutes).", draftInstructions: "To send the current draft unchanged:\n  raft message send --send-draft --target \"dm:@richard\"\nYou can also choose not to send anything.\n" },
+        ],
+      },
+      {
+        title: "unread messages and an unseen channel card, in one hold",
+        args: [
+          "#ops",
+          {
+            newMessageCount: 1,
+            shownMessageCount: 1,
+            holdReasons: ["unread_messages", "channel_card"],
+            channelCard: { id: "c-ops", name: "ops", type: "channel", description: "Release coordination. Post go/no-go here." },
+            heldMessages: [{ seq: 41, sender_name: "richard", timestamp: "2026-10-15T09:00:00.000Z", content: "deploy at 5?" }],
+          },
+          { heldAction: "Your message has been saved as a draft." },
+        ],
+      },
+      {
         title: "withheld context (reviewer isolation路径)",
         args: [
           "#general",
@@ -191,9 +108,3 @@ export const formatFreshnessHoldOutput = axSurface(
     ],
   },
 );
-
-function normalizeWithheldMessageCount(value: number | undefined): number {
-  return typeof value === "number" && Number.isFinite(value)
-    ? Math.max(0, Math.floor(value))
-    : 0;
-}

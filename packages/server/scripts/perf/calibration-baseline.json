@@ -174,12 +174,8 @@
       "durationMs": 16112
     },
     {
-      "file": "src/routes/internalAgentApi.cursorRebuild.test.ts",
+      "file": "src/routes/internalAgentApi.externalInboxPull.test.ts",
       "durationMs": 16089
-    },
-    {
-      "file": "src/routes/wiki.api.test.ts",
-      "durationMs": 15853
     },
     {
       "file": "src/routes/attachmentComments.api.test.ts",
@@ -342,10 +338,6 @@
       "durationMs": 9471
     },
     {
-      "file": "src/routes/workflows.api.test.ts",
-      "durationMs": 9451
-    },
-    {
       "file": "src/services/externalOutboundAttachmentCoordinator.test.ts",
       "durationMs": 9403
     },
@@ -448,10 +440,6 @@
     {
       "file": "src/routes/guestRbac.api.test.ts",
       "durationMs": 7412
-    },
-    {
-      "file": "src/routes/internalComputer.agentO11y.api.test.ts",
-      "durationMs": 7339
     },
     {
       "file": "src/routes/channels.getJoined.api.test.ts",
@@ -1002,10 +990,6 @@
       "durationMs": 2226
     },
     {
-      "file": "src/db/wikiBindingsMigration.test.ts",
-      "durationMs": 2201
-    },
-    {
       "file": "src/db/attachmentTransferIntentMigration.test.ts",
       "durationMs": 2200
     },
@@ -1139,10 +1123,6 @@
     },
     {
       "file": "src/services/pushDisplay.test.ts",
-      "durationMs": 28
-    },
-    {
-      "file": "src/services/wikiManifestService.test.ts",
       "durationMs": 28
     },
     {
@@ -1474,10 +1454,6 @@
       "durationMs": 2
     },
     {
-      "file": "src/services/daemonVersionService.test.ts",
-      "durationMs": 2
-    },
-    {
       "file": "src/services/integrationAuditService.test.ts",
       "durationMs": 2
     },
@@ -1531,10 +1507,6 @@
     },
     {
       "file": "src/tracing/sendRouteFailure.test.ts",
-      "durationMs": 2
-    },
-    {
-      "file": "src/wikiWorkspacePack.contract.test.ts",
       "durationMs": 2
     },
     {
@@ -1695,10 +1667,6 @@
     },
     {
       "file": "src/services/agentMigrationWorkerObservability.test.ts",
-      "durationMs": 1
-    },
-    {
-      "file": "src/services/agentO11yScopeDbWriter.test.ts",
       "durationMs": 1
     },
     {

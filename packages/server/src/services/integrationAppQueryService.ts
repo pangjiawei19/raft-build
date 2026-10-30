@@ -1,14 +1,16 @@
 import { and, asc, eq, gte, isNull, lt, or } from "drizzle-orm";
 import {
   actionCardActionSchema,
+  projectAppSetup,
+  asAppSetupInstallationId,
   canonicalizeOAuthClientCategory,
   type AgentApiOwnedIntegrationApp,
 } from "@botiverse/raft-shared";
 
-import { getDb } from "../db/index.js";
-import { actionCards, oauthClientMaintainers, oauthClients, serverAgentMembers } from "../db/schema.js";
-import { isMessageShortId, UUID_RE, uuidShortIdRange } from "../lib/messageId.js";
-import { oauthClientIsUserManagedPredicate } from "./oauthClientManagementPolicy.js";
+import { getDb } from "../db/index";
+import { actionCards, oauthClientInstalls, oauthClientMaintainers, oauthClients, serverAgentMembers } from "../db/schema";
+import { isMessageShortId, UUID_RE, uuidShortIdRange } from "../lib/messageId";
+import { oauthClientIsUserManagedPredicate } from "./oauthClientManagementPolicy";
 
 const REGISTER_APP_ACTION = "integration:register_app";
 
@@ -18,6 +20,7 @@ function recoveryCommand(clientKey: string): string {
 
 function committedProjection(row: {
   id: string;
+  installationId?: string | null;
   name: string;
   description: string | null;
   clientKey: string;
@@ -26,6 +29,13 @@ function committedProjection(row: {
   homepageUrl: string | null;
   callbackUrl: string | null;
   agentManifestUrl: string | null;
+  setupUrl: string | null;
+  setupDescription: string | null;
+  setupRevision: number;
+  setupServerId: string | null;
+  setupInstallStatus: string | null;
+  setupCompletedRevision: number | null;
+  setupCompletedAt: Date | null;
   scopes: string[] | null;
   category: string;
   dataAccessSummary: string | null;
@@ -38,6 +48,7 @@ function committedProjection(row: {
   return {
     state: "committed",
     card: null,
+    installationId: row.installationId ?? null,
     name: row.name,
     clientKey: row.clientKey,
     createdAt: row.createdAt.toISOString(),
@@ -46,6 +57,15 @@ function committedProjection(row: {
     homepageUrl: row.homepageUrl,
     callbackUrl: row.callbackUrl,
     agentManifestUrl: row.agentManifestUrl,
+    ...(row.setupUrl ? {
+      setupUrl: row.setupUrl,
+      setupDescription: row.setupDescription,
+      setup: row.installationId && row.setupServerId && row.setupInstallStatus === "active" ? projectAppSetup({
+        setupUrl: row.setupUrl, setupDescription: row.setupDescription, setupRevision: row.setupRevision,
+        installationId: asAppSetupInstallationId(row.installationId), serverId: row.setupServerId,
+        completedRevision: row.setupCompletedRevision, completedAt: row.setupCompletedAt,
+      }) : null,
+    } : {}),
     scopes: row.scopes ?? [],
     category: canonicalizeOAuthClientCategory(row.category) ?? "Other",
     dataAccessSummary: row.dataAccessSummary,
@@ -68,6 +88,7 @@ function pendingProjection(row: {
   return {
     state: "card_pending",
     card: row.messageId,
+    installationId: null,
     name: parsed.data.name,
     clientKey: parsed.data.clientKey ?? null,
     createdAt: row.createdAt.toISOString(),
@@ -76,6 +97,7 @@ function pendingProjection(row: {
     homepageUrl: parsed.data.homepageUrl ?? null,
     callbackUrl: parsed.data.returnUrl ?? null,
     agentManifestUrl: parsed.data.agentManifestUrl ?? null,
+    ...(parsed.data.setupUrl ? { setupUrl: parsed.data.setupUrl, setupDescription: parsed.data.setupDescription ?? null } : {}),
     scopes: parsed.data.scopes ?? [],
     category: parsed.data.category ?? null,
     dataAccessSummary: null,
@@ -102,6 +124,7 @@ async function isAgentServerAdmin(serverId: string, agentId: string): Promise<bo
 
 const MANAGEABLE_APP_COLUMNS = {
   id: oauthClients.id,
+  installationId: oauthClientInstalls.id,
   name: oauthClients.name,
   description: oauthClients.description,
   clientKey: oauthClients.clientId,
@@ -110,6 +133,13 @@ const MANAGEABLE_APP_COLUMNS = {
   homepageUrl: oauthClients.homepageUrl,
   callbackUrl: oauthClients.returnUrl,
   agentManifestUrl: oauthClients.agentManifestUrl,
+  setupUrl: oauthClients.setupUrl,
+  setupDescription: oauthClients.setupDescription,
+  setupRevision: oauthClients.setupRevision,
+  setupServerId: oauthClientInstalls.serverId,
+  setupInstallStatus: oauthClientInstalls.status,
+  setupCompletedRevision: oauthClientInstalls.setupCompletedRevision,
+  setupCompletedAt: oauthClientInstalls.setupCompletedAt,
   scopes: oauthClients.allowedScopes,
   category: oauthClients.category,
   dataAccessSummary: oauthClients.dataAccessSummary,
@@ -140,6 +170,10 @@ async function findOwnedCommittedApp(opts: {
     const [row] = await getDb()
       .select(MANAGEABLE_APP_COLUMNS)
       .from(oauthClients)
+      .leftJoin(oauthClientInstalls, and(
+        eq(oauthClientInstalls.clientId, oauthClients.id),
+        eq(oauthClientInstalls.serverId, opts.serverId),
+      ))
       .where(and(...conditions))
       .limit(1);
     return row ? committedProjection({ ...row, authority: "admin" }) : null;
@@ -148,6 +182,10 @@ async function findOwnedCommittedApp(opts: {
     .select(MANAGEABLE_APP_COLUMNS)
     .from(oauthClients)
     .innerJoin(oauthClientMaintainers, eq(oauthClientMaintainers.clientId, oauthClients.id))
+    .leftJoin(oauthClientInstalls, and(
+      eq(oauthClientInstalls.clientId, oauthClients.id),
+      eq(oauthClientInstalls.serverId, opts.serverId),
+    ))
     .where(and(
       ...conditions,
       eq(oauthClientMaintainers.principalType, "agent"),
@@ -183,6 +221,10 @@ export async function listAgentIntegrationApps(opts: {
     ? await db
       .select(MANAGEABLE_APP_COLUMNS)
       .from(oauthClients)
+      .leftJoin(oauthClientInstalls, and(
+        eq(oauthClientInstalls.clientId, oauthClients.id),
+        eq(oauthClientInstalls.serverId, opts.serverId),
+      ))
       .where(and(
         eq(oauthClients.serverId, opts.serverId),
         oauthClientIsUserManagedPredicate(),
@@ -196,6 +238,10 @@ export async function listAgentIntegrationApps(opts: {
       .select(MANAGEABLE_APP_COLUMNS)
       .from(oauthClients)
       .innerJoin(oauthClientMaintainers, eq(oauthClientMaintainers.clientId, oauthClients.id))
+      .leftJoin(oauthClientInstalls, and(
+        eq(oauthClientInstalls.clientId, oauthClients.id),
+        eq(oauthClientInstalls.serverId, opts.serverId),
+      ))
       .where(and(
         eq(oauthClients.serverId, opts.serverId),
         oauthClientIsUserManagedPredicate(),
@@ -280,6 +326,7 @@ export async function getAgentIntegrationAppByCard(opts: {
   return {
     state: "committed",
     card: row.messageId,
+    installationId: null,
     name,
     clientKey,
     createdAt: row.createdAt.toISOString(),

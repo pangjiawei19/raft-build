@@ -9,7 +9,6 @@ export const CONNECTED_APPS_ERROR_FORM = "form";
 export function getConnectedAppsErrorSurface(
   error: string,
   selectedListing: unknown,
-  selectedBuiltInApp: unknown,
   showRegisterDrawer: boolean,
   deleteClientTarget: unknown,
   offlineRequestTarget: unknown,
@@ -18,7 +17,7 @@ export function getConnectedAppsErrorSurface(
   if (!error) return "none";
   if (selectedListing) return "listing";
   if (showRegisterDrawer) return "form";
-  if (selectedBuiltInApp || deleteClientTarget || offlineRequestTarget || marketplaceUninstallTarget) return "modal";
+  if (deleteClientTarget || offlineRequestTarget || marketplaceUninstallTarget) return "modal";
   return "page";
 }
 
@@ -32,5 +31,5 @@ export function ConnectedAppsErrorBanner({
   error: string;
 }) {
   if (surface !== target) return null;
-  return <Banner intent="warning" density="sm" className="font-bold">{error}</Banner>;
+  return <Banner intent="warning" density="sm">{error}</Banner>;
 }

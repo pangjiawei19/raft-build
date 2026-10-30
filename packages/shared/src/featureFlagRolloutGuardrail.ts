@@ -1,4 +1,6 @@
 import { z } from "zod";
+import { lazySchema } from "./lazySchema";
+import { findClientRuleBypassConflicts } from "./featureFlagClientRules";
 
 /**
  * Phase-3 progressive-delivery contract for feature-flag writes.
@@ -17,25 +19,36 @@ export const FEATURE_FLAG_ROLLOUT_GUARDRAIL_MAX_RECEIPT_AGE_MS = 5 * 60 * 1_000;
 const FLAG_KEY_RE = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
 const CONTROL_PLANE_ID_RE = /^[a-z0-9][a-z0-9_.:-]{0,127}$/;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const flagKeySchema = z.string().regex(FLAG_KEY_RE);
-const controlPlaneIdSchema = z.string().regex(CONTROL_PLANE_ID_RE);
-const uuidSchema = z.string().regex(UUID_RE);
-const configVersionSchema = z.number().refine(Number.isSafeInteger).refine((value) => value >= 0);
-const basisPointsSchema = z.number().int().min(0).max(10_000);
+const flagKeySchema = lazySchema("flagKeySchema", () => z.string().regex(FLAG_KEY_RE));
+const controlPlaneIdSchema = lazySchema("controlPlaneIdSchema", () => z.string().regex(CONTROL_PLANE_ID_RE));
+const uuidSchema = lazySchema("uuidSchema", () => z.string().regex(UUID_RE));
+const configVersionSchema = lazySchema("configVersionSchema", () => z.number().refine(Number.isSafeInteger).refine((value) => value >= 0));
+const basisPointsSchema = lazySchema("basisPointsSchema", () => z.number().int().min(0).max(10_000));
 
 // Persisted rows carry adapter-specific metadata (timestamps, etc.). Strip
 // irrelevant columns, but retain the optional row key so it can be checked
 // against the locked top-level flag before any rule drives a decision.
-const ruleSchema = z.object({
+const ruleSchema = lazySchema("ruleSchema", () => z.object({
   id: uuidSchema,
   flagKey: flagKeySchema.optional(),
-  stage: z.enum(["user", "platform", "server", "audience", "lab", "plan", "percentage"]),
+  stage: z.enum(["user", "platform", "client", "server", "audience", "lab", "plan", "percentage"]),
   priority: z.number().int(),
   decision: z.enum(["allow", "deny"]),
   values: z.array(z.string().min(1)).refine((values) => new Set(values).size === values.length),
   percentageBasisPoints: basisPointsSchema.nullable(),
   variant: z.string().min(1).nullable(),
-});
+  // `client`-stage constraints (task #1144). Rows written before the column existed omit them.
+  clientOs: z.array(z.string().min(1)).nullable().optional(),
+  minClientBuild: z.number().int().nullable().optional(),
+  clientBuildTypes: z.array(z.string().min(1)).nullable().optional(),
+}));
+
+/** A rule carrying client constraints is never a canonical server/percentage rule to rewrite. */
+function hasClientConstraints(rule: FeatureFlagRolloutRuleInput): boolean {
+  return (rule.clientOs ?? null) !== null
+    || (rule.minClientBuild ?? null) !== null
+    || (rule.clientBuildTypes ?? null) !== null;
+}
 
 export type FeatureFlagRolloutRuleInput = z.infer<typeof ruleSchema>;
 
@@ -48,7 +61,7 @@ export interface FeatureFlagRolloutStateInput {
   rules: readonly FeatureFlagRolloutRuleInput[];
 }
 
-const baseStateSchema = z.strictObject({
+const baseStateSchema = lazySchema("baseStateSchema", () => z.strictObject({
   controlPlaneId: controlPlaneIdSchema,
   flagKey: flagKeySchema,
   configVersion: configVersionSchema,
@@ -56,10 +69,10 @@ const baseStateSchema = z.strictObject({
   // Rules are parsed only when the requested operation depends on them. This
   // keeps emergency kill available even if unrelated rule payloads are bad.
   rules: z.unknown().optional(),
-});
+}));
 type ParsedState = Omit<z.infer<typeof baseStateSchema>, "rules"> & { rules: unknown[] };
 
-const intentSchema = z.discriminatedUnion("kind", [
+const intentSchema = lazySchema("intentSchema", () => z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("server_allowlist_set"),
     flagKey: flagKeySchema,
@@ -79,11 +92,11 @@ const intentSchema = z.discriminatedUnion("kind", [
     expectedConfigVersion: configVersionSchema.optional(),
     desired: z.boolean(),
   }),
-]);
+]));
 
 export type FeatureFlagRolloutIntent = z.infer<typeof intentSchema>;
 
-const wideningOperationSchema = z.discriminatedUnion("kind", [
+const wideningOperationSchema = lazySchema("wideningOperationSchema", () => z.discriminatedUnion("kind", [
   z.strictObject({
     kind: z.literal("server_allowlist_add"),
     ruleId: uuidSchema.nullable(),
@@ -96,7 +109,7 @@ const wideningOperationSchema = z.discriminatedUnion("kind", [
     toBasisPoints: basisPointsSchema,
   }).refine((operation) => operation.toBasisPoints > operation.fromBasisPoints),
   z.strictObject({ kind: z.literal("kill_switch_disable") }),
-]);
+]));
 
 export type FeatureFlagRolloutWideningOperation = z.infer<typeof wideningOperationSchema>;
 
@@ -112,7 +125,8 @@ export type FeatureFlagRolloutBlockedReason =
   | "config_version_required"
   | "config_version_mismatch"
   | "unsupported_server_allowlist_shape"
-  | "unsupported_percentage_shape";
+  | "unsupported_percentage_shape"
+  | "client_rule_bypass";
 
 export type FeatureFlagRolloutClassification =
   | {
@@ -126,7 +140,7 @@ export type FeatureFlagRolloutClassification =
   | { kind: "no_op" }
   | { kind: "blocked"; reason: FeatureFlagRolloutBlockedReason };
 
-const receiptSchema = z.strictObject({
+const receiptSchema = lazySchema("receiptSchema", () => z.strictObject({
   schema: z.literal(FEATURE_FLAG_ROLLOUT_GUARDRAIL_SCHEMA),
   id: uuidSchema,
   verdict: z.enum(["pass", "fail"]),
@@ -138,7 +152,7 @@ const receiptSchema = z.strictObject({
   policyVersion: z.literal(FEATURE_FLAG_ROLLOUT_GUARDRAIL_POLICY_VERSION),
   evaluatedAt: z.string(),
   expiresAt: z.string(),
-});
+}));
 
 export type FeatureFlagRolloutGuardrailReceiptV1 = z.infer<typeof receiptSchema>;
 
@@ -201,6 +215,16 @@ function parseAllRules(state: ParsedState): FeatureFlagRolloutRuleInput[] | null
   return parsed.data;
 }
 
+/**
+ * Widening a server allowlist or a percentage must not create a rule that a client failing a client allow
+ * rule would fall through to (task #1144). Narrowing is never blocked by this.
+ */
+function wouldBypassClientRule(state: ParsedState, candidate: FeatureFlagRolloutRuleInput): boolean {
+  const rules = parseAllRules(state);
+  if (!rules) return true;
+  return findClientRuleBypassConflicts({ rules: [...rules, candidate] }).length > 0;
+}
+
 function deriveServerAllowlist(state: ParsedState):
   | { shape: "canonical"; ruleId: string | null; serverIds: string[] }
   | { shape: "unsupported" } {
@@ -216,6 +240,7 @@ function deriveServerAllowlist(state: ParsedState):
     || rule.percentageBasisPoints !== null
     || rule.variant !== null
     || rule.values.some((serverId) => !UUID_RE.test(serverId))
+    || hasClientConstraints(rule)
   ) return { shape: "unsupported" };
   return { shape: "canonical", ruleId: rule.id, serverIds: [...rule.values] };
 }
@@ -236,6 +261,7 @@ function derivePercentage(state: ParsedState):
     || rule.values.length !== 0
     || rule.percentageBasisPoints === null
     || rule.variant !== null
+    || hasClientConstraints(rule)
   ) return { shape: "unsupported" };
   return { shape: "canonical_allow", ruleId: rule.id, basisPoints: rule.percentageBasisPoints };
 }
@@ -283,6 +309,17 @@ export function classifyFeatureFlagRollout(
       const present = allowlist.serverIds.includes(intent.serverId);
       if ((intent.desired === "present") === present) return { kind: "no_op" };
       if (intent.desired === "present") {
+        if (wouldBypassClientRule(state, {
+          id: "00000000-0000-4000-8000-000000000000",
+          stage: "server",
+          priority: 0,
+          decision: "allow",
+          values: [intent.serverId],
+          percentageBasisPoints: null,
+          variant: null,
+        })) {
+          return { kind: "blocked", reason: "client_rule_bypass" };
+        }
         return classifyWidening(state, intent, {
           kind: "server_allowlist_add",
           ruleId: allowlist.ruleId,
@@ -322,6 +359,17 @@ export function classifyFeatureFlagRollout(
             toBasisPoints: intent.desiredBasisPoints,
           },
         };
+      }
+      if (wouldBypassClientRule(state, {
+        id: "00000000-0000-4000-8000-000000000000",
+        stage: "percentage",
+        priority: 0,
+        decision: "allow",
+        values: [],
+        percentageBasisPoints: intent.desiredBasisPoints,
+        variant: null,
+      })) {
+        return { kind: "blocked", reason: "client_rule_bypass" };
       }
       return classifyWidening(state, intent, {
         kind: "percentage_increase",

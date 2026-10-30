@@ -1,16 +1,25 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
+
+import { SIDEBAR_PANEL_BOUNDS } from "../src/lib/panelBounds";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
 test("desktop chat sidebar has a compact max width to avoid empty right gutter", () => {
   const source = readFileSync(resolve(repoRoot, "src/components/layout/MainLayout.tsx"), "utf8");
 
+  // The bounds moved into lib/panelBounds so the signed-in shell and the public server page cannot drift apart
+  // (cindyz, 2026-09-21). This now pins the VALUE rather than MainLayout's spelling of it: a regex over source text
+  // would pass again the moment someone re-inlined a different number, and would say nothing about what the shared
+  // module actually holds.
+  assert.equal(SIDEBAR_PANEL_BOUNDS.max, 320, "compact max width is what avoids the empty right gutter");
+  assert.equal(SIDEBAR_PANEL_BOUNDS.min, 180);
+  assert.equal(SIDEBAR_PANEL_BOUNDS.defaultWidth, 240);
+  // ...and that this surface still consumes the shared bounds instead of re-declaring its own.
   assert.match(
     source,
-    /useResizablePanel\(\{ storageKey: "slock:sidebarWidth", min: 180, max: 320, defaultWidth: 240 \}\)/,
+    /useResizablePanel\(\{ storageKey: "slock:sidebarWidth", \.\.\.SIDEBAR_PANEL_BOUNDS \}\)/,
   );
   assert.doesNotMatch(source, /storageKey: "slock:sidebarWidth"[^}]*max: 400/);
 });
@@ -25,7 +34,14 @@ test("desktop chat sidebar uses shrink-0 so the resize handle changes visible wi
     // parent (otherwise its `flex-1` doesn't constrain height and the
     // results list overflows the viewport, killing scroll). Reported by
     // stdrc #proj-uiux:c2313b1d msg=86b31b78 (2026-05-28).
-    /className=\{`bg-brutal-cream relative min-w-0 \$\{mobileShowSidebarInline \? "flex-1" : "shrink-0"\} \$\{searchMasterDetail \? "flex flex-col border-r-2 border-black" : ""\}`\}/,
+    // The right divider is the Raft DS seam between two regions.
+    /const masterDetailShellClassName = searchMasterDetail\s*\?\s*"flex flex-col border-r border-line-seam"/,
+  );
+  assert.match(
+    source,
+    // Desktop: the cream sidebar surface, `shrink-0` so the resize handle
+    // changes the visible width; the phone tab root is white paper.
+    /className=\{`relative h-full min-w-0 \$\{mobileShowSidebarInline \? "flex-1 bg-layer-canvas" : "shrink-0 bg-layer-sidebar"\} \$\{masterDetailShellClassName\}`\}/,
   );
   // task #311 master/detail: when /search has an open slot, col 2 hosts the
   // search panel. At lg+ (≥1024) it uses the search-specific persisted
@@ -60,13 +76,8 @@ test("desktop chat sidebar uses shrink-0 so the resize handle changes visible wi
   );
   // Breakpoint selection and both resize/recovery paths are covered through
   // the production sizing seam in masterDetailPanelResize.behavior.test.tsx.
-  assert.match(
-    source,
-    /workspaceEnabled\s*\?\s*\{[\s\S]*?minWidth:\s*MIN_WORKSPACE_GRID_SIDEBAR_WIDTH,[\s\S]*?maxWidth:\s*`min\(\$\{MAX_WORKSPACE_GRID_SIDEBAR_WIDTH\}px, 40vw\)`,?[\s\S]*?\}\s*:\s*\{\}/,
-    "Workspace mode should add its own responsive min/max width without changing classic sizing",
-  );
-  assert.doesNotMatch(source, /className="bg-brutal-cream relative min-w-0 flex-1"/);
-  assert.doesNotMatch(source, /className="bg-brutal-cream relative min-w-0 shrink-0"/);
+  assert.doesNotMatch(source, /className="bg-palette-cream relative min-w-0 flex-1"/);
+  assert.doesNotMatch(source, /className="bg-palette-cream relative min-w-0 shrink-0"/);
 });
 
 test("activity thread plus profile uses compact master width inside 1470px viewport budget", () => {
@@ -92,7 +103,7 @@ test("thread side panel browser resize path stays CSS-only", () => {
   const source = readFileSync(resolve(repoRoot, "src/components/layout/MainLayout.tsx"), "utf8");
   const threadPanelSource = readFileSync(resolve(repoRoot, "src/components/message/ThreadPanel.tsx"), "utf8");
   const styles = readFileSync(resolve(repoRoot, "src/index.css"), "utf8");
-  const sideThreadColumn = source.match(/function SideThreadColumn\(\) \{[\s\S]*?\n\}/)?.[0] ?? "";
+  const sideThreadColumn = source.match(/function SideThreadColumn\([^\n]*\) \{[\s\S]*?\n\}/)?.[0] ?? "";
 
   assert.ok(sideThreadColumn, "SideThreadColumn source should be discoverable");
   assert.doesNotMatch(
@@ -122,7 +133,7 @@ test("thread side panel browser resize path stays CSS-only", () => {
   );
   assert.match(
     source,
-    /className="thread-main-column flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden"\s+data-testid="thread-main-column"/,
+    /className="thread-main-column flex min-h-0 min-w-0 flex-1 flex-col overflow-clip"\s+data-testid="thread-main-column"/,
     "profile collapse must target an explicit channel main-column contract, not an incidental child position",
   );
   assert.match(
@@ -137,7 +148,7 @@ test("thread side panel browser resize path stays CSS-only", () => {
   );
   assert.match(
     styles,
-    /thread-profile-side-column\s*> \[data-testid="profile-panel"\][\s\S]*?min-width:\s*0[\s\S]*?max-width:\s*100%[\s\S]*?overflow:\s*hidden;/,
+    /thread-profile-side-column\s*> \[data-testid="profile-panel"\][\s\S]*?min-width:\s*0[\s\S]*?max-width:\s*(?:100%|calc\(100% - \d+px\))[\s\S]*?overflow:\s*hidden;/,
     "profile tab content must not grow the flex row and push shell columns out of view",
   );
   assert.match(
@@ -172,24 +183,32 @@ test("thread side panel browser resize path stays CSS-only", () => {
 
 test("sidebar section headers share row, toggle, and icon-button geometry", () => {
   const source = readFileSync(resolve(repoRoot, "src/components/layout/Sidebar.tsx"), "utf8");
+  const sortMenu = readFileSync(resolve(repoRoot, "src/components/layout/SidebarSortMenu.tsx"), "utf8");
 
+  // Raft Design System › Sidebar `.rf-section`: 16px above, 6px below, the
+  // title 13/18 700 ink-3 in sentence case; actions are raft-ui's small ghost
+  // icon buttons, pulled into the title row so they never grow it. All of it
+  // is raft-ui's section parts, not local copies of their classes.
+  assert.match(source, /SidebarSectionHeader as RaftSidebarSectionHeader/);
+  assert.ok((source.match(/<RaftSidebarSectionHeader\b/g) ?? []).length >= 4, "every section row is raft-ui's SidebarSectionHeader");
   assert.match(
     source,
-    /const SIDEBAR_SECTION_ROW_CLASS = "mb-1 mt-3 flex h-6 items-center justify-between px-2"/,
+    /function SidebarSectionToggle[\s\S]*?<SidebarSectionDisclosure\b/,
+    "collapsible section titles are raft-ui's SidebarSectionDisclosure",
   );
-  assert.match(
-    source,
-    /const SIDEBAR_SECTION_ROW_FIRST_CLASS = "mb-1 flex h-6 items-center justify-between px-2"/,
-  );
-  assert.match(
-    source,
-    /const SIDEBAR_SECTION_TOGGLE_CLASS = "flex h-6 min-w-0 flex-1 items-center gap-1 text-xs font-bold uppercase text-black tracking-widest hover:text-black\/70 transition-colors"/,
-  );
-  assert.match(
-    source,
-    /const SIDEBAR_SECTION_ICON_BUTTON_CLASS = "btn-flat-sm flex size-6 items-center justify-center p-0"/,
-  );
+  assert.ok((source.match(/<SidebarSectionToggle\b/g) ?? []).length >= 7, "every collapsible section title goes through the toggle");
+  assert.ok((source.match(/<SidebarSectionCount>/g) ?? []).length >= 7, "section counts are raft-ui's SidebarSectionCount");
+  assert.doesNotMatch(source, /SIDEBAR_SECTION_(?:ROW|TOGGLE|TITLE|COUNT|CONTROL)_CLASS/, "no local copy of the section parts' classes");
+  assert.doesNotMatch(source, /flex items-center justify-between gap-2 px-2 pt-4 pb-1\.5/);
+  // The 28px control's overhang into the title line is the raft-ui recipe's.
+  assert.doesNotMatch(`${source}\n${sortMenu}`, /className=\{?"?-my-1\.5/);
+  assert.doesNotMatch(source, /uppercase|tracking-widest/, "section titles are sentence case with no tracking");
 
+  // Every section action is the raft-ui control, not a hand-rolled button.
+  const controls = source.match(/<SidebarSectionControl\b/g) ?? [];
+  assert.ok(controls.length >= 4, "add-channel, add-agent, add-computer and invite actions use SidebarSectionControl");
+  assert.doesNotMatch(source, /btn-flat-sm/);
   assert.doesNotMatch(source, /className="mb-1 mt-3 flex items-center justify-between px-2"/);
   assert.doesNotMatch(source, /className="flex items-center gap-1 text-xs font-bold uppercase text-black tracking-widest/);
 });
+

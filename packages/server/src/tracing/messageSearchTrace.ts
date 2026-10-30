@@ -1,5 +1,6 @@
 import type { TraceAttributes } from "@botiverse/raft-shared";
-import { sanitizeRouteErrorMessage } from "./routeFailure.js";
+import { sanitizeRouteErrorMessage } from "./routeFailure";
+import { errorClassOf } from "./semanticTrace";
 
 export const MESSAGE_SEARCH_TRACE_KIND = "message_search";
 
@@ -14,11 +15,17 @@ export function messageSearchParamTraceAttrs(params: {
   sort: string;
   limit: number;
   offset: number;
+  /** Tokens the search actually uses (tokenizeSearchText); only the service knows it. */
+  queryTokenCount?: number;
 }): TraceAttributes {
   return {
     event_kind: MESSAGE_SEARCH_TRACE_KIND,
     query_present: params.query.length > 0,
     query_length_bucket: queryLengthBucket(params.query),
+    query_script: queryScript(params.query),
+    ...(params.queryTokenCount === undefined
+      ? {}
+      : { query_term_count_bucket: queryTermCountBucket(params.queryTokenCount) }),
     channel_filter_present: Boolean(params.channelId),
     sender_filter_present: Boolean(params.senderId),
     sender_type_filter: params.senderType ?? "any",
@@ -49,7 +56,7 @@ export function messageSearchErrorTraceAttrs(error: unknown, context: { query?: 
       : String(error ?? "");
 
   return {
-    error_class: error instanceof Error ? error.name : typeof error,
+    error_class: errorClassOf(error),
     ...(cause instanceof Error ? { error_cause_class: cause.name } : {}),
     ...(errorCode ? { error_code: errorCode, sqlstate: errorCode } : {}),
     error_message: sanitizeRouteErrorMessage(scrubSearchErrorMessage(message, context.query)),
@@ -62,6 +69,25 @@ function queryLengthBucket(query: string): "empty" | "short" | "medium" | "long"
   if (length <= 32) return "short";
   if (length <= 128) return "medium";
   return "long";
+}
+
+// Shape only, never the text: which script the query is written in, so
+// relevance work can be split by CJK vs Latin without reading the query.
+export function queryScript(query: string): "empty" | "cjk" | "latin" | "mixed" | "other" {
+  const trimmed = query.trim();
+  if (!trimmed) return "empty";
+  const cjk = /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(trimmed);
+  const latin = /\p{Script=Latin}/u.test(trimmed);
+  if (cjk && latin) return "mixed";
+  if (cjk) return "cjk";
+  if (latin) return "latin";
+  return "other";
+}
+
+export function queryTermCountBucket(count: number): "0" | "1" | "2" | "3" | "4+" {
+  if (count <= 0) return "0";
+  if (count >= 4) return "4+";
+  return String(count) as "1" | "2" | "3";
 }
 
 function scrubSearchErrorMessage(message: string, query: string | undefined): string {

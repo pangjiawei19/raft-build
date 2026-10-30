@@ -1,0 +1,11 @@
+{
+  "contract": "raft.activity-sync",
+  "rules": "Every change to activity-sync.tsp appends an entry whose sourceSha256 is the new source digest. An incompatible change (a field renamed or removed, a type, semantics or ordering change) takes the previous revision + 1. A compatible change keeps the previous revision and must say why in `compatible`; reviewers check that claim. Only changes that leave the wire unchanged qualify (comments, docs, renaming a TypeSpec-only alias): the Kotlin binding decodes strictly (unknown keys rejected), so even an added optional response field breaks clients built earlier. Entries are append-only. Clients enable the sync engine only when the server's revision equals the one they were built with.",
+  "ledger": [
+    {
+      "revision": 2,
+      "sourceSha256": "e47e0d12055c37c01c522f608e5d1b2e56378a588b24894f450468353791bdad",
+      "change": "Baseline: first tracked revision. Every source before this one (including bindings generated from it) is treated as revision 1 and incompatible: Gate B2 replaced expectedRowVersion with throughActivitySeq and DifferenceIngress gained paging fields without a version change."
+    }
+  ]
+}

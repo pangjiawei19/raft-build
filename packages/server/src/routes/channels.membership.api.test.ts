@@ -1,6 +1,7 @@
-import { tokenForHuman } from "../test/integration/credentials.js";
-import { fixturePasswordHash } from "../test/integration/credentials.js";
-import { createApiTest } from "../test/integration/apiTest.js";
+import { tokenForHuman } from "../test/integration/credentials";
+import { fixturePasswordHash } from "../test/integration/credentials";
+import { createApiTest } from "../test/integration/apiTest";
+import { randomUUID } from "node:crypto";
 import assert from "node:assert/strict";
 
 import { and, desc, eq } from "drizzle-orm";
@@ -8,8 +9,8 @@ import {
   BasicTracer,
   MemoryTraceSink
 } from "@botiverse/raft-shared";
-import { openTestApp } from "../test/integration/app.js";
-import { getDb } from "../db/index.js";
+import { openTestApp } from "../test/integration/app";
+import { getDb } from "../db/index";
 import {
   users, servers as serversTable,
   serverMembers,
@@ -17,26 +18,26 @@ import {
   channelHumans,
   channelAgents,
   messages, attachments, inboxNotificationFacts
-} from "../db/schema.js";
-import { addMember, removeMember, updateServerOnboardingAgent } from "../services/serverService.js";
-import { createAgent } from "../services/agentService.js";
-import { createChannel, addHuman, addAgent, removeHuman, removeAgent, findOrCreateDM, findOrCreateAgentDM, findOrCreateUserDM, canAgentAccessChannel, canAgentPostToChannel, canUserPostToChannel, isChannelHuman, resolveChannelByName } from "../services/channelService.js";
+} from "../db/schema";
+import { addMember, removeMember, updateServerOnboardingAgent } from "../services/serverService";
+import { createAgent } from "../services/agentService";
+import { createChannel, addHuman, addAgent, removeHuman, removeAgent, findOrCreateDM, findOrCreateAgentDM, findOrCreateUserDM, canAgentAccessChannel, canAgentPostToChannel, canUserPostToChannel, isChannelHuman, listDMChannels, resolveChannelByName } from "../services/channelService";
 import {
   __resetMessageServiceDepsForTests,
   __setMessageServiceDepsForTests,
   createMessage,
-} from "../services/messageService.js";
+} from "../services/messageService";
 import {
   recordInboxNotificationFacts
-} from "../services/inboxNotificationService.js";
-import { registerMachine } from "../services/machineService.js";
-import { assignMachine } from "../services/agentService.js";
+} from "../services/inboxNotificationService";
+import { registerMachine } from "../services/machineService";
+import { assignMachine } from "../services/agentService";
 import {
   __resetOnboardingServiceDepsForTests,
   __setOnboardingServiceDepsForTests,
   triggerAllChannelUnlockOnboarding,
-} from "../services/onboardingService.js";
-import { createServer, installFakeIo, headers, seedUser } from "./channels.api.fixtures.js";
+} from "../services/onboardingService";
+import { createServer, installFakeIo, headers, seedUser } from "./channels.api.fixtures";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 
@@ -110,13 +111,25 @@ test("GET /api/channels/dm records DM list phases and constant query shape", asy
     headers: headers(ownerToken, server.id),
   });
   assert.equal(res.status, 200);
-  const body = await res.json() as Array<{ id: string; peerType: "agent" | "user"; lastMessageAt: string | null }>;
+  const body = await res.json() as Array<{
+    id: string;
+    peerType: "agent" | "user";
+    lastMessageAt: string | null;
+    lastMessagePreview: string | null;
+    lastMessageSenderName: string | null;
+  }>;
   assert.equal(body.length, 3);
   assert.equal(body.filter((channel) => channel.peerType === "agent").length, 1);
   assert.equal(body.filter((channel) => channel.peerType === "user").length, 2);
   assert.equal(body.find((channel) => channel.id === agentDm.id)?.lastMessageAt, agentDmMessage.createdAt.toISOString());
   assert.equal(body.find((channel) => channel.id === userDm.id)?.lastMessageAt, userDmMessage.createdAt.toISOString());
   assert.equal(body.find((channel) => channel.id === selfDm.id)?.lastMessageAt, null);
+  assert.equal(body.find((channel) => channel.id === agentDm.id)?.lastMessagePreview, "agent dm message");
+  assert.equal(body.find((channel) => channel.id === agentDm.id)?.lastMessageSenderName, owner.displayName);
+  assert.equal(body.find((channel) => channel.id === userDm.id)?.lastMessagePreview, "user dm message");
+  assert.equal(body.find((channel) => channel.id === userDm.id)?.lastMessageSenderName, peer.displayName);
+  assert.equal(body.find((channel) => channel.id === selfDm.id)?.lastMessagePreview, null);
+  assert.equal(body.find((channel) => channel.id === selfDm.id)?.lastMessageSenderName, null);
 
   const span = sink.getAllSpans().find((candidate) =>
     candidate.name === "server.http.request"
@@ -138,20 +151,21 @@ test("GET /api/channels/dm records DM list phases and constant query shape", asy
   assert.deepEqual(
     dbEvents.map((event) => event.attrs?.query_name).sort(),
     [
-      "dm_channels.agent_dms_by_user",
       "dm_channels.last_messages_by_channels",
-      "dm_channels.self_dms_by_user",
-      "dm_channels.user_dms_by_user",
+      "dm_channels.peer_dms_by_user",
     ],
   );
-  assert.equal(dbEvents.length, 4);
-  assert.ok(dbEvents.length <= 4, "DM list query count should stay constant for mixed peer types");
+  // Agent, user and self DMs are one statement.
+  assert.equal(dbEvents.length, 2);
+  assert.ok(dbEvents.length <= 2, "DM list query count should stay constant for mixed peer types");
 
   const dbEventByQuery = new Map(dbEvents.map((event) => [event.attrs?.query_name, event]));
-  assert.equal(dbEventByQuery.get("dm_channels.agent_dms_by_user")?.attrs?.phase, "dm_channels.loaded");
-  assert.equal(dbEventByQuery.get("dm_channels.agent_dms_by_user")?.attrs?.row_count, 1);
-  assert.equal(dbEventByQuery.get("dm_channels.user_dms_by_user")?.attrs?.row_count, 3);
-  assert.equal(dbEventByQuery.get("dm_channels.self_dms_by_user")?.attrs?.row_count, 1);
+  assert.equal(dbEventByQuery.get("dm_channels.peer_dms_by_user")?.attrs?.phase, "dm_channels.loaded");
+  assert.equal(dbEventByQuery.get("dm_channels.peer_dms_by_user")?.attrs?.row_count, 3);
+  assert.equal(dbEventByQuery.get("dm_channels.peer_dms_by_user")?.attrs?.agent_dms_count, 1);
+  // The current user is never the peer of a user DM (the self DM is its own kind).
+  assert.equal(dbEventByQuery.get("dm_channels.peer_dms_by_user")?.attrs?.user_dms_count, 1);
+  assert.equal(dbEventByQuery.get("dm_channels.peer_dms_by_user")?.attrs?.self_dms_count, 1);
   assert.equal(dbEventByQuery.get("dm_channels.last_messages_by_channels")?.attrs?.dm_channels_count, 3);
   assert.equal(dbEventByQuery.get("dm_channels.last_messages_by_channels")?.attrs?.channels_with_messages_count, 2);
 
@@ -168,6 +182,31 @@ test("GET /api/channels/dm records DM list phases and constant query shape", asy
   assert.equal(Object.values(readyEvent.attrs ?? {}).includes(agentDm.id), false);
 });
 
+
+test("DM last-message summaries resolve sender names by id and tolerate non-uuid senders", async ({ app }) => {
+  void app; // initializes the database
+  const owner = await seedUser("dm-last-sender-owner@slock.test", "dm-last-sender-owner");
+  const peer = await seedUser("dm-last-sender-peer@slock.test", "dm-last-sender-peer");
+  const server = await createServer("DM Last Sender Server", "dm-last-sender-server", owner.id);
+  await addMember(server.id, peer.id);
+  const agent = await createAgent(server.id, "dm-last-sender-agent", { runtime: "codex" });
+  const agentDm = await findOrCreateDM(server.id, owner.id, agent.id);
+  const userDm = await findOrCreateUserDM(server.id, owner.id, peer.id);
+  assert.ok(agentDm && userDm);
+  await createMessage(agentDm.id, "agent", agent.id, "from the agent");
+  await createMessage(userDm.id, "user", peer.id, "from the peer");
+  // A system notice is sender_type 'user' with the non-uuid sender id 'system'.
+  const selfDm = await findOrCreateUserDM(server.id, owner.id, owner.id);
+  assert.ok(selfDm);
+  await createMessage(selfDm.id, "user", "system", "a system notice", "system");
+
+  const dms = await listDMChannels(server.id, owner.id);
+  const byId = new Map(dms.map((dm) => [dm.id, dm]));
+  assert.equal(byId.get(agentDm.id)?.lastMessageSenderName, agent.displayName || agent.name);
+  assert.equal(byId.get(userDm.id)?.lastMessageSenderName, peer.displayName);
+  assert.equal(byId.get(selfDm.id)?.lastMessagePreview, "a system notice");
+  assert.equal(byId.get(selfDm.id)?.lastMessageSenderName, null);
+});
 
 test("agent-to-agent DMs are not readable through human channel and attachment routes", async ({ app }) => {
   const db = getDb();
@@ -1729,4 +1768,89 @@ test("legacy agent channel-members and server info respect hidden human director
   assert.equal(serverInfo.status, 200);
   const serverInfoBody = await serverInfo.json() as { humans: Array<{ name: string }> };
   assert.deepEqual(serverInfoBody.humans, [], "legacy agent server info must not enumerate humans when the human directory is hidden");
+});
+
+test("saved check ignores client-local message ids instead of failing the whole batch (task #335)", async ({ app, seed }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner, members: [] });
+  const ownerToken = await tokenForHuman(owner.email);
+  const ownerHeaders = headers(ownerToken, server.id);
+  const createRes = await fetch(`${app.baseUrl}/api/channels`, {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({ name: "saved-check-local-ids", visibility: "public" }),
+  });
+  assert.equal(createRes.status, 200);
+  const channel = await createRes.json() as { id: string };
+  const savedMessage = await createMessage(channel.id, "user", owner.id, "saved and checked");
+  const unsavedMessage = await createMessage(channel.id, "user", owner.id, "not saved");
+  const save = await fetch(`${app.baseUrl}/api/channels/saved`, {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({ messageId: savedMessage.id }),
+  });
+  assert.equal(save.status, 200);
+
+  // What mobile sends while an optimistic send is still pending: server ids mixed with local ids.
+  const check = await fetch(`${app.baseUrl}/api/channels/saved/check`, {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({
+      messageIds: [savedMessage.id, "local-send-thread-7", unsavedMessage.id, "not-a-uuid", "0"],
+    }),
+  });
+  assert.equal(check.status, 200, await check.clone().text());
+  assert.deepEqual((await check.json() as { savedIds: string[] }).savedIds, [savedMessage.id]);
+
+  const onlyLocal = await fetch(`${app.baseUrl}/api/channels/saved/check`, {
+    method: "POST",
+    headers: ownerHeaders,
+    body: JSON.stringify({ messageIds: ["local-send-thread-8"] }),
+  });
+  assert.equal(onlyLocal.status, 200);
+  assert.deepEqual((await onlyLocal.json() as { savedIds: string[] }).savedIds, []);
+});
+
+test("POST /api/channels/:id/members/batch validates every target in a fixed number of queries", async ({ app, seed }) => {
+  type PgliteLike = { query: (...args: unknown[]) => Promise<unknown> };
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const ownerToken = await tokenForHuman(owner.email);
+  // The per-target validation reads: an agent row by id, a user's server role,
+  // a user row by id.
+  const validationRead = /from "agents" where \("agents"\."id" = \$1 and "agents"\."deleted_at" is null\)|"server_members"\."user_id" = \$2 and "servers"\."deleted_at" is null|from "users" where "users"\."id" = \$1$/;
+  const addBatch = async (size: number) => {
+    const channel = await seed.channel({ server, members: [owner], visibility: "private" });
+    const userIds: string[] = [];
+    const agentIds: string[] = [];
+    for (let i = 0; i < size; i += 1) {
+      const human = await seed.human();
+      await addMember(server.id, human.id, "member");
+      userIds.push(human.id);
+      agentIds.push((await createAgent(server.id, `batch-${randomUUID().slice(0, 8)}`, { runtime: "claude", model: "sonnet" })).id);
+    }
+    const pg = (getDb() as unknown as { $client: PgliteLike }).$client;
+    const originalQuery = pg.query.bind(pg);
+    let matched = 0;
+    pg.query = ((...args: unknown[]) => {
+      if (typeof args[0] === "string" && validationRead.test(args[0])) matched += 1;
+      return originalQuery(...args);
+    }) as PgliteLike["query"];
+    try {
+      const res = await fetch(`${app.baseUrl}/api/channels/${channel.id}/members/batch`, {
+        method: "POST",
+        headers: headers(ownerToken, server.id),
+        body: JSON.stringify({ userIds, agentIds }),
+      });
+      assert.equal(res.status, 200, await res.clone().text());
+      return matched;
+    } finally {
+      pg.query = originalQuery;
+    }
+  };
+
+  await addBatch(1);
+  const few = await addBatch(2);
+  const many = await addBatch(8);
+  assert.equal(many, few, `validation reads: 2+2 targets ${few}, 8+8 targets ${many}`);
 });

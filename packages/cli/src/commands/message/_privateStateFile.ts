@@ -3,6 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { isLocalStateAgentId } from "@botiverse/raft-shared/src/agentCliSurface";
+import { resolveRaftHome } from "../../state/raftHome";
+
 function privateDirectory(directory: string): void {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const stat = fs.lstatSync(directory);
@@ -12,17 +15,9 @@ function privateDirectory(directory: string): void {
   fs.chmodSync(directory, 0o700);
 }
 
-function configuredHome(): string | undefined {
-  for (const name of ["RAFT_HOME", "SLOCK_HOME"]) {
-    const value = process.env[name]?.trim();
-    if (value) return value;
-  }
-  return undefined;
-}
-
 export function privateStatePath(baseOverride: string | undefined, namespace: string, agentId: string, filename: string): string {
-  if (!/^[A-Za-z0-9_-]+$/.test(agentId)) throw new Error("Invalid local state agent identity");
-  const base = baseOverride?.trim() || configuredHome() || path.join(os.homedir(), ".slock");
+  if (!isLocalStateAgentId(agentId)) throw new Error("Invalid local state agent identity");
+  const base = baseOverride?.trim() || resolveRaftHome(process.env);
   // The user-data root is shared with the daemon, Computer and profiles and may
   // be a symlink; only the namespaces this module owns are hardened.
   fs.mkdirSync(base, { recursive: true, mode: 0o700 });

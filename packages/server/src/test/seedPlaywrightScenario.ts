@@ -1,12 +1,12 @@
 import argon2 from "argon2";
 import { and, eq, inArray } from "drizzle-orm";
-import { getDb } from "../db/index.js";
-import { users, channels, tasks, userAnnouncementDismissals, servers, serverMembers } from "../db/schema.js";
-import { createServer, addMember } from "../services/serverService.js";
-import { createMessage } from "../services/messageService.js";
-import { createAgent } from "../services/agentService.js";
-import { registerMachine } from "../services/machineService.js";
-import * as announcementService from "../services/announcementService.js";
+import { getDb } from "../db/index";
+import { users, channels, tasks, userAnnouncementDismissals, servers, serverMembers } from "../db/schema";
+import { createServer, addMember } from "../services/serverService";
+import { createMessage } from "../services/messageService";
+import { createAgent } from "../services/agentService";
+import { registerMachine } from "../services/machineService";
+import * as announcementService from "../services/announcementService";
 
 export type PlaywrightSeedState = {
   user: {
@@ -29,6 +29,12 @@ export type PlaywrightSeedState = {
     focusMessageId: string;
   };
   agent: {
+    id: string;
+    name: string;
+  };
+  // External (API-key) agent: the only kind that can mint `sk_agent_*`
+  // credentials, so e2e specs seed agent-authored messages through it.
+  externalAgent: {
     id: string;
     name: string;
   };
@@ -166,6 +172,7 @@ export async function seedPlaywrightScenario(
   // panel route resolves to a real id.
   const { machine } = await registerMachine(server.id, user.id, "playwright-machine");
   const agent = await createAgent(server.id, "playwright-agent", { machineId: machine.id });
+  const externalAgent = await createAgent(server.id, "seed-api-bot", { runtime: "external", model: "external" });
 
   const extraHumanPasswordHash = await argon2.hash(PLAYWRIGHT_EXTRA_HUMAN.password);
   const [extraHuman] = await db.insert(users).values({
@@ -195,11 +202,7 @@ export async function seedPlaywrightScenario(
   // contract test (`announcement-modal.spec.ts`) has a known row to drive,
   // but pre-dismissed for the playwright owner so every other test (which
   // logs in as that owner) does not see the modal in the way of its UI.
-  const announcementPages = [
-    { title: "Page 1", body: "First page **markdown** body." },
-    { title: "Page 2", body: "Second page body." },
-    { body: "Final page (no inline title)." },
-  ];
+  const announcementPages = [{ body: "Announcement **markdown** body." }];
   const announcementRow = await announcementService.publish({
     title: "Playwright announcement fixture",
     pages: announcementPages,
@@ -242,6 +245,10 @@ export async function seedPlaywrightScenario(
     agent: {
       id: agent.id,
       name: agent.name,
+    },
+    externalAgent: {
+      id: externalAgent.id,
+      name: externalAgent.name,
     },
     machine: {
       id: machine.id,

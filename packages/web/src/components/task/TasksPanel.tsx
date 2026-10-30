@@ -1,7 +1,42 @@
+import type { TaskStatusId } from "@botiverse/raft-ui";
+import {
+  Button,
+  Card,
+  PickerTriggerButton,
+  PanelHeaderContent,
+  PanelMeta,
+  PanelSectionHeader,
+  PanelTitle,
+  Popover,
+  PopoverTrigger,
+  SegmentedControl,
+  SegmentedControlItem,
+  SegmentedControlLabel,
+  TaskBoardColumn,
+  TaskBoardColumnBadge,
+  TaskBoardColumnChevron,
+  TaskBoardColumnCount,
+  TaskBoardColumnEmpty,
+  TaskBoardColumnHeading,
+  TaskBoardColumnItems,
+  TaskBoardColumnPanel,
+  TaskBoardColumnTrigger,
+  TaskSection as RuiTaskSection,
+  TaskSectionBadge,
+  TaskSectionChevron,
+  TaskSectionCount,
+  TaskSectionEmpty,
+  TaskSectionHeading,
+  TaskSectionItems,
+  TaskSectionPanel,
+  TaskSectionTrigger,
+  TasksPanelRoot,
+  TasksPanelToolbar,
+  TasksPanelViewport,
+} from "@botiverse/raft-ui";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
 import { CheckSquare, ChevronDown, Columns3, Hash, LayoutList, Plus, User as UserIcon, UserCircle2 } from "lucide-react";
-import { SegmentedControl, SegmentedControlItem, SegmentedControlLabel } from "raft-ui";
 import {
   DndContext,
   PointerSensor,
@@ -34,7 +69,6 @@ import SelectionPopover from "../ui/SelectionPopover";
 import VirtualizedTaskStack, { TaskVirtualLayout } from "./VirtualizedTaskStack";
 import { useLiveSearchParams } from "../../hooks/useLiveSearchParams";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
-import { buildLegacyTaskWindowUrl, buildThreadWindowUrl, openPanelInNewTab } from "../../utils/openPanelInNewTab";
 
 /**
  * Identity reference shape used by Creator + Assignee filters. Encoded in
@@ -104,80 +138,133 @@ function writeStoredTaskViewMode(nextView: ViewMode): void {
   }
 }
 
+const SKELETON_LINE_WIDTHS = ["w-1/2", "w-3/4"];
+
+/** A loading placeholder shaped like the task card it stands in for
+ *  (Raft DS TaskCard: raft-ui Card's surface, hairline and container radius). */
+function TaskCardSkeleton() {
+  return (
+    <Card
+      render={<SkeletonRow lineWidths={SKELETON_LINE_WIDTHS} />}
+      className="flex-row items-center gap-2 p-3"
+    />
+  );
+}
+
+/** The applied-filter count (Raft DS `rf-filter__count`): Space Mono 12, bold. */
+const FILTER_COUNT_CLASS_NAME = "font-mono text-mono-meta font-bold";
+
+function getTaskKey(task: Task): string {
+  return task.id;
+}
+
+const STATUS_TO_RUI_STATUS: Record<TaskStatus, TaskStatusId> = {
+  todo: "todo",
+  in_progress: "in-progress",
+  in_review: "in-review",
+  done: "done",
+  closed: "closed",
+};
+
 function TaskSection({
   status,
   tasks,
   onOpenTask,
-  onOpenTaskInNewTab,
-  onDragTask,
   collapsed = false,
   onToggleCollapsed,
   showChannelName = true,
   scrollElementRef,
+  hasMore = false,
+  loadingPage = false,
+  onLoadMore,
 }: {
   status: TaskStatus;
   tasks: Task[];
   onOpenTask: (task: Task) => void;
-  onOpenTaskInNewTab?: (task: Task) => void;
-  onDragTask?: (event: React.DragEvent<HTMLDivElement>, task: Task) => void;
   collapsed?: boolean;
-  onToggleCollapsed?: () => void;
+  onToggleCollapsed?: (status: TaskStatus) => void;
   showChannelName?: boolean;
   scrollElementRef: React.RefObject<HTMLDivElement | null>;
+  /** Server-mode lazy paging: more pages exist for this status lane. */
+  hasMore?: boolean;
+  loadingPage?: boolean;
+  onLoadMore?: () => void;
 }) {
   const { formatMessage } = useIntl();
+  const ruiStatus = STATUS_TO_RUI_STATUS[status];
+  const handleOpenChange = useCallback(() => onToggleCollapsed?.(status), [onToggleCollapsed, status]);
+  const renderTask = useCallback((task: Task) => (
+    <TaskCard
+      task={task}
+      onOpen={onOpenTask}
+      showChannelName={showChannelName}
+    />
+  ), [onOpenTask, showChannelName]);
   return (
-    <section className="space-y-2.5">
-      <button
-        type="button"
-        onClick={onToggleCollapsed}
+    <RuiTaskSection
+      open={!collapsed}
+      onOpenChange={handleOpenChange}
+      className="space-y-2.5"
+    >
+      <TaskSectionTrigger
         disabled={!onToggleCollapsed}
         aria-label={formatMessage(
           { id: collapsed ? "task.status.showGroup" : "task.status.hideGroup" },
           { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
         )}
-        className={`flex w-full items-center justify-between gap-3 text-left ${onToggleCollapsed ? "" : "cursor-default"}`}
+        className={onToggleCollapsed ? undefined : "cursor-default"}
       >
-        <div className="flex items-center gap-2">
-          <span className={`border border-black px-2 py-0.5 text-[10px] font-bold uppercase ${TASK_STATUS_UI[status].bg}`}>
+        <TaskSectionHeading>
+          <TaskSectionBadge status={ruiStatus}>
             {formatMessage({ id: TASK_STATUS_UI[status].labelId })}
-          </span>
-          <span className="text-xs font-mono text-black/50">{tasks.length}</span>
-        </div>
+          </TaskSectionBadge>
+          <TaskSectionCount>{tasks.length}</TaskSectionCount>
+        </TaskSectionHeading>
         {onToggleCollapsed ? (
-          <span className="inline-flex items-center text-black/50 hover:text-black">
-            <ChevronDown size={14} className={`transition-transform ${collapsed ? "-rotate-90" : ""}`} />
-          </span>
+          <TaskSectionChevron />
         ) : (
           <span />
         )}
-      </button>
-      {!collapsed && tasks.length === 0 ? (
-        <div className="border-2 border-dashed border-black/20 px-3 py-5 text-sm text-black/40">
-          {formatMessage(
-            { id: "task.status.emptyGroup" },
-            { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
-          )}
-        </div>
-      ) : !collapsed ? (
-        <VirtualizedTaskStack
-          items={tasks}
-          scrollElementRef={scrollElementRef}
-          estimateSize={116}
-          gap={10}
-          getItemKey={(task) => task.id}
-          renderItem={(task) => (
-            <TaskCard
-              task={task}
-              onOpen={onOpenTask}
-              onOpenInNewTab={onOpenTaskInNewTab}
-              onDragStart={onDragTask}
-              showChannelName={showChannelName}
+      </TaskSectionTrigger>
+      <TaskSectionPanel>
+        {tasks.length === 0 ? (
+          loadingPage ? (
+            <TaskCardSkeleton />
+          ) : (
+            <TaskSectionEmpty>
+              {formatMessage(
+                { id: "task.status.emptyGroup" },
+                { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
+              )}
+            </TaskSectionEmpty>
+          )
+        ) : (
+          <TaskSectionItems>
+            <VirtualizedTaskStack
+              items={tasks}
+              scrollElementRef={scrollElementRef}
+              estimateSize={116}
+              gap={10}
+              getItemKey={getTaskKey}
+              renderItem={renderTask}
             />
-          )}
-        />
-      ) : null}
-    </section>
+          </TaskSectionItems>
+        )}
+        {hasMore && (
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            disabled={loadingPage}
+            onClick={onLoadMore}
+            className="w-full"
+            data-testid={`task-load-more-${status}`}
+          >
+            {loadingPage ? formatMessage({ id: "common.loading" }) : formatMessage({ id: "task.panel.loadMore" })}
+          </Button>
+        )}
+      </TaskSectionPanel>
+    </RuiTaskSection>
   );
 }
 
@@ -218,7 +305,7 @@ function DraggableTaskWrapper({
       className={`relative ${disabled ? "" : "cursor-grab touch-none will-change-transform active:cursor-grabbing"} ${isDragging ? "opacity-90" : ""}`}
     >
       {children}
-    </div>
+      </div>
   );
 }
 
@@ -232,85 +319,101 @@ function DroppableColumn({
   onToggleCollapsed,
   statusTasks,
   openTask,
-  openTaskInNewTab,
-  onDragTask,
   isChannelMode,
   scrollElementRef,
   canModifyTasks,
+  hasMore = false,
+  loadingPage = false,
+  onLoadMore,
 }: {
   status: TaskStatus;
   collapsed: boolean;
-  onToggleCollapsed: () => void;
+  onToggleCollapsed: (status: TaskStatus) => void;
   statusTasks: Task[];
   openTask: (task: Task) => void;
-  openTaskInNewTab?: (task: Task) => void;
-  onDragTask?: (event: React.DragEvent<HTMLDivElement>, task: Task) => void;
   isChannelMode: boolean;
   scrollElementRef: React.RefObject<HTMLDivElement | null>;
   canModifyTasks: boolean;
+  /** Server-mode lazy paging: more pages exist for this status lane. */
+  hasMore?: boolean;
+  loadingPage?: boolean;
+  onLoadMore?: () => void;
 }) {
   const { formatMessage } = useIntl();
   const { setNodeRef, isOver } = useDroppable({ id: status, disabled: !canModifyTasks });
+  const ruiStatus = STATUS_TO_RUI_STATUS[status];
+  const handleOpenChange = useCallback(() => onToggleCollapsed(status), [onToggleCollapsed, status]);
+  const renderTask = useCallback((task: Task) => (
+    <DraggableTaskWrapper task={task} disabled={!canModifyTasks}>
+      <TaskCard
+        task={task}
+        onOpen={openTask}
+        showChannelName={!isChannelMode}
+      />
+    </DraggableTaskWrapper>
+  ), [canModifyTasks, isChannelMode, openTask]);
   return (
-    <div
+    <TaskBoardColumn
       ref={setNodeRef}
-      className={`flex w-[320px] shrink-0 self-start flex-col border-2 ${
-        isOver ? "border-black bg-soft-signal/20 shadow-brutal-sm" : "border-black/20 bg-white/30"
-      } p-3 transition-colors`}
+      open={!collapsed}
+      onOpenChange={handleOpenChange}
+      // The drop target is a hover-like hint: the pressed overlay, no colour
+      // (Raft DS: hints have no colour). The column's own chrome is the recipe's.
+      className={`rounded-container transition-colors ${isOver ? "bg-fill-pressed" : ""}`}
     >
-      <button
-        type="button"
-        onClick={onToggleCollapsed}
+      <TaskBoardColumnTrigger
         aria-label={formatMessage(
           { id: collapsed ? "task.status.showGroup" : "task.status.hideGroup" },
           { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
         )}
-        className={`flex w-full items-center justify-between gap-3 text-left ${collapsed ? "" : "mb-3"}`}
       >
-        <div className="flex items-center gap-2">
-          <span className={`border border-black px-2 py-0.5 text-[10px] font-bold uppercase ${TASK_STATUS_UI[status].bg}`}>
+        <TaskBoardColumnHeading>
+          <TaskBoardColumnBadge status={ruiStatus}>
             {formatMessage({ id: TASK_STATUS_UI[status].labelId })}
-          </span>
-          <span className="text-xs font-mono text-black/50">{statusTasks.length}</span>
-        </div>
-        <span className="inline-flex items-center text-black/50 hover:text-black">
-          <ChevronDown size={14} className={`transition-transform ${collapsed ? "-rotate-90" : ""}`} />
-        </span>
-      </button>
-      {!collapsed && (
-        <div className="space-y-2.5">
+          </TaskBoardColumnBadge>
+          <TaskBoardColumnCount>{statusTasks.length}</TaskBoardColumnCount>
+        </TaskBoardColumnHeading>
+        <TaskBoardColumnChevron />
+      </TaskBoardColumnTrigger>
+      <TaskBoardColumnPanel>
+        <TaskBoardColumnItems>
           {statusTasks.length === 0 ? (
-            <div className={`border-2 border-dashed px-3 py-5 text-sm ${
-              isOver ? "border-black text-black/60" : "border-black/20 text-black/40"
-            }`}>
-              {formatMessage(
-                { id: isOver ? "task.status.dropToSet" : "task.status.emptyGroup" },
-                { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
-              )}
-            </div>
+            loadingPage ? (
+              <TaskCardSkeleton />
+            ) : (
+              <TaskBoardColumnEmpty>
+                {formatMessage(
+                  { id: isOver ? "task.status.dropToSet" : "task.status.emptyGroup" },
+                  { status: formatMessage({ id: TASK_STATUS_UI[status].labelId }) },
+                )}
+              </TaskBoardColumnEmpty>
+            )
           ) : (
             <VirtualizedTaskStack
               items={statusTasks}
               scrollElementRef={scrollElementRef}
               estimateSize={116}
               gap={10}
-              getItemKey={(task) => task.id}
-              renderItem={(task) => (
-                <DraggableTaskWrapper task={task} disabled={!canModifyTasks}>
-                  <TaskCard
-                    task={task}
-                    onOpen={openTask}
-                    onOpenInNewTab={openTaskInNewTab}
-                    onDragStart={onDragTask}
-                    showChannelName={!isChannelMode}
-                  />
-                </DraggableTaskWrapper>
-              )}
+              getItemKey={getTaskKey}
+              renderItem={renderTask}
             />
           )}
-        </div>
-      )}
-    </div>
+          {hasMore && (
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={loadingPage}
+              onClick={onLoadMore}
+              className="w-full"
+              data-testid={`task-load-more-${status}`}
+            >
+              {loadingPage ? formatMessage({ id: "common.loading" }) : formatMessage({ id: "task.panel.loadMore" })}
+            </Button>
+          )}
+        </TaskBoardColumnItems>
+      </TaskBoardColumnPanel>
+    </TaskBoardColumn>
   );
 }
 
@@ -340,7 +443,7 @@ function IdentityFilterChip({
   includeUnassigned = false,
   selfOption = null,
   isOpen,
-  onToggleOpen,
+  onOpenChange,
 }: {
   icon: React.ReactNode;
   label: string;
@@ -357,26 +460,16 @@ function IdentityFilterChip({
    */
   selfOption?: { key: IdentityFilterValue; label: string } | null;
   isOpen: boolean;
-  onToggleOpen: () => void;
+  /** The popover's trigger, outside presses and Escape all report here. */
+  onOpenChange: (open: boolean) => void;
 }) {
   const { formatMessage } = useIntl();
-  const containerRef = useRef<HTMLDivElement>(null);
   const [search, setSearch] = useState("");
-
-  useEffect(() => {
-    if (!isOpen) return;
-    // Reset search input when dropdown opens. Intentional reset-on-open, not
-    // prop-derived state.
-    // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
-    setSearch("");
-    const handleClickOutside = (event: MouseEvent) => {
-      if (containerRef.current && !containerRef.current.contains(event.target as Node)) {
-        onToggleOpen();
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [isOpen, onToggleOpen]);
+  // Each opening starts from an empty search.
+  const handleOpenChange = useCallback((open: boolean) => {
+    if (open) setSearch("");
+    onOpenChange(open);
+  }, [onOpenChange]);
 
   // Inject the synthetic "Unassigned" row at the top of the option list. It
   // scrolls with the list (not sticky) but always sorts first so it stays
@@ -432,15 +525,17 @@ function IdentityFilterChip({
     );
   }, [optionsWithSentinel, search]);
 
-  const toggleValue = (value: IdentityFilterValue) => {
+  const toggleValue = useCallback((value: IdentityFilterValue) => {
     onChange(
       selected.includes(value)
         ? selected.filter((v) => v !== value)
         : [...selected, value],
     );
-  };
+  }, [onChange, selected]);
 
-  const popoverOptions = filteredOptions.map((opt) => ({
+  const clearSelection = useCallback(() => onChange([]), [onChange]);
+
+  const popoverOptions = useMemo(() => filteredOptions.map((opt) => ({
     key: opt.key,
     checked: selected.includes(opt.key),
     onClick: () => toggleValue(opt.key),
@@ -462,41 +557,34 @@ function IdentityFilterChip({
         email={opt.type === "user" ? opt.email ?? null : null}
       />
     ),
-  }));
+  })), [filteredOptions, selected, toggleValue]);
 
+  // raft-ui Popover: the list is placed in a portal against the chip and kept
+  // on screen; the popover owns the toggle, outside presses and Escape.
   return (
-    <div ref={containerRef} className="relative">
-      <button
-        type="button"
-        onClick={onToggleOpen}
-        className={`inline-flex items-center gap-2 border-2 px-3 py-1.5 text-xs font-bold transition-colors ${
-          selected.length > 0
-            ? "border-black bg-soft-signal text-black shadow-brutal-sm"
-            : "border-black/30 bg-white text-black/70 hover:border-black"
-        }`}
+    <Popover open={isOpen} onOpenChange={handleOpenChange}>
+      <PopoverTrigger
+        render={<PickerTriggerButton type="button" data-has-value={selected.length > 0 ? "" : undefined} />}
       >
         {icon}
         {label}
         {selected.length > 0 && (
-          <span className="border border-black px-1 py-0.5 font-mono text-[10px] leading-none">
-            {selected.length}
-          </span>
+          <span className={FILTER_COUNT_CLASS_NAME}>{selected.length}</span>
         )}
-        <ChevronDown size={12} />
-      </button>
-
-      {isOpen && (
-        <SelectionPopover
-          title={label}
-          searchable
-          search={search}
-          onSearchChange={setSearch}
-          options={popoverOptions}
-          showClear={selected.length > 0}
-          onClear={() => onChange([])}
-        />
-      )}
-    </div>
+        <span data-picker-trigger-indicator="" aria-hidden="true">
+          <ChevronDown />
+        </span>
+      </PopoverTrigger>
+      <SelectionPopover
+        title={label}
+        searchable
+        search={search}
+        onSearchChange={setSearch}
+        options={popoverOptions}
+        showClear={selected.length > 0}
+        onClear={clearSelection}
+      />
+    </Popover>
   );
 }
 
@@ -520,15 +608,9 @@ export interface TasksPanelProps {
   /** When set, render in channel mode (no channel filter, scoped task list,
    *  no top page header, and a New Task button). */
   channelId?: string;
-  /** Optional host override for surfaces like workspace-grid that need task
-   *  activation to open inside their own tab model instead of the global
-   *  right-panel thread store. */
-  onOpenTask?: (task: Task) => void;
-  onOpenTaskInNewTab?: (task: Task) => void;
-  onDragTask?: (event: React.DragEvent<HTMLDivElement>, task: Task) => void;
 }
 
-export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, onDragTask }: TasksPanelProps = {}) {
+export default function TasksPanel({ channelId }: TasksPanelProps = {}) {
   const { formatMessage } = useIntl();
   const isChannelMode = !!channelId;
 
@@ -542,7 +624,9 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
   const channelTasks = useTaskStore((s) => s.tasks);
   const serverLoading = useTaskStore((s) => s.serverLoading);
   const channelLoading = useTaskStore((s) => s.loading);
-  const loadServerTasks = useTaskStore((s) => s.loadServerTasks);
+  const loadActiveTaskSummaries = useTaskStore((s) => s.loadActiveTaskSummaries);
+  const loadServerTaskStatusPage = useTaskStore((s) => s.loadServerTaskStatusPage);
+  const serverTaskPages = useTaskStore((s) => s.serverTaskPages);
   const loadTasks = useTaskStore((s) => s.loadTasks);
   const registerServerTasksConsumer = useTaskStore((s) => s.registerServerTasksConsumer);
   const unregisterServerTasksConsumer = useTaskStore((s) => s.unregisterServerTasksConsumer);
@@ -582,7 +666,6 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
     done: true,
     closed: true,
   });
-  const channelFilterRef = useRef<HTMLDivElement>(null);
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const previousContainerWidthRef = useRef<number | null>(null);
   const rightPanelOpenRef = useRef(false);
@@ -609,9 +692,12 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
     if (isChannelMode) {
       loadTasks(channelId!);
     } else {
-      loadServerTasks();
+      // Server mode first screen loads the small active-status summary pages;
+      // done/closed lanes stay lazy (expand / "Load more"), so the panel never
+      // issues the unparameterized full-row /tasks/server load.
+      loadActiveTaskSummaries();
     }
-  }, [isChannelMode, channelId, loadTasks, loadServerTasks]);
+  }, [isChannelMode, channelId, loadTasks, loadActiveTaskSummaries]);
 
   // Register this server-Tasks view as an active consumer so a socket reconnect
   // can catch it up (see catchUpServerTasksOnReconnect). Channel mode does not
@@ -622,17 +708,6 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
     return () => unregisterServerTasksConsumer();
   }, [isChannelMode, registerServerTasksConsumer, unregisterServerTasksConsumer]);
 
-  useEffect(() => {
-    if (openFilter !== "channel") return;
-    setChannelSearch("");
-    const handleClickOutside = (event: MouseEvent) => {
-      if (channelFilterRef.current && !channelFilterRef.current.contains(event.target as Node)) {
-        setOpenFilter((prev) => (prev === "channel" ? null : prev));
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [openFilter]);
 
   useEffect(() => {
     rightPanelOpenRef.current = threadPanelOpen || legacyTaskPanelOpen;
@@ -779,6 +854,23 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
     }));
   }, [sortedTasks]);
 
+  // A server with zero ACTIVE tasks still has its done/closed lanes unfetched
+  // on first screen; only show the blanket empty state once every lane has
+  // loaded, otherwise the collapsed sections must stay reachable.
+  const allServerLanesLoaded = STATUS_ORDER.every((status) => serverTaskPages[status].loaded);
+
+  // Per-lane lazy paging props (server mode only): a "Load more" affordance
+  // while the lane's walk has a next cursor.
+  const lanePagingProps = (status: TaskStatus) => {
+    if (isChannelMode) return {};
+    const lane = serverTaskPages[status];
+    return {
+      hasMore: lane.loaded && lane.nextCursor !== null,
+      loadingPage: lane.loading,
+      onLoadMore: () => void loadServerTaskStatusPage(status),
+    };
+  };
+
   const setSelectedChannels = useCallback((channelIds: string[]) => {
     setSearchParams((previous) => {
       const next = new URLSearchParams(previous);
@@ -846,20 +938,52 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
     setSelectedChannels([]);
   }, [setSelectedChannels]);
 
-  const toggleStatusCollapsed = useCallback((status: TaskStatus) => {
-    setCollapsedStatuses((prev) => ({ ...prev, [status]: !prev[status] }));
+  const channelPopoverOptions = useMemo(() => filteredChannelOptions.map((channel) => ({
+    key: channel.id,
+    checked: selectedChannelIds.includes(channel.id),
+    onClick: () => toggleChannelFilter(channel.id),
+    label: `#${channel.name}`,
+  })), [filteredChannelOptions, selectedChannelIds, toggleChannelFilter]);
+
+  // One filter popover at a time: opening one replaces the other; a close
+  // only clears the one that closed.
+  const handleChannelPopoverOpenChange = useCallback((open: boolean) => {
+    // Each opening starts from an empty search.
+    if (open) setChannelSearch("");
+    setOpenFilter((prev) => (open ? "channel" : prev === "channel" ? null : prev));
   }, []);
+  const handleCreatorPopoverOpenChange = useCallback((open: boolean) => {
+    setOpenFilter((prev) => (open ? "creator" : prev === "creator" ? null : prev));
+  }, []);
+  const handleAssigneePopoverOpenChange = useCallback((open: boolean) => {
+    setOpenFilter((prev) => (open ? "assignee" : prev === "assignee" ? null : prev));
+  }, []);
+
+  const creatorSelfOption = useMemo(
+    () => (myUserKey ? { key: myUserKey, label: formatMessage({ id: "task.filter.createdByMe" }) } : null),
+    [myUserKey, formatMessage],
+  );
+  const assigneeSelfOption = useMemo(
+    () => (myUserKey ? { key: myUserKey, label: formatMessage({ id: "task.filter.assignedToMe" }) } : null),
+    [myUserKey, formatMessage],
+  );
+
+  const openCreateDialog = useCallback(() => setShowCreateDialog(true), []);
+  const closeCreateDialog = useCallback(() => setShowCreateDialog(false), []);
+
+  const toggleStatusCollapsed = useCallback((status: TaskStatus) => {
+    // Expanding a never-loaded lane (done/closed start collapsed + unloaded in
+    // server mode) lazily pulls its first summary page.
+    if (!isChannelMode && collapsedStatuses[status]) {
+      const lane = useTaskStore.getState().serverTaskPages[status];
+      if (!lane.loaded && !lane.loading) void loadServerTaskStatusPage(status);
+    }
+    setCollapsedStatuses((prev) => ({ ...prev, [status]: !prev[status] }));
+  }, [isChannelMode, collapsedStatuses, loadServerTaskStatusPage]);
 
   // Stable across renders so the memoized TaskCard rows don't all re-render
   // when an unrelated task updates. Deps are all zustand action refs (stable).
   const openTask = useCallback((task: Task) => {
-    // Stryker disable all: this host override is contract-pinned; the fallback
-    // task-opening behavior below retains its existing behavioral coverage.
-    if (onOpenTask) {
-      onOpenTask(task);
-      return;
-    }
-    // Stryker restore all
     closeProfile();
     if (task.isLegacy) {
       closeThread();
@@ -875,19 +999,7 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
     // never matched the in-channel Tasks tab.
     void openThread({ parentChannelId: task.channelId, parentMessageId: task.messageId, intent: "task" });
     // Stryker restore all
-  }, [closeProfile, closeThread, closeLegacyTask, onOpenTask, openLegacyTask, openThread]);
-
-  const openTaskInNewTab = useCallback((task: Task) => {
-    const current = useServerStore.getState().current;
-    if (!current?.slug) return;
-    const channel = useChannelStore.getState().channels.find((candidate) => candidate.id === task.channelId);
-    const location = { pathname: window.location.pathname, search: window.location.search, origin: window.location.origin };
-    const url = task.isLegacy
-      ? buildLegacyTaskWindowUrl(location, { serverSlug: current.slug, channelId: task.channelId, taskId: task.id, channelType: channel?.type === "dm" ? "dm" : "channel" })
-      : buildThreadWindowUrl(location, { serverSlug: current.slug, parentChannelId: task.channelId, parentMessageId: task.messageId, parentChannelType: channel?.type === "dm" ? "dm" : "channel" }, "task");
-    openPanelInNewTab(url);
-  }, []);
-  const taskNewTabHandler = onOpenTaskInNewTab ?? openTaskInNewTab;
+  }, [closeProfile, closeThread, closeLegacyTask, openLegacyTask, openThread]);
 
   /**
    * Resolves a dnd-kit drag-end event into a task status update.
@@ -913,77 +1025,59 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
   );
 
   return (
-    <div
+    <TasksPanelRoot
       className="flex min-h-0 flex-1 flex-col"
       data-testid={isChannelMode ? "channel-task-panel" : undefined}
     >
       {/* Server-mode page header. Channel mode is mounted inside ChatPanel
           which already shows the channel header, so a second "Tasks" title
-          would be redundant — drop straight into the toolbar. */}
+          would be redundant — drop straight into the toolbar.
+          Raft DS › Panel / NavBar: the head names the page and carries no icon
+          tile (the yellow location block belongs to a channel). On the phone
+          this is the Tasks tab root, so it sits in the frame like the other
+          tab roots: raft-ui's section head, white on desktop and the frame on
+          a phone. The Board/List toggle lives in the filter row, not here. */}
       {!isChannelMode && (
-        <div className="flex h-panel-header items-center gap-3 border-b-2 border-black bg-soft-signal px-5 md:bg-white">
-          <div className="hidden md:flex size-icon-header items-center justify-center border-2 border-black bg-soft-signal">
-            <CheckSquare size={18} />
-          </div>
-          <div className="min-w-0 flex-1">
-            <h2 className="font-bold text-base leading-tight">{formatMessage({ id: "task.panel.heading" })}</h2>
-            <p className="text-xs text-black/50 font-mono">
-              {sortedTasks.length}
+        <PanelSectionHeader>
+          <PanelHeaderContent>
+            <PanelTitle render={<h2>{formatMessage({ id: "task.panel.heading" })}</h2>} />
+            <PanelMeta render={<p />}>
+              <span className="font-mono">{sortedTasks.length}</span>
               {hasAnyFilter ? formatMessage({ id: "task.panel.ofTotal" }, { total: tasks.length }) : ""}
               {" "}{formatMessage({ id: "task.panel.channelTasks" })}
-            </p>
-          </div>
-          {/* Board/List toggle lives in the filter row below on both
-              desktop and mobile, per @stdrc msg efec44d1 2026-05-01
-              `#proj-uiux:c8711d2a`: "Board 和 List 的选择，无论在桌面端
-              还是在移动端，都可以都放到 Filter 那一栏，然后放到右边。" */}
-        </div>
+            </PanelMeta>
+          </PanelHeaderContent>
+        </PanelSectionHeader>
       )}
 
-      <div className="shrink-0 border-b-2 border-black bg-white px-4 py-3">
+      <TasksPanelToolbar>
         <div className="flex flex-wrap items-center gap-2">
           {/* Channel filter only makes sense in server mode — channel mode
               is already scoped to one channel. */}
           {!isChannelMode && (
-            <div ref={channelFilterRef} className="relative">
-              <button
-                type="button"
-                onClick={() =>
-                  setOpenFilter((prev) => (prev === "channel" ? null : "channel"))
-                }
-                className={`inline-flex items-center gap-2 border-2 px-3 py-1.5 text-xs font-bold transition-colors ${
-                  selectedChannelIds.length > 0
-                    ? "border-black bg-soft-signal text-black shadow-brutal-sm"
-                    : "border-black/30 bg-white text-black/70 hover:border-black"
-                }`}
+            <Popover open={openFilter === "channel"} onOpenChange={handleChannelPopoverOpenChange}>
+              <PopoverTrigger
+                render={<PickerTriggerButton type="button" data-has-value={selectedChannelIds.length > 0 ? "" : undefined} />}
               >
                 <Hash size={14} />
                 {formatMessage({ id: "task.panel.channelColumn" })}
                 {selectedChannelIds.length > 0 && (
-                  <span className="border border-black px-1 py-0.5 font-mono text-[10px] leading-none">
-                    {selectedChannelIds.length}
-                  </span>
+                  <span className={FILTER_COUNT_CLASS_NAME}>{selectedChannelIds.length}</span>
                 )}
-                <ChevronDown size={12} />
-              </button>
-
-              {openFilter === "channel" && (
-                <SelectionPopover
-                  title={formatMessage({ id: "task.filter.channels" })}
-                  searchable
-                  search={channelSearch}
-                  onSearchChange={setChannelSearch}
-                  options={filteredChannelOptions.map((channel) => ({
-                    key: channel.id,
-                    checked: selectedChannelIds.includes(channel.id),
-                    onClick: () => toggleChannelFilter(channel.id),
-                    label: `#${channel.name}`,
-                  }))}
-                  showClear={selectedChannelIds.length > 0}
-                  onClear={clearChannelFilters}
-                />
-              )}
-            </div>
+                <span data-picker-trigger-indicator="" aria-hidden="true">
+                  <ChevronDown />
+                </span>
+              </PopoverTrigger>
+              <SelectionPopover
+                title={formatMessage({ id: "task.filter.channels" })}
+                searchable
+                search={channelSearch}
+                onSearchChange={setChannelSearch}
+                options={channelPopoverOptions}
+                showClear={selectedChannelIds.length > 0}
+                onClear={clearChannelFilters}
+              />
+            </Popover>
           )}
 
           {/* Creator + Assignee chips: available in both server- and
@@ -995,11 +1089,9 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
             options={identityOptions}
             selected={selectedCreators}
             onChange={setSelectedCreators}
-            selfOption={myUserKey ? { key: myUserKey, label: formatMessage({ id: "task.filter.createdByMe" }) } : null}
+            selfOption={creatorSelfOption}
             isOpen={openFilter === "creator"}
-            onToggleOpen={() =>
-              setOpenFilter((prev) => (prev === "creator" ? null : "creator"))
-            }
+            onOpenChange={handleCreatorPopoverOpenChange}
           />
           <IdentityFilterChip
             icon={<UserIcon size={14} />}
@@ -1008,11 +1100,9 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
             selected={selectedAssignees}
             onChange={setSelectedAssignees}
             includeUnassigned
-            selfOption={myUserKey ? { key: myUserKey, label: formatMessage({ id: "task.filter.assignedToMe" }) } : null}
+            selfOption={assigneeSelfOption}
             isOpen={openFilter === "assignee"}
-            onToggleOpen={() =>
-              setOpenFilter((prev) => (prev === "assignee" ? null : "assignee"))
-            }
+            onOpenChange={handleAssigneePopoverOpenChange}
           />
 
           {/* "Created by me" / "Assigned to me" are no longer standalone
@@ -1021,13 +1111,12 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
               #proj-task:572c5ba6 msg=58495043. */}
 
           {hasAnyFilter && (
-            <button
+            <Button size="sm" variant="ghost"
               type="button"
               onClick={clearAllFilters}
-              className="inline-flex items-center gap-2 border border-black bg-white px-2.5 py-1 text-[11px] font-bold text-black/60 hover:text-black"
             >
               {formatMessage({ id: "task.panel.clearAll" })}
-            </button>
+            </Button>
           )}
 
           {/* New Task button: channel mode only. Server-wide page has no
@@ -1035,50 +1124,56 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
               expose a +New CTA there — users still create from the channel
               they want the task in. */}
           {isChannelMode && canModifyTasks && (
-            <button
+            <Button
               type="button"
-              onClick={() => setShowCreateDialog(true)}
-              className="btn-brutal-sm inline-flex items-center gap-1 bg-brutal-pink px-2 py-1 text-xs font-bold"
+              size="sm"
+              variant="outline"
+              onClick={openCreateDialog}
             >
-              <Plus size={12} />
+              <Plus size={16} />
               {formatMessage({ id: "task.board.newTask" })}
-            </button>
+            </Button>
           )}
 
           <SegmentedControl
             value={viewMode}
             onValueChange={setView}
             aria-label={formatMessage({ id: "task.viewAria" })}
-            className="ml-auto"
+            className="sm:ml-auto"
           >
-            <SegmentedControlItem value="board" data-testid="channel-task-view-board">
-              <Columns3 size={12} />
-              <SegmentedControlLabel>{formatMessage({ id: "task.view.board" })}</SegmentedControlLabel>
+            {/* Phone: icons only; the label stays as the accessible name. */}
+            <SegmentedControlItem
+              value="board"
+              data-testid="channel-task-view-board"
+            >
+              <Columns3 size={16} aria-hidden="true" />
+              <SegmentedControlLabel className="max-sm:sr-only">{formatMessage({ id: "task.view.board" })}</SegmentedControlLabel>
             </SegmentedControlItem>
-            <SegmentedControlItem value="list" data-testid="channel-task-view-list">
-              <LayoutList size={12} />
-              <SegmentedControlLabel>{formatMessage({ id: "task.view.list" })}</SegmentedControlLabel>
+            <SegmentedControlItem
+              value="list"
+              data-testid="channel-task-view-list"
+            >
+              <LayoutList size={16} aria-hidden="true" />
+              <SegmentedControlLabel className="max-sm:sr-only">{formatMessage({ id: "task.view.list" })}</SegmentedControlLabel>
             </SegmentedControlItem>
           </SegmentedControl>
         </div>
-      </div>
+      </TasksPanelToolbar>
 
-      <div
+      <TasksPanelViewport
         ref={scrollContainerRef}
         data-task-virtual-scroll
-        className="flex-1 overflow-auto bg-white p-4 safe-bottom"
+        // The floating-tab-bar clearance belongs to the Tasks tab root only —
+        // channel-detail panes have no capsule above them (task #678).
+        className={`flex-1 overflow-auto py-4 safe-bottom${isChannelMode ? "" : " mobile-nav-clearance"}`}
       >
         {loading ? (
           <div className="flex flex-col gap-2" aria-hidden="true">
             {Array.from({ length: 5 }, (_, i) => (
-              <SkeletonRow
-                key={i}
-                className="gap-2 rounded border-2 border-black/30 p-3"
-                lineWidths={["w-1/2", "w-3/4"]}
-              />
+              <TaskCardSkeleton key={i} />
             ))}
           </div>
-        ) : sortedTasks.length === 0 ? (
+        ) : sortedTasks.length === 0 && (isChannelMode || allServerLanesLoaded) ? (
           <EmptyState
             className="flex h-full flex-col items-center justify-center"
             icon={<CheckSquare size={36} />}
@@ -1101,44 +1196,45 @@ export default function TasksPanel({ channelId, onOpenTask, onOpenTaskInNewTab, 
                   key={status}
                   status={status}
                   collapsed={collapsedStatuses[status]}
-                  onToggleCollapsed={() => toggleStatusCollapsed(status)}
+                  onToggleCollapsed={toggleStatusCollapsed}
                   statusTasks={statusTasks}
                   openTask={openTask}
-                  openTaskInNewTab={taskNewTabHandler}
-                  onDragTask={canModifyTasks ? onDragTask : undefined}
                   isChannelMode={isChannelMode}
                   scrollElementRef={scrollContainerRef}
                   canModifyTasks={canModifyTasks}
+                  {...lanePagingProps(status)}
                 />
               ))}
             </TaskVirtualLayout>
           </DndContext>
         ) : (
-          <TaskVirtualLayout scrollElementRef={scrollContainerRef} className="space-y-6">
+          <TaskVirtualLayout
+            scrollElementRef={scrollContainerRef}
+            className="space-y-6"
+          >
             {groupedTasks.map(({ status, tasks: statusTasks }) => (
               <TaskSection
                 key={status}
                 status={status}
                 tasks={statusTasks}
                 onOpenTask={openTask}
-                onOpenTaskInNewTab={taskNewTabHandler}
-                onDragTask={canModifyTasks ? onDragTask : undefined}
                 collapsed={collapsedStatuses[status]}
-                onToggleCollapsed={() => toggleStatusCollapsed(status)}
+                onToggleCollapsed={toggleStatusCollapsed}
                 showChannelName={!isChannelMode}
                 scrollElementRef={scrollContainerRef}
+                {...lanePagingProps(status)}
               />
             ))}
           </TaskVirtualLayout>
         )}
-      </div>
+      </TasksPanelViewport>
 
       {showCreateDialog && channelId && (
         <CreateTaskDialog
           channelId={channelId}
-          onClose={() => setShowCreateDialog(false)}
+          onClose={closeCreateDialog}
         />
       )}
-    </div>
+    </TasksPanelRoot>
   );
 }

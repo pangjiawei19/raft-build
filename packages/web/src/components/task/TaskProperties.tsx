@@ -1,21 +1,22 @@
-import { useMemo, useState, useEffect, useLayoutEffect, useRef } from "react";
+import { useCallback, useMemo, useState, useEffect, useLayoutEffect, useRef } from "react";
+import { authorizeTaskAction } from "@botiverse/raft-shared";
 import { useIntl } from "react-intl";
 import { ChevronDown, ChevronRight } from "lucide-react";
-import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import type { MessageId } from "../../i18n/messages";
 
 import AvatarSlot from "../ui/AvatarSlot";
+import SectionEyebrow from "../ui/SectionEyebrow";
 import { useChannelMembers } from "../../hooks/useChannelMembers";
 import { useAuthStore } from "../../store/authStore";
 import { useTaskStore } from "../../store/taskStore";
 import type { Task, TaskHistoryEvent, TaskStatus } from "../../store/taskStore";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
-import { Badge, DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm } from "raft-ui";
+import { DescriptionDetails, DescriptionItem, DescriptionList, DescriptionTerm } from "@botiverse/raft-ui";
 
 import InlineBadgeEditor from "../InlineBadgeEditor";
-import Timeline from "../ui/Timeline";
+import { HistoryTimeline } from "./HistoryTimeline";
 
-import { STATUS_STYLES, canEditTaskStatus, getTaskStatusOptions } from "./taskStatusUi";
+import { STATUS_STYLES, canEditTaskStatus, getTaskStatusOptions, toRuiTaskStatus } from "./taskStatusUi";
 import { StatusBadge } from "./StatusBadge";
 import { dedupeTaskAssigneeMembers } from "./taskAssigneeCandidates";
 
@@ -54,7 +55,6 @@ function mentionLabel(name: string): string {
 
 export default function TaskProperties({ task }: { task: Task }) {
   const { formatMessage } = useIntl();
-  const { formatShortDateTime } = useTimeFormatter();
   const currentUser = useAuthStore((s) => s.user);
   const { capabilities, role } = useServerPermissions();
   const updateTaskStatus = useTaskStore((s) => s.updateTaskStatus);
@@ -76,26 +76,29 @@ export default function TaskProperties({ task }: { task: Task }) {
   // Resource receipts are an advanced CLI-only task capability. They are not
   // useful in the person-facing task timeline, so keep those internal events
   // out of the UI while the API remains available to CLI clients.
-  const visibleHistory = history.filter((event) => event.eventType !== "resource_receipt_recorded");
-  const historyColor = (event: TaskHistoryEvent): string | undefined => {
-    const candidate = [event.payload.to, event.payload.status, event.payload.from].find(
-      (value): value is string => typeof value === "string" && ["todo", "in_progress", "in_review", "done", "closed"].includes(value),
-    );
-    const status = candidate ?? (event.eventType === "closed" ? "closed" : event.eventType === "reopened" ? "in_progress" : undefined);
-    return status ? STATUS_STYLES[status as TaskStatus]?.bg : undefined;
-  };
-  let timelineStatus: TaskStatus | undefined;
-  const timelineItems = visibleHistory.map((event) => {
-    const pointColor = historyColor(event);
-    if (pointColor) timelineStatus = (Object.keys(STATUS_STYLES) as TaskStatus[]).find((s) => STATUS_STYLES[s].bg === pointColor);
-    return { event, pointColor, lineColor: timelineStatus ? STATUS_STYLES[timelineStatus].bg : undefined };
-  });
+  const visibleHistory = useMemo(
+    () => history.filter((event) => event.eventType !== "resource_receipt_recorded"),
+    [history],
+  );
 
   const canManageServer = capabilities.deleteAnyTask;
   const canEditStatus = canEditTaskStatus(task, currentUser?.id, canManageServer, role);
-  const canEditAssignee = role !== "guest";
-  const statusOptions = getTaskStatusOptions(task, currentUser?.id, canManageServer)
-    .map((option) => ({ id: option.id, label: formatMessage({ id: option.labelId }) }));
+  // Completed tasks are immutable by contract: the server freezes their
+  // assignee so the completion record remains historically accurate. Keep the
+  // control read-only here too, instead of showing a picker that can only fail
+  // with `task is done` after the user makes a selection.
+  const canEditAssignee = task.status !== "done" && authorizeTaskAction({ action: "assign", serverRole: role, canReadChannel: true, canWriteChannel: true, readOnlyReason: task.readOnlyReason });
+  const assigneeReadOnlyTitle = task.readOnlyReason
+    ? formatMessage({ id: "task.permissions.historicalJoint" })
+    : task.status === "done"
+      ? formatMessage({ id: "task.permissions.done" })
+      : undefined;
+  const currentUserId = currentUser?.id;
+  const statusOptions = useMemo(
+    () => getTaskStatusOptions(task, currentUserId, canManageServer)
+      .map((option) => ({ id: option.id, label: formatMessage({ id: option.labelId }) })),
+    [task, currentUserId, canManageServer, formatMessage],
+  );
 
   const unassignedLabel = formatMessage({ id: "task.properties.unassigned" });
 
@@ -137,12 +140,12 @@ export default function TaskProperties({ task }: { task: Task }) {
   // members we already have and fall back to the server's handle only when the
   // person is no longer a channel member. @stdrc msg=207ca92b: names should read
   // as display names, like everywhere else.
-  const displayNameFor = (type: "agent" | "user", id: string): string | null => {
+  const displayNameFor = useCallback((type: "agent" | "user", id: string): string | null => {
     const found = type === "agent"
       ? channelAgents.find((a) => a.id === id)
       : channelHumans.find((h) => h.id === id);
     return found ? found.displayName || found.name : null;
-  };
+  }, [channelAgents, channelHumans]);
 
   const assigneeDisplay = task.claimedById && task.claimedByType
     ? displayNameFor(task.claimedByType, task.claimedById)
@@ -151,7 +154,8 @@ export default function TaskProperties({ task }: { task: Task }) {
   const createdByDisplay = displayNameFor(task.createdByType, task.createdById)
     ?? mentionLabel(task.createdByName || formatMessage({ id: "task.properties.unknown" }));
 
-  const handleStatusSelect = async (id: string) => {
+  const handleStatusSelect = useCallback(async (id: string) => {
+    if (!canEditStatus) return;
     const next = id as TaskStatus;
     if (next === task.status) {
       setOpenEditor(null);
@@ -166,9 +170,10 @@ export default function TaskProperties({ task }: { task: Task }) {
     } finally {
       setBusy(false);
     }
-  };
+  }, [canEditStatus, task.status, task.channelId, task.id, updateTaskStatus]);
 
-  const handleAssigneeSelect = async (id: string) => {
+  const handleAssigneeSelect = useCallback(async (id: string) => {
+    if (!canEditAssignee) return;
     if (id === selectedAssigneeId) {
       setOpenEditor(null);
       return;
@@ -191,29 +196,40 @@ export default function TaskProperties({ task }: { task: Task }) {
     } finally {
       setBusy(false);
     }
-  };
+  }, [canEditAssignee, selectedAssigneeId, task.channelId, task.id, updateTaskAssignee]);
+
+  const toggleStatusEditor = useCallback(() => {
+    setOpenEditor((cur) => (cur === "status" ? null : "status"));
+  }, []);
+  const toggleAssigneeEditor = useCallback(() => {
+    setAssigneeSearch("");
+    setOpenEditor((cur) => (cur === "assignee" ? null : "assignee"));
+  }, []);
+  const closeEditor = useCallback(() => setOpenEditor(null), []);
+  const toggleHistory = useCallback(() => setHistoryOpen((v) => !v), []);
 
   // @artin asked for one horizontal facts row in #proj-task:142b9b9a. Keep
   // each label/value pair together, but let the row wrap on narrow panels.
+  // Raft DS › TaskCard: History folds under the properties, as a collapsible
+  // section title (13/18 700 ink-3); its timeline uses task-status pixels.
   return (<>
-    <div className="mb-4 border-b border-black/10 pb-3"><button type="button" className="mb-1 flex w-full items-center gap-1 text-left text-xs font-bold" aria-expanded={historyOpen} onClick={() => setHistoryOpen((v) => !v)}><span>{formatMessage({ id: "task.properties.history" })}</span>{historyOpen ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}</button>
-      {historyOpen && <div className="mt-3 w-full">{historyError ? <p className="text-xs text-red-700">{formatMessage({ id: "task.history.error" })}</p> : visibleHistory.length === 0 ? <p className="text-xs text-black/50">{formatMessage({ id: "task.history.empty" })}</p> : <Timeline items={timelineItems.map(({ event, pointColor, lineColor }) => ({ id: event.id, title: <TimelineText text={historyTitle(event, formatMessage)} bold />, meta: `${event.actorName ?? event.actorType} · ${formatShortDateTime(event.createdAt)}`, colorClass: pointColor, lineColorClass: lineColor, children: <TimelineDetail event={event} resolveName={(type, id) => displayNameFor(type, id)} formatMessage={formatMessage} /> }))} />}</div>}
-    </div>
     <DescriptionList
       className="flex flex-wrap items-center gap-x-6 gap-y-2"
       data-testid="task-properties"
     >
       <PropertyRow label={formatMessage({ id: "task.properties.status" })}>
-        {canEditStatus ? <InlineBadgeEditor
+        {canEditStatus || task.readOnlyReason ? <InlineBadgeEditor
           displayValue={formatMessage({ id: STATUS_STYLES[task.status].labelId })}
           selectedId={task.status}
           options={statusOptions}
           onSelect={handleStatusSelect}
-          open={openEditor === "status"}
-          onToggle={() => setOpenEditor((cur) => (cur === "status" ? null : "status"))}
-          onRequestClose={() => setOpenEditor(null)}
-          badgeClassName={STATUS_STYLES[task.status].bg}
-          disabled={busy}
+          open={canEditStatus && openEditor === "status"}
+          onToggle={toggleStatusEditor}
+          onRequestClose={closeEditor}
+          badgeStatus={toRuiTaskStatus(task.status)}
+          badgeClassName=""
+          disabled={busy || !canEditStatus}
+          buttonTitle={task.readOnlyReason ? formatMessage({ id: "task.permissions.historicalJoint" }) : undefined}
           buttonTestId="task-properties-status"
           optionTestIdPrefix="task-properties-status-option"
         /> : <StatusBadge status={task.status} data-testid="task-properties-status-readonly">
@@ -227,20 +243,17 @@ export default function TaskProperties({ task }: { task: Task }) {
           are assignable too, so this one has to be typed into; Status never
           will be (@stdrc msg=c8c890d2, msg=4c357cb1). */}
       <PropertyRow label={formatMessage({ id: "task.properties.assignee" })}>
-        {canEditAssignee ? <InlineBadgeEditor
+        <InlineBadgeEditor
           displayValue={assigneeDisplay}
           selectedId={selectedAssigneeId}
           options={assigneeOptions}
           onSelect={handleAssigneeSelect}
-          open={openEditor === "assignee"}
-          onToggle={() => {
-            setAssigneeSearch("");
-            setOpenEditor((cur) => (cur === "assignee" ? null : "assignee"));
-          }}
-          onRequestClose={() => setOpenEditor(null)}
-          badgeClassName="bg-white"
-          uppercase={false}
-          disabled={busy}
+          open={canEditAssignee && openEditor === "assignee"}
+          onToggle={toggleAssigneeEditor}
+          onRequestClose={closeEditor}
+          badgeClassName="bg-transparent text-foreground"
+          disabled={busy || !canEditAssignee}
+          buttonTitle={assigneeReadOnlyTitle}
           buttonTestId="task-properties-assignee"
           dropdownTestId="task-assignee-dropdown"
           searchable
@@ -248,34 +261,34 @@ export default function TaskProperties({ task }: { task: Task }) {
           onSearchChange={setAssigneeSearch}
           searchPlaceholder={formatMessage({ id: "task.assignee.searchPlaceholder" })}
           popoverTitle={formatMessage({ id: "task.properties.assignee" })}
-        /> : <Badge uppercase={false} data-testid="task-properties-assignee-readonly">
-          {assigneeDisplay}
-        </Badge>}
+        />
       </PropertyRow>
 
       <PropertyRow label={formatMessage({ id: "task.properties.createdBy" })}>
         <span>{createdByDisplay}</span>
       </PropertyRow>
     </DescriptionList>
+    {task.readOnlyReason && <p className="mt-2 text-caption text-foreground-hint" data-testid="task-readonly-reason">
+      {formatMessage({ id: "task.permissions.historicalJoint" })}
+    </p>}
+    <div className="pt-4"><SectionEyebrow as="button" className="flex w-full items-center gap-1 rounded-sticker text-left outline-none hover:text-foreground focus-visible:shadow-focus" aria-expanded={historyOpen} onClick={toggleHistory}><span>{formatMessage({ id: "task.properties.history" })}</span>{historyOpen ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}</SectionEyebrow>
+      {historyOpen && <div className="mt-3 w-full">{historyError ? <p className="text-caption text-warning-strong">{formatMessage({ id: "task.history.error" })}</p> : visibleHistory.length === 0 ? <p className="text-caption text-foreground-hint">{formatMessage({ id: "task.history.empty" })}</p> : <HistoryTimeline history={visibleHistory} resolveName={displayNameFor} />}</div>}
+    </div>
   </>);
 }
 
-function TimelineText({ text, bold = false, className = "" }: { text: string; bold?: boolean; className?: string }) {
+export function TimelineText({ text, bold = false, className = "" }: { text: string; bold?: boolean; className?: string }) {
   const ref = useRef<HTMLSpanElement>(null); const [open, setOpen] = useState(false); const [long, setLong] = useState(false);
   useLayoutEffect(() => { const el = ref.current; if (!el) return; const measure = () => setLong(el.scrollHeight > (Number.parseFloat(window.getComputedStyle(el).lineHeight) || 16) + 1); measure(); window.addEventListener("resize", measure); return () => window.removeEventListener("resize", measure); }, [text]);
   return <span className={`block ${className}`}><button type="button" className={`text-left ${bold ? "font-bold" : ""}`} onClick={() => long && setOpen((v) => !v)}><span ref={ref} className={`whitespace-pre-wrap break-words ${long && !open ? "line-clamp-1" : ""}`}>{text}</span>{long && (open ? <ChevronDown className="ml-1 inline" size={12} aria-hidden="true" /> : <ChevronRight className="ml-1 inline" size={12} aria-hidden="true" />)}</button></span>;
 }
 
-function TimelineDetail({ event, resolveName, formatMessage }: { event: TaskHistoryEvent; resolveName: (type: "agent" | "user", id: string) => string | null; formatMessage: ReturnType<typeof useIntl>["formatMessage"] }) {
+export function TimelineDetail({ event, resolveName, formatMessage }: { event: TaskHistoryEvent; resolveName: (type: "agent" | "user", id: string) => string | null; formatMessage: ReturnType<typeof useIntl>["formatMessage"] }) {
   const p = event.payload;
-  if (["status_changed", "closed", "reopened"].includes(event.eventType) && p.from && p.to) { const from = String(p.from) as TaskStatus; const to = String(p.to) as TaskStatus; return <div className="mt-1 flex items-center gap-1 text-black/60"><Badge variant="accent" uppercase={false} className={STATUS_STYLES[from]?.bg}>{formatMessage({ id: STATUS_STYLES[from]?.labelId ?? "task.status.todo" })}</Badge> → <Badge variant="accent" uppercase={false} className={STATUS_STYLES[to]?.bg}>{formatMessage({ id: STATUS_STYLES[to]?.labelId ?? "task.status.todo" })}</Badge></div>; }
-  return <TimelineText text={historyDetail(event, resolveName, formatMessage)} className="mt-1 text-black/60" />;
+  if (["status_changed", "closed", "reopened"].includes(event.eventType) && p.from && p.to) { const from = String(p.from) as TaskStatus; const to = String(p.to) as TaskStatus; return <div className="mt-0.5 flex items-center gap-1 text-foreground-hint"><StatusBadge status={from}>{formatMessage({ id: STATUS_STYLES[from]?.labelId ?? "task.status.todo" })}</StatusBadge> → <StatusBadge status={to}>{formatMessage({ id: STATUS_STYLES[to]?.labelId ?? "task.status.todo" })}</StatusBadge></div>; }
+  return <TimelineText text={historyDetail(event, resolveName, formatMessage)} className="mt-0.5 text-foreground-hint" />;
 }
 
-function historyTitle(event: TaskHistoryEvent, formatMessage: ReturnType<typeof useIntl>["formatMessage"]): string {
-  const key = ({ created: "task.history.created", amended: "task.history.amended", status_changed: "task.history.statusChanged", assignee_changed: "task.history.assigneeChanged", reopened: "task.history.reopened", closed: "task.history.closed", resource_receipt_recorded: "task.history.receipt" } as Record<string, MessageId>)[event.eventType];
-  return key ? formatMessage({ id: key }) : event.eventType;
-}
 
 function historyDetail(event: TaskHistoryEvent, resolveName?: (type: "agent" | "user", id: string) => string | null, formatMessage?: ReturnType<typeof useIntl>["formatMessage"]): string {
   const p = event.payload;

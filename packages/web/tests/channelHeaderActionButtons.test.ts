@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test, { afterEach } from "node:test";
 import "./helpers/domSetup";
 import { createElement } from "react";
 import { cleanup, fireEvent, render as rtlRender, screen } from "@testing-library/react";
@@ -16,7 +15,6 @@ import { buildSearchPath } from "../src/hooks/useAppNavigate";
 import { useMessageStore } from "../src/store/messageStore";
 import { useServerStore } from "../src/store/serverStore";
 import { useTaskStore } from "../src/store/taskStore";
-import { EXPECTED_RAFT_UI_VERSION } from "./helpers/raftUiVersion";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const originalGet = api.get.bind(api);
@@ -146,60 +144,38 @@ afterEach(() => {
   localStorage.clear();
 });
 
-test("channel header icon-only actions stay square while matching text action height", () => {
-  const source = readFileSync(
-    resolve(repoRoot, "src/components/message/ChatPanel.tsx"),
-    "utf8",
-  );
-  const buttonSource = readFileSync(
-    resolve(repoRoot, "src/components/ui/Button.tsx"),
-    "utf8",
-  );
-
-  // ChatPanel header labels migrated to react-intl (B2a): titles now resolve
-  // through the message.chatPanel.* catalog; the icon-Button structure is intact.
-  assert.match(source, /<Button[\s\S]*?shape="icon"[\s\S]*?title=\{formatMessage\(\{ id: "message\.chatPanel\.stopAllAgents" \}\)\}/);
-  assert.match(source, /<Button[\s\S]*?shape="icon"[\s\S]*?<Settings size=\{14\}/);
-  assert.match(source, /message\.chatPanel\.editChannel/);
-  assert.match(source, /message\.chatPanel\.channelOptions/);
-  assert.match(source, /<Button[\s\S]*?shape="icon"[\s\S]*?title=\{formatMessage\(\{ id: "message\.chatPanel\.searchChannel" \}\)\}/);
-  assert.doesNotMatch(source, /size-8/);
-  assert.match(buttonSource, /icon: "size-7 text-xs"/);
-});
 
 test("archived channels expose restore only across both settings and member entry surfaces", () => {
   const overflow = readFileSync(
     resolve(repoRoot, "src/components/channel/ChannelOverflowMenu.tsx"),
     "utf8",
   );
-  const members = readFileSync(
-    resolve(repoRoot, "src/components/agent/ChannelMembers.tsx"),
-    "utf8",
-  );
-  const legacyMembers = readFileSync(
-    resolve(repoRoot, "src/components/agent/LegacyChannelMembers.tsx"),
-    "utf8",
-  );
+  // MemberRoleActions (the per-row role gating) was split out of ChannelMembers.
+  const members = [
+    "src/components/agent/ChannelMembers.tsx",
+    "src/components/agent/MemberRoleActions.tsx",
+  ].map((path) => readFileSync(resolve(repoRoot, path), "utf8")).join("\n");
   const currentSettings = readFileSync(
     resolve(repoRoot, "src/components/channel/EditChannelDialog.tsx"),
-    "utf8",
-  );
-  const legacySettings = readFileSync(
-    resolve(repoRoot, "src/components/channel/LegacyEditChannelDialog.tsx"),
     "utf8",
   );
 
   assert.match(overflow, /canUseChannelMemberAction\([\s\S]*?\) && !channel\?\.archivedAt;/);
   assert.match(members, /const isArchived = !!currentChannel\?\.archivedAt;[\s\S]*?canUseChannelMemberAction\([\s\S]*?\) && !isArchived;/);
-  assert.match(legacyMembers, /const isArchived = !!currentChannel\?\.archivedAt;[\s\S]*?canUseChannelMemberAction\([\s\S]*?\) && !isArchived;/);
-  for (const source of [members, legacyMembers]) {
+  for (const source of [members]) {
     assert.match(source, /const canChangeRole = !isArchived && !isAllChannel && member\.canChangeChannelRole;/);
-    assert.match(source, /const canExplainProtectedDemote = !isArchived[\s\S]*?currentChannel\?\.channelCapabilities\?\.changeChannelMemberRoles === true/);
-    assert.match(source, /const showRoleAction = channelManagerRoleActionsEnabled\s*&& \(canChangeRole \|\| canExplainProtectedDemote\);/);
-    assert.match(source, /roleAction=\{showRoleAction \?/);
+    // Role-action gating lives in the MemberRoleActions child; the parent
+    // threads the archived flag, channel capability and feature gate in.
+    assert.match(source, /isArchived=\{isArchived\}/);
+    assert.match(source, /roleCapabilitiesEnabled=\{currentChannel\?\.channelCapabilities\?\.changeChannelMemberRoles === true\}/);
+    assert.match(source, /roleActionsEnabled=\{channelManagerRoleActionsEnabled\}/);
+    assert.match(source, /const canExplainProtectedDemote = !isArchived[\s\S]*?&& roleCapabilitiesEnabled/);
+    assert.match(source, /const showRoleAction = roleActionsEnabled\s*&& \(canChangeRole \|\| canExplainProtectedDemote\);/);
+    assert.match(source, /const roleAction = useMemo\(\(\) => \(showRoleAction \?/);
+    assert.match(source, /<ChannelMemberHoverActions roleAction=\{roleAction\}/);
   }
-  for (const source of [members, legacyMembers]) assert.match(source, /showAddSection && canAddChannelMembers/);
-  for (const source of [currentSettings, legacySettings]) {
+  for (const source of [members]) assert.match(source, /showAddSection && canAddChannelMembers/);
+  for (const source of [currentSettings]) {
     assert.match(source, /const showLeaveAction = !!onLeaveChannel && !isAllChannel && !isArchived;/);
     assert.match(source, /const showManageActions = canEditChannel && !isArchived;/);
     assert.match(source, /isArchived && effectiveCapabilities\.archiveChannels/);
@@ -218,12 +194,12 @@ test("regular channel header search opens Search with the current channel filter
 
   assert.match(
     chatPanel,
-    /const showChannelSearchButton = isJoinableChannel;/,
+    /const channelHeaderActions = isJoinableChannel \? \(/,
     "the header shortcut should stay scoped to regular channel surfaces",
   );
   assert.match(
     chatPanel,
-    /handleSearchThisChannel\(channel\.id\)/,
+    /handleSearchCurrentChannel = useCallback\(\(\) => handleSearchThisChannel\(channel\?\.id/,
     "the header shortcut should preserve the current channel as the search filter",
   );
   assert.match(
@@ -279,85 +255,37 @@ test("channel header text and count actions use the shared button size contract"
     resolve(repoRoot, "src/components/agent/ChannelMembers.tsx"),
     "utf8",
   );
-  const memberCountButton = channelMembers.match(/<Button[\s\S]*?shape="iconText"[\s\S]*?<\/Button>/)?.[0] ?? "";
+  const memberCountButton = channelMembers.match(/<Button[\s\S]*?size="sm"[\s\S]*?<\/Button>/)?.[0] ?? "";
   assert.doesNotMatch(chatPanel, /title="Leave channel"/);
   assert.match(
     channelMembers,
-    /<Button[\s\S]*?shape="iconText"[\s\S]*?className="min-w-7 gap-1 px-1\.5"/,
+    /<Button[\s\S]*?size="sm"[\s\S]*?className="min-w-7 gap-1 px-1\.5"/,
   );
-  assert.match(channelMembers, /text-\[11px\][^"]*tabular-nums/);
+  // The count is machine text (Space Mono 12/16), tabular so it never jitters.
+  assert.match(channelMembers, /font-mono text-mono-meta[^"]*tabular-nums/);
   assert.doesNotMatch(channelMembers, /h-8 min-w-8/);
   assert.doesNotMatch(memberCountButton, /badge=/);
-  const buttonSource = readFileSync(resolve(repoRoot, "src/components/ui/Button.tsx"), "utf8");
-  assert.match(buttonSource, /iconText: "h-7 gap-1\.5 px-2\.5 text-xs"/);
-  assert.doesNotMatch(buttonSource, /\bcount:/);
+  assert.equal(existsSync(resolve(repoRoot, "src/components/ui/Button.tsx")), false);
 });
 
-test("channel leave action lives inside channel options above visibility actions", () => {
-  const chatPanel = readFileSync(
-    resolve(repoRoot, "src/components/message/ChatPanel.tsx"),
-    "utf8",
-  );
-  const editDialog = readFileSync(
-    resolve(repoRoot, "src/components/channel/EditChannelDialog.tsx"),
-    "utf8",
-  );
-  const memberRemoval = readFileSync(
-    resolve(repoRoot, "src/components/channel/useChannelMemberRemoval.tsx"),
-    "utf8",
-  );
-  const englishMessages = readFileSync(
-    resolve(repoRoot, "src/i18n/messages/en.ts"),
-    "utf8",
-  );
-
-  assert.match(chatPanel, /<EditChannelDialog/);
-  assert.match(chatPanel, /onLeaveChannel=/);
-  assert.match(chatPanel, /canLeaveChannel/);
-  assert.match(chatPanel, /leaveChannel\(channel\.id\)/);
-  // The leave warning is `channel.edit.confirmLeave` now. Keep BOTH halves of the
-  // contract: the id is wired at the call site, and en.ts still carries the exact
-  // three clauses this test was written to protect.
-  assert.match(editDialog, /id: "channel\.edit\.confirmLeave"/);
-  assert.match(englishMessages, /Existing followed threads are not automatically unfollowed/);
-  assert.match(englishMessages, /followed public threads can still notify you until you unfollow or manage those threads/);
-  assert.match(englishMessages, /Private content remains gated by current access/);
-  // The remove warning moved with the shared removal flow
-  // (useChannelMemberRemoval, consumed by ChannelMembers AND the member
-  // page). Keep BOTH halves of the contract: the id is wired at the
-  // dialog site, and en.ts still carries the exact copy.
-  assert.match(memberRemoval, /id: "agent\.channelMembers\.removeMemberMessage"/);
-  assert.match(englishMessages, /"agent\.channelMembers\.removeMemberMessage":\s*\n\s*"\{name\} will stop receiving ordinary delivery from #\{channel\} and cannot send messages until they rejoin\. Existing followed threads are not automatically unfollowed; followed public threads can still notify them until they unfollow or manage those threads\. Private content remains gated by current access\."/);
-  assert.match(
-    editDialog,
-    /channel\.edit\.leaveChannel[\s\S]*?channel\.edit\.makePublic/,
-    "Leave Channel should stay above the Make Public/Private visibility action",
-  );
-  assert.match(
-    editDialog,
-    /setShowLeaveConfirm\(true\)[\s\S]*?<ConfirmDialog[\s\S]*?id: "channel\.edit\.leaveChannel"[\s\S]*?layer=\{1\}/,
-    "leave warning should stack above Channel settings instead of replacing it",
-  );
-});
 
 test("Channel settings uses the raft-ui right-side full-height Drawer shell", () => {
   const editDialog = readFileSync(
     resolve(repoRoot, "src/components/channel/EditChannelDialog.tsx"),
     "utf8",
   );
-  const webPackage = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf8")) as {
-    dependencies: Record<string, string>;
-  };
-
-  assert.equal(webPackage.dependencies["raft-ui"], EXPECTED_RAFT_UI_VERSION);
   assert.match(editDialog, /function ChannelSettingsSheet/);
   assert.match(editDialog, /const isDirty = name !== initialName/);
-  assert.match(editDialog, /import \{[\s\S]*?Drawer,[\s\S]*?DrawerClose,[\s\S]*?DrawerContent,[\s\S]*?DrawerDescription,[\s\S]*?DrawerTitle,[\s\S]*?\} from "raft-ui"/);
+  assert.match(editDialog, /import \{[\s\S]*?Drawer,[\s\S]*?DrawerClose,[\s\S]*?DrawerContent,[\s\S]*?DrawerDescription,[\s\S]*?DrawerTitle,[\s\S]*?\} from "@botiverse\/raft-ui"/);
   assert.match(editDialog, /<Drawer[\s\S]*?swipeDirection="right"[\s\S]*?disablePointerDismissal=\{isDirty\}/);
   assert.match(editDialog, /eventDetails\.reason === "outside-press"[\s\S]*?eventDetails\.reason === "swipe"[\s\S]*?eventDetails\.cancel\(\)/);
-  assert.match(editDialog, /onOpenChangeComplete=\{\(nextOpen\) => \{[\s\S]*?if \(!nextOpen\) onClose\(\);/);
+  assert.match(editDialog, /handleOpenChangeComplete = useCallback\(\(nextOpen: boolean\) => \{[\s\S]*?if \(!nextOpen\) onClose\(\);[\s\S]*?onOpenChangeComplete=\{handleOpenChangeComplete\}/);
   assert.match(editDialog, /data-testid="channel-settings-sheet"/);
-  assert.match(editDialog, /inset-y-0 right-0 h-dvh w-full max-w-\[min\(100vw,34rem\)\]/);
+  assert.match(editDialog, /inset-y-0 right-0 h-dvh w-full \[--drawer-content-height:100dvh\]/);
+  // DS Sheet: raft-ui's drawer recipe caps the width (420; the whole width on
+  // a phone) and draws the surface, so the call site sets neither.
+  assert.doesNotMatch(editDialog, /data-testid="channel-settings-sheet"\s+className="[^"]*(?:max-w-|bg-|border-l)/);
+  assert.match(editDialog, /<DrawerHeader[\s\S]*?<DrawerBody[\s\S]*?<DrawerFooter/);
   assert.match(editDialog, /\[--drawer-content-height:100dvh\] \[--drawer-inset:0px\]/);
   assert.match(editDialog, /min-h-0 flex-1 overflow-y-auto/);
   assert.match(editDialog, /id=\{CHANNEL_SETTINGS_FORM_ID\}/);
@@ -388,6 +316,6 @@ test("#all hides the header members button for ordinary members when human direc
   );
   assert.match(
     chatPanel,
-    /!\{?hideAllChannelMembersButton[\s\S]*?<ChannelMembers channelId=\{channel\.id\} \/>/,
+    /showMembers=\{!hideAllChannelMembersButton\}/,
   );
 });

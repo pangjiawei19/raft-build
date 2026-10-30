@@ -1,32 +1,32 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import {
   createMessageWindowHarness,
   flushAsyncWork,
-} from "./messageWindowHarness.js";
-import { buildOptimisticMessageId } from "../src/components/message/optimisticMessageDraft.js";
+} from "./messageWindowHarness";
+import { buildOptimisticMessageId } from "../src/components/message/optimisticMessageDraft";
 import {
+  CONTEXT_BEYOND_HISTORY_ERROR,
   compareMessagesForDisplay,
   isMatchingOptimisticMessage,
   selectChannelMessageBucket,
   selectChannelWindowMeta,
   useMessageStore,
-} from "../src/store/messageStore.js";
+} from "../src/store/messageStore";
 import type {
   Message,
   MessageAttachment,
-} from "../src/store/messageStore.js";
-import { useThreadStore } from "../src/store/threadStore.js";
-import type { ThreadSummary } from "../src/store/threadStore.js";
-import type { ThreadReplyPreview } from "../src/store/threadRepliesReadModel.js";
+} from "../src/store/messageStore";
+import { useThreadStore } from "../src/store/threadStore";
+import type { ThreadSummary } from "../src/store/threadStore";
+import type { ThreadReplyPreview } from "../src/store/threadRepliesReadModel";
 import {
   hydrateThreadRepliesSnapshotWithSyncCore,
   resetThreadRepliesSyncCoreForTests,
-} from "../src/store/threadRepliesSyncDomain.js";
-import { useServerStore } from "../src/store/serverStore.js";
+} from "../src/store/threadRepliesSyncDomain";
+import { useServerStore } from "../src/store/serverStore";
 
 const CHANNEL_ID = "channel-1";
-const SERIAL = { concurrency: false };
+const SERIAL = {};
 
 function message(seq: number): Message {
   return {
@@ -2156,6 +2156,24 @@ test("falls back to the channel timeline when focused message context is missing
   }
 });
 
+test("a focused message hidden by the plan history cutoff reports beyond-history, not not-found (task #14)", SERIAL, async () => {
+  const harness = createMessageWindowHarness();
+  try {
+    // The context route 404s for a target behind the cutoff; the fallback page
+    // reports the channel as history-limited.
+    harness.enqueueChannelPages({ messages: [message(20), message(21)], historyLimited: true });
+
+    await harness.loadMessageContext(CHANNEL_ID, "old-message");
+
+    const snapshot = harness.snapshot(CHANNEL_ID);
+    assert.deepEqual(snapshot.messageIds, ["m-20", "m-21"]);
+    assert.equal(snapshot.contextLoadError, CONTEXT_BEYOND_HISTORY_ERROR);
+    assert.equal(harness.windowMeta(CHANNEL_ID).contextLoadError, CONTEXT_BEYOND_HISTORY_ERROR);
+  } finally {
+    harness.restore();
+  }
+});
+
 test("stale focused-context failure cannot publish after leaving and re-entering the channel", SERIAL, async () => {
   const harness = createMessageWindowHarness();
   const staleContext = deferred<{
@@ -2685,6 +2703,36 @@ test("[#3774] optimistic sent on first thread open (empty bucket) gets a server-
       "optimistic-x",
       `optimistic must be last (bottom), not top; got ${JSON.stringify(ids)}`,
     );
+  } finally {
+    harness.restore();
+  }
+});
+
+// Reconnect catch-up regression (2026-10): `GET /messages/sync` served `seq`
+// as a STRING (raw int8 row) while every other path serves a number. The store
+// must coerce at ingest so a wire string never reaches `channelMessages`.
+test("thread catch-up sync and sync:resume coerce wire-string seqs to numbers at ingest", SERIAL, async () => {
+  const harness = createMessageWindowHarness();
+  const THREAD_ID = "thread-1";
+  try {
+    harness.primeWindow(CHANNEL_ID, [message(13)]);
+    useMessageStore.setState((state) => ({
+      channelMessages: { ...state.channelMessages, [THREAD_ID]: [messageInChannel(THREAD_ID, 12)] },
+    }));
+    // Global seqs interleave: thread 12,14,16 while the parent channel got 13,15.
+    const wire = (seq: number) => ({ ...messageInChannel(THREAD_ID, seq), seq: String(seq) }) as unknown as Message;
+    harness.enqueueSyncPages([wire(14), wire(16)]);
+
+    await useMessageStore.getState().syncGap(THREAD_ID, { sinceSeq: 12 });
+
+    const thread = harness.messages(THREAD_ID);
+    assert.deepEqual(thread.map((row) => row.id), ["m-12", "m-14", "m-16"]);
+    assert.deepEqual(thread.map((row) => typeof row.seq), ["number", "number", "number"]);
+
+    harness.batchMessages([({ ...messageInChannel(CHANNEL_ID, 15), seq: "15" }) as unknown as Message]);
+    const channel = harness.messages(CHANNEL_ID);
+    assert.deepEqual(channel.map((row) => row.seq), [13, 15]);
+    assert.equal(useMessageStore.getState().lastSeq, 16);
   } finally {
     harness.restore();
   }

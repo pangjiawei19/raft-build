@@ -1,6 +1,6 @@
-#!/usr/bin/env -S node --import tsx
+#!/usr/bin/env -S node --import=@oxc-node/core/register
 /**
- * slockdev — tsx rewrite (task #15, +task #12 cf-tunnel default).
+ * slockdev — TypeScript rewrite (task #15, +task #12 cf-tunnel default).
  *
  * Faithful replacement for the bash slockdev. Behavior parity is the
  * contract: same stdout, same exit codes, same docker/tmux/psql side
@@ -19,11 +19,11 @@
  *     for some bytes but execution semantics are equivalent for the
  *     values we pass (URLs, paths, secrets, alnum). The string is
  *     internal to tmux and never printed.
- *   - ensure_rustfs_bucket reuses bash's npx-tsx + @aws-sdk/client-s3
+ *   - ensure_rustfs_bucket reuses bash's @aws-sdk/client-s3
  *     Head/Create approach (60× retry) to keep behavior byte-equivalent
  *     rather than risk SDK-version drift. The script lives as a real
  *     file at packages/server/ensure-rustfs-bucket.mjs (invoked as
- *     `npx tsx ensure-rustfs-bucket.mjs` with cwd=packages/server) so
+ *     `pnpm exec node ensure-rustfs-bucket.mjs` with cwd=packages/server) so
  *     that Windows + shell:true does not corrupt a multi-line --eval
  *     payload (Node DEP0190 — args are concatenated, not escaped).
  */
@@ -45,8 +45,8 @@ import {
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { parseReaderStartedAtMs, runTraceCli, traceBannerLines } from "./raftdev-trace.js";
-import { persistentSchemaHash, readPersistentEnvironment, writePersistentEnvironment } from "./raftdev-persistent.js";
+import { parseReaderStartedAtMs, runTraceCli, traceBannerLines } from "./raftdev-trace";
+import { persistentSchemaHash, readPersistentEnvironment, writePersistentEnvironment } from "./raftdev-persistent";
 
 export const PROJECT_DIR = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -753,14 +753,18 @@ export function parseSeedCommandArgs(args: string[], defaultName: string): SeedC
   return { name, withOnboarding };
 }
 
+// TypeScript scripts run on Node with the oxc-node loader. `pnpm exec` keeps
+// the package-manager spawn seam (Windows .cmd shim, fake-bin tests).
+export function tsScriptArgs(script: string, args: string[] = []): string[] {
+  return ["exec", "node", "--import", "@oxc-node/core/register", script, ...args];
+}
+
 export function buildDevSeedArgs(outputPath: string, withOnboarding: boolean): string[] {
-  return [
-    "tsx",
-    "scripts/seed.ts",
+  return tsScriptArgs("scripts/seed.ts", [
     "--output",
     outputPath,
     ...(withOnboarding ? ["--with-onboarding"] : []),
-  ];
+  ]);
 }
 
 function sh(
@@ -973,6 +977,30 @@ function portInUse(port: number): boolean {
     : sh("lsof", ["-iTCP:" + String(port), "-sTCP:LISTEN", "-P", "-n"], { quiet: true });
   return r.code === 0 && r.stdout.trim() !== "";
 }
+// tmux keeps a login shell after a command exits, and Node --watch may keep
+// its parent alive after the server child exits. Check sockets, not those PIDs.
+// This is listener evidence only, not an HTTP/application health assertion.
+function applicationListeners(e: Env): { name: string; port: number; listening: boolean }[] {
+  const replicas = new Set([1]);
+  for (const window of tmuxWindowNames(e.TMUX_SESSION)) {
+    const match = window.match(/^server-([2-9]|[1-9][0-9]+)$/);
+    if (match && Number(match[1]) <= MAX_REPLICAS) replicas.add(Number(match[1]));
+  }
+  return [
+    ...[...replicas].sort((a, b) => a - b).map((k) => ({
+      name: replicaWindowName(k), port: replicaServerPort(e.OFFSET, k),
+    })),
+    { name: "web", port: e.WEB_PORT },
+  ].map((entry) => ({ ...entry, listening: portInUse(entry.port) }));
+}
+
+function printApplicationListeners(listeners: ReturnType<typeof applicationListeners>): void {
+  for (const { name, port, listening } of listeners) {
+    out(`  Listener   : ${name} :${port} (${listening ? "listening" : "no listener detected"})`);
+  }
+  out("  Listener checks do not verify HTTP health; a missing listener may still be starting.");
+}
+
 function checkPort(port: number, service: string): void {
   if (portInUse(port)) {
     out(`ERROR: Port ${port} (${service}) is already in use.`);
@@ -997,8 +1025,7 @@ function ensureRustfsBucket(e: Env): boolean {
     writeFileSync(initLog, "");
     const fdOut = openSync(initLog, "a");
     const fdErr = openSync(initLog, "a");
-    const npxCommand = packageManagerCommand("npx");
-    const r = spawnSync(npxCommand, ["tsx", "ensure-rustfs-bucket.mjs"], {
+    const r = spawnSync(packageManagerCommand("pnpm"), ["exec", "node", "ensure-rustfs-bucket.mjs"], {
       cwd: join(PROJECT_DIR, "packages/server"),
       env: {
         ...process.env,
@@ -1050,7 +1077,7 @@ Commands:
   migrate [name]  为持久数据库显式执行版本化迁移，服务保持停止
   destroy <name> --yes
                   永久删除指定环境的容器、数据卷和本地配置
-  status          Show all running environments
+  status          Show environment resources and application listeners
   seed [name] [--with-onboarding]
                   Re-run seed script; default fixture skips onboarding
   script <name>   Run a repo-owned dev script against an environment
@@ -1066,6 +1093,11 @@ Commands:
 
 Name defaults to the directory basename (e.g., "slock").
 Different names get different ports, so multiple environments can coexist.
+
+Runtime status:
+  status 检查应用端口；持久环境额外检查 API 和 Web 的 HTTP 就绪状态。
+  持久环境健康运行时，重复 start 返回成功；异常时保留数据恢复服务。
+  临时预览环境已有 tmux 会话时，start 返回 1，不重复启动进程。
 
 Optional:
   --description <text> on start labels what this preview environment is for.
@@ -1295,10 +1327,11 @@ function cmdStatus(): void {
     const serverListening = portInUse(e.SERVER_PORT);
     const webListening = portInUse(e.WEB_PORT);
     out(`Environment '${en}':`);
+    const listeners = hasSession ? applicationListeners(e) : [];
     if (persistent) out("  Mode       : persistent（启停保留数据）");
-    if (hasSession && readyServiceCount === 3 && serverListening && webListening && (!persistent || persistentHttpReady(e))) {
+    if (hasSession && readyServiceCount === 3 && listeners.every((entry) => entry.listening) && serverListening && webListening && (!persistent || persistentHttpReady(e))) {
       const redisState = externalRedisListening ? "; Redis external" : "";
-      out(`  Runtime    : running (tmux session + required services ready${redisState})`);
+      out(`  Runtime    : running (tmux session + required services ready; application ports listening${redisState})`);
     } else if (persistent && !hasSession && readyServiceCount === 0 && !serverListening && !webListening) {
       out("  Runtime    : stopped（服务已停止，持久数据保留）");
     } else if (hasSession || dockerResidueCount > 0) {
@@ -1310,6 +1343,7 @@ function cmdStatus(): void {
       out("  Runtime    : stopped (state only; no tmux session or Docker resources)");
     }
     out(`  HTTP       : API ${serverListening ? "监听中" : "未监听"}；Web ${webListening ? "监听中" : "未监听"}`);
+    if (hasSession) printApplicationListeners(listeners);
     out(`  PostgreSQL : localhost:${15432 + o}`);
     out(`  Postgres   : postgresql://postgres:slock-dev-${en}@localhost:${15432 + o}/slock`);
     out(`  Redis      : localhost:${16379 + o}`);
@@ -1411,7 +1445,7 @@ function cmdScript(args: string[]): void {
   const r = spawnSync(
     "node",
     [
-      "--import", "tsx", scriptPath,
+      "--import", "@oxc-node/core/register", scriptPath,
       "--server-url", `http://localhost:${e.SERVER_PORT}`,
       "--seed-file", e.SEED_FILE,
       ...(scriptName === "feedback-report" ? ["--worker-url", `http://localhost:${e.TRACE_WORKER_PORT}`] : []),
@@ -1520,9 +1554,7 @@ function redactRisingWaveDiagnostic(e: Env, value: string): string {
 }
 
 function runManagedRisingWaveBootstrap(e: Env): number {
-  const result = spawnSync(packageManagerCommand("npx"), [
-    "tsx", "scripts/bootstrap-risingwave-local.ts",
-  ], {
+  const result = spawnSync(packageManagerCommand("pnpm"), tsScriptArgs("scripts/bootstrap-risingwave-local.ts"), {
     cwd: join(PROJECT_DIR, "packages/server"),
     env: {
       ...process.env,
@@ -1563,18 +1595,17 @@ function runSeededRisingWaveParity(
     return false;
   }
 
-  const npxCommand = packageManagerCommand("npx");
+  const pnpmCommand = packageManagerCommand("pnpm");
   let finalStdout = "";
   let finalStderr = "";
   for (let attempt = 1; attempt <= attempts; attempt++) {
-    const result = spawnSync(npxCommand, [
-      "tsx", "scripts/verify-risingwave-inbox-parity.ts",
+    const result = spawnSync(pnpmCommand, [
+      ...tsScriptArgs("scripts/verify-risingwave-inbox-parity.ts"),
       "--server-id", identity.serverId,
       "--user-id", identity.userId,
       "--filter", "all,unread,mentions",
       "--limit", "100",
       "--offset", "0",
-      "--summary-server-id", identity.serverId,
       ...(options.bootstrapSeedBaseline ? ["--bootstrap-seed-baseline"] : []),
     ], {
       cwd: join(PROJECT_DIR, "packages/server"),
@@ -1696,7 +1727,7 @@ function cmdSeed(args: string[]): void {
     process.exit(1);
   }
   out(`Seeding test data for '${name}'...`);
-  r = spawnSync(npxCommand, buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
+  r = spawnSync(packageManagerCommand("pnpm"), buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
     cwd: join(PROJECT_DIR, "packages/server"),
     env: {
       ...process.env,
@@ -2559,9 +2590,11 @@ function cmdStart(args: string[], initOnly = false): void {
   out("");
 
   if (tmuxHasSession(e.TMUX_SESSION)) {
-    out(`Environment '${name}' is already running.`);
+    out(`Environment '${name}': tmux session already exists; no processes were started.`);
+    printApplicationListeners(applicationListeners(e));
     out(`  Attach:  ./raftdev logs ${name}`);
     out(`  Stop:    ./raftdev stop ${name}`);
+    out("  To recover: inspect logs, stop explicitly, then repeat the original start command and options.");
     process.exit(1);
   }
 
@@ -2927,7 +2960,7 @@ function cmdStart(args: string[], initOnly = false): void {
       });
       if ((r.status ?? 1) !== 0) process.exit(r.status ?? 1);
       if (!existsSync(e.SEED_FILE)) {
-        r = spawnSync(npxCommand, ["tsx", "scripts/init-local.ts", "--output", e.SEED_FILE], {
+        r = spawnSync(packageManagerCommand("pnpm"), tsScriptArgs("scripts/init-local.ts", ["--output", e.SEED_FILE]), {
           cwd: join(PROJECT_DIR, "packages/server"),
           env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
           stdio: "inherit", shell: packageManagerSpawnShell(),
@@ -2961,7 +2994,7 @@ function cmdStart(args: string[], initOnly = false): void {
     out("Schema is up to date.");
 
     out("Seeding test data...");
-    r = spawnSync(npxCommand, buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
+    r = spawnSync(packageManagerCommand("pnpm"), buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
       cwd: join(PROJECT_DIR, "packages/server"),
       env: {
         ...process.env,
@@ -3075,6 +3108,8 @@ function cmdStart(args: string[], initOnly = false): void {
     serverCmd += `${envAssign("DEPLOYMENT_ENV", "slockdev")} `;
     serverCmd += `${envAssign("DATABASE_URL", e.DATABASE_URL)} `;
     serverCmd += `${envAssign("JWT_SECRET", e.JWT_SECRET)} `;
+    // Stable per env so keys minted earlier keep verifying on the HMAC path.
+    serverCmd += `${envAssign("AGENT_API_KEY_HMAC_SECRET", `raftdev-agent-key-hmac-${name}-0123456789abcdef`)} `;
     // task #30 — opt-in Raft Computer path. Default OFF (zero behaviour
     // change for non-Computer envs). `RAFTDEV_COMPUTER=1 ./raftdev start`
     // enables the device-code login surface + the >=32-char bootstrap
@@ -3232,6 +3267,12 @@ function cmdStart(args: string[], initOnly = false): void {
     twCmd += `${envAssign("TRACE_WEB_CORS_ORIGIN", `http://localhost:${e.WEB_PORT}`)} `;
     twCmd += `${envAssign("DEPLOYMENT_ENV", "slockdev")} `;
     twCmd += `${envAssign("PORT", String(e.TRACE_WORKER_PORT))} `;
+    // Same Node entry as production (src/node.ts), storing into the local RustFS.
+    twCmd += `${envAssign("R2_ENDPOINT", e.S3_ENDPOINT)} `;
+    twCmd += `${envAssign("R2_REGION", "us-east-1")} `;
+    twCmd += `${envAssign("R2_BUCKET", e.RUSTFS_BUCKET)} `;
+    twCmd += `${envAssign("R2_ACCESS_KEY_ID", e.RUSTFS_ACCESS_KEY)} `;
+    twCmd += `${envAssign("R2_SECRET_ACCESS_KEY", e.RUSTFS_SECRET_KEY)} `;
     // Trace-observe loop: forward received OTLP traces to the local collector.
     // The worker appends `/v1/traces` to TRACE_INGEST_OTLP_ENDPOINT
     // (normalizeOtlpTracesEndpoint), so we pass the collector's OTLP HTTP base.
@@ -3290,7 +3331,7 @@ function cmdStart(args: string[], initOnly = false): void {
 
   if (latencyProfile) {
     const proxyCmd =
-      `node --import tsx scripts/dev/raftdev-latency-proxy.ts ` +
+      `node --import @oxc-node/core/register scripts/dev/raftdev-latency-proxy.ts ` +
       `--port ${String(e.LATENCY_PROXY_PORT)} ` +
       `--target-port ${String(e.SERVER_PORT)} ` +
       `--min-ms ${String(latencyProfile.minMs)} ` +
@@ -3316,7 +3357,7 @@ function cmdStart(args: string[], initOnly = false): void {
 
   if (persistent) writeFileSync(e.ACTIVITY_FILE, `${Math.floor(Date.now() / 1000)}\n`);
   if (idleTtlSeconds > 0) {
-    const janitorCmd = `node --import tsx scripts/dev/raftdev.ts janitor ${shellQuote(name)} ${String(idleTtlSeconds)}`;
+    const janitorCmd = `node --import @oxc-node/core/register scripts/dev/raftdev.ts janitor ${shellQuote(name)} ${String(idleTtlSeconds)}`;
     runRequiredTmux(
       ["new-window", "-t", e.TMUX_SESSION, "-n", "janitor", "-c", PROJECT_DIR, runTmuxShellCommand(janitorCmd)],
       "janitor",
@@ -3420,7 +3461,7 @@ function cmdJanitor(name: string, ttlSecondsArg: string | undefined): void {
       const logFd = openSync(join(e.SLOCKDEV_DIR, "idle-stop.log"), "a", 0o600);
       try {
         const child = spawn(process.execPath, [
-          "--import", "tsx", fileURLToPath(import.meta.url), "stop", name,
+          "--import", "@oxc-node/core/register", fileURLToPath(import.meta.url), "stop", name,
         ], {
           cwd: PROJECT_DIR,
           detached: true,

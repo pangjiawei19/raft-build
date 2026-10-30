@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { JSDOM } from "jsdom";
 
 const dom = new JSDOM("<!doctype html><html><body></body></html>", { url: "http://localhost" });
@@ -87,6 +86,6 @@ test("without an opener the heading stays a static divider and no dead control r
     true,
     "a heading with nowhere to go must not look clickable",
   );
-  // Static dividers keep UPPERCASE, and the rows still render.
+  // The static divider renders as plain text (no caps), and the rows still render.
   assert.equal(screen.getAllByTestId("mention-hover-activity-row").length, 2);
 });

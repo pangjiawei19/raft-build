@@ -1,5 +1,7 @@
+import { Badge, Button } from "@botiverse/raft-ui";
 import { BellRing, Clock3, Link2, RefreshCw, Repeat } from "lucide-react";
 import type { MouseEvent } from "react";
+import { useCallback } from "react";
 import { useIntl } from "react-intl";
 import type { ReminderSummary } from "@botiverse/raft-shared";
 import Banner from "../ui/Banner";
@@ -44,26 +46,23 @@ function ReminderCard({
   };
 
   return (
-    <SurfaceListItem>
+    <SurfaceListItem interactive={false}>
       <div className="min-w-0">
-        <div className="text-sm font-bold text-black break-words">{reminder.title}</div>
-        <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-black/50">
-          <span className="inline-flex items-center gap-1 font-medium text-black/60">
-            <Clock3 size={12} />
+        <div className="break-words text-subhead font-semibold text-foreground">{reminder.title}</div>
+        <div className="mt-1 flex flex-wrap items-center gap-2 text-caption text-foreground-muted">
+          <span className="inline-flex items-center gap-1">
+            <Clock3 size={14} className="shrink-0 text-foreground-muted" />
             {(() => {
               const parts = getRelativeTimeParts(reminder.fireAt);
               return formatRelativeTimeParts(parts.value, parts.unit, locale);
             })()}
           </span>
-          <span className="font-mono">{formatShortDateTime(reminder.fireAt)}</span>
+          <span className="font-mono text-mono-meta text-foreground-hint">{formatShortDateTime(reminder.fireAt)}</span>
           {reminder.recurrence && (
-            <span
-              title={reminder.recurrence.description}
-              className="inline-flex items-center gap-1 border border-black bg-brutal-lavender/30 px-1.5 py-0.5 font-mono text-[11px] text-black"
-            >
-              <Repeat size={11} />
-              {reminder.recurrence.description}
-            </span>
+            <Badge appearance="outline">
+              <Repeat size={14} className="shrink-0" />
+              <span className="truncate">{reminder.recurrence.description}</span>
+            </Badge>
           )}
         </div>
         {reminder.msgRef && (
@@ -72,14 +71,14 @@ function ReminderCard({
               <a
                 href={reminder.msgPermalink}
                 onClick={handleMsgRefClick}
-                className="inline-flex max-w-full cursor-default items-center gap-1 truncate border border-black bg-white px-1.5 py-0.5 font-mono text-[11px] text-black hover:bg-soft-signal/30"
+                className="inline-flex h-[22px] max-w-full cursor-default items-center gap-1 truncate rounded-sticker bg-info-soft px-1.5 font-mono text-mono-meta text-foreground outline-none hover:press-overlay focus-visible:shadow-focus"
               >
-                <Link2 size={11} className="shrink-0" />
+                <Link2 size={14} className="shrink-0 text-foreground-muted" />
                 <span className="truncate">{reminder.msgRef}</span>
               </a>
             ) : (
-              <span className="inline-flex max-w-full items-center gap-1 truncate border border-black bg-white px-1.5 py-0.5 font-mono text-[11px] text-black/70">
-                <Link2 size={11} className="shrink-0" />
+              <span className="inline-flex h-[22px] max-w-full items-center gap-1 truncate rounded-sticker bg-inactive-soft px-1.5 font-mono text-mono-meta text-foreground-muted">
+                <Link2 size={14} className="shrink-0 text-foreground-muted" />
                 <span className="truncate">{reminder.msgRef}</span>
               </span>
             )}
@@ -107,56 +106,56 @@ export default function AgentRemindersSection({
 }) {
   const { formatMessage } = useIntl();
   const isTab = variant === "tab";
+  const handleRetry = useCallback(() => {
+    void onRetry?.();
+  }, [onRetry]);
   return (
     <div
       className={
         isTab
-          ? "flex-1 overflow-y-auto bg-white px-5 py-5"
-          : "px-5 py-4 border-t border-black/10"
+          ? "flex-1 overflow-y-auto bg-layer-canvas px-5 py-5"
+          : "px-5 py-4 border-t border-line-hairline"
       }
     >
       {isTab ? (
-        loading ? <div className="mb-3 text-xs font-bold text-black/50">{formatMessage({ id: "common.loading" })}</div> : null
+        loading ? <div className="mb-3 text-footnote text-foreground-hint">{formatMessage({ id: "common.loading" })}</div> : null
       ) : (
         <SectionHeader
           className="mb-3"
-          icon={<BellRing size={14} className="text-black/50" />}
+          icon={<BellRing size={16} />}
           label={formatMessage({ id: "agent.reminders.pendingLabel" })}
           count={reminders.length}
           action={
             loading ? (
-              <span className="text-xs font-bold text-black/50">{formatMessage({ id: "common.loading" })}</span>
+              <span className="text-caption text-foreground-hint">{formatMessage({ id: "common.loading" })}</span>
             ) : null
           }
         />
       )}
 
       {error ? (
-        <Banner intent="warning" density="sm" className="font-bold">
-          <div>{error}</div>
-          {onRetry && (
-            <button
-              type="button"
-              onClick={() => void onRetry()}
-              className="btn-brutal-sm mt-2 bg-white px-2 py-1 text-[11px] font-bold"
-            >
-              <span className="inline-flex items-center gap-1">
-                <RefreshCw size={12} />
-                {formatMessage({ id: "agent.reminders.retry" })}
-              </span>
-            </button>
-          )}
+        <Banner
+          intent="warning"
+          density="sm"
+          actions={onRetry ? (
+            <Button variant="outline" size="sm" type="button" onClick={handleRetry}>
+              <RefreshCw size={16} />
+              {formatMessage({ id: "agent.reminders.retry" })}
+            </Button>
+          ) : undefined}
+        >
+          {error}
         </Banner>
       ) : reminders.length === 0 ? (
         isTab ? (
           <EmptyState
-            className="flex h-full flex-col items-center justify-center bg-white"
-            icon={<BellRing size={28} />}
+            className="flex h-full flex-col items-center justify-center bg-layer-canvas"
+            icon={<BellRing size={36} />}
             title={formatMessage({ id: "emptyState.noRemindersTitle" })}
             description={formatMessage({ id: "emptyState.noRemindersDesc" })}
           />
         ) : (
-          <div className="text-sm text-black/50">{formatMessage({ id: "agent.reminders.noPending" })}</div>
+          <div className="text-callout text-foreground-hint">{formatMessage({ id: "agent.reminders.noPending" })}</div>
         )
       ) : (
         <div className="space-y-3">

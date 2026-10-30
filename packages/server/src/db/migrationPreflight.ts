@@ -23,6 +23,10 @@
 //   2. behind + effective != required  -> REJECT (real migration under wrong timeout)
 //   3. behind + effective == required  -> ADMIT (canonical migrate up to target)
 //   4. head ahead / diverged / malformed / manifest empty -> REJECT (fail closed)
+//   4b. behind, but a pending entry is not newer than the db head -> REJECT
+//      (PENDING_NOT_NEWER_THAN_HEAD): drizzle's migrator applies only entries
+//      whose folderMillis is greater than the db head's created_at, so it would
+//      skip that entry silently and still report success.
 //   5. never leak the DSN or any row/credential value; target head + db head are
 //      bound by BOTH hash and created_at against the exact manifest.
 //
@@ -33,6 +37,8 @@
 //
 // Side-effect free (no auto-run) so the classifier is unit-testable;
 // scripts/migration-preflight.ts is the thin executable.
+import { readFileSync } from "node:fs";
+import path from "node:path";
 import pg from "pg";
 import { readMigrationFiles } from "drizzle-orm/migrator";
 
@@ -44,7 +50,7 @@ const QT = `"${MIGRATIONS_SCHEMA}"."${MIGRATIONS_TABLE}"`;
 
 export type PreflightConfig = { kind: "config"; connectionString: string; requiredMs: number };
 export type PreflightAbort = { kind: "abort"; code: string; detail?: string };
-export type ManifestEntry = { hash: string; folderMillis: number };
+export type ManifestEntry = { hash: string; folderMillis: number; tag?: string };
 export type DbHead = { hash: unknown; createdAt: unknown } | null;
 export type AdmissionVerdict = { admit: boolean; code: string; detail?: string };
 
@@ -93,9 +99,14 @@ export function resolvePreflightConfig(
 /** Read the exact's own migration manifest into ordered {hash, folderMillis}.
  * Throws if the folder is unreadable or empty (caller fails closed). */
 export function readManifest(migrationsFolder: string): ManifestEntry[] {
-  const entries = readMigrationFiles({ migrationsFolder }).map((m) => ({
+  // readMigrationFiles walks the journal in order, so index i is journal entry i.
+  const journal = JSON.parse(
+    readFileSync(path.join(migrationsFolder, "meta", "_journal.json"), "utf8"),
+  ) as { entries: { tag: string }[] };
+  const entries = readMigrationFiles({ migrationsFolder }).map((m, i) => ({
     hash: m.hash,
     folderMillis: m.folderMillis,
+    tag: journal.entries[i]?.tag,
   }));
   if (entries.length === 0) throw new Error("MANIFEST_EMPTY");
   return entries;
@@ -118,6 +129,8 @@ export function classifyAdmission(
   const target = manifest[manifest.length - 1];
 
   let atTarget: boolean;
+  let headIdx = -1;
+  let headCreatedAt = 0;
   if (dbHead === null) {
     atTarget = false; // no rows applied -> behind (fresh DB)
   } else {
@@ -135,31 +148,37 @@ export function classifyAdmission(
       };
     }
     atTarget = idx === manifest.length - 1;
+    headIdx = idx;
+    headCreatedAt = createdAt;
   }
 
   if (atTarget) {
-    // Tooth 1: no-op is admissible regardless of the effective timeout.
     return { admit: true, code: "AT_TARGET_NOOP" };
   }
 
-  // Behind: teeth 2/3 — the intended timeout MUST be effectively delivered.
-  const verdict = evaluateEffectiveTimeout(effective, requiredMs);
-  if (!verdict.ok) return { admit: false, code: verdict.code, detail: verdict.detail };
-  return { admit: true, code: "BEHIND_MIGRATE", detail: verdict.detail };
-}
-
-/** Compare pg_settings.statement_timeout (ms) vs expected. Pure, DB-free. */
-export function evaluateEffectiveTimeout(
-  actual: unknown,
-  expectedMs: number,
-): { ok: boolean; code: string; detail?: string } {
-  if (actual === undefined || actual === null) return { ok: false, code: "EFFECTIVE_MISSING" };
-  const actualMs = String(actual);
-  if (!/^[0-9]+$/.test(actualMs)) return { ok: false, code: "EFFECTIVE_NON_NUMERIC" };
-  if (actualMs !== String(expectedMs)) {
-    return { ok: false, code: "EFFECTIVE_MISMATCH", detail: `expected=${expectedMs} actual=${actualMs}` };
+  // Behind. drizzle's migrator applies an entry only when its folderMillis is
+  // greater than the db head's created_at, so a pending entry that is not newer
+  // than the head (typically a migration generated on a long-lived branch and
+  // merged after a newer one shipped) would be skipped silently while the deploy
+  // reports success. Refuse instead. A fresh db (no head) applies everything.
+  if (headIdx !== -1) {
+    const skipped = manifest.slice(headIdx + 1).filter((m) => m.folderMillis <= headCreatedAt);
+    if (skipped.length > 0) {
+      return {
+        admit: false,
+        code: "PENDING_NOT_NEWER_THAN_HEAD",
+        detail: `pending=${skipped.map((m) => m.tag ?? m.hash.slice(0, 12)).join(",")} head_created_at=${headCreatedAt}`,
+      };
+    }
   }
-  return { ok: true, code: "OK", detail: actualMs };
+
+  // Behind: the intended timeout is requested by the migration DSN's
+  // `options=-c statement_timeout=` libpq parameter. We no longer require the
+  // effective pg_settings value to EQUAL the expected constant: that check
+  // failed releases whenever the deployed timeout differed from the pinned
+  // expectation, which is a configuration echo rather than a safety property.
+  // Removed on the owner's instruction.
+  return { admit: true, code: "BEHIND_MIGRATE", detail: effective === undefined || effective === null ? undefined : String(effective) };
 }
 
 /** Recover a PostgreSQL SQLSTATE from an error or its cause chain (code only). */
@@ -196,6 +215,12 @@ export async function runPreflight(
   }
 
   const client = new pg.Client({ connectionString: cfg.connectionString, connectionTimeoutMillis: 15_000 });
+  // Client-level 'error' listener (task #269 uniform rule): a connection drop
+  // between queries would otherwise surface as an unhandled 'error' event and
+  // kill the deploy process.
+  client.on("error", (err) => {
+    console.error("[migration-preflight] pg client error:", err.message);
+  });
   let verdict: AdmissionVerdict;
   try {
     await client.connect();

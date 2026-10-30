@@ -524,6 +524,25 @@ assert(!("format" in counter), "must not claim int64: the wire cannot carry it")
 
 const manifest = await readJson(resolve(root, "manifest.json"));
 assert.equal(manifest.status, "experimental");
+{
+  const { readContractRevision } = await import("./contract-revision.mjs");
+  const { revision } = await readContractRevision();
+  assert.equal(manifest.revision, revision, "manifest revision must equal the revisions.json ledger");
+  assert.equal(manifest.revisionsSha256, await sha256(resolve(root, "revisions.json")), "manifest must pin revisions.json");
+  // Both bindings must carry the ledger's revision: the client compares it
+  // with the server's X-Raft-Contract header to decide whether to sync.
+  const kotlinBinding = await readFile(resolve(root, "generated/bindings/ActivitySync.kt"), "utf8");
+  assert.ok(
+    kotlinBinding.includes(`const val ACTIVITY_SYNC_CONTRACT_REVISION: Int = ${revision}\n`),
+    "Kotlin binding must carry the ledger revision",
+  );
+  assert.ok(
+    binding.includes(`export const ACTIVITY_SYNC_CONTRACT_REVISION = ${revision} as const;`),
+    "TypeScript binding must carry the ledger revision",
+  );
+  assert.ok(kotlinBinding.includes('const val ACTIVITY_SYNC_CONTRACT: String = "raft.activity-sync"\n'), "Kotlin binding must carry the contract name");
+  assert.ok(binding.includes('export const ACTIVITY_SYNC_CONTRACT = "raft.activity-sync" as const;'), "TypeScript binding must carry the contract name");
+}
 // Was `=== null` at freeze time, when no Kotlin binding existed. Now that the
 // Kotlin leg is here it is pinned the same way every other binding is: the
 // manifest value must equal the real file's digest. That is a STRONGER gate

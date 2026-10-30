@@ -9,34 +9,44 @@ import type { ButtonHTMLAttributes, ReactNode } from "react";
  * - Sidebar add-popover menus (Add channel → Join existing / Create new …)
  * - Mark-as-read / pin / archive / delete rows
  *
- * Origin: stdrc 2026-05-25 #proj-theme:ac79cf20 msg=dae4c262 +
- * msg=245a96f0 + msg=8fdf9cba. Inventory pass found ~30 hand-rolled
- * `flex w-full … hover:bg-soft-signal transition-colors` rows that
- * had drifted on a few axes (`uppercase tracking-wide` on Sidebar
- * sort/add popovers, density modifiers in some places but not others).
+ * Use it instead of hand-rolling a row, so every action menu keeps one case
+ * (as written) and one density.
  *
  * Distinct from `SelectionPopover` — that primitive is for single-select
  * dropdowns where the trailing ✓ marks the chosen option. This row is
- * pure action: no ✓, no selected-state fill. When state-changing items
- * like "Mark as Read ↔ Mark as Unread" or "Pin ↔ Unpin" toggle their
- * label based on current state, that's just label state, not a toggle
- * UI affordance (stdrc msg=245a96f0).
+ * pure action: no ✓, no selected-state fill. An item whose label follows the
+ * current state ("Mark as Read ↔ Mark as Unread", "Pin ↔ Unpin") only changes
+ * its label; it is not a toggle.
  *
- * Hover token: `bg-soft-signal/30` matches SegmentedControl unselected
- * hover + SelectionPopover row hover, so all selection-family and
- * action-menu surfaces share a single hover color. Right-click menus
- * intentionally do NOT differentiate destructive vs non-destructive at
- * the row level — every irreversible action is gated by a
- * `ConfirmDialog`, so the menu itself stays visually uniform (stdrc
- * msg=60e789d1: "Agent 的 Stop 和 Restart 菜单也没有特别的 hover 样式
- * … 因为它反正会弹出一个窗口提示，所以不需要在菜单上做特别呈现").
+ * Raft Design System › Menu (`rf-menu__item`): 36 tall, 8px radius, 14/20
+ * 500 ink, a 16px ink-2 icon, 10px gap; pointer hover and keyboard focus are
+ * the yellow-soft highlight, disabled is the disabled ink. Destructive rows
+ * are NOT coloured — every irreversible action is gated by a `ConfirmDialog`
+ * whose red/orange button carries the consequence, so the menu itself stays
+ * visually uniform.
+ *
+ * Hand-rolled (not raft-ui's DropdownMenuItem / ContextMenuItem) because these
+ * rows also live in plain popovers outside a Base UI Menu root; the classes
+ * mirror raft-ui's raft menu-item recipe so both kinds of menu read the same.
  */
 export type MenuItemProps = ButtonHTMLAttributes<HTMLButtonElement> & {
-  /** Optional leading icon. Conventionally a lucide icon at `size={14}`. */
+  /** Optional leading icon. Conventionally a lucide icon at `size={14}`–`16`. */
   icon?: ReactNode;
   /** Optional right-aligned slot (e.g. shortcut hint). */
   trailing?: ReactNode;
 };
+
+// Compact-viewport density (`max-height: 600px`) is applied unconditionally —
+// harmless on tall viewports and keeps Sidebar / MessageItem / SavedPanel
+// context menus visually uniform in small viewports without per-callsite
+// opt-in.
+const MENU_ITEM_CLASS = [
+  "flex min-h-9 w-full items-center gap-2.5 rounded-control px-2.5 py-1.5 text-left [@media(max-height:600px)]:min-h-8 [@media(max-height:600px)]:py-1",
+  "font-sans text-callout font-medium text-foreground",
+  "outline-none transition-colors enabled:hover:bg-brand-soft enabled:focus-visible:bg-brand-soft",
+  "[&>svg]:shrink-0 [&>svg:first-child]:text-foreground-muted",
+  "disabled:cursor-not-allowed disabled:text-foreground-disabled disabled:[&>svg:first-child]:text-foreground-disabled",
+].join(" ");
 
 export default function MenuItem({
   icon,
@@ -47,18 +57,12 @@ export default function MenuItem({
   children,
   ...rest
 }: MenuItemProps) {
-  // Compact-viewport density (`[@media(max-height:600px)]:py-1`) is
-  // applied unconditionally — harmless on tall viewports and keeps
-  // Sidebar / MessageItem / SavedPanel context menus visually uniform
-  // in small viewports without per-callsite opt-in.
-  const base = "flex w-full items-center gap-2 px-3 py-2 [@media(max-height:600px)]:py-1 text-sm text-left transition-colors";
-  const tone = "font-medium text-black hover:bg-soft-signal/30 disabled:cursor-not-allowed disabled:text-black/30";
-
   return (
     <button
       type={type}
       role={role}
-      className={`${base} ${tone} ${className}`}
+      data-slot="menu-item"
+      className={`${MENU_ITEM_CLASS} ${className}`.trim()}
       {...rest}
     >
       {icon}

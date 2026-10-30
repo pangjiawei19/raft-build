@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const srcRoot = resolve(repoRoot, "src");
@@ -41,19 +40,19 @@ test("document attachment cards show preview affordance and visible loading feed
 
   assert.match(
     messageSource,
-    /variant="compact"[\s\S]{0,200}?loading=\{isHtmlLoading\}[\s\S]{0,200}?affordance="preview"[\s\S]{0,120}?affordanceName="document-preview"/,
+    /<AttachmentChip\b[\s\S]{0,200}?loading=\{isHtmlLoading\}[\s\S]{0,200}?affordance="preview"[\s\S]{0,120}?affordanceName="document-preview"/,
   );
   assert.match(chipSource, /message\.attachment\.openingPreview/);
   assert.match(chipSource, /data-message-affordance="attachment-preview-loading"/);
-  // Loading state overrides PreviewShell's bg-white via Tailwind important.
-  // No opacity modifier — that combined with the OKlab color-mix shell bg
-  // paints cyan on Chromium (stdrc 2026-05-23 #proj-theme:441c8b2b
-  // cfd10230). The loading bar + spinner are the dominant busy signal.
-  assert.match(chipSource, /"!bg-soft-signal\/30 cursor-wait"/);
-  // Normal-state hover lives on PreviewShell's shared skin. No active token
-  // — press inherits hover, matching pre-refactor QuotedMessageCard.
-  assert.match(shellSource, /hover:bg-black\/5`/);
-  assert.doesNotMatch(shellSource, /active:bg-soft-signal/);
+  // Loading is a passive DS indicator: the card keeps its surface (no pink
+  // tint), and the in-card loading row + spinner are the busy signal.
+  assert.match(chipSource, /\? "cursor-wait"/);
+  assert.doesNotMatch(chipSource, /bg-attention-soft/);
+  // Normal-state hover lives on PreviewShell's shared skin (the DS pressed
+  // wash over the card surface). No active token — press inherits hover,
+  // matching pre-refactor QuotedMessageCard.
+  assert.match(shellSource, /hover:press-overlay shadow-none`/);
+  assert.doesNotMatch(shellSource, /active:bg-palette-yellow/);
   assert.doesNotMatch(shellSource, /active:opacity-90/);
   assert.match(chipSource, /const disabled = isOptimistic \|\| loading \|\| !onClick;/);
   // PreviewShell renders <div> instead of <button> when onClick is undefined,
@@ -76,16 +75,26 @@ test("supported video attachments render an inline player and still reuse the at
   assert.match(messageSource, /data-message-affordance="inline-video-preview"/);
   assert.match(messageSource, /new IntersectionObserver/);
   assert.match(messageSource, /videoRef\.current\?\.pause\(\)/);
-  assert.match(messageSource, /api\.get\(`\/attachments\/\$\{attachment\.id\}\/url\?disposition=inline`, \{ signal: controller\.signal \}\)/);
-  assert.match(messageSource, /controller\.signal\.aborted/);
-  assert.match(messageSource, /abortRef\.current\?\.abort\(\)/);
+  // Lazy URL fetch + abort + refresh-on-error live in the shared hook (task #18).
+  const mediaUrlHookSource = readSource("hooks/useRefreshingMediaUrl.ts");
+  assert.match(messageSource, /useRefreshingMediaUrl\(\{[\s\S]{0,200}?mediaKind: "video"/);
+  assert.match(mediaUrlHookSource, /api\.get\(`\/attachments\/\$\{attachmentId\}\/url\?disposition=inline`, \{ signal: controller\.signal \}\)/);
+  assert.match(mediaUrlHookSource, /controller\.signal\.aborted/);
+  assert.match(mediaUrlHookSource, /abortRef\.current\?\.abort\(\)/);
   assert.match(messageSource, /<video[\s\S]{0,220}?src=\{inlineUrl\}[\s\S]{0,220}?controls[\s\S]{0,220}?playsInline[\s\S]{0,220}?preload="metadata"/);
   assert.doesNotMatch(messageSource, /data-message-affordance="inline-video-controls"/);
   assert.doesNotMatch(messageSource, /data-message-affordance="inline-video-play-toggle"/);
   assert.doesNotMatch(messageSource, /data-message-affordance="inline-video-mute-toggle"/);
   assert.doesNotMatch(messageSource, /video-range-brutal/);
   assert.doesNotMatch(cssSource, /video-range-brutal/);
-  assert.match(messageSource, /className="absolute right-1\.5 top-1\.5 flex size-6 items-center justify-center border border-black bg-white\/80 text-black\/60 hover:bg-white hover:text-black"/);
+  // Inline video shell migrated to RUI MessageVideoPreview (task #640
+  // follow-up, 2026-09-23): the expand control is the RUI action slot
+  // (absolute right-1.5 top-1.5 size-6 comes from the recipe), still carrying
+  // the pinned affordance + Eye icon.
+  assert.match(messageSource, /<MessageVideoPreview\b/);
+  assert.match(messageSource, /<MessageVideoPreviewFallback\b/);
+  assert.match(messageSource, /<MessageVideoPreviewAction[\s\S]{0,200}?data-message-affordance="inline-video-expand"/);
+  assert.doesNotMatch(messageSource, /className="absolute right-1\.5 top-1\.5 flex size-6 items-center justify-center border border-line-hairline bg-layer-canvas\/80/);
   assert.match(messageSource, /<Eye size=\{12\} \/>/);
   assert.doesNotMatch(messageSource, /<Maximize2/);
   assert.doesNotMatch(messageSource, /data-message-affordance="inline-video-download"/);
@@ -121,7 +130,7 @@ test("paused video comments expose an explicit add timestamp affordance when no 
   assert.match(messageSource, /getPendingAnchor=\{getPendingAnchor\}/);
   assert.match(panelSource, /onAnchorCleared\?: \(\) => void;/);
   assert.match(panelSource, /getPendingAnchor\?: \(\) => CommentAnchor \| null;/);
-  assert.match(panelSource, /const clearActiveAnchor = \(\) => \{/);
+  assert.match(panelSource, /const clearActiveAnchor = useCallback\(\(\) => \{/);
   assert.match(panelSource, /onAnchorCleared\?\.\(\);/);
   assert.match(panelSource, /const anchorForSend = getPendingAnchor \? getPendingAnchor\(\) : activeAnchor;/);
   assert.match(
@@ -146,7 +155,7 @@ test("audio attachments render custom inline players without the preview chip", 
   assert.match(messageSource, /data-message-affordance="inline-audio-preview"/);
   assert.match(messageSource, /const audioAttachments = message\.attachments\.filter\(\(att\) => isPreviewableAudioAttachment\(att\)\);/);
   assert.match(messageSource, /\.filter\(\(att\) => !isPreviewableVideoAttachment\(att\) && !isPreviewableAudioAttachment\(att\)\)/);
-  assert.match(messageSource, /<InlineAudioAttachmentCard[\s\S]{0,260}?attachment=\{att\}[\s\S]{0,260}?onDownload=\{handleDownload\}/);
+  assert.match(messageSource, /<InlineAudioAttachmentCard[\s\S]{0,260}?attachment=\{att\}[\s\S]{0,260}?onDownload=\{handleDownloadAttachment\}/);
   assert.match(messageSource, /isAudio=\{false\}/);
   assert.doesNotMatch(messageSource, /isAudio=\{isAudio\}/);
   assert.doesNotMatch(messageSource, /const isAudio = isPreviewableAudioAttachment\(att\);/);
@@ -158,7 +167,8 @@ test("audio attachments render custom inline players without the preview chip", 
   // for forwarded snapshots and from the inline card in normal messages; pin
   // both so audio stays playable without returning to the preview chip path.
   assert.match(messageSource, /audio: \(id\) => `\/attachments\/\$\{id\}\/url\?disposition=inline`/);
-  assert.match(messageSource, /api\.get\(`\/attachments\/\$\{attachment\.id\}\/url\?disposition=inline`, \{ signal: controller\.signal \}\)/);
+  assert.match(messageSource, /useRefreshingMediaUrl\(\{[\s\S]{0,200}?mediaKind: "audio"/);
+  assert.match(readSource("hooks/useRefreshingMediaUrl.ts"), /api\.get\(`\/attachments\/\$\{attachmentId\}\/url\?disposition=inline`, \{ signal: controller\.signal \}\)/);
   assert.match(messageSource, /function AudioAttachmentPreviewModal/);
   assert.match(messageSource, /export function AudioPreviewBody/);
   assert.match(messageSource, /function InlineAudioPlayer/);
@@ -176,7 +186,7 @@ test("audio attachments render custom inline players without the preview chip", 
   assert.match(inlineAudioClass, /max-w-\[min\(28rem,calc\(100vw-7rem\)\)\]/);
   assert.doesNotMatch(inlineAudioClass, /shadow-brutal/);
   const chipSource = readSource("components/message/AttachmentChip.tsx");
-  assert.match(chipSource, /<Eye size=\{12\} \/>/);
+  assert.match(chipSource, /<Eye size=\{16\} \/>/);
 });
 
 test("attachment previews intercept close-tab shortcut before the browser closes the tab", () => {

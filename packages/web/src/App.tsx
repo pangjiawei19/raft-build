@@ -1,25 +1,33 @@
-import { useEffect, useRef, useState, useMemo } from "react";
-import { Routes, Route, Navigate, useParams, useNavigate, useLocation } from "react-router-dom";
+import { Button, Card } from "@botiverse/raft-ui";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
+import { usePreviewApiTarget } from "./hooks/usePreviewApiTarget";
+import { Routes, Route, Navigate, useParams, useNavigate, useLocation, matchPath } from "react-router-dom";
 import { useAuthStore } from "./store/authStore";
 import { useIntl } from "react-intl";
 import { useLocale } from "./i18n/LocaleProvider";
 import { shouldReconcileAccountLocale } from "./i18n/locale";
 import { useServerStore } from "./store/serverStore";
-import type { CommunityServerSlug } from "./store/serverStore";
+import type { CommunityServerSlug, Server } from "./store/serverStore";
 import { useAgentStore } from "./store/agentStore";
 import { useMachineStore } from "./store/machineStore";
 import { serverPersistence } from "./store/serverPersistenceRegistry";
 import MobileDownloadChooserPage from "./pages/MobileDownloadChooserPage";
 import ChineseCommunityPage from "./pages/ChineseCommunityPage";
 import DeviceLoginPage from "./pages/DeviceLoginPage";
+import AppLoginPage from "./pages/AppLoginPage";
 import HumanLoginSetupPage from "./pages/HumanLoginSetupPage";
 import IntegrationInvitePage from "./pages/IntegrationInvitePage";
+import { INTEGRATION_INVITE_ROUTE } from "@botiverse/raft-shared";
+import AgentConnectionCallbackPage from "./pages/AgentConnectionCallbackPage";
 import PublicServerPage from "./pages/PublicServerPage";
 import { useChannelStore } from "./store/channelStore";
+import type { Channel } from "./store/channelStore";
+import { useThreadStore } from "./store/threadStore";
 import api from "./api/client";
 import PaletteAuditPage from "./pages/PaletteAuditPage";
 import AccountBootstrapPreviewPage from "./pages/AccountBootstrapPreviewPage";
 import ServerSetupComputerRuntimePreviewPage from "./pages/ServerSetupComputerRuntimePreviewPage";
+import DisplayStylePreviewPage from "./pages/DisplayStylePreviewPage";
 import ServerSetupProjectionGate from "./components/onboarding/ServerSetupProjectionGate";
 import LoginPage from "./components/auth/LoginPage";
 import RegisterPage from "./components/auth/RegisterPage";
@@ -78,11 +86,11 @@ import type {
   AuthView,
 } from "./utils/devMode";
 import { emitAuthTraceAndFlush } from "./utils/webAuthTrace";
-import { getFlagOverride, setFlagOverride } from "./analytics/posthog";
-import { FEATURE_FLAG_REGISTRY } from "./analytics/flagRegistry";
+import { jointInviteAcceptErrorMessage } from "./utils/jointChannelLimit";
+import { showToast } from "./components/toastBridge";
 import DraggableDevOverlay from "./components/dev/DraggableDevOverlay";
 import { HIDE_LOCAL_DEV_TOOLS_EVENT } from "./components/dev/devOverlayEvents";
-import { Button } from "raft-ui";
+import Tooltip from "./components/ui/Tooltip";
 import { Settings2, X } from "lucide-react";
 import { isHostShell } from "./embed";
 import { readNativeOnboardingGeneration } from "./embed/nativeOnboarding";
@@ -90,6 +98,8 @@ import {
   genericAppDocumentTitle,
   getServerRouteDocumentTitle,
   hostShellFallbackDocumentTitle,
+  serverRouteChannelId,
+  serverRouteDmId,
   serverRouteAgentId,
   serverRouteMachineId,
   useBrowserDocumentTitle,
@@ -101,6 +111,7 @@ function getUrlParams() {
   const joinMatch = window.location.pathname.match(/^\/join\/([^/?#]+)/);
   return {
     authCallback: params.get("auth_callback"),
+    appLoginHandoff: !!matchPath("/login/app", window.location.pathname),
     verifyToken: params.get("verify"),
     resetToken: params.get("reset"),
     inviteToken: params.get("invite") || joinMatch?.[1] || null,
@@ -118,10 +129,43 @@ function routeCommunitySlug(value: string | undefined): CommunityServerSlug | nu
 
 export { requestServerSelection };
 
+function documentTitleChannelLabel(channel: Channel | null | undefined): string | null {
+  if (!channel) return null;
+  if (channel.type === "dm") {
+    const peerLabel = (channel.peerDisplayName || channel.peerName || channel.name).trim();
+    return peerLabel ? `@${peerLabel}` : null;
+  }
+  const channelName = channel.name.trim();
+  return channelName ? `#${channelName}` : null;
+}
+
+// Slockdev debug panel actions that need no component state. Kept apart from
+// `clearLocalState` (below), the one panel action allowed to clear auth tokens.
+function reloadPage() {
+  window.location.reload();
+}
+
+function openServerPicker() {
+  requestServerSelection();
+  serverPersistence.clearLastServerSlug();
+  window.location.assign("/");
+}
+
 function EnvironmentDevOverlay() {
+  const { pathname } = useLocation();
+  const isRaftBench = !!matchPath("/s/:serverSlug/raftbench", pathname);
+  const previewApiTarget = usePreviewApiTarget(deploymentEnv === "web-preview");
   const [open, setOpen] = useState(false);
   const [hidden, setHidden] = useState(false);
   const { formatMessage } = useIntl();
+  const closePanel = useCallback(() => setOpen(false), []);
+  const togglePanel = useCallback(() => setOpen((value) => !value), []);
+  const hideAllDevTools = useCallback(() => {
+    document.documentElement.dataset.raftDevToolsHidden = "true";
+    window.dispatchEvent(new Event(HIDE_LOCAL_DEV_TOOLS_EVENT));
+    setOpen(false);
+    setHidden(true);
+  }, []);
   if (!environmentLabelMessageId) return null;
   if (isSlockdev && import.meta.env?.VITE_SLOCKDEV_HIDE_PANEL === "1") return null;
   if (hidden) return null;
@@ -130,32 +174,22 @@ function EnvironmentDevOverlay() {
     {
       branch: import.meta.env?.VITE_PREVIEW_BRANCH,
       commitSha: import.meta.env?.VITE_COMMIT_SHA,
-      apiTarget: import.meta.env?.VITE_PREVIEW_API_TARGET,
+      apiTarget: previewApiTarget,
     },
     formatMessage,
   );
   const badgeLabel = `${environmentLabel}${previewEnvironmentDetails ? ` · ${previewEnvironmentDetails}` : ""}`;
-  const className = isSlockdev
-    ? "bg-soft-signal"
-    : "bg-brutal-orange";
   const triggerTitle = formatMessage(
     { id: isSlockdev ? "devTools.overlay.triggerTitle" : "env.badge.dragTitle" },
     { label: badgeLabel },
   );
-  const hideAllDevTools = () => {
-    document.documentElement.dataset.raftDevToolsHidden = "true";
-    window.dispatchEvent(new Event(HIDE_LOCAL_DEV_TOOLS_EVENT));
-    setOpen(false);
-    setHidden(true);
-  };
-
   return (
     <DraggableDevOverlay
       id="environment-dev-tools"
       handleSelector="[data-dev-overlay-handle]"
       panel={isSlockdev && open ? (
         <SlockdevDebugPanel
-          onClose={() => setOpen(false)}
+          onClose={closePanel}
           onHideAll={hideAllDevTools}
         />
       ) : null}
@@ -163,39 +197,47 @@ function EnvironmentDevOverlay() {
       onOpenChange={setOpen}
       collapsible
       collapsedChildren={(
-        <span
+        <Button
+          type="button"
+          variant="primary"
+          size="icon-sm"
           aria-hidden="true"
           data-dev-overlay-handle
-          className="flex size-6 touch-none select-none items-center justify-center border border-black bg-soft-signal text-sm leading-none shadow-brutal-sm cursor-grab active:cursor-grabbing"
+          className="flex size-6 touch-none select-none items-center justify-center text-sm leading-none cursor-grab active:cursor-grabbing"
         >
           <Settings2 size={12} strokeWidth={2.5} />
-        </span>
+        </Button>
       )}
-      className="fixed z-40 max-w-[calc(100vw-1rem)] font-display"
+      className={`fixed z-40 w-max max-w-[calc(100vw-1rem)] font-display${isRaftBench ? " max-md:hidden" : ""}`}
       title={triggerTitle}
       testId="raftdev-debug-overlay"
     >
-      {isSlockdev ? (
-        <button
-          type="button"
-          data-dev-overlay-handle
-          onClick={() => setOpen((value) => !value)}
-          className={`max-w-full touch-none select-none truncate border-2 border-black px-2 py-1 text-[10px] font-bold tracking-widest shadow-brutal-sm cursor-grab active:cursor-grabbing ${className}`}
-          data-testid="raftdev-debug-trigger"
-        >
-          <span data-testid="environment-badge">{badgeLabel}</span>
-        </button>
-      ) : (
-        <div
-          data-dev-overlay-handle
-          className={`max-w-full touch-none select-none truncate border-2 border-black px-2 py-0.5 text-[10px] font-bold uppercase shadow-brutal-sm opacity-80 cursor-grab active:cursor-grabbing ${className}`}
-          data-testid="environment-badge"
-        >
-          {badgeLabel}
-        </div>
-      )}
+      <Button
+        type="button"
+        variant="primary"
+        size="icon-sm"
+        data-dev-overlay-handle
+        onClick={isSlockdev ? togglePanel : undefined}
+        aria-label={triggerTitle}
+        className="size-7 touch-none select-none cursor-grab active:cursor-grabbing"
+        data-testid="raftdev-debug-trigger"
+      >
+        <Settings2 size={14} strokeWidth={2.5} aria-hidden="true" />
+      </Button>
     </DraggableDevOverlay>
   );
+}
+
+function clearLocalState() {
+  emitAuthTraceAndFlush("slock.auth.session_cleared", {
+    clearSessionCaller: "clearLocalState",
+    logoutTrigger: "dev_clear_local_state",
+  });
+  localStorage.removeItem("slock_access_token");
+  localStorage.removeItem("slock_refresh_token");
+  serverPersistence.clearLastServerSlug();
+  localStorage.removeItem(PENDING_INVITE_STORAGE_KEY);
+  window.location.assign("/");
 }
 
 interface SlockdevDebugPanelProps {
@@ -214,22 +256,14 @@ function SlockdevDebugPanel(props: SlockdevDebugPanelProps) {
   const envName = import.meta.env?.VITE_SLOCKDEV_ENV_NAME || "";
   const previewDescription = import.meta.env?.VITE_SLOCKDEV_PREVIEW_DESCRIPTION?.trim() || "";
   const seedCommand = getSlockdevSeedCommand(envName);
-  if (!isSlockdev) return null;
-  if (import.meta.env?.VITE_SLOCKDEV_HIDE_PANEL === "1") return null;
 
-  const clearLocalState = () => {
-    emitAuthTraceAndFlush("slock.auth.session_cleared", {
-      clearSessionCaller: "clearLocalState",
-      logoutTrigger: "dev_clear_local_state",
-    });
-    localStorage.removeItem("slock_access_token");
-    localStorage.removeItem("slock_refresh_token");
-    serverPersistence.clearLastServerSlug();
-    localStorage.removeItem(PENDING_INVITE_STORAGE_KEY);
-    window.location.assign("/");
-  };
+  const devLogin = useCallback(() => login(SLOCKDEV_EMAIL, SLOCKDEV_PASSWORD).catch((err) => {
+    console.error("Dev login failed", err);
+  }), [login]);
 
-  const copySeedCommand = async () => {
+  const handleLogout = useCallback(() => logout(), [logout]);
+
+  const copySeedCommand = useCallback(async () => {
     try {
       await navigator.clipboard.writeText(seedCommand);
       setCopied(true);
@@ -237,16 +271,19 @@ function SlockdevDebugPanel(props: SlockdevDebugPanelProps) {
     } catch (err) {
       console.warn("Failed to copy raftdev seed command", err);
     }
-  };
+  }, [seedCommand]);
+
+  if (!isSlockdev) return null;
+  if (import.meta.env?.VITE_SLOCKDEV_HIDE_PANEL === "1") return null;
 
   return (
-        <div className="w-72 max-w-[calc(100vw-1rem)] overflow-y-auto border-2 border-black bg-white p-3 text-xs shadow-brutal">
+    <div className="w-72 max-w-[calc(100vw-1rem)] overflow-y-auto rounded-container bg-layer-popover p-3 text-xs text-foreground shadow-float ring-1 ring-line-seam">
           <div className="mb-2 flex items-start justify-between gap-2">
             <div className="min-w-0">
-              <div className="font-bold uppercase tracking-widest text-black">
+              <div className="text-footnote font-bold text-foreground">
                 {formatMessage({ id: "devTools.overlay.panelTitle" })}
               </div>
-              <div className="mt-0.5 text-black/50">
+              <div className="mt-0.5 text-foreground-muted">
                 <div className="truncate">{envName || "slockdev"}</div>
                 <div className="truncate">
                   {user ? <SignedInAs user={user} nameClassName="font-normal" /> : "Not signed in"}
@@ -256,7 +293,7 @@ function SlockdevDebugPanel(props: SlockdevDebugPanelProps) {
             <Button
               type="button"
               onClick={onClose}
-              size="icon-xs"
+              size="icon-sm"
               variant="ghost"
               aria-label={formatMessage({ id: "common.close" })}
               data-testid="raftdev-debug-close"
@@ -267,121 +304,97 @@ function SlockdevDebugPanel(props: SlockdevDebugPanelProps) {
           </div>
 
           {previewDescription ? (
-            <details className="mb-2 border border-black/20 bg-soft-signal/20 p-2" title={previewDescription}>
-              <summary className="cursor-pointer select-none text-[10px] font-bold uppercase tracking-widest text-black/60">
-                Preview description
-              </summary>
-              <p className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-black/70">
-                {previewDescription}
-              </p>
-            </details>
+            <Tooltip content={previewDescription}>
+              <details className="mb-2 rounded-control border border-line-hairline bg-fill-muted p-2">
+                <summary className="cursor-pointer select-none text-caption font-bold text-foreground-muted">
+                  Preview description
+                </summary>
+                <p className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-foreground-muted">
+                  {previewDescription}
+                </p>
+              </details>
+            </Tooltip>
           ) : null}
 
           <div className="grid grid-cols-2 gap-2">
-            <button
+            <Button
               type="button"
               disabled={loading}
-              onClick={() => login(SLOCKDEV_EMAIL, SLOCKDEV_PASSWORD).catch((err) => {
-                console.error("Dev login failed", err);
-              })}
-              className="border-2 border-black bg-brutal-pink px-2 py-1 font-bold disabled:opacity-50"
+              onClick={devLogin}
+              variant="accent"
+              size="sm"
+              className="w-full min-w-0"
             >
               Dev login
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
-              onClick={() => window.location.reload()}
-              className="border-2 border-black bg-white px-2 py-1 font-bold"
+              onClick={reloadPage}
+              variant="outline"
+              size="sm"
+              className="w-full min-w-0"
             >
               Reload
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
-              onClick={() => {
-                requestServerSelection();
-                serverPersistence.clearLastServerSlug();
-                window.location.assign("/");
-              }}
-              className="border-2 border-black bg-white px-2 py-1 font-bold"
+              onClick={openServerPicker}
+              variant="outline"
+              size="sm"
+              className="w-full min-w-0"
             >
               Server Picker
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
-              onClick={() => logout()}
-              className="border-2 border-black bg-white px-2 py-1 font-bold"
+              onClick={handleLogout}
+              variant="outline"
+              size="sm"
+              className="w-full min-w-0"
             >
               Log out
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               onClick={clearLocalState}
-              className="col-span-2 border-2 border-black bg-brutal-orange/30 px-2 py-1 font-bold"
+              variant="warning"
+              size="sm"
+              className="col-span-2 w-full"
             >
               Clear Local Session
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               onClick={copySeedCommand}
-              className="col-span-2 border-2 border-black bg-soft-signal px-2 py-1 text-left font-mono text-[11px] font-bold"
+              variant="primary"
+              size="sm"
+              className="col-span-2 h-auto min-h-8 w-full justify-start whitespace-normal break-all text-left font-mono text-[11px]"
             >
               {copied ? "Copied" : seedCommand}
-            </button>
-            <button
+            </Button>
+            <Button
               type="button"
               onClick={onHideAll}
-              className="col-span-2 border border-black bg-white px-2 py-1 text-left text-[10px] font-bold tracking-widest text-black/60 hover:bg-black hover:text-white"
+              variant="outline"
+              size="sm"
+              className="col-span-2 h-auto min-h-8 w-full justify-start whitespace-normal text-left text-[10px]"
             >
               {formatMessage({ id: "devTools.overlay.hideUntilReload" })}
-            </button>
+            </Button>
           </div>
 
-          {/* Feature flags — local per-browser override toggles (stdrc
-              #proj-activity:171042a3 2026-06-25). "Auto" = use PostHog / default;
-              picking a variant forces it locally (render-only, doesn't change
-              real experiment exposure). Reload applies it to all flag readers. */}
-          {FEATURE_FLAG_REGISTRY.length > 0 && (
-            <div className="mt-3 border-t-2 border-black/10 pt-2">
-              <div className="mb-1 text-[10px] font-bold uppercase tracking-widest text-black/60">
-                Feature flags
-              </div>
-              {FEATURE_FLAG_REGISTRY.map((flag) => {
-                const current = getFlagOverride(flag.key);
-                const apply = (value: string | null) => {
-                  setFlagOverride(flag.key, value);
-                  window.location.reload();
-                };
-                return (
-                  <div key={flag.key} className="mb-1.5">
-                    <div className="mb-0.5 text-[11px] font-bold text-black/80" title={flag.key}>
-                      {flag.label}
-                    </div>
-                    <div className="flex flex-wrap gap-1">
-                      <button
-                        type="button"
-                        onClick={() => apply(null)}
-                        className={`border border-black px-1.5 py-0.5 text-[10px] font-bold ${current === null ? "bg-black text-white" : "bg-white"}`}
-                      >
-                        Auto
-                      </button>
-                      {flag.variants.map((v) => (
-                        <button
-                          key={v}
-                          type="button"
-                          onClick={() => apply(v)}
-                          className={`border border-black px-1.5 py-0.5 text-[10px] font-bold ${current === v ? "bg-brutal-pink text-white" : "bg-white"}`}
-                        >
-                          {v}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
         </div>
   );
+}
+
+/** ServerSelector pick → make it current and open its remembered surface. */
+function useOpenSelectedServer(replace: boolean) {
+  const setCurrent = useServerStore((s) => s.setCurrent);
+  const navigate = useNavigate();
+  return useCallback((server: Server) => {
+    setCurrent(server);
+    navigate(readServerSurfaceMemory(server.slug) ?? `/s/${server.slug}`, { replace });
+  }, [navigate, replace, setCurrent]);
 }
 
 /** Resolves server from URL slug and renders MainLayout */
@@ -400,18 +413,20 @@ export function ServerAccessDeniedPage() {
     ? (readServerSurfaceMemory(fallbackServer.slug) ?? `/s/${fallbackServer.slug}`)
     : "/";
 
-  useEffect(() => {
-    const timeout = window.setTimeout(() => {
-      navigate(fallbackPath, { replace: true });
-    }, 3000);
-    return () => window.clearTimeout(timeout);
+  const goToFallback = useCallback(() => {
+    navigate(fallbackPath, { replace: true });
   }, [fallbackPath, navigate]);
 
+  useEffect(() => {
+    const timeout = window.setTimeout(goToFallback, 3000);
+    return () => window.clearTimeout(timeout);
+  }, [goToFallback]);
+
   return (
-    <div className="flex min-h-0 flex-1 items-center justify-center bg-brutal-cream px-4 font-display safe-top safe-bottom">
-      <div className="w-full max-w-md border-2 border-black bg-white p-6 shadow-brutal">
-        <h1 className="text-2xl font-black text-black">{formatMessage({ id: "pages.serverNotFound.title" })}</h1>
-        <p className="mt-3 text-sm leading-6 text-black/70">
+    <div className="flex min-h-0 flex-1 items-center justify-center bg-layer-sidebar px-4 font-display safe-top safe-bottom">
+      <Card className="w-full max-w-md p-6">
+        <h1 className="text-title text-foreground">{formatMessage({ id: "pages.serverNotFound.title" })}</h1>
+        <p className="mt-3 text-callout text-foreground-muted">
           {fallbackServer
             ? formatMessage(
                 { id: "pages.serverNotFound.redirectingToServer" },
@@ -420,20 +435,22 @@ export function ServerAccessDeniedPage() {
             : formatMessage({ id: "pages.serverNotFound.redirectingToList" })}
         </p>
         <div className="mt-5">
-          <button
+          <Button
+            variant="outline"
+            size="lg"
             type="button"
-            onClick={() => navigate(fallbackPath, { replace: true })}
-            className="text-sm font-bold text-black/50 underline hover:text-black"
+            onClick={goToFallback}
           >
             {fallbackServer
               ? formatMessage({ id: "pages.serverNotFound.goToMyServer" })
               : formatMessage({ id: "pages.serverNotFound.chooseServer" })}
-          </button>
+          </Button>
         </div>
-      </div>
+      </Card>
     </div>
   );
 }
+
 
 export function ServerResolver() {
   const { formatMessage } = useIntl();
@@ -448,12 +465,31 @@ export function ServerResolver() {
   const server = serverSlug ? servers.find((s) => s.slug === serverSlug) : undefined;
   const routeAgentId = serverSlug ? serverRouteAgentId(location.pathname, serverSlug) : null;
   const routeMachineId = serverSlug ? serverRouteMachineId(location.pathname, serverSlug) : null;
+  const routeChannelId = serverSlug ? serverRouteChannelId(location.pathname, serverSlug) : null;
+  const routeDmId = serverSlug ? serverRouteDmId(location.pathname, serverSlug) : null;
+  const openThreadParentMessageId = useThreadStore((s) => s.openParentMessageId);
+  const openThreadParentChannelId = useThreadStore((s) => s.openParentChannelId);
   const routeAgent = useAgentStore((state) =>
     routeAgentId ? state.agents.find((agent) => agent.id === routeAgentId) : undefined
   );
   const routeMachine = useMachineStore((state) =>
     routeMachineId ? state.machines.find((machine) => machine.id === routeMachineId) : undefined
   );
+  const routeChannelTitleLabel = useChannelStore((state) => {
+    const scopedChannelId = routeChannelId ?? routeDmId;
+    if (!scopedChannelId) return null;
+    return documentTitleChannelLabel(
+      state.channels.find((channel) => channel.id === scopedChannelId)
+      ?? state.dmChannels.find((channel) => channel.id === scopedChannelId),
+    );
+  });
+  const threadChannelTitleLabel = useChannelStore((state) => {
+    if (!openThreadParentMessageId || !openThreadParentChannelId) return null;
+    return documentTitleChannelLabel(
+      state.channels.find((channel) => channel.id === openThreadParentChannelId)
+      ?? state.dmChannels.find((channel) => channel.id === openThreadParentChannelId),
+    );
+  });
   const missingCommunitySlug = routeCommunitySlug(server ? undefined : serverSlug);
   const directCommunityRouteIntentRef = useRef<CommunityServerSlug | null>(null);
   const communityAutoJoinAttemptedRef = useRef<string | null>(null);
@@ -489,6 +525,8 @@ export function ServerResolver() {
             {
               agentLabel: routeAgent?.displayName || routeAgent?.name,
               machineLabel: routeMachine?.name,
+              channelLabel: routeChannelTitleLabel,
+              threadChannelLabel: threadChannelTitleLabel,
             },
             hostShell,
             titleFallbacks,
@@ -496,7 +534,7 @@ export function ServerResolver() {
         : hostShell
           ? hostShellFallbackDocumentTitle(titleFallbacks)
           : genericAppDocumentTitle(),
-    [hostShell, location.pathname, routeAgent?.displayName, routeAgent?.name, routeMachine?.name, routeServerName, routeServerSlug, titleFallbacks],
+    [hostShell, location.pathname, routeAgent?.displayName, routeAgent?.name, routeChannelTitleLabel, routeMachine?.name, routeServerName, routeServerSlug, threadChannelTitleLabel, titleFallbacks],
   );
 
   useEffect(() => {
@@ -545,6 +583,7 @@ export function ServerResolver() {
   }, [serverSlug, server, loading, current?.id, setCurrent]);
 
   useBrowserDocumentTitle(routeDocumentTitle);
+  const openSelectedServer = useOpenSelectedServer(true);
 
   useEffect(() => {
     if (!jointInviteId || !server || !current || current.id !== server.id) return;
@@ -567,13 +606,14 @@ export function ServerResolver() {
       .catch((err) => {
         jointInviteAcceptingRef.current = null;
         console.error("Failed to accept joint channel invite", err);
+        showToast({ title: jointInviteAcceptErrorMessage(err, formatMessage), type: "error" });
       });
-  }, [appNav, current, jointInviteId, location.pathname, location.search, navigate, server]);
+  }, [appNav, current, formatMessage, jointInviteId, location.pathname, location.search, navigate, server]);
 
   if (loading) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center bg-brutal-cream font-display safe-top">
-        <div className="text-xl font-bold">{formatMessage({ id: "pages.app.loadingServers" })}</div>
+      <div className="flex min-h-0 flex-1 items-center justify-center bg-layer-sidebar font-display safe-top">
+        <div className="text-headline text-foreground-muted">{formatMessage({ id: "pages.app.loadingServers" })}</div>
       </div>
     );
   }
@@ -581,8 +621,8 @@ export function ServerResolver() {
   if (!server) {
     if (missingCommunitySlug && communityJoinFlow.joiningCommunitySlug === missingCommunitySlug) {
       return (
-        <div className="flex min-h-0 flex-1 items-center justify-center bg-brutal-cream font-display safe-top">
-          <div className="text-xl font-bold">{formatMessage({ id: "pages.app.joiningCommunity" })}</div>
+        <div className="flex min-h-0 flex-1 items-center justify-center bg-layer-sidebar font-display safe-top">
+          <div className="text-headline text-foreground-muted">{formatMessage({ id: "pages.app.joiningCommunity" })}</div>
         </div>
       );
     }
@@ -593,14 +633,7 @@ export function ServerResolver() {
     // The first-server flow IS the right screen here, so render it directly.
     if (showServerSelector || servers.length === 0) {
       return (
-        <ServerSelector
-          onSelect={(nextServer) => {
-            setCurrent(nextServer);
-            navigate(readServerSurfaceMemory(nextServer.slug) ?? `/s/${nextServer.slug}`, {
-              replace: true,
-            });
-          }}
-        />
+        <ServerSelector onSelect={openSelectedServer} />
       );
     }
     return (
@@ -613,8 +646,8 @@ export function ServerResolver() {
 
   if (!current || current.id !== server.id) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center bg-brutal-cream font-display safe-top">
-        <div className="text-xl font-bold">{formatMessage({ id: "common.loading" })}</div>
+      <div className="flex min-h-0 flex-1 items-center justify-center bg-layer-sidebar font-display safe-top">
+        <div className="text-headline text-foreground-muted">{formatMessage({ id: "common.loading" })}</div>
       </div>
     );
   }
@@ -640,7 +673,7 @@ export function ServerResolver() {
     if (!generation) return <Navigate to={`/s/${server.slug}`} replace />;
     return (
       <main
-        className="relative flex min-h-0 flex-1 bg-brutal-cream font-display safe-top safe-bottom"
+        className="relative flex min-h-0 flex-1 bg-layer-sidebar font-display safe-top safe-bottom"
         data-testid="native-onboarding-web-surface"
       >
         <ServerSetupProjectionGate
@@ -654,6 +687,12 @@ export function ServerResolver() {
     );
   }
 
+  // `/thread-window` is intentionally kept as a first-class route even though
+  // the in-app "open in new tab" entry points (thread header / overflow menu,
+  // task card, message context menu) were removed on 2026-09-10 by product
+  // call. The route, its URL sync and the window components stay so the
+  // standalone window can be re-exposed later without rebuilding the plumbing
+  // — see utils/openPanelInNewTab.ts (builders, no UI callsites today).
   if (location.pathname === `/s/${server.slug}/thread-window`) {
     // Remount on a new deep-link identity so an async failure from a previous
     // popup target cannot bleed into the next thread/task opened in this tab.
@@ -665,25 +704,19 @@ export function ServerResolver() {
 
 export function ServerSelectionPage() {
   const { formatMessage } = useIntl();
-  const setCurrent = useServerStore((s) => s.setCurrent);
   const loading = useServerStore((s) => s.loading);
-  const navigate = useNavigate();
+  const openSelectedServer = useOpenSelectedServer(false);
 
   if (loading) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center bg-brutal-cream font-display safe-top">
-        <div className="text-xl font-bold">{formatMessage({ id: "pages.app.loadingServers" })}</div>
+      <div className="flex min-h-0 flex-1 items-center justify-center bg-layer-sidebar font-display safe-top">
+        <div className="text-headline text-foreground-muted">{formatMessage({ id: "pages.app.loadingServers" })}</div>
       </div>
     );
   }
 
   return (
-    <ServerSelector
-      onSelect={(server) => {
-        setCurrent(server);
-        navigate(readServerSurfaceMemory(server.slug) ?? `/s/${server.slug}`);
-      }}
-    />
+    <ServerSelector onSelect={openSelectedServer} />
   );
 }
 
@@ -696,11 +729,30 @@ export function ServerRedirect() {
   const navigate = useNavigate();
   const [showServerSelector] = useState(() => consumeServerSelectionRequest());
   const location = useLocation();
+  const openSelectedServer = useOpenSelectedServer(true);
+
+  // `/.well-known/change-password` redirects here before auth is known. The
+  // pathname survives the signed-out login screen, so once auth + the server
+  // list are restored this same resolver can choose the browser's remembered
+  // server without inventing an account-global settings surface.
+  const changePasswordIntent = isChangePasswordIntentPath(location.pathname);
+
+  const enterSelectedServer = useCallback((server: Server) => {
+    setCurrent(server);
+    // replace, like every other root → server hop: the picker at "/" only
+    // exists while no last server is remembered, so a history Back onto it
+    // would just re-run ServerRedirect and bounce forward again.
+    navigate(serverEntryPath({
+      serverSlug: server.slug,
+      rememberedSurface: readServerSurfaceMemory(server.slug),
+      changePasswordIntent,
+    }), { replace: true });
+  }, [changePasswordIntent, navigate, setCurrent]);
 
   if (loading) {
     return (
-      <div className="flex min-h-0 flex-1 items-center justify-center bg-brutal-cream font-display safe-top">
-        <div className="text-xl font-bold">{formatMessage({ id: "pages.app.loadingServers" })}</div>
+      <div className="flex min-h-0 flex-1 items-center justify-center bg-layer-sidebar font-display safe-top">
+        <div className="text-headline text-foreground-muted">{formatMessage({ id: "pages.app.loadingServers" })}</div>
       </div>
     );
   }
@@ -708,26 +760,13 @@ export function ServerRedirect() {
   // A deliberate Server Picker action must win over normal last-server and
   // deep-location restoration, including on a cold navigation to "/".
   if (showServerSelector) {
-    return (
-      <ServerSelector
-        onSelect={(server) => {
-          setCurrent(server);
-          navigate(readServerSurfaceMemory(server.slug) ?? `/s/${server.slug}`, { replace: true });
-        }}
-      />
-    );
+    return <ServerSelector onSelect={openSelectedServer} />;
   }
 
   const nativeTarget = getDesktopServerBootstrapTarget(location.search, servers);
   if (nativeTarget) {
     return <Navigate to={nativeTarget} replace />;
   }
-
-  // `/.well-known/change-password` redirects here before auth is known. The
-  // pathname survives the signed-out login screen, so once auth + the server
-  // list are restored this same resolver can choose the browser's remembered
-  // server without inventing an account-global settings surface.
-  const changePasswordIntent = isChangePasswordIntentPath(location.pathname);
 
   // Auto-redirect to last used server
   const lastSlug = serverPersistence.readLastServerSlug();
@@ -746,18 +785,7 @@ export function ServerRedirect() {
   }
 
   // No last server — show selector (user picks or creates)
-  return (
-    <ServerSelector
-      onSelect={(server) => {
-        setCurrent(server);
-        navigate(serverEntryPath({
-          serverSlug: server.slug,
-          rememberedSurface: readServerSurfaceMemory(server.slug),
-          changePasswordIntent,
-        }));
-      }}
-    />
-  );
+  return <ServerSelector onSelect={enterSelectedServer} />;
 }
 
 // Standalone palette audit page (#proj-uiux:0e6befb8 task #92).
@@ -767,12 +795,15 @@ export function ServerRedirect() {
 // AppShell and are never conditionally skipped — earlier the early-return
 // gated `window.location.pathname === "/palette-audit"` made every hook in
 // AppShell rules-of-hooks-conditional under SPA nav.
+// Already signed in: the login/register entry points are inert.
+function ignoreAuthEntry() {}
+
 /** Auth bootstrap loading / restoring chrome — exported for zh-cn i18n behavior tests. */
 export function AuthBootstrapStatus({ view }: { view: "loading" | "restoring" }) {
   const { formatMessage } = useIntl();
   return (
-    <div className="flex min-h-0 flex-1 items-center justify-center bg-brutal-cream font-display safe-top">
-      <div className="text-xl font-bold">
+    <div className="flex min-h-0 flex-1 items-center justify-center bg-layer-sidebar font-display safe-top">
+      <div className="text-headline text-foreground-muted">
         {view === "restoring"
           ? formatMessage({ id: "auth.bootstrap.restoringSession" })
           : formatMessage({ id: "common.loading" })}
@@ -793,7 +824,9 @@ export function AppShell() {
   const logout = useAuthStore((s) => s.logout);
 
   const serverLoading = useServerStore((s) => s.loading);
+  const servers = useServerStore((s) => s.servers);
   const loadServers = useServerStore((s) => s.loadServers);
+  const setCurrentServer = useServerStore((s) => s.setCurrent);
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -805,6 +838,8 @@ export function AppShell() {
   const urlParamsRef = useMemo(() => getUrlParams(), []);
   const [inviteToken, setInviteToken] = useState<string | null>(urlParamsRef.inviteToken);
   const urlParams = useMemo(() => ({ ...urlParamsRef, inviteToken }), [urlParamsRef, inviteToken]);
+
+  const appLoginHandoff = !!matchPath("/login/app", location.pathname);
 
   // Load user on mount
   useEffect(() => {
@@ -946,32 +981,62 @@ export function AppShell() {
   }, [initialized, restoreState, hasStoredSession, loadUser]);
 
   const profileSetupRequired = requiresAccountProfileSetup(user);
-  const publicServerRoute = location.pathname.match(/^\/s\/([^/]+)\/?$/);
+  // Any `/s/<slug>/...` link can open the public read-only page for a
+  // nonmember; a `/channel/<id>` deep link preselects that public channel.
+  const publicServerRoute = location.pathname.match(/^\/s\/([^/]+)(?:\/channel\/([^/]+))?(?:\/.*)?$/);
   let publicServerSlug: string | null = null;
+  let publicChannelId: string | null = null;
   if (publicServerRoute) {
     try {
       publicServerSlug = decodeURIComponent(publicServerRoute[1]!);
+      publicChannelId = publicServerRoute[2] ? decodeURIComponent(publicServerRoute[2]) : null;
     } catch {
       publicServerSlug = null;
+      publicChannelId = null;
     }
   }
+
+  // Signing in from a public server temporarily dismisses the public page so
+  // the login form can render at the same URL. Once identity arrives, restore
+  // that page for a nonmember instead of treating the session as membership.
+  // oxlint-disable-next-line react-doctor/no-derived-state-effect
+  useEffect(() => {
+    if (authenticatedUserId && publicServerSlug) setPublicViewDismissed(false);
+  }, [authenticatedUserId, publicServerSlug]);
+
+  // App handoff and OAuth completion need account identity, not the workspace.
+  // The callback navigates to its return URL once authentication completes.
+  const deferServerBootstrap = appLoginHandoff || urlParamsRef.authCallback === "social";
 
   // Identity setup is account-global and must complete before any server data
   // or pending invite side effects are loaded.
   useEffect(() => {
-    if (user && !profileSetupRequired) {
+    if (user && !profileSetupRequired && !deferServerBootstrap) {
       loadServers();
     }
-  }, [user, profileSetupRequired, loadServers]);
+  }, [user, profileSetupRequired, deferServerBootstrap, loadServers]);
+
+  // Single boot entry for the cross-server unread summary. Components keep
+  // only their event/interval triggers (LeftRail: prefs + local-unread edge;
+  // Sidebar: interval/focus/visibility/prefs/eager edge) — previously each
+  // mount issued its own boot fetch (the unread-summary boot wave).
+  const serversCount = useServerStore((s) => s.servers.length);
+  const loadServerUnreadSummary = useServerStore((s) => s.loadServerUnreadSummary);
+  useEffect(() => {
+    if (!user || serversCount === 0 || deferServerBootstrap) return;
+    void loadServerUnreadSummary();
+  }, [user, serversCount, deferServerBootstrap, loadServerUnreadSummary]);
 
   // Precise PWA resume: restore the last deep location on cold start from `/`.
   // Only active once the user is authenticated and there's no pending invite,
   // so it doesn't fight with login / email-verification / invite redirects.
   const hasPendingInvite = !!localStorage.getItem(PENDING_INVITE_STORAGE_KEY);
   const canResumeLocation = !!user
+    && !deferServerBootstrap
     && user.emailVerified
     && !profileSetupRequired
     && !urlParams.inviteToken
+    && !urlParams.resetToken
     && !hasPendingInvite
     && !serverLoading
     && !isServerSelectionRequested();
@@ -982,6 +1047,18 @@ export function AppShell() {
   // itself.
   useEffect(() => {
     if (!user || !user.emailVerified || profileSetupRequired) return;
+    // While a reset link is active, do NOT consume the pending invite or navigate
+    // to /?invite=… — that would clobber the ?reset token (breaking refresh) and
+    // burn the invite record. Leave it in storage untouched: when the reset is
+    // done, onBack reloads the app, and that fresh mount (URL no longer carrying
+    // ?reset) runs this effect and resumes the still-stored invite. Read resetToken
+    // off urlParamsRef (the mount-frozen useMemo([]) source), not urlParams: the
+    // resolved resetToken string is constant either way (so behavior is identical),
+    // but urlParams derives from inviteToken — which this effect sets — so
+    // oxlint react-doctor/no-chain-state-updates statically rejects listing
+    // urlParams.resetToken as a dep. Depending on the mount-frozen ref avoids that
+    // while keeping exhaustive-deps satisfied.
+    if (urlParamsRef.resetToken || urlParamsRef.appLoginHandoff) return;
     const pendingInviteRedirect = takePendingInviteRedirectPath();
     if (!pendingInviteRedirect) return;
 
@@ -990,7 +1067,50 @@ export function AppShell() {
 
     setInviteToken(pendingInvite);
     navigate(pendingInviteRedirect, { replace: true });
-  }, [user, profileSetupRequired, navigate]);
+  }, [user, profileSetupRequired, urlParamsRef, navigate]);
+
+  const showLogin = useCallback(() => setAuthView("login"), []);
+  const showRegister = useCallback(() => setAuthView("register"), []);
+  const showForgotPassword = useCallback(() => setAuthView("forgot-password"), []);
+  const clearInviteToken = useCallback(() => setInviteToken(null), []);
+  const inviteSwitchToLogin = useCallback(() => {
+    setInviteToken(null);
+    setAuthView("login");
+  }, []);
+  const inviteSwitchToRegister = useCallback(() => {
+    setInviteToken(null);
+    setAuthView("register");
+  }, []);
+  const dismissPublicView = useCallback(() => setPublicViewDismissed(true), []);
+  const publicSignIn = useCallback(() => {
+    setPublicViewDismissed(true);
+    setAuthView("login");
+  }, []);
+  const publicRegister = useCallback(() => {
+    setPublicViewDismissed(true);
+    setAuthView("register");
+  }, []);
+
+  const hasUser = !!user;
+  const leaveResetPassword = useCallback(() => {
+    const url = new URL(window.location.href);
+    url.searchParams.delete("reset");
+    // Keep url.search: drop ONLY reset, preserve any invite/verify/other
+    // params so the post-reset reload can still resume those flows.
+    window.history.replaceState({}, "", url.pathname + url.search + url.hash);
+    // Logged-out → return to sign-in; logged-in → reload keeps the current
+    // session and lands back in the app (never an implicit logout/switch).
+    if (!hasUser) setAuthView("login");
+    window.location.reload();
+  }, [hasUser]);
+
+  const handlePublicServerJoined = useCallback(async () => {
+    await loadServers();
+    const joined = useServerStore.getState().servers.find((server) => server.slug === publicServerSlug);
+    if (!joined) throw new Error("Joined server was not returned by the server list");
+    setCurrentServer(joined);
+    navigate(publicChannelId ? `/s/${joined.slug}/channel/${encodeURIComponent(publicChannelId)}` : `/s/${joined.slug}`, { replace: true });
+  }, [loadServers, navigate, publicChannelId, publicServerSlug, setCurrentServer]);
 
   // Determine page content
   let content: React.ReactNode;
@@ -999,17 +1119,17 @@ export function AppShell() {
     content = <SocialAuthCallbackPage />;
   } else if (authBootstrapView === "loading" || authBootstrapView === "restoring") {
     content = <AuthBootstrapStatus view={authBootstrapView} />;
-  } else if (urlParams.resetToken && !user) {
+  } else if (urlParams.resetToken) {
+    // A reset link must work even when a session is already active (e.g. an
+    // OAuth-created account setting its first password is, by definition, logged
+    // in). The page only calls resetPassword(token, …), which resets the TOKEN's
+    // owner server-side and never touches the current session — so a logged-in A
+    // opening B's link resets B without mutating A. Checked before every other
+    // branch so a reset token wins if it coexists with invite/verify params.
     content = (
       <ResetPasswordPage
         token={urlParams.resetToken}
-        onBack={() => {
-          const url = new URL(window.location.href);
-          url.searchParams.delete("reset");
-          window.history.replaceState({}, "", url.pathname + url.hash);
-          setAuthView("login");
-          window.location.reload();
-        }}
+        onBack={leaveResetPassword}
       />
     );
   } else if (!user) {
@@ -1017,41 +1137,30 @@ export function AppShell() {
       content = (
         <InviteAcceptPage
           token={urlParams.inviteToken}
-          onInviteConsumed={() => setInviteToken(null)}
-          onSwitchToLogin={() => {
-            setInviteToken(null);
-            setAuthView("login");
-          }}
-          onSwitchToRegister={() => {
-            setInviteToken(null);
-            setAuthView("register");
-          }}
+          onInviteConsumed={clearInviteToken}
+          onSwitchToLogin={inviteSwitchToLogin}
+          onSwitchToRegister={inviteSwitchToRegister}
         />
       );
     } else if (publicServerSlug && !publicViewDismissed) {
       content = (
         <PublicServerPage
           slug={publicServerSlug}
-          onSignIn={() => {
-            setPublicViewDismissed(true);
-            setAuthView("login");
-          }}
-          onRegister={() => {
-            setPublicViewDismissed(true);
-            setAuthView("register");
-          }}
-          onUnavailable={() => setPublicViewDismissed(true)}
+          initialChannelId={publicChannelId}
+          onSignIn={publicSignIn}
+          onRegister={publicRegister}
+          onUnavailable={dismissPublicView}
         />
       );
     } else if (authView === "register") {
-      content = <RegisterPage onSwitchToLogin={() => setAuthView("login")} />;
+      content = <RegisterPage onSwitchToLogin={showLogin} />;
     } else if (authView === "forgot-password") {
-      content = <ForgotPasswordPage onBack={() => setAuthView("login")} />;
+      content = <ForgotPasswordPage onBack={showLogin} />;
     } else {
       content = (
         <LoginPage
-          onSwitchToRegister={() => setAuthView("register")}
-          onForgotPassword={() => setAuthView("forgot-password")}
+          onSwitchToRegister={showRegister}
+          onForgotPassword={showForgotPassword}
         />
       );
     }
@@ -1059,20 +1168,34 @@ export function AppShell() {
     content = (
       <InviteAcceptPage
         token={urlParams.inviteToken}
-        onInviteConsumed={() => setInviteToken(null)}
-        onSwitchToLogin={() => {}}
-        onSwitchToRegister={() => {}}
+        onInviteConsumed={clearInviteToken}
+        onSwitchToLogin={ignoreAuthEntry}
+        onSwitchToRegister={ignoreAuthEntry}
       />
     );
   } else if (!user.emailVerified) {
     content = <EmailVerificationPage initialToken={urlParams.verifyToken} />;
   } else if (profileSetupRequired) {
     content = <AccountIdentitySetupPage />;
+  } else if (appLoginHandoff) {
+    content = <AppLoginPage />;
   } else if (serverLoading) {
     content = (
-      <div className="flex min-h-0 flex-1 items-center justify-center bg-brutal-cream font-display safe-top">
-        <div className="text-xl font-bold">{formatMessage({ id: "pages.app.loadingServers" })}</div>
+      <div className="flex min-h-0 flex-1 items-center justify-center bg-layer-sidebar font-display safe-top">
+        <div className="text-headline text-foreground-muted">{formatMessage({ id: "pages.app.loadingServers" })}</div>
       </div>
+    );
+  } else if (publicServerSlug && !publicViewDismissed && !servers.some((server) => server.slug === publicServerSlug)) {
+    content = (
+      <PublicServerPage
+        slug={publicServerSlug}
+        initialChannelId={publicChannelId}
+        authenticated
+        onSignIn={ignoreAuthEntry}
+        onRegister={ignoreAuthEntry}
+        onUnavailable={dismissPublicView}
+        onJoined={handlePublicServerJoined}
+      />
     );
   } else {
     // Authenticated + servers loaded → URL-based server routing
@@ -1082,7 +1205,8 @@ export function AppShell() {
         <Route path="/login-with-slock/setup" element={<HumanLoginSetupPage />} />
         <Route path="/login-with-slock-human/setup" element={<HumanLoginSetupPage />} />
         <Route path="/login/device" element={<DeviceLoginPage />} />
-        <Route path="/integration-invites/:token" element={<IntegrationInvitePage />} />
+        <Route path={INTEGRATION_INVITE_ROUTE} element={<IntegrationInvitePage />} />
+        <Route path="/connections/callback" element={<AgentConnectionCallbackPage />} />
         <Route path="/servers" element={<ServerSelectionPage />} />
         <Route path="/s/:serverSlug/*" element={<ServerResolver />} />
         <Route path="*" element={<ServerRedirect />} />
@@ -1121,6 +1245,10 @@ function App() {
       <Route
         path="/dev/server-setup"
         element={import.meta.env.DEV ? <ServerSetupComputerRuntimePreviewPage /> : <Navigate to="/" replace />}
+      />
+      <Route
+        path="/dev/display-style"
+        element={import.meta.env.DEV ? <DisplayStylePreviewPage /> : <Navigate to="/" replace />}
       />
       {/* Public utility routes must render outside the authenticated shell.
           Place them before the catch-all, which would otherwise swallow them

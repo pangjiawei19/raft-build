@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const srcRoot = resolve(repoRoot, "src");
@@ -24,10 +23,10 @@ test("top panel tabs use the shared reorderable tab bar", () => {
   const agentPanel = readSource("src/components/agent/AgentDetailPanel.tsx");
   const sidebar = readSource("src/components/layout/Sidebar.tsx");
 
-  assert.match(chatPanel, /import \{ SortableTabsList, SortableTabsTab, Tabs, TabsLabel, useOrderedTabs \} from "raft-ui";/);
+  assert.match(chatPanel, /SortableTabsList[\s\S]*SortableTabsTab[\s\S]*Tabs[\s\S]*TabsLabel[\s\S]*useOrderedTabs[\s\S]*from "@botiverse\/raft-ui"/);
   assert.match(
     agentPanel,
-    /import \{[^}]*\bSortableTabsList\b[^}]*\bSortableTabsTab\b[^}]*\bTabs\b[^}]*\bTabsLabel\b[^}]*\buseOrderedTabs\b[^}]*\} from "raft-ui";/,
+    /import \{[^}]*\bSortableTabsList\b[^}]*\bSortableTabsTab\b[^}]*\bTabs\b[^}]*\bTabsLabel\b[^}]*\buseOrderedTabs\b[^}]*\} from "@botiverse\/raft-ui";/,
   );
   assert.doesNotMatch(chatPanel, /ReorderablePanelTabs/);
   assert.doesNotMatch(agentPanel, /ReorderablePanelTabs/);
@@ -46,19 +45,44 @@ test("top panel tabs use the shared reorderable tab bar", () => {
   assert.match(chatPanel, /useOrderedTabs\(chatPanelTabs, channelPanelTabOrder\)/);
   assert.match(chatPanel, /sidebarOrder\.channelPanelTabOrder/);
   assert.match(chatPanel, /updateSidebarOrder\(\{ channelPanelTabOrder: nextOrder \}\)/);
-  assert.match(chatPanel, /<Tabs<ChatPanelTab>[\s\S]*?className="overflow-hidden border-b-2 border-black bg-white"/);
+  // The actual panel/tab-list parent boundary is covered by the rendered
+  // ChatPanel test; source order alone can preserve the wrong composition.
   assert.match(chatPanel, /<SortableTabsList<ChatPanelTab>/);
-  assert.match(chatPanel, /<SortableTabsTab[\s\S]*?data-testid=\{`panel-tab-\$\{tab\.id\}`\}[\s\S]*?className="!cursor-default"[\s\S]*?>/);
+  // Raft DS tabs: the recipe owns the tab's height, its pointer cursor (DS
+  // `.rf-tabs__item`; raft-ui's sortable tab sets it inline) and its 16px
+  // icon, so the channel strip overrides none of them.
+  assert.match(chatPanel, /<SortableTabsTab\s+key=\{tab\.id\}\s+value=\{tab\.id\}\s+data-testid=\{`panel-tab-\$\{tab\.id\}`\}\s*>\s*<Icon \/>/);
 
   assert.match(agentPanel, /useOrderedTabs\(visibleAgentTabItems, normalizedAgentPanelTabOrder\)/);
   assert.match(agentPanel, /sidebarOrder\.agentPanelTabOrder/);
   assert.match(agentPanel, /tab === "channels" \|\| tab === "dms" \? "chat" : tab/);
   assert.match(agentPanel, /updateSidebarOrder\(\{ agentPanelTabOrder: nextOrder \}\)/);
   assert.match(agentPanel, /<SortableTabsList<AgentTab>/);
-  assert.match(agentPanel, /<div\s+ref=\{agentTabsRef\}[\s\S]*?className=\{`min-w-0 max-w-full overflow-hidden/);
-  assert.match(agentPanel, /className="max-w-full border-y-0 border-l-0 border-r-2 border-black bg-white"/);
-  assert.doesNotMatch(agentPanel, /className="max-w-none border-y-0 border-l-0 border-r-2 border-black bg-white"/);
-  assert.match(agentPanel, /<SortableTabsTab[\s\S]*?data-testid=\{`panel-tab-\$\{tab\.id\}`\}[\s\S]*?className="!cursor-default"[\s\S]*?>/);
+  // Both tab bars take their chrome and their overflow behaviour (the row
+  // scrolls itself, wheel included, fades at the hidden side, keeps the
+  // selected tab in view) from raft-ui's ConversationPanelTabs / TabsList; the
+  // agent panel adds no scroll classes, border or background of its own.
+  assert.match(chatPanel, /<ConversationPanelTabs render=\{<Tabs<ChatPanelTab>/);
+  assert.match(
+    agentPanel,
+    /<ConversationPanelTabs\s+render=\{<Tabs<AgentTab> value=\{activeTab\} onValueChange=\{setActiveTab\} \/>\}\s*>/,
+  );
+  assert.doesNotMatch(agentPanel, /overflow-x-auto overflow-y-hidden scrollbar-none/);
+  assert.doesNotMatch(agentPanel, /theme-brutal:border-0 theme-brutal:bg-layer-canvas/);
+  assert.doesNotMatch(agentPanel, /<Tabs<AgentTab>[^>]*className=/);
+  // raft-ui's tab recipe draws the selected state itself; there is no separate
+  // indicator or background part to mount any more.
+  assert.doesNotMatch(agentPanel, /\bTabs(?:Indicator|Background)\b/);
+  assert.doesNotMatch(chatPanel, /\bTabs(?:Indicator|Background)\b/);
+  assert.doesNotMatch(agentPanel, /border-r-2 border-line-strong bg-layer-canvas/);
+  // DS Tabs, the sticker version (the default): the recipe owns the 32px
+  // item and its 44px hit area, so neither panel adds a height of its own.
+  assert.match(agentPanel, /<SortableTabsTab\s+key=\{tab\.id\}\s+value=\{tab\.id\}\s+data-testid=\{`panel-tab-\$\{tab\.id\}`\}\s*>\s*<Icon \/>/);
+  for (const source of [chatPanel, agentPanel]) {
+    assert.doesNotMatch(source, /<SortableTabsTab[^>]*cursor-/, "the tab recipe owns the cursor");
+  }
+  assert.doesNotMatch(agentPanel, /<SortableTabsList<AgentTab>[^>]*variant=/);
+  assert.doesNotMatch(chatPanel, /<SortableTabsList<ChatPanelTab>[^>]*variant=/);
   assert.doesNotMatch(agentPanel, /showMoreMenu/);
 });
 
@@ -100,14 +124,9 @@ test("agent detail default tabs place Activity second after Profile", () => {
   assert.match(agentPanel, /<AgentMcpTab agentId=\{agent\.id\} canManageServer=\{canManageServer\} \/>/);
 });
 
-test("agent detail active tab scroll reruns after agent and tab order settle", () => {
+test("the agent panel leaves keeping the selected tab in view to raft-ui's tab row", () => {
   const agentPanel = readSource("src/components/agent/AgentDetailPanel.tsx");
 
-  assert.match(agentPanel, /const orderedAgentTabKey = orderedAgentTabIds\.join\("\|"\);/);
-  assert.match(agentPanel, /useLayoutEffect\(\(\) => \{/);
-  assert.match(agentPanel, /querySelector<HTMLElement>\('\[data-slot="tabs-list"\]'\)/);
-  assert.match(agentPanel, /querySelector<HTMLElement>\(`\[data-testid="panel-tab-\$\{activeTab\}"\]`\)/);
-  assert.match(agentPanel, /tabsList\.scrollLeft\s*=\s*Math\.max\(0, Math\.min\(targetScrollLeft, maxScrollLeft\)\)/);
-  assert.match(agentPanel, /\}, \[activeTab, agent\.id, orderedAgentTabKey\]\);/);
+  assert.doesNotMatch(agentPanel, /scrollActiveTabIntoView|scroller\.scrollLeft/);
   assert.doesNotMatch(agentPanel, /activeTabButton\?\.scrollIntoView/);
 });

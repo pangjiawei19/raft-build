@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
-import { test } from "vitest";
 
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/node-postgres";
@@ -12,8 +11,8 @@ import {
   closeDatabase,
   type Database,
   initDatabase,
-} from "../db/index.js";
-import * as schema from "../db/schema.js";
+} from "../db/index";
+import * as schema from "../db/schema";
 import {
   agents,
   channelAgents,
@@ -28,29 +27,30 @@ import {
   serverMembers,
   servers,
   users,
-} from "../db/schema.js";
+} from "../db/schema";
 import {
   enqueueExternalInboundEvent,
   processExternalInboundEventOnce,
   type ExternalInboundNormalizedMessage,
   type ExternalInboundRuntimeAuthority,
   type ExternalInboundWorkerDependencies,
-} from "./externalInboundWorkerService.js";
+} from "./externalInboundWorkerService";
 import {
   __resetOrdinaryMessageOutboundAuthorizationResolverForTests,
   __setOrdinaryMessageOutboundAuthorizationResolverForTests,
-} from "./externalDeliveryOutboxService.js";
+} from "./externalDeliveryOutboxService";
 import {
   broadcastAndDeliver,
   drainSenderReadReceiptsForTests,
-} from "./messageService.js";
+} from "./messageService";
+import { withChannelDelivery } from "../test/orchestratorStub";
 
 const REAL_PG_URL_ENV = "EXTERNAL_INBOUND_REAL_PG_URL";
 const REAL_PG_URL = process.env[REAL_PG_URL_ENV];
 const REAL_PG_REQUIRED = process.env.EXTERNAL_INBOUND_REAL_PG_REQUIRED === "1";
 const MIGRATIONS_FOLDER = fileURLToPath(new URL("../../drizzle", import.meta.url));
 const NOW = new Date("2026-08-13T04:47:00.000Z");
-const noopOrchestrator = { deliverMessage: async () => undefined } as any;
+const noopOrchestrator = withChannelDelivery({ deliverMessage: async () => undefined }) as any;
 
 function createIo() {
   return {

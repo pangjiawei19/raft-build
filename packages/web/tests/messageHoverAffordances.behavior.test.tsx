@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { MemoryRouter } from "react-router-dom";
 import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
@@ -221,9 +220,11 @@ test("continuation-row hover timestamp follows the UI 12h/24h setting", async ()
 
   const findGutter = (row: HTMLElement, text: string, title: string) => {
     const gutter = Array.from(row.querySelectorAll("span"))
-      .find((candidate) => candidate.textContent === text && candidate.getAttribute("title") === title);
-    assert.ok(gutter, `expected continuation gutter timestamp ${text} with title ${title}`);
-    assert.match(gutter.className, /group-hover\/message:text-black\/40/);
+      .find((candidate) => candidate.textContent === text && candidate.hasAttribute("data-base-ui-tooltip-trigger"));
+    assert.ok(gutter, `expected continuation gutter timestamp ${text} with RUI tooltip (was native title=${title})`);
+    // The DS treatment (Space Mono 12, ink-3 revealed on row hover) is the
+    // recipe's; the call site paints no colour or size of its own.
+    assert.doesNotMatch(gutter.className, /theme-brutal:|group-hover\/message:/);
   };
 
   let view = await renderMessage({
@@ -254,6 +255,17 @@ test("thread origin hover affordances stay anchored to the message row", async (
   assert.ok(reaction);
   assert.ok(thread);
 
+  // The reply-in-thread affordance carries the raft-ui ThreadIcon (task #710):
+  // package geometry (18×18 box + leading path), not the lucide stand-in.
+  const threadSvg = thread.querySelector("svg");
+  assert.equal(threadSvg?.getAttribute("viewBox"), "0 0 18 18");
+  assert.match(threadSvg?.querySelector("path")?.getAttribute("d") ?? "", /^M16\.25 5V4\.25/);
+  assert.equal(
+    threadSvg?.getAttribute("class")?.includes("lucide-message-square") ?? false,
+    false,
+    "the thread affordance no longer uses the lucide MessageSquare stand-in",
+  );
+
   assert.equal(body.closest("#message-message-1"), row);
   assert.equal(saveButton.closest("#message-message-1"), row);
   assert.equal(reaction.closest("#message-message-1"), row);
@@ -271,10 +283,13 @@ test("thread origin hover affordances stay anchored to the message row", async (
     false,
     "the transparent toolbar remains a hit target so moving above the row cannot collapse its own hover",
   );
-  assert.match(toolbar.className, /(?:^| )opacity-0(?: |$)/);
-  assert.match(toolbar.className, /(?:^| )group-hover\/message:opacity-100(?: |$)/);
-  assert.match(toolbar.className, /(?:^| )group-focus-within\/message:opacity-100(?: |$)/);
+  // Since raft-ui 0.5.35 (#386) the reveal is variable-driven and stays
+  // anchored to the row: the row sets `--mi-toolbar-opacity` / `--mi-toolbar-pe`
+  // on hover and focus-within (and an open popup), the toolbar reads them.
+  assert.match(toolbar.className, /(?:^| )opacity-\(--mi-toolbar-opacity,0\)(?: |$)/);
   assert.equal(toolbar.classList.contains("hidden"), false);
+  assert.match(row.className, /(?:^| )hover:\[--mi-toolbar-opacity:1\](?: |$)/);
+  assert.match(row.className, /(?:^| )focus-within:\[--mi-toolbar-opacity:1\](?: |$)/);
   assert.equal(reaction.closest("[data-message-affordance='toolbar']"), toolbar);
   assert.equal(thread.closest("[data-message-affordance='toolbar']"), toolbar);
   assert.equal(saveButton.closest("[data-message-affordance='toolbar']"), toolbar);
@@ -287,10 +302,19 @@ test("thread context menu gives Follow Thread a distinct message-plus icon", asy
 
   const openThreadItem = screen.getByRole("menuitem", { name: "Open Thread" });
   const followThreadItem = screen.getByRole("menuitem", { name: "Follow Thread" });
-  const openThreadIconClass = openThreadItem.querySelector("svg")?.getAttribute("class") ?? "";
+  const openThreadSvg = openThreadItem.querySelector("svg");
   const followThreadIconClass = followThreadItem.querySelector("svg")?.getAttribute("class") ?? "";
 
-  assert.match(openThreadIconClass, /lucide-message-square/);
+  // Open Thread carries the raft-ui conversation ThreadIcon (task #710): the
+  // package geometry (18×18 box + its leading path), NOT a lucide stand-in.
+  assert.equal(openThreadSvg?.getAttribute("viewBox"), "0 0 18 18");
+  assert.match(openThreadSvg?.querySelector("path")?.getAttribute("d") ?? "", /^M16\.25 5V4\.25/);
+  assert.equal(
+    openThreadSvg?.getAttribute("class")?.includes("lucide-message-square") ?? false,
+    false,
+    "Open Thread no longer uses the lucide MessageSquare stand-in",
+  );
+  // Follow Thread keeps its distinct message-plus glyph.
   assert.match(followThreadIconClass, /lucide-message-circle-plus/);
 });
 
@@ -403,7 +427,10 @@ test("saved thread origin bookmark renders as the active save action", async () 
   const { saveButton } = await renderMessage({ saved: true });
   const row = saveButton.closest("#message-message-1");
 
-  assert.match(saveButton.className, /(?:^| )text-brutal-orange(?: |$)/);
+  assert.equal(saveButton.getAttribute("data-active"), "true");
+  // The recipe draws the active state; the call site paints no colour of its own.
+  assert.doesNotMatch(saveButton.className, /data-active:text-attention-strong|theme-brutal:/);
+  assert.equal(saveButton.querySelector("svg")?.getAttribute("fill"), "currentColor", "saved bookmark is filled");
   assert.ok(row);
   assert.equal(
     row.querySelector("[data-message-affordance='saved-indicator']"),

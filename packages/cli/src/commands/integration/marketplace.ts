@@ -3,11 +3,11 @@
 import type { Command } from "commander";
 import type { AgentApiIntegrationMarketplaceResponse } from "@botiverse/raft-shared";
 
-import { createAgentApiSurfaceClient } from "../../agentApiPath.js";
-import { defineCommand, registerCliCommand } from "../../core/command.js";
-import type { CommandRuntimeOptions } from "../../core/context.js";
-import { cliError } from "../../core/errors.js";
-import { writeJson, writeText, adoptCliReplyText } from "../../core/renderer.js";
+import { createAgentApiSurfaceClient } from "../../agentApiPath";
+import { defineCommand, registerCliCommand } from "../../core/command";
+import type { CommandRuntimeOptions } from "../../core/context";
+import { cliError } from "../../core/errors";
+import { writeJson, writeText, adoptCliReplyText } from "../../core/renderer";
 
 interface MarketplaceOptions {
   limit?: string;
@@ -35,6 +35,8 @@ export function formatMarketplaceApps(data: AgentApiIntegrationMarketplaceRespon
       `   installed on this Server: ${app.installedOnServer ? "yes" : "no"}`,
       `   allowed scopes: ${app.allowedScopes.length > 0 ? app.allowedScopes.join(", ") : "none declared"}`,
     ];
+    if (app.setupUrl) lines.push("   post-install setup: required");
+    if (app.setupDescription) lines.push(`   setup instructions: ${oneLine(app.setupDescription)}`);
     if (app.description) lines.push(`   description: ${oneLine(app.description)}`);
     if (app.dataAccessSummary) lines.push(`   data access: ${oneLine(app.dataAccessSummary)}`);
     if (app.homepageUrl) lines.push(`   homepage: ${app.homepageUrl}`);

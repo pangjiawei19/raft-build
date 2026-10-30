@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { getCreatableRuntimeOptions } from "@botiverse/raft-shared";
@@ -175,7 +174,7 @@ test("MCP credential-header rows are each individually addressable", async () =>
     </MemoryRouter>,
   );
   const addServer = await waitFor(() => {
-    const [button] = screen.queryAllByRole("button", { name: /add server/i });
+    const [button] = screen.queryAllByRole("button", { name: /add mcp server/i });
     assert.ok(button, "the MCP editor must be reachable");
     return button;
   });

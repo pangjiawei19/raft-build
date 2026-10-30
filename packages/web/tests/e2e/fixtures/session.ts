@@ -87,7 +87,7 @@ export async function newAuthenticatedContext(
   // contract. Keep the announcement-modal spec as the sole owner of that
   // stateful fixture so shard/order changes cannot put a modal over unrelated
   // UI actions.
-  await context.route("**/api/announcements/active", async (route) => {
+  await context.route(/\/api\/announcements\/active(?:\?|$)/, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",

@@ -1,6 +1,5 @@
 // @ts-nocheck
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -58,7 +57,7 @@ function renderRail(userId: string | null) {
   return render(
     <MemoryRouter initialEntries={["/s/botiverse/channel/general"]}>
       <TestIntlProvider>
-        <LeftRail side="left" workspaceModeAvailable={false} />
+        <LeftRail />
       </TestIntlProvider>
     </MemoryRouter>,
   );
@@ -71,7 +70,7 @@ function renderRail(userId: string | null) {
  */
 function railDots() {
   const help = screen.queryByTestId("left-rail-help");
-  return help ? help.querySelectorAll("span.rounded-full") : [];
+  return help ? help.querySelectorAll('[data-slot="app-rail-item-indicator"]') : [];
 }
 
 function openHelp() {
@@ -108,13 +107,14 @@ test("a user who has not seen the mobile app gets a dot on Help and on the row",
   // these as `h-2.5 w-2.5` / `h-1 w-1` — the primitive emits the `size-*`
   // shorthand, which is the same box. Asserting the doc's spelling failed
   // against correct markup, so this pins what the component actually renders.)
+  // Raft Design System: the attention mark is the 9px square pixel (`lg`).
   assert.ok(
-    rowDot.className.includes("size-2.5"),
-    `the menu-row dot must be the canonical 10px: ${rowDot.className}`,
+    rowDot.className.includes("size-[9px]"),
+    `the menu-row dot must be the canonical 9px pixel: ${rowDot.className}`,
   );
   assert.ok(
-    !rowDot.className.includes("size-1 "),
-    `the menu-row dot must not fall back to the compact 4px: ${rowDot.className}`,
+    !rowDot.className.includes("size-1.5 "),
+    `the menu-row dot must not fall back to the compact 6px: ${rowDot.className}`,
   );
 });
 

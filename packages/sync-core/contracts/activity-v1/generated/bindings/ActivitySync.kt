@@ -56,6 +56,12 @@ object ActivitySyncContractJson {
 
 const val ACTIVITY_SYNC_TYPESPEC_SHA256: String = "e47e0d12055c37c01c522f608e5d1b2e56378a588b24894f450468353791bdad"
 
+/** Wire contract identity, compared with the server-reported contract (X-Raft-Contract header, follow-up to task #3). */
+const val ACTIVITY_SYNC_CONTRACT: String = "raft.activity-sync"
+
+/** Contract revision from revisions.json; enable the sync engine only when the server reports exactly this revision. */
+const val ACTIVITY_SYNC_CONTRACT_REVISION: Int = 2
+
 typealias OpaqueId = String
 
 typealias SafeUnsignedCounter = Long

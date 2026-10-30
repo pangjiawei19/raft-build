@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
-import { test } from "vitest";
 import { ProxyAgent } from "undici";
-import { createProviderHttpClient, daemonFetch, withDaemonFetchProxy } from "./daemonFetch.js";
+import { createProviderHttpClient, daemonFetch, withDaemonFetchProxy } from "./daemonFetch";
 import {
+  buildDirectFetchDispatcher,
   buildIsolatedFetchDispatcher,
   evictIsolatedFetchDispatcher,
-} from "./proxy.js";
+} from "./proxy";
 
 test("daemonFetch accepts a native Request without passing the Request object to undici", async () => {
   const seen: { method?: string; testHeader?: string; body: string } = { body: "" };
@@ -197,7 +197,10 @@ test("withDaemonFetchProxy honors NO_PROXY bypasses", () => {
   });
 
   assert.equal(init.method, "POST");
-  assert.equal(init.dispatcher, undefined);
+  // Bypassed targets still get the daemon's HTTP/1.1 dispatcher, not undici's
+  // global one (which negotiates HTTP/2 in undici 8).
+  assert.equal(init.dispatcher, buildDirectFetchDispatcher());
+  assert.ok(!(init.dispatcher instanceof ProxyAgent));
 });
 
 test("provider HTTP clients own and dispose their isolated dispatcher pools", async () => {

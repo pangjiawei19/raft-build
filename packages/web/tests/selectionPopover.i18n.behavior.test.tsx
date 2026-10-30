@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, render, screen } from "@testing-library/react";
 
-import SelectionPopover from "../src/components/ui/SelectionPopover";
+// The copy lives in the sections both forms share (the positioned popover and
+// the bare panel); the bare panel renders without a Popover root.
+import { SelectionPopoverPanel as SelectionPopover } from "../src/components/ui/SelectionPopover";
 import { en as enMessages } from "../src/i18n/messages/en";
 import { zhCn as zhMessages } from "../src/i18n/messages/zh-cn";
 import { TestIntlProvider } from "./helpers/intl";

@@ -21,6 +21,7 @@ export function getCurrentReturnTo(): string {
 export function buildSocialAuthStartUrl(provider: SocialAuthProviderId, returnTo: string): string {
   const url = new URL(`${getApiBaseUrl()}/auth/${provider}/start`, window.location.origin);
   url.searchParams.set("returnTo", sanitizeReturnTo(returnTo));
+  url.searchParams.set("linkOnConflict", "1");
   return url.toString();
 }
 

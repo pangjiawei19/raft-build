@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, fireEvent, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -66,7 +65,7 @@ function renderMachine(machine: Machine) {
 
   return renderWithIntl(
     <MemoryRouter initialEntries={[`/s/acme/settings/computers/${machine.id}`]}>
-      <MachineDetailPanel machine={machine} workspaceEmbedded />
+      <MachineDetailPanel machine={machine} hideHeader />
     </MemoryRouter>,
   );
 }

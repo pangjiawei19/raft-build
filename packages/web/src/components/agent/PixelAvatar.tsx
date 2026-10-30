@@ -7,7 +7,10 @@ import { en } from "../../i18n/messages/en";
 
 /**
  * Pixel art avatar system for agents.
- * Each avatar is an 8×8 grid rendered via CSS grid with 1:1 cells.
+ * Each avatar is an 8×8 sprite rendered as ONE <img> whose src is a cached
+ * SVG data URL (task #137). It used to be a CSS grid of 64 <div>s per avatar:
+ * a busy channel carried 134 avatars = 8,710 of its 14,827 DOM nodes (59%),
+ * inflating every style/layout pass over the timeline and sidebar.
  * Stored as avatarUrl = "pixel:key" (predefined) or "pixel:random:seed" (generated).
  *
  * Canonical palette + sprite data live in assets/avatars/pixelAvatars.json
@@ -139,6 +142,37 @@ function generateAvatar(seed: string): { grid: PaletteKey[][]; bg: string } {
   return result;
 }
 
+/** Sprite data for a key: a predefined sprite, or "random:<seed>" generated. */
+export function getPixelAvatarData(avatarKey: string): { grid: PaletteKey[][]; bg: string } | null {
+  if (avatarKey.startsWith("random:")) return generateAvatar(avatarKey.slice(7));
+  return AVATARS[avatarKey] || null;
+}
+
+function svgDataUrl(svg: string): string {
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
+}
+
+const dataUrlCache = new Map<string, string | null>();
+
+/**
+ * The avatar as one SVG data URL (8×8 viewBox, crisp edges). Single source for
+ * the live avatar and for share/screenshot capture. Cached per key: sprites are
+ * immutable and palette colors are fixed (not theme tokens).
+ */
+export function pixelAvatarDataUrl(avatarKey: string): string | null {
+  const cached = dataUrlCache.get(avatarKey);
+  if (cached !== undefined) return cached;
+  const data = getPixelAvatarData(avatarKey);
+  let url: string | null = null;
+  if (data) {
+    const cells = data.grid.flatMap((row, y) => row.flatMap((colorKey, x) =>
+      colorKey === "_" ? [] : [`<rect x="${x}" y="${y}" width="1" height="1" fill="${C[colorKey]}"/>`]));
+    url = svgDataUrl(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 8 8" shape-rendering="crispEdges"><rect width="8" height="8" fill="${data.bg}"/>${cells.join("")}</svg>`);
+  }
+  dataUrlCache.set(avatarKey, url);
+  return url;
+}
+
 /** Parse "pixel:key" or "pixel:random:seed" format from avatarUrl */
 export function parsePixelAvatar(avatarUrl: string | null): string | null {
   if (!avatarUrl?.startsWith("pixel:")) return null;
@@ -150,57 +184,27 @@ function getEffectiveAvatarKey(avatarUrl: string | null): string {
   return parsePixelAvatar(avatarUrl) || DEFAULT_AVATAR_KEY;
 }
 
-/** Render a pixel art avatar at the given size */
+/** Render a pixel art avatar. It fills its frame (the avatar sticker sizes
+ *  it), so the pixels sit flush to the border at any DPR. */
 const PixelAvatar = memo(function PixelAvatar({
   avatarKey,
-  size = 40,
   className = "",
 }: {
   avatarKey: string;
-  size?: number;
   className?: string;
 }) {
-  // Determine if this is a random avatar (key starts with "random:")
-  const isRandom = avatarKey.startsWith("random:");
-  const seed = isRandom ? avatarKey.slice(7) : null;
-
-  const data = useMemo(() => {
-    if (seed) return generateAvatar(seed);
-    return AVATARS[avatarKey] || null;
-  }, [avatarKey, seed]);
-
-  if (!data) return null;
-
-  const cellSize = size / 8;
+  const src = useMemo(() => pixelAvatarDataUrl(avatarKey), [avatarKey]);
+  if (!src) return null;
 
   return (
-    <div
-      className={`shrink-0 ${className}`}
-      style={{
-        // Default to fixed `size`. Callers can override via className
-        // (`!w-full !h-full`) to make the grid fill its parent — used by
-        // AvatarSlot to push pixels flush to the border on non-integer
-        // DPR devices.
-        width: size,
-        height: size,
-        display: "grid",
-        gridTemplateColumns: `repeat(8, minmax(0, 1fr))`,
-        gridTemplateRows: `repeat(8, minmax(0, 1fr))`,
-        backgroundColor: data.bg,
-        imageRendering: "pixelated",
-      }}
+    <img
+      src={src}
+      alt=""
+      draggable={false}
+      className={`size-full shrink-0 ${className}`.trim()}
+      style={{ imageRendering: "pixelated" }}
       data-agent-pixel-avatar="true"
-      data-cell-size={cellSize}
-    >
-      {data.grid.flat().map((colorKey, i) => (
-        <div
-          key={i}
-          style={{
-            backgroundColor: colorKey === "_" ? "transparent" : C[colorKey],
-          }}
-        />
-      ))}
-    </div>
+    />
   );
 });
 
@@ -210,15 +214,12 @@ export function isCustomAvatar(avatarUrl: string | null): boolean {
   return !avatarUrl.startsWith("pixel:");
 }
 
-/** Render an agent avatar — custom image if uploaded, pixel art otherwise */
+/** Render an agent avatar — custom image if uploaded, pixel art otherwise.
+ *  Either one fills its frame: put it inside an AvatarSlot. */
 export const AgentAvatar = memo(function AgentAvatar({
   avatarUrl,
-  size = 40,
-  className = "",
 }: {
   avatarUrl: string | null;
-  size?: number;
-  className?: string;
 }) {
   // Some legacy test render trees mount this shared leaf without IntlProvider.
   const intl = useContext(IntlContext as unknown as Context<OptionalAvatarIntl | null>);
@@ -229,13 +230,12 @@ export const AgentAvatar = memo(function AgentAvatar({
       <img
         src={avatarUrl!}
         alt={avatarAlt}
-        className={`shrink-0 object-cover ${className}`}
-        style={{ width: size, height: size }}
+        className="size-full shrink-0 object-cover"
         onError={() => setFailedCustomUrl(avatarUrl)}
       />
     );
   }
-  return <PixelAvatar avatarKey={getEffectiveAvatarKey(avatarUrl)} size={size} className={className} />;
+  return <PixelAvatar avatarKey={getEffectiveAvatarKey(avatarUrl)} />;
 });
 
 export default PixelAvatar;

@@ -1,61 +1,88 @@
-import "zod-openapi";
-
+// NOTE: do not add `import "zod-openapi"` here. This file is reachable from
+// the @botiverse/raft-shared package barrel, so zod-openapi's global
+// `declare module 'zod/v4'` augmentation would leak into the published type
+// files of every downstream package (sdk, computer/lib) and rewrite their
+// consumers' own zod typing. The `.meta()` calls below use only built-in
+// zod fields (id/description/readOnly). If a future contract genuinely
+// needs OpenAPI-specific meta fields with type checking, the import belongs
+// in `openApiContract.ts` (the document-generation end, unreachable from
+// the barrel) — and note the augmentation only applies to modules that
+// import zod from "zod/v4", so the file using those fields must import from
+// "zod/v4" too, not "zod".
 import { z } from "zod";
+import { lazySchema } from "./lazySchema";
 
 export const ATTACHMENT_UPLOAD_MAX_SIZE_BYTES = 200 * 1024 * 1024;
 
-export const attachmentUploadIdSchema = z.uuid().meta({ id: "AttachmentUploadId" });
-export const attachmentIdSchema = z.uuid().meta({ id: "AttachmentId" });
+export const attachmentUploadIdSchema = lazySchema("attachmentUploadIdSchema", () => z.uuid().meta({ id: "AttachmentUploadId" }));
+export const attachmentIdSchema = lazySchema("attachmentIdSchema", () => z.uuid().meta({ id: "AttachmentId" }));
 
-export const attachmentUploadStateSchema = z.enum([
+export const attachmentUploadStateSchema = lazySchema("attachmentUploadStateSchema", () => z.enum([
   "pending",
   "verifying",
   "completed",
   "canceled",
   "expired",
   "failed",
-]).meta({ id: "AttachmentUploadState" });
+]).meta({ id: "AttachmentUploadState" }));
 
-export const attachmentReservationStateSchema = z.enum([
+export const attachmentReservationStateSchema = lazySchema("attachmentReservationStateSchema", () => z.enum([
   "pending",
   "consumed",
   "canceled",
   "expired",
-]).meta({ id: "AttachmentReservationState" });
+]).meta({ id: "AttachmentReservationState" }));
 
-export const attachmentSchema = z.strictObject({
+export const attachmentSchema = lazySchema("attachmentSchema", () => z.strictObject({
   id: attachmentIdSchema,
   filename: z.string().min(1).max(255),
   mimeType: z.string().min(1).max(255).nullable(),
   sizeBytes: z.int().nonnegative().max(ATTACHMENT_UPLOAD_MAX_SIZE_BYTES),
   thumbnailUrl: z.url().nullable(),
-}).meta({ id: "AttachmentUploadResponse" });
+}).meta({ id: "AttachmentUploadResponse" }));
 
-export const attachmentUploadSessionSchema = z.strictObject({
+export const attachmentUploadSessionSchema = lazySchema("attachmentUploadSessionSchema", () => z.strictObject({
   uploadId: attachmentUploadIdSchema,
   state: attachmentUploadStateSchema,
   expiresAt: z.iso.datetime(),
   attachment: attachmentSchema.nullable(),
   terminalReason: z.string().min(1).nullable(),
   reservationState: attachmentReservationStateSchema.nullable().optional(),
-}).meta({ id: "AttachmentUploadSessionView" });
+}).meta({ id: "AttachmentUploadSessionView" }));
 
-export const attachmentUploadCapabilitiesSchema = z.strictObject({
+export const attachmentUploadRecoverySchema = lazySchema("attachmentUploadRecoverySchema", () => z.strictObject({
+  uploadId: attachmentUploadIdSchema,
+  filename: z.string().min(1).max(255),
+  mimeType: z.string().min(1).max(255),
+  sizeBytes: z.int().positive().max(ATTACHMENT_UPLOAD_MAX_SIZE_BYTES),
+  state: z.enum(["pending", "verifying"]),
+  expiresAt: z.iso.datetime(),
+}).meta({ id: "AttachmentUploadRecoveryView" }));
+
+export const attachmentUploadRecoveryListSchema = lazySchema("attachmentUploadRecoveryListSchema", () => z.strictObject({
+  uploads: z.array(attachmentUploadRecoverySchema).max(100),
+}).meta({ id: "AttachmentUploadRecoveryList" }));
+
+export const attachmentUploadCapabilitiesSchema = lazySchema("attachmentUploadCapabilitiesSchema", () => z.strictObject({
   directUploadEnabled: z.boolean(),
   directUploadThresholdBytes: z.int().positive().max(ATTACHMENT_UPLOAD_MAX_SIZE_BYTES).nullable(),
   maxBytes: z.int().positive().max(ATTACHMENT_UPLOAD_MAX_SIZE_BYTES),
   sessionExpiresInSeconds: z.int().positive().max(86_400).nullable(),
-}).meta({ id: "AttachmentUploadCapabilities" });
+}).meta({ id: "AttachmentUploadCapabilities" }));
 
-export const createAttachmentUploadSessionRequestSchema = z.strictObject({
+export const createAttachmentUploadSessionRequestSchema = lazySchema("createAttachmentUploadSessionRequestSchema", () => z.strictObject({
   channelId: z.uuid(),
   filename: z.string().min(1).max(255),
   mimeType: z.string().min(1).max(255),
   sizeBytes: z.int().positive().max(ATTACHMENT_UPLOAD_MAX_SIZE_BYTES),
   clientRequestId: z.uuid(),
-}).meta({ id: "CreateAttachmentUploadSessionRequest" });
+}).meta({ id: "CreateAttachmentUploadSessionRequest" }));
 
-export const createAttachmentUploadSessionResponseSchema = z.strictObject({
+export const listAttachmentUploadSessionsPathParamsSchema = lazySchema("listAttachmentUploadSessionsPathParamsSchema", () => z.strictObject({
+  channelId: z.uuid(),
+}).meta({ id: "ListAttachmentUploadSessionsPathParams" }));
+
+export const createAttachmentUploadSessionResponseSchema = lazySchema("createAttachmentUploadSessionResponseSchema", () => z.strictObject({
   uploadId: attachmentUploadIdSchema,
   attachmentId: attachmentIdSchema,
   state: z.literal("pending"),
@@ -71,17 +98,17 @@ export const createAttachmentUploadSessionResponseSchema = z.strictObject({
       "If-None-Match": z.literal("*"),
     }),
   }),
-}).meta({ id: "CreateAttachmentUploadSessionResponse" });
+}).meta({ id: "CreateAttachmentUploadSessionResponse" }));
 
-export const completeAttachmentUploadSessionResponseSchema = z.strictObject({
+export const completeAttachmentUploadSessionResponseSchema = lazySchema("completeAttachmentUploadSessionResponseSchema", () => z.strictObject({
   uploadId: attachmentUploadIdSchema,
   state: z.literal("completed"),
   attachment: attachmentSchema,
-}).meta({ id: "CompleteAttachmentUploadSessionResponse" });
+}).meta({ id: "CompleteAttachmentUploadSessionResponse" }));
 
-export const attachmentUploadPathParamsSchema = z.strictObject({
+export const attachmentUploadPathParamsSchema = lazySchema("attachmentUploadPathParamsSchema", () => z.strictObject({
   uploadId: attachmentUploadIdSchema,
-});
+}));
 
 const flatError = <Code extends string, Retryable extends boolean>(
   id: string,
@@ -181,6 +208,18 @@ export const attachmentUploadContract = {
     summary: "Get server-authoritative attachment upload limits",
     responses: {
       200: { description: "Current upload capability", schema: attachmentUploadCapabilitiesSchema },
+    },
+  }),
+  list: defineOperation({
+    method: "get",
+    path: "/api/attachments/upload-sessions/{channelId}/active",
+    operationId: "listAttachmentUploadSessions",
+    summary: "List active attachment uploads for a channel",
+    requestParams: listAttachmentUploadSessionsPathParamsSchema,
+    responses: {
+      200: { description: "Active uploads owned by the current member", schema: attachmentUploadRecoveryListSchema },
+      400: { description: "Invalid channel id", schema: invalidUploadRequestErrorSchema },
+      403: { description: "Upload is forbidden", schema: attachmentUploadForbiddenErrorSchema },
     },
   }),
   create: defineOperation({

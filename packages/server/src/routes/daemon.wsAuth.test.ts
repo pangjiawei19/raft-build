@@ -1,24 +1,25 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
-import { openTestDatabase, closeTestDatabase } from "../test/integration/database.js";
+import { dbTest as test } from "../test/integration/dbTest";
+import { openTestDatabase, closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
+import { serverMachineContextCapabilities } from "../runtimeOutcomeOutboxIngest";
+import { RAFT_SERVER_CAPABILITIES_HEADER, SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1 } from "@botiverse/raft-shared";
 import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
-import { afterAll, beforeAll } from "vitest";
 
 import { eq } from "drizzle-orm";
 import { WebSocket } from "ws";
 
-import { getDb } from "../db/index.js";
-import { computers, machines, servers, users } from "../db/schema.js";
-import { setupMachineWebSocket } from "./daemon.js";
-import { createServer as createRaftServer, addMember } from "../services/serverService.js";
-import { registerMachine } from "../services/machineService.js";
+import { getDb } from "../db/index";
+import { computers, machines, servers, users } from "../db/schema";
+import { setupMachineWebSocket } from "./daemon";
+import { createServer as createRaftServer, addMember } from "../services/serverService";
+import { registerMachine } from "../services/machineService";
 import {
   generateComputerApiKeyMaterial,
   extractComputerApiKeyPrefix,
-} from "../services/computerCredentialService.js";
+} from "../services/computerCredentialService";
 import argon2 from "argon2";
-import type { AgentOrchestrator } from "../services/agentOrchestrator.js";
+import type { AgentOrchestrator } from "../services/agentOrchestrator";
 
 
 // task #88 (#wg-raft-computer 2026-06-05): pins the /daemon/connect auth
@@ -89,7 +90,7 @@ async function seedUser(): Promise<string> {
   return u.id;
 }
 
-type ConnectResult = { status?: number; reason?: string; open?: boolean; firstMessage?: unknown };
+type ConnectResult = { status?: number; reason?: string; open?: boolean; firstMessage?: unknown; upgradeHeaders?: Record<string, string | string[] | undefined> };
 
 function attemptConnect(
   key: string | null,
@@ -125,18 +126,21 @@ function attemptConnect(
       ws.terminate();
       finish({ status: res.statusCode, reason: Array.isArray(raw) ? raw[0] : raw });
     });
+    // task #1268: the 101 response pre-reads the server capabilities for the daemon.
+    let upgradeHeaders: Record<string, string | string[] | undefined> = {};
+    ws.on("upgrade", (res) => { upgradeHeaders = res.headers; });
     ws.on("open", () => {
       if (!captureFirstMessage) {
         clearTimeout(timer);
         ws.close();
-        finish({ open: true });
+        finish({ open: true, upgradeHeaders });
       }
     });
     ws.on("message", (data) => {
       if (!captureFirstMessage) return;
       clearTimeout(timer);
       ws.close();
-      finish({ open: true, firstMessage: JSON.parse(data.toString()) });
+      finish({ open: true, upgradeHeaders, firstMessage: JSON.parse(data.toString()) });
     });
     ws.on("error", () => {
       // For a 401 the ws client fires `unexpected-response` then `error`;
@@ -151,7 +155,8 @@ function attemptConnect(
 }
 
 function lastSpan(): CapturedSpan {
-  return spans[spans.length - 1];
+  const authSpans = spans.filter((span) => span.name === "server.daemon.connect.auth");
+  return authSpans[authSpans.length - 1];
 }
 
 // Every reject must end the span with the closed-set outcome/reason/auth_stage
@@ -255,6 +260,8 @@ test("same prefix but non-verifying key → 401 computer_key_hash_mismatch", asy
   assert.equal(res.status, 401);
   assert.equal(res.reason, "computer_key_hash_mismatch");
   assertRejectSpanContract("computer_key_hash_mismatch", "computer_lookup");
+  // The failed verify still costs a pool thread, so it is counted.
+  assert.equal(lastSpan().endAttrs?.argon2_verify_count, 1);
 });
 
 test("computer attachment with null machineId → 401 computer_machine_unlinked", async () => {
@@ -364,12 +371,18 @@ test("valid computer attachment → 101 accepted; span carries ids, never the ke
     type: "machine:context",
     machineId: machine.id,
     serverId: server.id,
+    // task #1268: the server always advertises ready-before-detection.
+    capabilities: serverMachineContextCapabilities(),
   });
   const span = lastSpan();
   assert.equal(span.ended, true);
   assert.equal(span.endAttrs?.outcome, "accepted");
   assert.equal(span.endAttrs?.machine_id, machine.id);
   assert.equal(span.endAttrs?.server_id, server.id);
+  // One argon2 verify for the one prefix candidate; its wall time is on the root.
+  assert.equal(span.endAttrs?.argon2_verify_count, 1);
+  assert.equal(typeof span.endAttrs?.argon2_verify_ms_total, "number");
+  assert.equal(span.endAttrs?.argon2_verify_ms_max, span.endAttrs?.argon2_verify_ms_total);
   assertConnectHostContract(span, "api_slock_ai", true);
   const acceptEvent = span.events.find((e) => e.name === "auth.accepted");
   assert.ok(acceptEvent);
@@ -388,6 +401,25 @@ test("valid computer attachment → 101 accepted; span carries ids, never the ke
   assert.equal(typeof span.startAttrs.api_key_fingerprint, "string");
 });
 
+test("argon2 cost on the auth span: 0 when no candidate, 1 on a legacy key's first connect, 0 from the auth cache", async () => {
+  const userId = await seedUser();
+  const server = await createRaftServer("Argon2 Cost Co", `ws-a2-${randomUUID()}`, userId);
+  await addMember(server.id, userId, "owner");
+
+  const unknown = await generateComputerApiKeyMaterial();
+  const miss = await attemptConnect(unknown.apiKey);
+  assert.equal(miss.reason, "computer_not_found");
+  assert.equal(lastSpan().endAttrs?.argon2_verify_count, 0);
+  assert.equal(lastSpan().endAttrs?.argon2_verify_ms_total, 0);
+
+  const { apiKey } = await registerMachine(server.id, userId, "argon2-cost-m");
+  assert.equal((await attemptConnect(apiKey)).open, true);
+  assert.equal(lastSpan().endAttrs?.outcome, "accepted");
+  assert.equal(lastSpan().endAttrs?.argon2_verify_count, 1);
+  assert.equal((await attemptConnect(apiKey)).open, true);
+  assert.equal(lastSpan().endAttrs?.argon2_verify_count, 0);
+});
+
 test("legacy query-string key remains accepted during daemon rollout", async () => {
   const userId = await seedUser();
   const server = await createRaftServer("Legacy Query Co", `ws-lq-${randomUUID()}`, userId);
@@ -398,6 +430,33 @@ test("legacy query-string key remains accepted during daemon rollout", async () 
   assert.equal(res.open, true);
   assert.equal(lastSpan().endAttrs?.outcome, "accepted");
   assert.equal(registeredPrincipalKinds.at(-1), "legacy_machine");
+});
+
+test("task #1268: the accepted 101 response carries Raft-Server-Capabilities with runtime-detection-async-v1, matching machine:context", async () => {
+  const userId = await seedUser();
+  const server = await createRaftServer("Live Co", `ws-caps-${randomUUID()}`, userId);
+  await addMember(server.id, userId, "owner");
+  const { machine } = await registerMachine(server.id, userId, "caps-m");
+  const mat = await generateComputerApiKeyMaterial();
+  await getDb()
+    .insert(computers)
+    .values({
+      serverId: server.id,
+      name: "caps-box",
+      apiKeyHash: mat.apiKeyHash,
+      apiKeyPrefix: mat.apiKeyPrefix,
+      attachedByUserId: userId,
+      machineId: machine.id,
+    });
+
+  const res = await attemptConnect(mat.apiKey, { host: "api.slock.ai", captureFirstMessage: true });
+  assert.equal(res.open, true);
+  const raw = res.upgradeHeaders?.[RAFT_SERVER_CAPABILITIES_HEADER];
+  const headerCaps = (Array.isArray(raw) ? raw.join(" ") : raw ?? "").split(/\s+/).filter(Boolean);
+  assert.ok(headerCaps.includes(SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1), `header should declare the capability, got ${JSON.stringify(raw)}`);
+  const context = res.firstMessage as { type: string; capabilities?: string[] };
+  assert.equal(context.type, "machine:context");
+  assert.deepEqual([...headerCaps].sort(), [...(context.capabilities ?? [])].sort(), "header and machine:context declare the same list");
 });
 
 // MUST be the last test: it closes the DB to force the auth lookup to throw,

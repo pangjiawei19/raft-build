@@ -3,6 +3,7 @@ import type { AgentActivity, ChannelAdminBasis, ChannelRole, ServerRole } from "
 import type { Agent } from "../store/agentStore";
 import { useAgentStore } from "../store/agentStore";
 import api from "../api/client";
+import type { ChannelMemberServer } from "../utils/channelLocalMembership";
 import { getSocket } from "../api/socket";
 import { notifyChannelMembersChanged, subscribeChannelMembersChanged } from "../store/channelMemberEvents";
 
@@ -13,6 +14,9 @@ export interface ChannelHuman {
   serverId?: string;
   serverName?: string | null;
   serverSlug?: string | null;
+  /** Joint channels only (RFC 075 phase 1): every server this person
+   *  participates through, the viewed server first. */
+  servers?: ChannelMemberServer[];
   name: string;
   displayName: string | null;
   description: string | null;
@@ -43,6 +47,9 @@ export interface ChannelExternalMember {
   handles: string[];
   actorKind: "human" | "guest" | "remote" | "bot" | "unknown";
   avatarUrl: string | null;
+  /** Slack workspace display name for the external-identity panel
+   *  ("from <workspace>" line). Provider-side ids stay server-side. */
+  workspaceName: string | null;
 }
 
 interface ChannelMembersPayload {
@@ -54,6 +61,8 @@ interface ChannelMembersPayload {
 export type AddChannelMembersBatchInput = {
   userIds: string[];
   agentIds: string[];
+  actionCardMessageId?: string;
+  actionCardConfirmationVersion?: number;
 };
 
 export type AddChannelMembersBatchResult = {
@@ -188,9 +197,13 @@ export function useChannelMembers(channelId: string, { enabled = true }: { enabl
     });
   }, [channelId, enabled, loadMembers]);
 
-  const addAgent = useCallback(async (agentId: string) => {
+  const addAgent = useCallback(async (agentId: string, context?: { actionCardMessageId?: string; actionCardConfirmationVersion?: number }) => {
     try {
-      await api.post(`/channels/${channelId}/members`, { agentId });
+      await api.post(`/channels/${channelId}/members`, {
+        agentId,
+        ...(context?.actionCardMessageId ? { actionCardMessageId: context.actionCardMessageId } : {}),
+        ...(context?.actionCardConfirmationVersion !== undefined ? { actionCardConfirmationVersion: context.actionCardConfirmationVersion } : {}),
+      });
       notifyChannelMembersChanged(channelId);
       await loadMembers();
     } catch (err) {
@@ -212,9 +225,13 @@ export function useChannelMembers(channelId: string, { enabled = true }: { enabl
     }
   }, [channelId, loadMembers]);
 
-  const addHuman = useCallback(async (userId: string) => {
+  const addHuman = useCallback(async (userId: string, context?: { actionCardMessageId?: string; actionCardConfirmationVersion?: number }) => {
     try {
-      await api.post(`/channels/${channelId}/members`, { userId });
+      await api.post(`/channels/${channelId}/members`, {
+        userId,
+        ...(context?.actionCardMessageId ? { actionCardMessageId: context.actionCardMessageId } : {}),
+        ...(context?.actionCardConfirmationVersion !== undefined ? { actionCardConfirmationVersion: context.actionCardConfirmationVersion } : {}),
+      });
       notifyChannelMembersChanged(channelId);
       await loadMembers();
     } catch (err) {

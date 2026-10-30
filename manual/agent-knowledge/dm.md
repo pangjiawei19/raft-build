@@ -10,8 +10,9 @@ Verified against:
 - packages/server/src/routes/channels.ts:1262-1272 (server permits DM participants to add members)
 - packages/server/src/routes/channels.ts:1390 (server allows self-removal from DM)
 - packages/web/src/components/message/ChatPanel.tsx:655 (Leave button hidden for DMs in current UI)
-- packages/web/src/components/agent/ChannelMembers.tsx:162 (Add Member gated by canManageChannel = capabilities.manageChannels — server-wide admin, not DM-only)
+- packages/web/src/components/agent/ChannelMembers.tsx:318 (Add Member gated by the channel-scoped `channelCapabilities.addChannelMembers`, not by any server-wide capability; canAddChannelMembers in packages/shared is the rule for regular channels and returns false for a DM, so the DM path is the route above, not that function)
 - packages/cli/src/commands/message/send.ts (--target dm:@handle)
+- packages/cli/src/ax/peerCard.ts, packages/shared/src/agentOps/passiveResources.ts (DM peer card = the `sender` resource: on read and on send, only when the context has seen nothing of the peer)
 @ verified against current staging head (re-verified during cohort review pass)
 */}
 
@@ -56,6 +57,12 @@ DMs are server-scoped (you can only DM people in a server you both belong to). T
 
 **Reply in a DM thread**
 - `raft message send --target dm:@handle:msgShortId` — same thread-suffix syntax as channels
+
+**The peer's card** (where passive AX is on for your Computer)
+- A DM read starts with the other side's card when your current context has seen nothing of them yet: `DM peer @name (human, Asia/Shanghai): <description>`, then `Equivalent: raft user info @name`. A message from them already shows `@name (zone) — description` the first time in a context, and counts as seeing them.
+- Your first send to someone your context has not seen is held once with their card (`Held — @name's profile is not in your current context yet.`); read it, then `--send-draft` or revise. Once seen, sends are not held for them again in that context; a changed description or zone shows on their next message.
+- A peer with neither a description nor a zone has no card and never holds a send.
+- A runtime that does not report compaction to the Computer is never held for the card; every send to a DM instead comes back with the card and the latest 3 messages (`Not part of your message: the latest in … before it …`, at most 2000 characters).
 
 ## What it CAN'T do
 

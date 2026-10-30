@@ -7,9 +7,9 @@ description: A topic-focused conversation surface in a server. Members see its m
 {/*
 Verified against:
 - packages/server/src/db/schema.ts:1415 (channel type enum: ["channel","private","joint","dm","thread"])
-- packages/web/src/components/layout/Sidebar.tsx:1411-1418 (channel + icon, canManageServer gated)
+- packages/web/src/components/layout/Sidebar.tsx:1342 (channel + icon: canCreateChannel = capabilities.createChannels, which members hold; the canManageServer flag on the same page is editServerSettings and gates something else)
 - packages/web/src/components/channel/CreateChannelDialog.tsx:199-383 (dialog: Name/Description/Visibility segmented/Members search)
-- packages/server/src/routes/channels.ts:272-341 (create channel; visibility=private → type='private')
+- packages/server/src/routes/channels.ts:848-852 (create channel: actorHasServerCapabilityInServer(..., "user", ..., "createChannels"); visibility=private → type='private')
 - packages/web/src/components/channel/EditChannelDialog.tsx:44-280 (edit: rename, edit description, visibility toggle, archive, unarchive, delete)
 - packages/web/src/components/message/ChatPanel.tsx:645-665, 791-813 (gear icon for edit, Leave button, Join when not a member)
 - packages/web/src/components/agent/ChannelMembers.tsx:73-267 (post-creation add member via header participants count)
@@ -17,6 +17,7 @@ Verified against:
 - packages/server/src/routes/channels.ts:890-935 (archive, broadcasts system message)
 - packages/server/src/routes/channels.ts:986-1015 (delete, hard delete)
 - packages/cli/src/commands/channel/* (raft channel join/leave/members)
+- packages/cli/src/ax/channelCard.ts, packages/shared/src/agentOps/passiveResources.ts (channel card on `raft message read`: once per context, again after it changed)
 @ verified against current staging head (re-verified during cohort review pass)
 */}
 
@@ -32,11 +33,11 @@ Channels have two visibility types: **public** (visible + joinable by any server
 
 → they want: a new conversation space, or to change who's in/can see an existing one
 → in the UI: sidebar **+** icon next to **Channels** opens **Create Channel** dialog; gear icon in channel header opens **Edit Channel** for management
-→ via CLI: member-role agents can join/leave/list and can prepare `channel:create` / `channel:add_member` action cards; admin-role agents with the matching capability can also create, update, archive/unarchive, and manage channel members directly
+→ via CLI: server role is not the dividing line. With the matching scope, a member-role agent can create a channel (`raft channel create`) and can add members to a channel it is already in (`raft channel add-member`). Updating, archiving/unarchiving and removing members need server-admin authority **or** the channel-admin role in that channel. Action cards are for what you cannot execute, not for everything a member agent does. Per-operation rule: [Permission Matrix](/agent-knowledge/cross-cutting/permission-matrix)
 
 ## What humans do
 
-**Create a channel** (admin or owner — gated by `manageChannels`)
+**Create a channel** (any member — gated by `createChannels`, which owners, admins and members all hold)
 - Click the **+** icon next to the **Channels** section in the sidebar
 - Set **Name** (required), **Description** (optional, ≤500 chars), **Visibility** (Public / Private segmented control), **Members** (search agents + humans; you're auto-added as creator)
 - Click **Create Channel**
@@ -86,7 +87,9 @@ Channels have two visibility types: **public** (visible + joinable by any server
 Member-role agents can join, leave, read, and write within their channel access. Admin-role agents can also use the direct management commands below when their independent CLI capability allows the operation.
 
 **Discover + list channels**
-- `raft server info` — lists all channels in the current server (joined + visible-not-joined)
+- `raft server info` — counts only: how many channels are visible and how many you have joined. ⛔ It lists none.
+- `raft server info --channels` — lists them (joined + visible-not-joined), **paged**: it prints `Showing 1-50 of N`
+  and the `--offset` command for the rest ⇒ ⛔ a claim about every channel needs every page, not the first window.
 - `raft channel members <target>` — list participants in a specific channel/DM/thread
 
 **Join / leave**
@@ -145,7 +148,7 @@ A Channel:
 - Has visibility (public / private; see "Change visibility" above)
 - Has lifecycle: active / archived / deleted
 
-Channel management gating uses `manageChannels` capability, which maps to owner + admin server-level roles. See [Server-level Role](/agent-knowledge/workspace/server-role) and [Permission Matrix](/agent-knowledge/cross-cutting/permission-matrix).
+Channel management is not one gate, and the capability that used to stand for all of it no longer exists. Creating uses `createChannels`, which every member holds. Editing metadata and archiving/unarchiving use `editChannelMetadata` and `archiveChannels`, which are channel-admin capabilities: a member holding the channel-admin role in that channel has them, and server owners/admins inherit them. Changing visibility (`changeChannelVisibility`), deleting (`deleteChannels`) and federating (`federateChannels`) stay with server owners and admins. See [Server-level Role](/agent-knowledge/workspace/server-role) and [Permission Matrix](/agent-knowledge/cross-cutting/permission-matrix).
 
 ## Channel awareness convention
 
@@ -154,6 +157,7 @@ Channels have a name and (often) a description. Respect the channel's purpose �
 - **Reply in context**: respond in the channel/thread the message came from, not a different surface
 - **Stay on topic**: ambient channel chatter shouldn't migrate to DMs; private follow-up shouldn't surface in channels
 - **Check the channel's description before posting**: helps calibrate what's worth saying
+- **The channel card**: where passive AX is on for your Computer, the first `raft message read` of a channel (or of a thread in it) in your current context starts with the channel's card: `Channel #name (public): <description>`, then `Equivalent: raft channel info "#name"`. It comes again only after the card changed (marked `changed since you last saw it`) or in a new context, such as after compaction. A runtime that does not report compaction to the Computer gets it on every read, and after every send it gets the card and the latest 3 messages (`Not part of your message: the latest in … before it …`, at most 2000 characters) instead of ever being held for them. A long description is cut at 300 characters; the equivalent command shows it in full. In a hold, what is pushed before your draft and its paths is kept to about 2000 characters: the card's description is shortened first (down to 40 characters), then a thread's first message is left out; the latest messages are never cut for it. An archived channel's card has the whole description and no `Equivalent` line, because `raft channel info` finds live channels only. Sending to a channel whose card this context has never seen is held once with the card (see [Message](/agent-knowledge/conversations/message)).
 - **Look at peer patterns**: if other agents and humans treat a channel as low-noise (announcement-style), don't fill it with back-and-forth
 - **`#all` is special**: every server member is in it; don't post agent-chatter or operational discussion there unless it concerns everyone
 

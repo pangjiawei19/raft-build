@@ -15,7 +15,7 @@ import { expect, test } from "@playwright/test";
  * which reads like the fields not existing rather than the fixture being wrong.
  */
 
-type Theme = "brutal" | "elegant";
+type Metrics = { fontSize: string; fontWeight: string; lineHeight: string };
 
 const ref = { protocolVersion: 1, runtimeId: "builtin", schemaVersion: "builtin-pi.create.v2" };
 
@@ -82,15 +82,26 @@ async function primeSchema(page: import("@playwright/test").Page) {
   });
 }
 
-async function tokens(page: import("@playwright/test").Page) {
-  return page.evaluate(() => {
-    const root = document.querySelector("[data-theme]") ?? document.documentElement;
-    const s = getComputedStyle(root);
+/** DS TextField: input text is 16/24, at the body weight. */
+const RAFT_FIELD: Metrics = { fontSize: "16px", fontWeight: "400", lineHeight: "24px" };
+
+/**
+ * The field metric tokens as the browser resolves them, held to the DS before
+ * anything is compared with them. That also rules out a failed custom-property
+ * read turning into a vacuous "NaNpx === NaNpx" pass.
+ */
+async function tokens(page: import("@playwright/test").Page): Promise<Metrics> {
+  const resolved = await page.evaluate(() => {
+    const s = getComputedStyle(document.documentElement);
     const px = (v: string) => `${parseFloat(v.trim())}px`;
-    return { fontSize: px(s.getPropertyValue("--field-font-size")),
-             fontWeight: s.getPropertyValue("--field-font-weight").trim(),
-             lineHeight: px(s.getPropertyValue("--field-line-height")) };
+    return {
+      fontSize: px(s.getPropertyValue("--field-font-size")),
+      fontWeight: s.getPropertyValue("--field-font-weight").trim(),
+      lineHeight: px(s.getPropertyValue("--field-line-height")),
+    };
   });
+  expect(resolved, "the field axis resolves to the DS input type, 16/24 400").toEqual(RAFT_FIELD);
+  return resolved;
 }
 
 async function measure(page: import("@playwright/test").Page, wanted: string[]) {
@@ -106,51 +117,48 @@ async function measure(page: import("@playwright/test").Page, wanted: string[]) 
   }, wanted);
 }
 
-for (const theme of ["brutal", "elegant"] as Theme[]) {
-  for (const state of [
-      // Model is a SELECT in the preset state (its option source supplies values), so
-    // it is not a migrated <Input> there; it becomes a text input only under the
-    // gateway provider, which is the "gateway/custom model" migration point.
-    { provider: null as string | null, expect: ["Server DeepSeek API Key*"] },
-    { provider: "Server Gateway", expect: ["Server Gateway API Key*", "Base URL*", "Model*"] },
-  ]) {
-    const name = state.provider ?? "default preset";
-    test(`${theme}: schema-driven inputs obey the field axis (${name})`, async ({ page }) => {
-      await primeSchema(page);
-      await page.goto("/visual-testing.html?case=components.members.create-agent.builtin-provider-dialog"
-        + (theme === "elegant" ? "&theme=elegant" : ""));
-      await page.waitForSelector('[data-slot="field"]');
-      await page.waitForTimeout(1400);
+for (const state of [
+  // Model is a SELECT in the preset state (its option source supplies values), so
+  // it is not a migrated <Input> there; it becomes a text input only under the
+  // gateway provider, which is the "gateway/custom model" migration point.
+  { provider: null as string | null, expect: ["Server DeepSeek API Key*"] },
+  { provider: "Server Gateway", expect: ["Server Gateway API Key*", "Base URL*", "Model*"] },
+]) {
+  const name = state.provider ?? "default preset";
+  test(`schema-driven inputs obey the field axis (${name})`, async ({ page }) => {
+    await primeSchema(page);
+    await page.goto("/visual-testing.html?case=components.members.create-agent.builtin-provider-dialog");
+    await page.waitForSelector('[data-slot="field"]');
+    await page.waitForTimeout(1400);
 
-      // The definition must actually have loaded. Without this, every field is
-      // absent and an empty measurement would look like "nothing to check".
-      const unavailable = await page.locator('[data-testid^="schema-runtime"]').filter({ hasText: /unavailable|Refresh/i }).count();
-      expect(unavailable, `${theme}: the schema definition loaded (not the unavailable state)`).toBe(0);
+    // The definition must actually have loaded. Without this, every field is
+    // absent and an empty measurement would look like "nothing to check".
+    const unavailable = await page.locator('[data-testid^="schema-runtime"]').filter({ hasText: /unavailable|Refresh/i }).count();
+    expect(unavailable, `the schema definition loaded (not the unavailable state)`).toBe(0);
 
-      if (state.provider) {
-        const trigger = page.locator('[data-slot="field"]').filter({ hasText: "Provider" })
-          .locator('[data-slot="button"]').first();
-        await trigger.click();
-        await page.waitForTimeout(400);
-        await page.locator('[data-slot="select-item"]').filter({ hasText: state.provider }).first().click();
-        await page.waitForTimeout(900);
-      }
+    if (state.provider) {
+      const trigger = page.locator('[data-slot="field"]').filter({ hasText: "Provider" })
+        .locator('[data-slot="button"]').first();
+      await trigger.click();
+      await page.waitForTimeout(400);
+      await page.locator('[data-slot="select-item"]').filter({ hasText: state.provider }).first().click();
+      await page.waitForTimeout(900);
+    }
 
-      const labels = (await page.locator('[data-slot="field-label"]').allTextContents()).map((l) => l.trim());
-      for (const want of state.expect) {
-        expect(labels, `${theme}: "${want}" rendered`).toContain(want);
-      }
+    const labels = (await page.locator('[data-slot="field-label"]').allTextContents()).map((l) => l.trim());
+    for (const want of state.expect) {
+      expect(labels, `"${want}" rendered`).toContain(want);
+    }
 
-      const t = await tokens(page);
-      const measured = await measure(page, [...state.expect]);
-      expect(measured.map((m) => m.label).sort(),
-        `${theme}: measured exactly the named schema inputs`).toEqual([...state.expect].sort());
-      for (const m of measured) {
-        expect(m.onAxis, `${theme}: "${m.label}" must carry text-field/font-field`).toBe(true);
-        expect(m.fontSize, `${theme}: "${m.label}" font-size`).toBe(t.fontSize);
-        expect(m.fontWeight, `${theme}: "${m.label}" font-weight`).toBe(t.fontWeight);
-        expect(m.lineHeight, `${theme}: "${m.label}" line-height`).toBe(t.lineHeight);
-      }
-    });
-  }
+    const t = await tokens(page);
+    const measured = await measure(page, [...state.expect]);
+    expect(measured.map((m) => m.label).sort(),
+      `measured exactly the named schema inputs`).toEqual([...state.expect].sort());
+    for (const m of measured) {
+      expect(m.onAxis, `"${m.label}" must carry text-field/font-field`).toBe(true);
+      expect(m.fontSize, `"${m.label}" font-size`).toBe(t.fontSize);
+      expect(m.fontWeight, `"${m.label}" font-weight`).toBe(t.fontWeight);
+      expect(m.lineHeight, `"${m.label}" line-height`).toBe(t.lineHeight);
+    }
+  });
 }

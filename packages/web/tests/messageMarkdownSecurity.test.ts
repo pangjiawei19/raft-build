@@ -1,32 +1,52 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import { createElement } from "react";
+import type { ReactElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { IntlProvider } from "react-intl";
 import ReactMarkdown from "react-markdown";
-import rehypeRaw from "rehype-raw";
-import rehypeSanitize from "rehype-sanitize";
 import MarkdownContent from "../src/components/markdown/MarkdownContent";
+import { mergedMessages } from "../src/i18n/messages";
 import {
-  escapeUserRawHtmlForMessageMarkdown,
+  MESSAGE_MARKDOWN_REHYPE_PLUGINS,
+  messageMarkdownRemarkPlugins,
   messageMarkdownSanitizeSchema,
 } from "../src/components/message/messageMarkdownSecurity";
+import { messageTokenNode } from "../src/components/message/remarkMessageTokens";
 
-function renderMessageMarkdown(source: string) {
+// Custom-protocol links render CustomProtocolLink, which reads the intl
+// catalog — mirror the production provider for renders that exercise it.
+function withIntl(element: ReactElement) {
+  return createElement(
+    IntlProvider,
+    { locale: "en", messages: mergedMessages("en") },
+    element,
+  );
+}
+
+// The message body pipeline as MessageItem runs it (task #762), minus the
+// ref matchers: no rehype-raw, user HTML shown as text, one sanitize schema.
+function renderStyledMessageMarkdown(source: string, remarkPlugins = messageMarkdownRemarkPlugins()) {
   return renderToStaticMarkup(
-    createElement(ReactMarkdown, {
-      children: source,
-      rehypePlugins: [rehypeRaw, [rehypeSanitize, messageMarkdownSanitizeSchema]],
+    createElement(MarkdownContent, {
+      source,
+      remarkPlugins,
+      rehypePlugins: MESSAGE_MARKDOWN_REHYPE_PLUGINS,
     }),
   );
 }
 
-function renderStyledMessageMarkdown(source: string) {
-  return renderToStaticMarkup(
-    createElement(MarkdownContent, {
-      source,
-      rehypePlugins: [rehypeRaw, [rehypeSanitize, messageMarkdownSanitizeSchema]],
-    }),
-  );
+// A message token (what the ref matchers produce) through the same pipeline.
+function renderMessageToken(label: string, hProperties: Record<string, string>) {
+  const insertToken = () => (tree: { children: unknown[] }) => {
+    tree.children = [{ type: "paragraph", children: [messageTokenNode("a", label, hProperties)] }];
+  };
+  // Plain ReactMarkdown: MarkdownContent's shared link component does not
+  // forward data-* (MessageItem's own `a` reads them from the node instead).
+  return renderToStaticMarkup(createElement(ReactMarkdown, {
+    children: "placeholder",
+    remarkPlugins: messageMarkdownRemarkPlugins(insertToken),
+    rehypePlugins: MESSAGE_MARKDOWN_REHYPE_PLUGINS,
+  }));
 }
 
 function renderDefaultMarkdown(source: string) {
@@ -38,7 +58,7 @@ function renderDefaultMarkdown(source: string) {
 }
 
 function renderEscapedUserMarkdown(source: string) {
-  return renderStyledMessageMarkdown(escapeUserRawHtmlForMessageMarkdown(source));
+  return renderStyledMessageMarkdown(source);
 }
 
 test("message markdown renders incomplete raw HTML tags as visible text", () => {
@@ -75,6 +95,39 @@ test("message markdown keeps normal markdown links", () => {
 
   assert.match(html, /<a href="https:\/\/slock\.ai"/);
   assert.match(html, />Slock<\/a>/);
+});
+
+test("message markdown allows obsidian:// links while stripping unlisted custom schemes", () => {
+  const renderWithIntl = (source: string) =>
+    renderToStaticMarkup(withIntl(createElement(MarkdownContent, {
+      source,
+      remarkPlugins: messageMarkdownRemarkPlugins(),
+      rehypePlugins: MESSAGE_MARKDOWN_REHYPE_PLUGINS,
+    })));
+  const allowed = renderWithIntl("[Open note](obsidian://open?vault=Main)");
+  assert.match(allowed, /<a href="obsidian:\/\/open\?vault=Main"/);
+  assert.match(allowed, />Open note<\/a>/);
+
+  // Angle-bracket autolinks are CommonMark autolinks (any scheme), so they
+  // reach the same allowlist; bare obsidian:// text is intentionally NOT
+  // linkified (remark-gfm + remarkAutolinkBareUrls cover http(s) only).
+  const autolink = renderWithIntl("see <obsidian://open?vault=Main>");
+  assert.match(autolink, /<a href="obsidian:\/\/open\?vault=Main"/);
+
+  const stripped = renderWithIntl("[bad link](foo://bar)");
+  assert.doesNotMatch(stripped, /foo:\/\/bar/);
+  assert.doesNotMatch(stripped, /<a href=/);
+});
+
+test("shared markdown allows obsidian:// links while stripping unlisted custom schemes", () => {
+  const renderWithIntl = (source: string) =>
+    renderToStaticMarkup(withIntl(createElement(MarkdownContent, { source })));
+  const allowed = renderWithIntl("[Open note](obsidian://open?vault=Main)");
+  assert.match(allowed, /href="obsidian:\/\/open\?vault=Main"/);
+
+  const stripped = renderWithIntl("[bad link](foo://bar)");
+  assert.doesNotMatch(stripped, /foo:\/\/bar/);
+  assert.doesNotMatch(stripped, /<a href=/);
 });
 
 test("message markdown parses explicit markdown links before bare-url linkification", () => {
@@ -177,24 +230,32 @@ test("message markdown keeps invalid angle-bracket text visible", () => {
   assert.doesNotMatch(html, /<a href=/);
 });
 
-test("message markdown keeps controlled injected message anchors", () => {
-  const mention = renderMessageMarkdown('<a data-mention="kasei" data-mention-type="user" data-mention-id="user-1">@Kasei</a>');
+test("message markdown keeps the data attributes of message token anchors", () => {
+  const mention = renderMessageToken("@Kasei", { dataMention: "kasei", dataMentionType: "user", dataMentionId: "user-1" });
   assert.match(mention, /data-mention="kasei"/);
   assert.match(mention, /data-mention-type="user"/);
   assert.match(mention, /data-mention-id="user-1"/);
 
-  const channel = renderMessageMarkdown('<a data-channel="general">#general</a>');
+  const channel = renderMessageToken("#general", { dataChannel: "general" });
   assert.match(channel, /data-channel="general"/);
 
-  const thread = renderMessageMarkdown('<a data-thread-ref="abc123" data-thread-parent="channel-1" data-thread-parent-name="general" data-thread-parent-type="channel">#general:abc123</a>');
+  const thread = renderMessageToken("#general:abc123", {
+    dataThreadRef: "abc123",
+    dataThreadParent: "channel-1",
+    dataThreadParentName: "general",
+    dataThreadParentType: "channel",
+  });
   assert.match(thread, /data-thread-ref="abc123"/);
   assert.match(thread, /data-thread-parent="channel-1"/);
   assert.match(thread, /data-thread-parent-name="general"/);
   assert.match(thread, /data-thread-parent-type="channel"/);
 
-  const raftRef = renderMessageMarkdown('<a data-raft-ref-kind="channel" data-raft-ref-target="#general">#general</a>');
+  const raftRef = renderMessageToken("#general", { dataRaftRefKind: "channel", dataRaftRefTarget: "#general" });
   assert.match(raftRef, /data-raft-ref-kind="channel"/);
   assert.match(raftRef, /data-raft-ref-target="#general"/);
+
+  const unlisted = renderMessageToken("x", { dataEvil: "1", onClick: "alert(1)" });
+  assert.doesNotMatch(unlisted, /data-evil|onclick/i, "token attributes still pass the sanitize allowlist");
 });
 
 test("message markdown schema does not allow extra raw HTML tags", () => {

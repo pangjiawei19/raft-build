@@ -1,17 +1,21 @@
-import { execFileSync, spawn } from "node:child_process";
+import { ambientProcessEnv } from "../processEnvPatch";
+import { RuntimeExecutableNotFoundError } from "../spawnFailureErrors";
+import { execFileSync } from "node:child_process";
+import { spawnRuntimeChild } from "./runtimeChild";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { hydrateRuntimeConfig, runtimeConfigToLaunchFields, type AgentConfig , type AxSurfaceText } from "@botiverse/raft-shared";
-import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent } from "./types.js";
-import { buildGeminiTokenUsageEvent } from "./geminiEventNormalizer.js";
-import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport.js";
-import { resolveNodeHostLaunch } from "./nodeHostLaunch.js";
-import { resolveCommandOnPath, type ProbeDeps } from "./probe.js";
+import type { RuntimeDriver, SpawnContext, SpawnResult, ParsedEvent } from "./types";
+import { buildGeminiTokenUsageEvent } from "./geminiEventNormalizer";
+import { buildCliTransportSystemPrompt, prepareCliTransport } from "./cliTransport";
+import { resolveNodeHostLaunch } from "./nodeHostLaunch";
+import { resolveCommandOnPath, resolveCommandOnPathAsync, type ProbeDeps } from "./probe";
+import { ProbeChildError, runProbeChild } from "./probeChild";
 import {
   prepareManagedMcpRuntimeProxy,
   writeManagedMcpRuntimeConfigFile,
-} from "../managedMcpRuntimeProxy.js";
-import { resolveRaftHome } from "../raftHome.js";
+} from "../managedMcpRuntimeProxy";
+import { resolveRaftHome } from "../raftHome";
 
 export async function buildGeminiSpawnEnv(
   ctx: SpawnContext,
@@ -77,6 +81,129 @@ export function buildGeminiArgs(config: AgentConfig): string[] {
   return args;
 }
 
+/**
+ * task #1277 — budget for the two Windows discovery children of the async
+ * resolver (`npm root -g`, `where.exe gemini`). The synchronous resolver runs
+ * them with no timeout (unchanged here); a child that exceeds this budget is
+ * treated like any other discovery failure: the next candidate is tried, and
+ * a runtime that is not found stays "not resolved", never "not installed".
+ */
+export const GEMINI_WINDOWS_DISCOVERY_TIMEOUT_MS = 5000;
+
+/** `where.exe` exits 1 when nothing matched and 2 when it could not run (documented). */
+const WHERE_EXE_NO_MATCH_STATUS = 1;
+
+/**
+ * task #1242 (review on #9801): only a child's documented clean "no match"
+ * exit decides anything. A budget timeout is `probe_timeout`; every other way
+ * a child can fail — spawn error (`code`), a non-zero status that is not the
+ * documented no-match status, a signal, or an error of unknown shape — is
+ * `probe_failed`. `runProbeChild` reports an ordinary non-zero exit through
+ * `status` with no `code`, so a `code`-only check misses it.
+ */
+export function classifyDiscoveryFailure(
+  error: unknown,
+  child: { cleanNoMatchStatus?: number } = {},
+): "probe_timeout" | "probe_failed" | "no_match" {
+  if (error instanceof ProbeChildError) {
+    if (error.code === "ETIMEDOUT") return "probe_timeout";
+    if (error.code !== undefined) return "probe_failed";
+    if (error.signal) return "probe_failed";
+    if (typeof error.status === "number" && error.status === child.cleanNoMatchStatus) return "no_match";
+    return "probe_failed";
+  }
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : undefined;
+  if (code === "ETIMEDOUT") return "probe_timeout";
+  return "probe_failed";
+}
+
+function isProbeAbort(error: unknown): boolean {
+  return error instanceof ProbeChildError && error.code === "ABORT_ERR";
+}
+
+/** task #1277 — {@link resolveGeminiSpawn} off the event loop, under the caller's signal. */
+export async function resolveGeminiSpawnAsync(
+  commandArgs: string[],
+  deps: ProbeDeps = {},
+): Promise<{ command: string; args: string[]; env: NodeJS.ProcessEnv }> {
+  const platform = deps.platform ?? process.platform;
+  if (platform !== "win32") {
+    return {
+      command: (await resolveCommandOnPathAsync("gemini", deps)) ?? "gemini",
+      args: commandArgs,
+      env: deps.env ?? ambientProcessEnv(),
+    };
+  }
+
+  const runChild = deps.runProbeChildFn ?? runProbeChild;
+  const existsSyncFn = deps.existsSyncFn ?? existsSync;
+  const env = deps.env ?? ambientProcessEnv();
+  const winPath = path.win32;
+  let geminiEntry: string | null = null;
+  // task #1242: a discovery child that timed out (or failed to run) did not
+  // decide anything. When no entry is found, the error carries that verdict so
+  // downstream never reads "not resolved" as "not installed".
+  let undecided: "probe_timeout" | "probe_failed" | undefined;
+  const noteUndecided = (error: unknown, child: { cleanNoMatchStatus?: number }) => {
+    const verdict = classifyDiscoveryFailure(error, child);
+    if (verdict === "probe_timeout") undecided = "probe_timeout";
+    else if (verdict === "probe_failed" && undecided === undefined) undecided = "probe_failed";
+  };
+
+  try {
+    const globalRoot = (await runChild("npm", ["root", "-g"], {
+      env,
+      timeoutMs: GEMINI_WINDOWS_DISCOVERY_TIMEOUT_MS,
+      platform,
+      signal: deps.signal,
+    })).stdout.trim();
+    const candidate = winPath.join(globalRoot, "@google", "gemini-cli", "bundle", "gemini.js");
+    if (existsSyncFn(candidate)) geminiEntry = candidate;
+  } catch (error) {
+    if (isProbeAbort(error)) throw error;
+    // `npm root -g` has no clean "no match" exit: any failure is undecided.
+    noteUndecided(error, {});
+    // Fall through to resolving the npm shim location.
+  }
+
+  if (!geminiEntry) {
+    try {
+      const cmdPath = (await runChild("where.exe", ["gemini"], {
+        env,
+        timeoutMs: GEMINI_WINDOWS_DISCOVERY_TIMEOUT_MS,
+        platform,
+        signal: deps.signal,
+      })).stdout.trim().split(/\r?\n/)[0] ?? "";
+      const candidate = winPath.join(winPath.dirname(cmdPath), "node_modules", "@google", "gemini-cli", "bundle", "gemini.js");
+      if (existsSyncFn(candidate)) geminiEntry = candidate;
+    } catch (error) {
+      if (isProbeAbort(error)) throw error;
+      noteUndecided(error, { cleanNoMatchStatus: WHERE_EXE_NO_MATCH_STATUS });
+    }
+  }
+
+  if (!geminiEntry) {
+    throw new RuntimeExecutableNotFoundError({ runtimeId: "gemini", ...(undecided ? { reason: undecided } : {}), message:
+      undecided === "probe_timeout"
+        ? "The Gemini CLI discovery on Windows did not finish within its budget. This is not evidence that Gemini is missing; retry."
+        : undecided === "probe_failed"
+          ? "The Gemini CLI discovery on Windows could not run. This is not evidence that Gemini is missing; retry."
+          : "Cannot resolve Gemini CLI entry point on Windows. " +
+            "Ensure @google/gemini-cli is installed globally via npm (npm i -g @google/gemini-cli)." });
+  }
+
+  const nodeHost = resolveNodeHostLaunch({
+    env,
+    execPath: deps.execPath,
+    execIsElectron: deps.execIsElectron,
+  });
+  return {
+    command: nodeHost.command,
+    args: [geminiEntry, ...commandArgs],
+    env: nodeHost.env,
+  };
+}
+
 export function resolveGeminiSpawn(
   commandArgs: string[],
   deps: ProbeDeps = {},
@@ -86,13 +213,13 @@ export function resolveGeminiSpawn(
     return {
       command: resolveCommandOnPath("gemini", deps) ?? "gemini",
       args: commandArgs,
-      env: deps.env ?? process.env,
+      env: deps.env ?? ambientProcessEnv(),
     };
   }
 
   const execFileSyncFn = deps.execFileSyncFn ?? execFileSync;
   const existsSyncFn = deps.existsSyncFn ?? existsSync;
-  const env = deps.env ?? process.env;
+  const env = deps.env ?? ambientProcessEnv();
   const winPath = path.win32;
   let geminiEntry: string | null = null;
 
@@ -123,10 +250,9 @@ export function resolveGeminiSpawn(
   }
 
   if (!geminiEntry) {
-    throw new Error(
+    throw new RuntimeExecutableNotFoundError({ runtimeId: "gemini", message:
       "Cannot resolve Gemini CLI entry point on Windows. " +
-      "Ensure @google/gemini-cli is installed globally via npm (npm i -g @google/gemini-cli).",
-    );
+      "Ensure @google/gemini-cli is installed globally via npm (npm i -g @google/gemini-cli)." });
   }
 
   const nodeHost = resolveNodeHostLaunch({
@@ -196,9 +322,16 @@ export class GeminiDriver implements RuntimeDriver {
       : null;
 
     const spawnEnv = await buildGeminiSpawnEnv(ctx, process.platform, managedMcpSettingsPath);
-    const { command, args, env } = resolveGeminiSpawn(buildGeminiArgs(ctx.config), { env: spawnEnv });
+    // task #1277: the launch resolution (PATH lookup; on Windows the npm and
+    // where.exe discovery) runs as bounded probe children under this start
+    // attempt's signal; a cancelled lookup is rethrown, never a verdict.
+    const { command, args, env } = await resolveGeminiSpawnAsync(buildGeminiArgs(ctx.config), { env: spawnEnv, signal: ctx.launchSignal });
 
-    const proc = spawn(command, args, {
+    // task #365: after the last await, right before the child exists.
+    ctx.assertLaunchCurrent?.();
+    // A start stopped while the lookup ran must not create a child.
+    if (ctx.launchSignal?.aborted) throw new ProbeChildError("gemini launch cancelled before the child was created", { code: "ABORT_ERR" });
+    const proc = spawnRuntimeChild(command, args, {
       cwd: ctx.workingDirectory,
       stdio: ["pipe", "pipe", "pipe"],
       env,

@@ -6,7 +6,7 @@
  * command authority.
  */
 
-import { currentDate } from "./clock.js";
+import { currentDate } from "./clock";
 
 export const EXTERNAL_PROJECTION_CONTRACT_VERSION = "external-projection.v1" as const;
 
@@ -36,6 +36,7 @@ export interface ExternalActorProjection extends ExternalProjectionIdentity {
  * message. It intentionally contains no Raft principal or membership fields.
  */
 export interface ExternalMessageAuthorProjection extends ExternalProjectionIdentity {
+  workspaceName: string | null;
   externalConversationId: string;
   externalMessageId: string;
   displayName: string;
@@ -46,9 +47,22 @@ export interface ExternalMessageAuthorProjection extends ExternalProjectionIdent
 }
 
 /**
- * Agent-visible provenance for ordinary external content. The payload remains
- * inert under sender_type=third_party_app and carries no task/mention/command
- * authority.
+ * The provider whose bridged messages reach Agents as ordinary Raft messages:
+ * ordinary content rendering and `mentioned` from the server-minted mention
+ * fact. Binding a Slack workspace and pairing channels is the humans'
+ * acceptance of that. Every other external provider stays inert.
+ */
+export const SLACK_BRIDGE_EXTERNAL_PROVIDER = "slack" as const;
+
+export function isSlackBridgedExternalProvider(provider: string | null | undefined): boolean {
+  return provider === SLACK_BRIDGE_EXTERNAL_PROVIDER;
+}
+
+/**
+ * Agent-visible provenance for ordinary external content. Sender type stays
+ * third_party_app and the payload carries no task/command authority. Content
+ * is inert except for Slack-bridged messages, which also carry the reading
+ * Agent's personal `mentioned` fact (see isSlackBridgedExternalProvider).
  */
 export interface AgentVisibleExternalMessageProvenance {
   schema: "external-message-provenance.v1";

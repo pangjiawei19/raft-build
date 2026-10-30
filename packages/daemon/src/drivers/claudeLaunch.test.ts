@@ -1,16 +1,19 @@
 import assert from "node:assert/strict";
+import type { execFileSync } from "node:child_process";
 import path from "node:path";
-import { test } from "vitest";
+import { mkdtempSync, rmSync, statSync } from "node:fs";
+import os from "node:os";
 import {
   buildClaudeArgs,
   buildClaudeSpawnSpec,
   CLAUDE_DESKTOP_CLI_RELATIVE_PATH,
   CLAUDE_DISALLOWED_TOOLS,
+  writeClaudeSystemPromptFile,
   probeClaude,
   probeClaudeLaunch,
   resolveClaudeCommand,
   resolveClaudeLaunchCommand,
-} from "./claudeLaunch.js";
+} from "./claudeLaunch";
 
 const config = {
   name: "hao",
@@ -180,33 +183,43 @@ test("claude launch args do not pass chat-MCP config flags", () => {
   assert.ok(!args.includes("--runtime-actions-only"));
 });
 
-test("claude spawn spec uses shell for unresolved command on Windows", () => {
-  assert.deepEqual(buildClaudeSpawnSpec(null, "win32"), {
-    command: "claude",
-    shell: true,
-  });
-});
+test("claude spawn spec never uses a shell on Windows", () => {
+  const npmBin = "C:\\Users\\tester\\AppData\\Roaming\\npm";
+  const shim = `${npmBin}\\claude.cmd`;
+  const exe = `${npmBin}\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe`;
+  const args = ["--settings", JSON.stringify({ fastMode: true }), "--model", "opus & echo x"];
+  const deps = {
+    platform: "win32" as const,
+    existsSyncFn: (file: string) => file === shim || file === exe,
+    readFileSyncFn: () => 'CALL :find_dp0\r\n"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe"   %*\r\n',
+    windowsEnvironmentReaderFn: () => ({}),
+    execFileSyncFn: ((command: string) => {
+      assert.equal(command, "powershell.exe");
+      return Buffer.from(`${shim}\r\n`);
+    }) as any,
+  };
 
-test("claude spawn spec uses shell for Windows batch shims", () => {
-  assert.deepEqual(buildClaudeSpawnSpec("C:\\Users\\tester\\AppData\\Roaming\\npm\\claude.cmd", "win32"), {
-    command: "C:\\Users\\tester\\AppData\\Roaming\\npm\\claude.cmd",
-    shell: true,
-  });
-  assert.deepEqual(buildClaudeSpawnSpec("C:\\tools\\claude.BAT", "win32"), {
-    command: "C:\\tools\\claude.BAT",
-    shell: true,
-  });
-});
-
-test("claude spawn spec does not use shell for executable paths or non-Windows platforms", () => {
-  assert.deepEqual(buildClaudeSpawnSpec("C:\\tools\\claude.exe", "win32"), {
+  assert.deepEqual(buildClaudeSpawnSpec(shim, args, deps), { command: exe, args, shell: false });
+  assert.deepEqual(buildClaudeSpawnSpec(null, args, deps), { command: exe, args, shell: false });
+  assert.deepEqual(buildClaudeSpawnSpec("claude", args, deps), { command: exe, args, shell: false });
+  assert.deepEqual(buildClaudeSpawnSpec("C:\\tools\\claude.exe", args, deps), {
     command: "C:\\tools\\claude.exe",
+    args,
     shell: false,
   });
-  assert.deepEqual(buildClaudeSpawnSpec("/usr/local/bin/claude", "darwin"), {
+  assert.throws(
+    () => buildClaudeSpawnSpec("C:\\tools\\claude.BAT", args, { ...deps, readFileSyncFn: () => "@echo off\r\n" }),
+    /batch wrapper/,
+  );
+});
+
+test("claude spawn spec passes the command through off Windows", () => {
+  assert.deepEqual(buildClaudeSpawnSpec("/usr/local/bin/claude", ["--model", "opus"], { platform: "darwin" }), {
     command: "/usr/local/bin/claude",
+    args: ["--model", "opus"],
     shell: false,
   });
+  assert.deepEqual(buildClaudeSpawnSpec(null, [], { platform: "linux" }), { command: "claude", args: [], shell: false });
 });
 
 test("resolveClaudeCommand falls back to Claude Desktop URL handler on macOS", () => {
@@ -297,9 +310,55 @@ test("probeClaude recovers on the next Windows detection after a command lookup 
     windowsEnvironmentReaderFn: () => null,
   };
 
-  assert.deepEqual(probeClaude(deps), { available: false });
-  assert.deepEqual(probeClaude(deps), {
+  // A timed-out lookup is undecided, not "not installed". (task #1240: the
+  // lookup timing rides along as `diagnostic`; it is asserted separately.)
+  const { diagnostic: timedOutDiagnostic, lookupTiming: timedOutTiming, ...timedOut } = probeClaude(deps);
+  assert.deepEqual(timedOut, { available: false, unavailableReason: "probe_timeout" });
+  assert.match(timedOutDiagnostic ?? "", /^lookup: /);
+  assert.ok(timedOutTiming);
+  const { lookupTiming: recoveredTiming, ...recovered } = probeClaude(deps);
+  assert.ok(recoveredTiming);
+  assert.deepEqual(recovered, {
     available: true,
     version: "2.1.210 (Claude Code)",
   });
+});
+
+
+// task #302 sibling arm: kimi.ts was the file that lacked an explicit mode, but
+// the invariant belongs to the whole runtime prompt-file family, so pin it here
+// too rather than leaving the sibling unguarded.
+test("claude system prompt file is written owner-only (task #302)", () => {
+  if (process.platform === "win32") return; // POSIX permission bits do not apply
+  const dir = mkdtempSync(path.join(os.tmpdir(), "claude-mode-"));
+  try {
+    const promptPath = writeClaudeSystemPromptFile("standing prompt body", dir);
+    assert.equal(statSync(promptPath).mode & 0o777, 0o600, "claude system prompt file must be 0600");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("task #1240: probeClaude carries the Windows lookup timing as a bounded diagnostic, available or not", () => {
+  const execFileSyncFn = ((_command: string, args?: readonly string[]) => {
+    if (args?.includes("--version")) return Buffer.from("2.1.0\r\n");
+    if (args?.some((arg) => typeof arg === "string" && arg.includes("Get-Command"))) return Buffer.from("C:\\Users\\secret-user\\AppData\\Roaming\\npm\\claude.cmd\r\n");
+    throw Object.assign(new Error("unexpected"), { status: 1 });
+  }) as unknown as typeof execFileSync;
+  const available = probeClaude({ platform: "win32", env: { PATH: "C:\\Windows\\System32" }, execFileSyncFn, windowsEnvironmentReaderFn: () => null, existsSyncFn: () => true });
+  assert.equal(available.available, true);
+  assert.equal(available.diagnostic, undefined, "a healthy runtime carries no diagnostic (ready-time diagnostics warn)");
+  assert.match(available.lookupTiming ?? "", /^environment \d+ ms spawn_error \(budget 5000 ms\), get-command \d+ ms ok \(budget 5000 ms\)$/);
+  assert.doesNotMatch(available.lookupTiming ?? "", /secret-user|AppData/);
+
+  const timedOut = probeClaude({
+    platform: "win32",
+    env: { PATH: "C:\\Windows\\System32" },
+    execFileSyncFn: (() => { throw Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" }); }) as unknown as typeof execFileSync,
+    windowsEnvironmentReaderFn: () => null,
+  });
+  assert.equal(timedOut.available, false);
+  assert.equal(timedOut.unavailableReason, "probe_timeout");
+  assert.match(timedOut.diagnostic ?? "", /^lookup: .*get-command \d+ ms timeout \(truncated\) \(budget 5000 ms\)/);
+  assert.equal(timedOut.lookupTiming, timedOut.diagnostic?.replace(/^lookup: /, ""));
 });

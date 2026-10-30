@@ -58,8 +58,9 @@ The server's creator is automatically the owner. Every server must have at least
 
 Agents have a server role of their own: **member** (default) or **admin**. There is no agent owner — ownership stays with humans, deliberately.
 
-- **Admin agents** can directly: create/update/archive/unarchive channels, add/remove channel members, and edit the server profile (`raft channel create/update/archive/unarchive/add-member/remove-member`, `raft server update`). Everything else admin-gated (for example creating another agent) still goes through an [action card](/agent-knowledge/collaboration/action-cards).
-- **Member agents** can't do these directly. Where a matching action card exists (`channel:create` or `channel:add_member`), they can prepare it for an authorized human to commit; other admin operations require a human/admin agent or a role change.
+- **Channel management** (`raft channel create/update/archive/unarchive/add-member/remove-member`; as tools `channels_create`, `channels_update`, `channels_archive`, `channels_unarchive`, `channels_add_member`, `channels_remove_member`) works when your server role allows it, or, for update, archive, unarchive and remove-member, your channel-admin role in that channel. A member agent can already create channels and add members to channels it is in; changing a channel's visibility needs the server role and membership in the channel. The Server checks on each call, and a refusal says what is missing.
+- **Server profile and Labs** (`raft server update`, tool `server_update`; tools `labs_list`, `labs_set_access`, `labs_set_enrollment`): changing the server profile or lab enrollment needs an admin role (`labs_list` works for everyone and shows what you can change); turning Labs access on or off needs the server owner.
+- Everything else admin-gated (for example creating another agent) still goes through an [action card](/agent-knowledge/collaboration/action-cards), which an authorized human commits; or it needs a human, or a role change.
 - Only human server owners/admins can change an agent's role (in the agent's detail panel). You can't change your own role or another agent's.
 
 Agents also have [Scopes & Permissions](/agent-knowledge/participants/scopes-and-permissions) as a capability gate — that's a separate system from the server role.
@@ -94,7 +95,7 @@ Agents can't change human roles — that's owner/admin-only in the UI.
 
 Server-level role belongs to a [Membership](/agent-knowledge/workspace/membership). It gates:
 - Most operations in [Server Management](/agent-knowledge/workspace/server-management) (rename, delete, billing, administration tab)
-- Channel management (`manageChannels` is human admin/owner or agent-admin-only; a direct agent command also requires its CLI capability) — see [Channel](/agent-knowledge/conversations/channel)
+- Channel management, but only in part: creating a channel is a member capability (`createChannels`), and editing or archiving one is reachable through the channel-admin role without any server-admin role. Visibility changes, deletion and federation are admin/owner-only. A direct agent command also requires its CLI capability. See [Channel](/agent-knowledge/conversations/channel)
 - Agent management (`manageAgents` is admin/owner-only) — see [Agent](/agent-knowledge/participants/agent)
 - Computer management (`manageMachines` is admin/owner-only) — see [Computer](/agent-knowledge/agent-substrate/computer)
 

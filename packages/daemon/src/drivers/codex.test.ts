@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { expect, test } from "vitest";
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,10 +9,18 @@ import {
   MemoryTraceSink,
   createSpanAttrContractTracer,
 } from "@botiverse/raft-shared";
-import { buildCodexAppServerArgs, CodexDriver, clearCodexProbeCacheForTests, detectCodexModels, detectCodexModelsFromAppServer, probeCodex, compareCodexVersions, parseCodexVersion, resolveCodexCommand, resolveCodexSpawn } from "./codex.js";
-import { resolveCodexHomeRootFromEnv } from "./codexHome.js";
-import type { ParsedEvent, SpawnContext } from "./types.js";
-import { DAEMON_CORE_TRACE_ATTR_CONTRACTS } from "../core.js";
+import { buildCodexAppServerArgs, CODEX_NPM_ROOT_TIMEOUT_MS, CodexDriver, clearCodexProbeCacheForTests, codexThreadName, detectCodexModels, detectCodexModelsFromAppServer, probeCodex, compareCodexVersions, parseCodexVersion, resolveCodexCommand, resolveCodexSpawn, resolveCodexSpawnAsync } from "./codex";
+import type { execFileSync } from "node:child_process";
+import { ProbeChildError, type runProbeChild } from "./probeChild";
+
+/** task #1277: plays a sync execFileSync stand-in through the async probe-child seam (same error objects, same verdicts). */
+function viaProbeChild(execFileSyncFn: typeof execFileSync): typeof runProbeChild {
+  return async (command, args) => ({ stdout: String(execFileSyncFn(command, [...args]) ?? ""), stderr: "" });
+}
+import { resolveCodexHomeRootFromEnv } from "./codexHome";
+import type { ParsedEvent, SpawnContext } from "./types";
+import { DAEMON_CORE_TRACE_ATTR_CONTRACTS } from "../core";
+import { traceRows } from "../testing/traceRows";
 
 const codexConfig = {
   name: "codex-agent",
@@ -135,6 +142,7 @@ if (process.argv[2] !== "app-server" || process.argv[3] !== "--listen" || proces
   process.exit(2);
 }
 
+let unarchived = false;
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
   const message = JSON.parse(line);
@@ -161,6 +169,25 @@ rl.on("line", (line) => {
       send({ id: message.id, error: { message: "No permission to access thread " + message.params.threadId } });
       return;
     }
+    if ((scenario === "resume_archived" && !unarchived) || scenario === "resume_archived_unarchive_fails") {
+      const id = message.params.threadId;
+      send({ id: message.id, error: { code: -32600, message: "session " + id + " is archived. Run \`codex unarchive " + id + "\` to unarchive it first." } });
+      return;
+    }
+    if (scenario === "resume_named") {
+      send({ id: message.id, result: { thread: { id: message.params.threadId, name: "Renamed by user" } } });
+      return;
+    }
+    send({ id: message.id, result: { thread: { id: message.params.threadId } } });
+    return;
+  }
+
+  if (message.method === "thread/unarchive") {
+    if (scenario === "resume_archived_unarchive_fails") {
+      send({ id: message.id, error: { code: -32600, message: "no archived rollout found for thread id " + message.params.threadId } });
+      return;
+    }
+    unarchived = true;
     send({ id: message.id, result: { thread: { id: message.params.threadId } } });
     return;
   }
@@ -181,7 +208,10 @@ rl.on("line", (line) => {
   }
 
   if (message.method === "model/list") {
-    send({
+    // task #1277: SCRIPTED_CODEX_HOLD_MS delays the reply so a test can cancel
+    // while the app-server is active.
+    const hold = Number(process.env.SCRIPTED_CODEX_HOLD_MS || 0);
+    const reply = () => send({
       id: message.id,
       result: {
         data: [
@@ -207,6 +237,7 @@ rl.on("line", (line) => {
         nextCursor: null,
       },
     });
+    if (hold > 0) setTimeout(reply, hold); else reply();
     return;
   }
 
@@ -311,6 +342,11 @@ function sessionIdForScenario(scenario: string): string | null {
       return "busy-thread-1";
     case "resume_permission_denied":
       return "forbidden-thread-1";
+    case "resume_archived":
+    case "resume_archived_unarchive_fails":
+      return "archived-thread-1";
+    case "resume_named":
+      return "named-thread-1";
     case "resume_success":
     case "resume_pending":
       return "existing-thread-1";
@@ -387,7 +423,7 @@ test("codex launch trace records only derived host facts and launch generation",
   const tracer = new BasicTracer({ sink });
 
   await withScriptedCodexAppServer("fresh", async () => {
-    const spans = sink.getAllSpans().filter((span) => span.name === "daemon.runtime.node_host_launch");
+    const spans = traceRows(sink).filter((span) => span.name === "daemon.runtime.node_host_launch");
     assert.equal(spans.length, 1);
     assert.deepEqual(spans[0]?.attrs, {
       agentId: "agent-1",
@@ -420,7 +456,7 @@ test("codex instruction-shape trace covers actual fresh and resume thread reques
         `scripted codex ${expectedMethod} and initial turn/start`,
       );
 
-      const spans = sink.getAllSpans().filter(
+      const spans = traceRows(sink).filter(
         (span) => span.name === "daemon.codex.request_instruction_shape",
       );
       assert.equal(spans.length, 1);
@@ -476,7 +512,7 @@ test("codex resume fallback recomputes instruction shape from the second request
   assert.equal(requests[1].params.developerInstructions, fallbackDeveloper);
   assert.equal(requests[1].params.baseInstructions, fallbackBase);
 
-  const spans = sink.getAllSpans().filter(
+  const spans = traceRows(sink).filter(
     (span) => span.name === "daemon.codex.request_instruction_shape",
   );
   assert.equal(spans.length, 2);
@@ -529,7 +565,7 @@ test("codex instruction-shape trace covers compaction and its first subsequent r
     const encoded = driver.encodeStdinMessage("after compaction", driver.currentSessionId, { mode: "idle" });
     assert.ok(encoded);
 
-    const spans = sink.getAllSpans().filter(
+    const spans = traceRows(sink).filter(
       (span) => span.name === "daemon.codex.request_instruction_shape",
     );
     assert.deepEqual(spans.map((span) => span.attrs?.observation_phase), [
@@ -545,7 +581,7 @@ test("codex instruction-shape trace covers compaction and its first subsequent r
     assert.equal(spans[3]!.attrs?.session_id, "fresh-thread-1");
 
     driver.encodeStdinMessage("second request", driver.currentSessionId, { mode: "idle" });
-    assert.equal(sink.getAllSpans().filter(
+    assert.equal(traceRows(sink).filter(
       (span) => span.name === "daemon.codex.request_instruction_shape",
     ).length, 4);
   }, { tracer });
@@ -597,7 +633,7 @@ test("codex app-server keeps default CODEX_HOME unset when absent", async () => 
       assert.equal(readFileSync(trustConfigPath, "utf8").includes(JSON.stringify(workDir)), true);
       assert.deepEqual(
         readScriptedCodexMessages(logPath).map((message) => message.method),
-        ["initialize", "initialized", "thread/start", "turn/start"],
+        ["initialize", "initialized", "thread/start", "thread/name/set", "turn/start"],
       );
     });
   } finally {
@@ -656,6 +692,13 @@ test("codex scripted app-server harness starts a fresh thread and initial turn",
             "model": "gpt-5.3-codex",
             "sandbox": "danger-full-access",
             "sandbox_mode": "danger-full-access",
+          },
+        },
+        {
+          "method": "thread/name/set",
+          "params": {
+            "name": "Raft · Codex Agent",
+            "threadId": "fresh-thread-1",
           },
         },
         {
@@ -723,6 +766,13 @@ test("codex resume success starts the initial turn on the resumed thread", async
           },
         },
         {
+          "method": "thread/name/set",
+          "params": {
+            "name": "Raft · Codex Agent",
+            "threadId": "existing-thread-1",
+          },
+        },
+        {
           "method": "turn/start",
           "params": {
             "input": [
@@ -775,8 +825,8 @@ test("codex resume missing rollout falls back to fresh thread/start", async () =
         source: "codex_resume_missing_rollout",
         resumeErrorClass: "missing_rollout",
         recoveryAction: "fallback_fresh_thread",
-        message: "Codex could not resume its previous thread; Slock started a fresh Codex thread.",
-        details: "Use Slock conversation history and local MEMORY.md/notes as the recovery point; do not assume prior Codex thread context is loaded.",
+        message: "Codex could not resume its previous thread; Raft started a fresh Codex thread.",
+        details: "Use Raft conversation history and local MEMORY.md/notes as the recovery point; do not assume prior Codex thread context is loaded.",
         requestedSessionId: "missing-thread-1",
       },
       codexToolingObservation("thread/start"),
@@ -830,13 +880,20 @@ test("codex resume missing rollout falls back to fresh thread/start", async () =
           },
         },
         {
+          "method": "thread/name/set",
+          "params": {
+            "name": "Raft · Codex Agent",
+            "threadId": "fresh-thread-1",
+          },
+        },
+        {
           "method": "turn/start",
           "params": {
             "input": [
               {
-                "text": "Codex could not resume its previous thread; Slock started a fresh Codex thread.
+                "text": "Codex could not resume its previous thread; Raft started a fresh Codex thread.
 
-      Use Slock conversation history and local MEMORY.md/notes as the recovery point; do not assume prior Codex thread context is loaded.
+      Use Raft conversation history and local MEMORY.md/notes as the recovery point; do not assume prior Codex thread context is loaded.
 
       initial prompt",
                 "type": "text",
@@ -873,8 +930,8 @@ test("codex resume active writer falls back to fresh thread/start", async () => 
         source: "codex_resume_thread_writer_busy",
         resumeErrorClass: "thread_writer_busy",
         recoveryAction: "fallback_fresh_thread",
-        message: "Codex could not resume its previous thread because another writer is active; Slock started a fresh Codex thread.",
-        details: "Use Slock conversation history and local MEMORY.md/notes as the recovery point; do not assume prior Codex thread context is loaded.",
+        message: "Codex could not resume its previous thread because another writer is active; Raft started a fresh Codex thread.",
+        details: "Use Raft conversation history and local MEMORY.md/notes as the recovery point; do not assume prior Codex thread context is loaded.",
         requestedSessionId: "busy-thread-1",
       },
       codexToolingObservation("thread/start"),
@@ -885,20 +942,98 @@ test("codex resume active writer falls back to fresh thread/start", async () => 
     const messages = readScriptedCodexMessages(logPath);
     assert.deepEqual(
       messages.map((message) => message.method),
-      ["initialize", "initialized", "thread/resume", "thread/start", "turn/start"],
+      ["initialize", "initialized", "thread/resume", "thread/start", "thread/name/set", "turn/start"],
     );
     assert.equal(messages[2].params.threadId, "busy-thread-1");
     assert.equal(Object.prototype.hasOwnProperty.call(messages[3].params, "threadId"), false);
     assert.equal(messages[3].params.cwd, messages[2].params.cwd);
     assert.equal(messages[3].params.developerInstructions, messages[2].params.developerInstructions);
     assert.match(
-      messages[4].params.input[0].text,
-      /^Codex could not resume its previous thread because another writer is active; Slock started a fresh Codex thread\./,
+      messages[5].params.input[0].text,
+      /^Codex could not resume its previous thread because another writer is active; Raft started a fresh Codex thread\./,
     );
-    assert.match(messages[4].params.input[0].text, /Use Slock conversation history and local MEMORY\.md\/notes as the recovery point/);
-    assert.match(messages[4].params.input[0].text, /\n\ninitial prompt$/);
+    assert.match(messages[5].params.input[0].text, /Use Raft conversation history and local MEMORY\.md\/notes as the recovery point/);
+    assert.match(messages[5].params.input[0].text, /\n\ninitial prompt$/);
   });
 });
+test("codex resume of an archived thread unarchives it and resumes the same thread (task #14)", async () => {
+  await withScriptedCodexAppServer("resume_archived", async ({ events, logPath }) => {
+    await waitFor(
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "archived-thread-1"),
+      "codex archived resume turn_end",
+    );
+
+    assert.equal(events.some((event) => event.kind === "error" || event.kind === "runtime_recovery"), false);
+    assert.deepEqual(events[0], {
+      kind: "telemetry",
+      name: "recovery",
+      source: "codex_resume_unarchived",
+      attrs: { resume_error_class: "archived", recovery_action: "unarchive_resume" },
+    });
+
+    const messages = readScriptedCodexMessages(logPath);
+    assert.deepEqual(
+      messages.map((message) => message.method),
+      ["initialize", "initialized", "thread/resume", "thread/unarchive", "thread/resume", "thread/name/set", "turn/start"],
+    );
+    assert.equal(messages[3].params.threadId, "archived-thread-1");
+    assert.deepEqual(messages[4].params, messages[2].params);
+    assert.equal(messages[6].params.threadId, "archived-thread-1");
+    assert.equal(messages[6].params.input[0].text, "initial prompt");
+  });
+});
+
+test("codex resume of an archived thread starts fresh when unarchive fails (task #14)", async () => {
+  await withScriptedCodexAppServer("resume_archived_unarchive_fails", async ({ events, logPath }) => {
+    await waitFor(
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "fresh-thread-1"),
+      "codex archived fallback turn_end",
+    );
+
+    assert.equal(events.some((event) => event.kind === "error"), false);
+    assert.deepEqual(events.slice(0, 2), [
+      {
+        kind: "telemetry",
+        name: "recovery",
+        source: "codex_resume_archived",
+        attrs: { resume_error_class: "archived", recovery_action: "fallback_fresh_thread" },
+      },
+      {
+        kind: "runtime_recovery",
+        source: "codex_resume_archived",
+        resumeErrorClass: "archived",
+        recoveryAction: "fallback_fresh_thread",
+        message: "Codex could not resume its previous thread because it is archived and could not be unarchived; Raft started a fresh Codex thread.",
+        details: "Use Raft conversation history and local MEMORY.md/notes as the recovery point; do not assume prior Codex thread context is loaded.",
+        requestedSessionId: "archived-thread-1",
+      },
+    ]);
+
+    const messages = readScriptedCodexMessages(logPath);
+    assert.deepEqual(
+      messages.map((message) => message.method),
+      ["initialize", "initialized", "thread/resume", "thread/unarchive", "thread/start", "thread/name/set", "turn/start"],
+    );
+    assert.match(messages[6].params.input[0].text, /^Codex could not resume its previous thread because it is archived/);
+  });
+});
+
+test("codex keeps a thread name the user already set (task #14)", async () => {
+  await withScriptedCodexAppServer("resume_named", async ({ events, logPath }) => {
+    await waitFor(
+      () => events.some((event) => event.kind === "turn_end" && event.sessionId === "named-thread-1"),
+      "codex named resume turn_end",
+    );
+    assert.equal(readScriptedCodexMessages(logPath).some((message) => message.method === "thread/name/set"), false);
+  });
+});
+
+test("codexThreadName labels Raft threads and skips a missing agent name", () => {
+  assert.equal(codexThreadName("Otter"), "Raft · Otter");
+  assert.equal(codexThreadName("  "), null);
+  assert.equal(codexThreadName(null), null);
+});
+
 
 test("codex resume permission error does not fall back to a fresh thread", async () => {
   await withScriptedCodexAppServer("resume_permission_denied", async ({ events, logPath }) => {
@@ -2805,6 +2940,23 @@ test("detectCodexModels extracts visible API-supported models and reads default 
   });
 });
 
+test("detectCodexModels keeps GPT-6.1 Sol only when the cache lists it", () => {
+  withTempHome((home) => {
+    mkdirSync(path.join(home, ".codex"));
+    const write = (visibility: string) => writeFileSync(path.join(home, ".codex", "models_cache.json"), JSON.stringify({
+      models: [
+        { slug: "gpt-6.1-sol", display_name: "GPT-6.1-Sol", visibility },
+        { slug: "gpt-6-astra", display_name: "GPT-6-Astra", visibility: "list" },
+      ],
+    }));
+    write("list");
+    assert.deepEqual(detectCodexModels(home)!.models.map((m) => m.id), ["gpt-6.1-sol", "gpt-6-astra"]);
+    // A hidden entry stays hidden even though the bundled fallback knows the slug.
+    write("hide");
+    assert.deepEqual(detectCodexModels(home)!.models.map((m) => m.id), ["gpt-6-astra"]);
+  });
+});
+
 test("detectCodexModels reads CODEX_HOME root-shaped cache and config", () => {
   withTempHome((home) => {
     writeFileSync(path.join(home, "models_cache.json"), JSON.stringify({
@@ -2920,7 +3072,28 @@ test("probeCodex does not advertise version-only installs without app-server", (
   });
 
   assert.equal(result.available, false);
+  assert.equal(result.unavailableReason, "probe_failed");
   assert.match(result.diagnostic ?? "", /\/tmp\/codex rejected: app-server probe exit status 2/);
+});
+
+test("probeCodex reports not_installed when no Codex candidate exists anywhere", () => {
+  withTempHome((home) => {
+    const result = probeCodex({
+      platform: "linux",
+      homeDir: home,
+      env: { PATH: "/nonexistent-bin", HOME: home },
+      existsSyncFn: () => false,
+      execFileSyncFn: (() => {
+        throw Object.assign(new Error("which: no codex"), { status: 1 });
+      }) as unknown as typeof import("node:child_process").execFileSync,
+      statSyncFn: () => {
+        throw new Error("disable host-file cache for the injected probe");
+      },
+    });
+
+    assert.equal(result.available, false);
+    assert.equal(result.unavailableReason, "not_installed");
+  });
 });
 
 test("resolveCodexCommand ignores Windows sandbox runner fallback", () => {
@@ -3054,12 +3227,14 @@ test("resolveCodexSpawn runs the Windows npm entry through a genuine Node host",
   assert.equal(result.env?.ELECTRON_RUN_AS_NODE, undefined);
 });
 
-test("resolveCodexSpawn skips an npm JS entry in a Windows SEA and selects the PATH cmd shim", () => {
+test("resolveCodexSpawn in a Windows SEA runs the PATH wrapper's entry with the wrapper's node, not cmd.exe", () => {
   clearCodexProbeCacheForTests();
   const seaExecutable = String.raw`C:\Program Files\Raft\raft-computer.exe`;
   const globalRoot = String.raw`C:\Users\bot\AppData\Roaming\npm\node_modules`;
   const npmEntry = String.raw`C:\Users\bot\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js`;
   const shim = String.raw`C:\Users\bot\AppData\Roaming\npm\codex.cmd`;
+  const pathNode = String.raw`C:\Program Files\nodejs\node.exe`;
+  const shimContent = 'CALL :find_dp0\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n';
   const invoked: string[] = [];
 
   const result = resolveCodexSpawn(["app-server", "--listen", "stdio://"], {
@@ -3070,25 +3245,32 @@ test("resolveCodexSpawn skips an npm JS entry in a Windows SEA and selects the P
     execIsSea: true,
     hasNodeRuntime: true,
     existsSyncFn: (candidate) => candidate === npmEntry || candidate === shim,
+    readFileSyncFn: (file) => {
+      assert.equal(file, shim);
+      return shimContent;
+    },
     windowsEnvironmentReaderFn: () => ({}),
     execFileSyncFn: ((command: string, args?: readonly string[]) => {
       invoked.push(command);
       if (command === "npm") return Buffer.from(`${globalRoot}\r\n`);
-      if (command === "powershell.exe") return Buffer.from(`${shim}\r\n`);
+      if (command === "powershell.exe") {
+        return Buffer.from(`${args?.[args.length - 1] === "node" ? pathNode : shim}\r\n`);
+      }
       if (command === seaExecutable) assert.fail("a SEA executable must never be used as the Node host");
-      if (command === shim && args?.[0] === "app-server") {
-        assert.deepEqual(args, ["app-server", "--help"]);
+      if (command === shim) assert.fail("a .cmd wrapper must not be executed");
+      if (command === pathNode && args?.[1] === "app-server") {
+        assert.deepEqual(args, [npmEntry, "app-server", "--help"]);
         return Buffer.from("Usage: codex app-server\r\n");
       }
-      if (command === shim && args?.[0] === "--version") return Buffer.from("codex-cli 0.149.0\r\n");
+      if (command === pathNode && args?.[1] === "--version") return Buffer.from("codex-cli 0.149.0\r\n");
       throw new Error(`unexpected command ${command}`);
     }) as any,
   });
 
   assert.deepEqual(result, {
-    command: shim,
-    args: ["app-server", "--listen", "stdio://"],
-    shell: true,
+    command: pathNode,
+    args: [npmEntry, "app-server", "--listen", "stdio://"],
+    shell: false,
     source: "path",
   });
   assert.ok(!invoked.includes(seaExecutable));
@@ -3169,27 +3351,23 @@ test("probeCodex reports a bounded missing-node-host rejection when a Windows SE
   clearCodexProbeCacheForTests();
 });
 
-test("resolveCodexSpawn uses shell:true on Windows when PATH resolves to a .cmd shim", () => {
+test("resolveCodexSpawn never runs a .cmd wrapper it cannot resolve", () => {
   const shim = "C:\\Users\\test\\AppData\\Local\\npm\\codex.cmd";
-  const result = resolveCodexSpawn(["app-server", "--listen", "stdio://"], {
+  assert.throws(() => resolveCodexSpawn(["app-server", "--listen", "stdio://"], {
     platform: "win32",
+    existsSyncFn: (candidate) => candidate === shim,
+    readFileSyncFn: () => "@echo off\r\npowershell -File \"%SCRIPT_DIR%\\codex.ps1\" %*\r\n",
+    windowsEnvironmentReaderFn: () => ({}),
     execFileSyncFn: ((command: string, args?: readonly string[]) => {
       if (command === "npm") throw new Error("npm install not found");
-      if (command === shim && args?.[0] === "app-server") {
-        assert.deepEqual(args, ["app-server", "--help"]);
-        return Buffer.from("Usage: codex app-server\r\n");
-      }
+      if (command === shim) assert.fail("a .cmd wrapper must not be executed");
       if (command === "powershell.exe") {
         assert.deepEqual(args?.slice(0, 3), ["-NoProfile", "-NonInteractive", "-Command"]);
         return Buffer.from(`${shim}\r\n`);
       }
-      return Buffer.from("");
+      throw new Error(`unexpected command ${command}`);
     }) as any,
-  });
-
-  assert.equal(result.command, shim);
-  assert.deepEqual(result.args, ["app-server", "--listen", "stdio://"]);
-  assert.equal(result.shell, true);
+  }), /batch wrapper rejected: batch_target_unresolved/);
 });
 
 test("resolveCodexSpawn falls back to standard Codex Desktop install path on Windows", () => {
@@ -3547,4 +3725,443 @@ test("codex probe cache re-probes after a cached failure recovers", () => {
   assert.ok(execCount > afterFail, "recovered binary after mtime change must re-probe");
 
   clearCodexProbeCacheForTests();
+});
+
+// task #1263: the Windows `npm root -g` discovery child runs under a budget and a
+// timed-out child neither stalls nor reclassifies the probe.
+function windowsNpmRootFakes(npmBehaviour: "ok" | "timeout", desktopCodex?: string) {
+  const captured: { npmTimeout?: unknown } = {};
+  const execFileSyncFn = ((command: string, args?: readonly string[], options?: { timeout?: unknown }) => {
+    if (command === "npm") {
+      captured.npmTimeout = options?.timeout;
+      if (npmBehaviour === "timeout") throw Object.assign(new Error("spawnSync npm ETIMEDOUT"), { code: "ETIMEDOUT" });
+      return Buffer.from("C:\\Users\\user\\AppData\\Roaming\\npm\\node_modules\r\n");
+    }
+    if (desktopCodex && command === desktopCodex && args?.[0] === "app-server") {
+      return Buffer.from("Usage: codex app-server\r\n");
+    }
+    assert.equal(command, "powershell.exe");
+    if (args?.some((arg) => arg.includes("Get-Command"))) {
+      if (desktopCodex) return Buffer.from(`${desktopCodex}\r\n`);
+      throw Object.assign(new Error("CommandNotFound"), { status: 3 });
+    }
+    return Buffer.from("");
+  }) as unknown as typeof import("node:child_process").execFileSync;
+  return { captured, execFileSyncFn };
+}
+
+test("task #1263: the Windows npm root discovery child runs under CODEX_NPM_ROOT_TIMEOUT_MS", () => {
+  assert.equal(CODEX_NPM_ROOT_TIMEOUT_MS, 5000);
+  withTempHome((home) => {
+    const { captured, execFileSyncFn } = windowsNpmRootFakes("ok");
+    const result = probeCodex({
+      platform: "win32",
+      homeDir: home,
+      env: { PATH: "C:\\nonexistent-bin" },
+      existsSyncFn: () => false,
+      execFileSyncFn,
+      statSyncFn: () => {
+        throw new Error("disable host-file cache for the injected probe");
+      },
+    });
+    assert.equal(captured.npmTimeout, CODEX_NPM_ROOT_TIMEOUT_MS);
+    assert.equal(result.available, false);
+    assert.equal(result.unavailableReason, "not_installed");
+  });
+});
+
+test("task #1263: a timed-out npm root child keeps the not_installed classification and leaves a path-free note", () => {
+  withTempHome((home) => {
+    const { execFileSyncFn } = windowsNpmRootFakes("timeout");
+    const result = probeCodex({
+      platform: "win32",
+      homeDir: home,
+      env: { PATH: "C:\\nonexistent-bin" },
+      existsSyncFn: () => false,
+      execFileSyncFn,
+      statSyncFn: () => {
+        throw new Error("disable host-file cache for the injected probe");
+      },
+    });
+    assert.equal(result.available, false);
+    assert.equal(result.unavailableReason, "not_installed");
+    assert.match(result.diagnostic ?? "", /npm_global discovery: `npm root -g` did not finish within 5000 ms, so the global npm install was not searched and a Codex installed only there is not ruled out/);
+    assert.doesNotMatch(result.diagnostic ?? "", /npm_global discovery[^;]*(Users|AppData|\\\\)/);
+  });
+});
+
+test("task #1263: a timed-out npm root child still lets PATH/desktop discovery select Codex", () => {
+  const desktopCodex = "C:\\Users\\user\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe";
+  withTempHome((home) => {
+    const { execFileSyncFn } = windowsNpmRootFakes("timeout", desktopCodex);
+    const result = probeCodex({
+      platform: "win32",
+      homeDir: home,
+      env: { PATH: "C:\\nonexistent-bin" },
+      existsSyncFn: (candidate: unknown) => candidate === desktopCodex,
+      execFileSyncFn,
+      statSyncFn: () => {
+        throw new Error("disable host-file cache for the injected probe");
+      },
+    });
+    assert.equal(result.available, true);
+    assert.match(result.diagnostic ?? "", /npm root -g` did not finish within 5000 ms/);
+  });
+});
+
+test("task #1263: a timed-out npm root child still lets PATH discovery select a codex executable, in the original order", () => {
+  const shim = "C:\\Users\\user\\AppData\\Local\\Programs\\codex\\codex.exe";
+  withTempHome((home) => {
+    const calls: string[] = [];
+    const execFileSyncFn = ((command: string, args?: readonly string[]) => {
+      if (command === "npm") {
+        calls.push("npm");
+        throw Object.assign(new Error("spawnSync npm ETIMEDOUT"), { code: "ETIMEDOUT" });
+      }
+      if (command === shim && args?.[0] === "app-server") {
+        calls.push("app-server");
+        return Buffer.from("Usage: codex app-server\r\n");
+      }
+      assert.equal(command, "powershell.exe");
+      if (args?.some((arg) => arg.includes("Get-Command"))) {
+        calls.push("get-command");
+        return Buffer.from(`${shim}\r\n`);
+      }
+      return Buffer.from("");
+    }) as unknown as typeof import("node:child_process").execFileSync;
+    const result = probeCodex({
+      platform: "win32",
+      homeDir: home,
+      env: { PATH: "C:\\Users\\user\\AppData\\Local\\Programs\\codex" },
+      existsSyncFn: () => false,
+      execFileSyncFn,
+      statSyncFn: () => {
+        throw new Error("disable host-file cache for the injected probe");
+      },
+    });
+    assert.equal(result.available, true);
+    assert.equal(calls[0], "npm", "npm root discovery still runs first");
+    assert.ok(calls.indexOf("get-command") > calls.indexOf("npm"), "PATH discovery follows the timed-out npm step");
+    assert.ok(calls.includes("app-server"), "the PATH candidate is probed");
+    assert.match(result.diagnostic ?? "", /npm root -g` did not finish within 5000 ms/);
+  });
+});
+
+test("task #1263: a timed-out npm root child still lets desktop-only discovery select Codex (reviewer)", () => {
+  const desktopCodex = "C:\\Users\\user\\AppData\\Local\\OpenAI\\Codex\\bin\\codex.exe";
+  withTempHome((home) => {
+    const fakes = windowsNpmRootFakes("timeout", desktopCodex);
+    const execFileSyncFn = ((command: string, args?: readonly string[], options?: unknown) => {
+      if (command === "powershell.exe" && args?.some(arg => arg.includes("Get-Command"))) throw Object.assign(new Error("missing"), {status: 3});
+      return (fakes.execFileSyncFn as any)(command, args, options);
+    }) as typeof fakes.execFileSyncFn;
+    const result = probeCodex({
+      platform: "win32",
+      homeDir: home,
+      env: { PATH: "C:\\nonexistent-bin", LOCALAPPDATA: "C:\\Users\\user\\AppData\\Local" },
+      existsSyncFn: (candidate: unknown) => candidate === desktopCodex,
+      execFileSyncFn,
+      statSyncFn: () => {
+        throw new Error("disable host-file cache for the injected probe");
+      },
+    });
+    assert.equal(result.available, true);
+    assert.match(result.diagnostic ?? "", /npm root -g` did not finish within 5000 ms/);
+  });
+});
+
+
+// ── task #1277, PR 2: the async candidate resolution behind the form's model detection ──
+
+test("task #1277: resolveCodexSpawnAsync selects the same candidate, with the same version arbitration, as resolveCodexSpawn", async () => {
+  // Two POSIX candidates: the PATH codex (older) and the desktop plugin
+  // app-server under the home directory (newer), which darwin discovery scans.
+  const home = "/nonexistent-home";
+  const bundle = path.join(home, ".codex", "plugins", ".plugin-appserver", "codex");
+  const stand = ((command: string, args?: readonly string[]) => {
+    if (command === "which") return Buffer.from("/usr/local/bin/codex\n");
+    if (args?.[0] === "app-server") return Buffer.from("Usage\n");
+    if (args?.[0] === "--version") return Buffer.from(command === bundle ? "codex-cli 0.90.0\n" : "codex-cli 0.80.0\n");
+    throw new Error(`unexpected ${command} ${args?.join(" ")}`);
+  }) as unknown as typeof execFileSync;
+  const deps = { platform: "darwin" as const, homeDir: home, existsSyncFn: (p: string) => p === bundle, env: { PATH: "/usr/local/bin" } };
+  clearCodexProbeCacheForTests();
+  const viaSync = resolveCodexSpawn(["app-server"], { ...deps, execFileSyncFn: stand });
+  clearCodexProbeCacheForTests();
+  const viaAsync = await resolveCodexSpawnAsync(["app-server"], { ...deps, runProbeChildFn: viaProbeChild(stand) });
+  assert.deepEqual(viaAsync, viaSync);
+  assert.equal(viaAsync.command, bundle, "the newer desktop bundle wins the version arbitration in both");
+});
+
+test("task #1277: resolveCodexSpawnAsync rejects with the same text as resolveCodexSpawn when every candidate fails its app-server probe", async () => {
+  const stand = ((command: string, args?: readonly string[]) => {
+    if (command === "which") return Buffer.from("/usr/local/bin/codex\n");
+    if (args?.[0] === "app-server") throw Object.assign(new Error("exit 2"), { status: 2 });
+    throw new Error(`unexpected ${command}`);
+  }) as unknown as typeof execFileSync;
+  const deps = { platform: "linux" as const, homeDir: "/nonexistent-home", existsSyncFn: () => false, env: { PATH: "/usr/local/bin" } };
+  clearCodexProbeCacheForTests();
+  let syncMessage = "";
+  try { resolveCodexSpawn(["app-server"], { ...deps, execFileSyncFn: stand }); } catch (error) { syncMessage = (error as Error).message; }
+  clearCodexProbeCacheForTests();
+  await assert.rejects(resolveCodexSpawnAsync(["app-server"], { ...deps, runProbeChildFn: viaProbeChild(stand) }), (error: unknown) => {
+    assert.equal((error as Error).message, syncMessage);
+    assert.match(syncMessage, /app-server probe exit status 2/);
+    return true;
+  });
+});
+
+test("task #1277: the async candidate probe reuses a verdict the synchronous probe cached, without spawning", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-async-cache-"));
+  try {
+    const codexPath = path.join(root, "codex");
+    writeFileSync(codexPath, "#!/bin/sh\n");
+    const stand = ((command: string, args?: readonly string[]) => {
+      if (command === "which") return Buffer.from(`${codexPath}\n`);
+      if (args?.[0] === "app-server") return Buffer.from("Usage\n");
+      if (args?.[0] === "--version") return Buffer.from("codex-cli 0.80.0\n");
+      throw new Error(`unexpected ${command}`);
+    }) as unknown as typeof execFileSync;
+    const deps = { platform: "linux" as const, homeDir: path.join(root, "no-home"), env: { PATH: root } };
+    clearCodexProbeCacheForTests();
+    resolveCodexSpawn(["app-server"], { ...deps, execFileSyncFn: stand });
+    // The async resolver must only run the PATH lookup; the probe and the
+    // version read come from the shared cache.
+    const spawned: string[] = [];
+    const viaAsync = await resolveCodexSpawnAsync(["app-server"], {
+      ...deps,
+      runProbeChildFn: async (command, args) => {
+        spawned.push([command, ...args].join(" "));
+        if (command === "which") return { stdout: `${codexPath}\n`, stderr: "" };
+        throw new Error(`the cached probe must not be rerun: ${command} ${args.join(" ")}`);
+      },
+    });
+    assert.equal(viaAsync.command, codexPath);
+    assert.deepEqual(spawned, ["which codex"]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("task #1277: codex form detection no longer blocks the daemon's event loop on the candidate search", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-detect-nonblocking-"));
+  try {
+    const workDir = path.join(root, "work");
+    mkdirSync(workDir, { recursive: true });
+    const { binDir, logPath } = installScriptedCodexAppServer(root);
+    // A `which` that answers slowly stands in for a cold PATH scan.
+    const slowWhich = path.join(binDir, "which");
+    writeFileSync(slowWhich, `#!/bin/sh\nsleep 0.4\necho ${path.join(binDir, "codex")}\n`);
+    chmodSync(slowWhich, 0o755);
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks += 1; }, 20);
+    try {
+      clearCodexProbeCacheForTests();
+      const result = await detectCodexModelsFromAppServer({
+        cwd: workDir,
+        timeoutMs: 5000,
+        env: { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`, SCRIPTED_CODEX_LOG: logPath },
+        deps: { platform: "linux", homeDir: path.join(root, "no-home") },
+      });
+      assert.ok(result && result.models.length > 0, JSON.stringify(result));
+      assert.ok(ticks >= 5, `the event loop ran ${ticks} ticks during the 400 ms lookup; a blocking lookup would run none`);
+    } finally {
+      clearInterval(ticker);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("task #1277 (review): a cancelled codex form detection rejects with the abort and never starts the app-server", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-detect-abort-"));
+  try {
+    const workDir = path.join(root, "work");
+    mkdirSync(workDir, { recursive: true });
+    const { binDir, logPath } = installScriptedCodexAppServer(root);
+    const env = { ...process.env, PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`, SCRIPTED_CODEX_LOG: logPath };
+    const isAbort = (error: unknown) => error instanceof Error && (error as { code?: unknown }).code === "ABORT_ERR";
+    // Pre-aborted: nothing runs.
+    const pre = new AbortController();
+    pre.abort();
+    clearCodexProbeCacheForTests();
+    await assert.rejects(detectCodexModelsFromAppServer({ cwd: workDir, env, deps: { platform: "linux", homeDir: path.join(root, "no-home"), signal: pre.signal } }), isAbort, "pre-aborted");
+    // Aborted as the lookup returns: the candidate is known, the app-server must still not start.
+    const gap = new AbortController();
+    clearCodexProbeCacheForTests();
+    await assert.rejects(detectCodexModelsFromAppServer({
+      cwd: workDir, env,
+      deps: {
+        platform: "linux", homeDir: path.join(root, "no-home"), signal: gap.signal,
+        runProbeChildFn: async (command, args) => {
+          if (command === "which") return { stdout: `${path.join(binDir, "codex")}\n`, stderr: "" };
+          if (args.includes("--version")) { gap.abort(); return { stdout: "codex-cli 0.80.0\n", stderr: "" }; }
+          return { stdout: "Usage\n", stderr: "" };
+        },
+      },
+    }), isAbort, "aborted between the candidate probe and the spawn");
+    assert.equal(existsSync(logPath), false, "the scripted app-server must never have started");
+    // Aborted while the app-server is active: killed, rejected well before the deadline.
+    const active = new AbortController();
+    clearCodexProbeCacheForTests();
+    const startedAt = Date.now();
+    // Abort once the app-server is really running (its first logged request),
+    // not during the candidate probes that precede the spawn.
+    const abortOnceStarted = setInterval(() => {
+      if (!existsSync(logPath)) return;
+      clearInterval(abortOnceStarted);
+      active.abort();
+    }, 20);
+    await assert.rejects(detectCodexModelsFromAppServer({
+      cwd: workDir, timeoutMs: 10_000,
+      env: { ...env, SCRIPTED_CODEX_HOLD_MS: "8000" },
+      deps: { platform: "linux", homeDir: path.join(root, "no-home"), signal: active.signal },
+    }), (error: unknown) => {
+      assert.ok(isAbort(error), "aborted while active");
+      const cleanup = (error as { cleanup?: { childExited: boolean } }).cleanup;
+      assert.equal(cleanup?.childExited, true, "the app-server's exit was observed, not assumed");
+      return true;
+    }).finally(() => clearInterval(abortOnceStarted));
+    assert.ok(Date.now() - startedAt < 5000, "the cancel ended the detection, not the 10 s deadline");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("task #1277 (review): a cancel during the candidate's app-server probe or version read is rethrown before any cache write, so later resolutions are unaffected", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-async-cancel-cache-"));
+  try {
+    const codexPath = path.join(root, "codex");
+    writeFileSync(codexPath, "#!/bin/sh\n");
+    const deps = { platform: "linux" as const, homeDir: path.join(root, "no-home"), env: { PATH: root } };
+    const good = ((command: string, args?: readonly string[]) => {
+      if (command === "which") return Buffer.from(`${codexPath}\n`);
+      if (args?.[0] === "app-server") return Buffer.from("Usage\n");
+      if (args?.[0] === "--version") return Buffer.from("codex-cli 0.80.0\n");
+      throw new Error(`unexpected ${command}`);
+    }) as unknown as typeof execFileSync;
+    const isAbort = (error: unknown) => error instanceof Error && (error as { code?: unknown }).code === "ABORT_ERR";
+
+    for (const stage of ["app-server", "--version"] as const) {
+      clearCodexProbeCacheForTests();
+      const controller = new AbortController();
+      const cancelAt: typeof runProbeChild = async (command, args) => {
+        if (command === "which") return { stdout: `${codexPath}\n`, stderr: "" };
+        if (args[0] === stage) {
+          controller.abort();
+          throw new ProbeChildError(`${stage} aborted`, { code: "ABORT_ERR", cleanup: { childExited: true, waitedMs: 2 } });
+        }
+        return { stdout: args[0] === "--version" ? "codex-cli 0.80.0\n" : "Usage\n", stderr: "" };
+      };
+      await assert.rejects(
+        resolveCodexSpawnAsync(["app-server"], { ...deps, signal: controller.signal, runProbeChildFn: cancelAt }),
+        (error: unknown) => isAbort(error) && (error as { cleanup?: { childExited?: boolean } }).cleanup?.childExited === true,
+        `${stage}: the cancel is rethrown with its cleanup, not classified`,
+      );
+      // The shared cache holds no verdict for this candidate: a following
+      // normal resolution, synchronous and asynchronous, selects it with its
+      // real version.
+      const viaSync = resolveCodexSpawn(["app-server"], { ...deps, execFileSyncFn: good });
+      assert.equal(viaSync.command, codexPath, `${stage}: the synchronous resolver still accepts the candidate`);
+      assert.equal(probeCodex({ ...deps, execFileSyncFn: good }).version, "codex-cli 0.80.0", `${stage}: the version is read, not a cached unknown`);
+      const viaAsync = await resolveCodexSpawnAsync(["app-server"], { ...deps, runProbeChildFn: viaProbeChild(good) });
+      assert.equal(viaAsync.command, codexPath, `${stage}: the async resolver still accepts the candidate`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("task #1277 (review): a cancel during the Windows npm-root discovery is rethrown with its (unconfirmed) cleanup and no PATH lookup follows", async () => {
+  const controller = new AbortController();
+  const children: string[] = [];
+  const runChild: typeof runProbeChild = async (command, args) => {
+    children.push([command, ...args].join(" "));
+    if (command === "npm") {
+      controller.abort();
+      throw new ProbeChildError("npm root -g aborted", { code: "ABORT_ERR", cleanup: { childExited: false, waitedMs: 5000 } });
+    }
+    return { stdout: "C:\\tools\\codex.exe\r\n", stderr: "" };
+  };
+  await assert.rejects(
+    resolveCodexSpawnAsync(["app-server"], {
+      platform: "win32",
+      env: { PATH: "C:\\tools" },
+      windowsEnvironmentReaderFn: () => ({}),
+      existsSyncFn: () => false,
+      signal: controller.signal,
+      runProbeChildFn: runChild,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof ProbeChildError && error.code === "ABORT_ERR");
+      assert.deepEqual(error.cleanup, { childExited: false, waitedMs: 5000 }, "the original abort, with its unconfirmed cleanup, is what the caller sees");
+      return true;
+    },
+  );
+  assert.deepEqual(children, ["npm root -g"], "no PATH lookup runs after the cancel");
+});
+
+// ── task #1277, B-group: the codex launch resolves under the start attempt's cancel ──
+
+test("task #1277 (launch): a codex spawn with an already-cancelled launch signal creates no child and rejects with the abort", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-launch-cancel-"));
+  const previous = { PATH: process.env.PATH, SCRIPTED_CODEX_LOG: process.env.SCRIPTED_CODEX_LOG };
+  try {
+    const workDir = path.join(root, "work");
+    mkdirSync(workDir, { recursive: true });
+    const { binDir, logPath } = installScriptedCodexAppServer(root);
+    process.env.PATH = `${binDir}${path.delimiter}${previous.PATH ?? ""}`;
+    process.env.SCRIPTED_CODEX_LOG = logPath;
+    clearCodexProbeCacheForTests();
+    const controller = new AbortController();
+    controller.abort();
+    const driver = new CodexDriver();
+    await assert.rejects(
+      driver.spawn({ ...makeSpawnContext(workDir), launchSignal: controller.signal }),
+      (error: unknown) => error instanceof Error && (error as { code?: unknown }).code === "ABORT_ERR",
+    );
+    assert.equal(existsSync(logPath), false, "no codex app-server was started");
+  } finally {
+    process.env.PATH = previous.PATH;
+    if (previous.SCRIPTED_CODEX_LOG === undefined) delete process.env.SCRIPTED_CODEX_LOG; else process.env.SCRIPTED_CODEX_LOG = previous.SCRIPTED_CODEX_LOG;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("task #1277 (launch): a codex launch cancelled while the candidate search runs creates no child and leaves the probe cache clean", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(path.join(os.tmpdir(), "codex-launch-cancel-mid-"));
+  const previous = { PATH: process.env.PATH, SCRIPTED_CODEX_LOG: process.env.SCRIPTED_CODEX_LOG };
+  try {
+    const workDir = path.join(root, "work");
+    mkdirSync(workDir, { recursive: true });
+    const { binDir, logPath } = installScriptedCodexAppServer(root);
+    // A slow `which` stands in for a cold PATH scan during the candidate search.
+    const slowWhich = path.join(binDir, "which");
+    writeFileSync(slowWhich, `#!/bin/sh\nsleep 0.5\necho ${path.join(binDir, "codex")}\n`);
+    chmodSync(slowWhich, 0o755);
+    process.env.PATH = `${binDir}${path.delimiter}${previous.PATH ?? ""}`;
+    process.env.SCRIPTED_CODEX_LOG = logPath;
+    clearCodexProbeCacheForTests();
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 100);
+    const driver = new CodexDriver();
+    await assert.rejects(
+      driver.spawn({ ...makeSpawnContext(workDir), launchSignal: controller.signal }),
+      (error: unknown) => error instanceof Error && (error as { code?: unknown }).code === "ABORT_ERR",
+    );
+    assert.equal(existsSync(logPath), false, "no codex app-server was started after the cancel");
+    // The cancel wrote nothing to the shared probe cache: a later uncancelled
+    // launch resolution still finds the candidate usable.
+    const result = await driver.spawn(makeSpawnContext(workDir));
+    assert.ok(result.process, "the next launch spawns normally");
+    result.process.kill("SIGKILL");
+  } finally {
+    process.env.PATH = previous.PATH;
+    if (previous.SCRIPTED_CODEX_LOG === undefined) delete process.env.SCRIPTED_CODEX_LOG; else process.env.SCRIPTED_CODEX_LOG = previous.SCRIPTED_CODEX_LOG;
+    rmSync(root, { recursive: true, force: true });
+  }
 });

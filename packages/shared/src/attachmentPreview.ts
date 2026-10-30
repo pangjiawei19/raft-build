@@ -1,5 +1,11 @@
 export const CSV_PREVIEW_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
-export const XLSX_PREVIEW_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024;
+// Parsing is synchronous CPU on the server request path (task #19): above this
+// the preview falls back to the download card.
+export const XLSX_PREVIEW_MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024;
+// Markdown previews larger than this are refused (download card instead).
+export const MARKDOWN_PREVIEW_PAYLOAD_BYTE_LIMIT = 64 * 1024;
+// Text previews read at most this many bytes of the file.
+export const TEXT_PREVIEW_BYTE_LIMIT = 96 * 1024;
 
 // Non-text/* MIME types that are still plain text in practice.
 const TEXT_PREVIEW_MIME_TYPES = new Set([
@@ -94,6 +100,8 @@ export type AttachmentPreviewData =
   | PdfAttachmentPreviewData
   | TextAttachmentPreviewData;
 
+// "unavailable" is transient (compute capacity, not the file): callers may
+// retry later, and caches must not pin it.
 export type AttachmentPreviewResponse =
   | { status: "ok"; data: AttachmentPreviewData; truncated?: boolean }
-  | { status: "unsupported"; reason?: "unreadable" | "encrypted" | "corrupt" | "too_large" | "unsupported" };
+  | { status: "unsupported"; reason?: "unreadable" | "encrypted" | "corrupt" | "too_large" | "unsupported" | "unavailable" };

@@ -1,12 +1,13 @@
 import { expect, test } from "@playwright/test";
 import { loginViaApi } from "../../fixtures/auth";
+import { navigateToMessageScrollerWithReadinessEvidence } from "../../fixtures/messageScrollerReadiness";
 import { waitForSeedState } from "../../fixtures/seedState";
 import { dismissOwnerOnboarding } from "../../fixtures/session";
 
 // After the channel Tasks tab and the server-wide Tasks page were unified onto
 // TasksPanel (PR #1439, #proj-task task #3), the channel-mode panel:
 //   - exposes Board/List view toggle (default Board)
-//   - shows a +New Task CTA (channel-mode only)
+//   - shows a +Create Task CTA (channel-mode only)
 //   - renders 4 status columns in board view (TODO / IN PROGRESS / IN REVIEW / DONE)
 //   - drops the per-status filter tabs that the legacy TaskBoard exposed —
 //     filtering by status is implicit in the column layout.
@@ -70,8 +71,9 @@ test.describe("channel task board view", () => {
     await expect(page.getByTestId("channel-task-view-list")).toHaveAttribute("aria-checked", "false");
     await expect(page.getByTestId("channel-task-board-view")).toBeVisible();
 
-    // Channel-mode-only CTA.
-    await expect(page.getByRole("button", { name: /new task/i }).first()).toBeVisible();
+    // Channel-mode-only CTA. It says the title of the dialog it opens
+    // (Create Task), per the Raft DS copy rule.
+    await expect(page.getByRole("button", { name: "Create Task", exact: true })).toBeVisible();
 
     // All five status columns render in board view (todo / in_progress /
     // in_review / done / closed). The 5th column (Closed = won't-do) was
@@ -119,7 +121,7 @@ test.describe("channel task board view", () => {
     await expect(page.getByTestId("channel-task-board-view")).toBeVisible();
   });
 
-  test("dragging an unassigned todo to In Progress claims it and writes the status", async ({ page, request }) => {
+  test("dragging an unassigned todo to In Progress claims it and writes the status", async ({ page, request }, testInfo) => {
     const seedState = await waitForSeedState();
     const login = await loginViaApi(request, seedState);
     await dismissOwnerOnboarding(request, seedState, login.accessToken);
@@ -137,8 +139,10 @@ test.describe("channel task board view", () => {
     const task = createBody.tasks[0];
     expect(task).toBeTruthy();
 
-    await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
-    await expect(page.getByTestId("message-scroller")).toBeVisible();
+    await navigateToMessageScrollerWithReadinessEvidence(page, testInfo, {
+      consumer: "channel-task-board",
+      channelId: seedState.channel.id,
+    }, () => page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`));
     await page.getByTestId("panel-tab-tasks").click();
     await expect(page.getByTestId("channel-task-board-view")).toBeVisible();
 

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const read = (p: string) => readFileSync(resolve(repoRoot, p), "utf8");
@@ -87,16 +86,13 @@ test("tokenizer stays activity-local (NOT in the shared util)", () => {
 
 test("ref chip reuses chat affordance recipe; no spinner, cursor stays default", () => {
   const src = read("src/components/agent/RefText.tsx");
-  assert.match(src, /import \{ MSG_REF_CHIP \} from "\.\.\/message\/messageRefChip";/);
-  assert.match(src, /className=\{`\$\{MSG_REF_CHIP\} cursor-default text-black/);
-  // Same tint recipe family as MessageItem refs (thread=cyan, channel/dm=pink).
-  assert.match(src, /bg-brutal-cyan\/30 hover:bg-brutal-cyan\/60/);
-  assert.match(src, /bg-brutal-pink\/30 hover:bg-brutal-pink\/60/);
-  const sharedChip = read("src/components/message/messageRefChip.ts");
-  assert.match(sharedChip, /inline-block/);
-  assert.match(sharedChip, /align-bottom/);
-  assert.match(sharedChip, /border border-black/);
-  assert.match(sharedChip, /leading-\[1\.3em\]/);
+  assert.match(src, /<MessageReferenceChip/);
+  assert.match(src, /variant=\{isThread \? "link" : "accent"\}/);
+  // Size and baseline are owned by the RUI message-reference recipe since
+  // raft-ui 0.5.16 (#319): the chip is body size on the body baseline. slock no
+  // longer appends a local font scale.
+  assert.doesNotMatch(src, /MSG_REF_CHIP_FONT_SCALE|messageRefChip|0\.875em/);
+  assert.doesNotMatch(src, /\bMSG_REF_CHIP\b(?!\w)/);
   // Cursor contract: refs are app chrome — never the link hand.
   assert.match(src, /cursor-default/);
   assert.doesNotMatch(src, /cursor-pointer/);
@@ -126,10 +122,11 @@ test("AgentActivityLog linkifies ONLY structured-metadata entries, not free-form
     "RefText must be used exactly 3x (SlockAction + System + Status)",
   );
 
-  // SlockActionEntry — the function carrying the bg-blue-300 slock-action dot.
+  // SlockActionEntry — the function carrying the done-lime slock-action pixel
+  // (DS Timeline activity log: presence lights only, raft-ui Status presence).
   const slockAction = src.match(/function SlockActionEntry\([\s\S]*?\n\}\n/);
   assert.ok(slockAction, "SlockActionEntry not found");
-  assert.match(slockAction[0], /bg-blue-300/);
+  assert.match(slockAction[0], /presence="online"/);
   assert.match(slockAction[0], /<RefText text=\{text\} \/>/);
 
   // The structured-metadata entries route through RefText.

@@ -87,6 +87,7 @@ What agents CAN do:
 
 - **"I enabled push but I'm not getting notifications"**: check browser permission (`Denied` shows in status). Re-grant via the browser's notification settings.
 - **"Test push works but real mentions don't"**: check the message actually triggered a notification-shape (DM / direct mention / followed thread reply — see coverage line). Channel-root chatter without your mention doesn't push.
+- **"I stopped getting browser notifications while Raft Desktop is open"**: by design. While someone is using Raft Desktop (its window in front within the last 10 minutes), message pushes to their browsers are skipped so the same message does not notify twice; the desktop app notifies instead. Browser pushes resume 10 minutes after they stop using the desktop app, or at once if the desktop app sees them away (no keyboard or mouse input for 10 minutes, or the screen locked); the desktop app then notifies again too. The window is fixed — there is no setting for it. The Settings test notification is never skipped.
 - **"I muted the server but I'm still getting browser notifications"**: cache or sync lag. Hard refresh + check the mute toggle is still on.
 - **"I want per-channel mute"**: this exists — `raft channel mute --target "#channel"` (undo with `raft channel unmute`). It suppresses ordinary Activity delivery from that channel itself; personal @mentions and DMs still reach you, and threads they follow keep delivering independently. For a single thread, point them at `raft thread unfollow`. What is *not* per-channel is the **push** settings surface, which stays server-level. Ask which one they mean before answering "no".
 - **"DM mute"**: not available today — there is no user-reachable way to mute a DM. You can hide one from the sidebar (right-click → Close DM), but that is a display action, not a mute, and messages keep arriving. Say it's missing rather than pointing at Close DM as if it were the feature.
@@ -98,5 +99,5 @@ Notifications:
 - Span three distinct surfaces (push subscription · server mute · in-app notification bell)
 - Are configured per-[Account](/agent-knowledge/participants/account) (settings live in the user's Settings panel)
 - Server mute is per-account but server-scoped (each server has its own mute state per user)
-- Push delivery is gated by browser permission AND server-mute state AND user enable
+- Push delivery is gated by browser permission AND server-mute state AND user enable; message pushes to browsers also pause while the user is on Raft Desktop
 - Distinct from [Inbox](/agent-knowledge/coordination/inbox) (in-app attention aggregation)

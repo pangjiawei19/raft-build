@@ -5,29 +5,29 @@ import {
   setClockTimeout,
   type ManagedMcpToolCatalogEntry,
 } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
-import { actorHasServerCapabilityInServer } from "../lib/actorPermissions.js";
+import { getDb } from "../db/index";
+import { actorHasServerCapabilityInServer } from "../lib/actorPermissions";
 import {
   managedMcpCredentials,
   managedMcpOAuthAttempts,
   managedMcpServers,
-} from "../db/schema.js";
+} from "../db/schema";
 import {
   decryptManagedMcpSecret,
   encryptManagedMcpSecret,
   ManagedMcpCredentialError,
-} from "./managedMcpCredentialService.js";
+} from "./managedMcpCredentialService";
 import {
   completeManagedMcpOAuth,
   listManagedMcpOAuthTools,
   ManagedMcpGatewayError,
   startManagedMcpOAuth,
   validateManagedMcpEndpoint,
-} from "./managedMcpGateway.js";
+} from "./managedMcpGateway";
 import {
   ManagedMcpOAuthProvider,
   type ManagedMcpOAuthStorage,
-} from "./managedMcpOAuthProvider.js";
+} from "./managedMcpOAuthProvider";
 
 const OAUTH_ATTEMPT_TTL_MS = 10 * 60_000;
 const OAUTH_LEASE_TTL_MS = 60_000;
@@ -590,6 +590,186 @@ export async function disconnectManagedMcpOAuthConnection(
   );
 }
 
+/**
+ * The provider a tool call runs with. Every write still goes through the
+ * credential lease (`persistToolCallStorage`), so it records which kind of
+ * write the SDK is making: a token save from a refresh it just won, an
+ * invalidation after a refresh it lost, or bookkeeping (discovery, client
+ * information, verifier).
+ */
+class ToolCallOAuthProvider extends ManagedMcpOAuthProvider {
+  writeKind: "tokens" | "invalidate" | "other" = "other";
+
+  override async saveTokens(...args: Parameters<ManagedMcpOAuthProvider["saveTokens"]>): Promise<void> {
+    this.writeKind = "tokens";
+    try {
+      await super.saveTokens(...args);
+    } finally {
+      this.writeKind = "other";
+    }
+  }
+
+  override async invalidateCredentials(
+    ...args: Parameters<ManagedMcpOAuthProvider["invalidateCredentials"]>
+  ): Promise<void> {
+    this.writeKind = "invalidate";
+    try {
+      await super.invalidateCredentials(...args);
+    } finally {
+      this.writeKind = "other";
+    }
+  }
+}
+
+/** What one tool call read, and whether another call saved newer credentials under it. */
+interface ToolCallSnapshot {
+  credentialId: string;
+  version: number;
+  supersededByConcurrentSave: boolean;
+}
+
+async function loadCredentialSnapshot(
+  serverId: string,
+  mcpServerId: string,
+): Promise<CredentialRow> {
+  const [credential] = await getDb()
+    .select()
+    .from(managedMcpCredentials)
+    .where(
+      and(
+        eq(managedMcpCredentials.serverId, serverId),
+        eq(managedMcpCredentials.mcpServerId, mcpServerId),
+      ),
+    )
+    .limit(1);
+  if (!credential) {
+    throw new ManagedMcpOAuthError(
+      "MCP OAuth is not connected",
+      "managed_mcp_oauth_required",
+    );
+  }
+  return credential;
+}
+
+/**
+ * A tool call's write-back: the only part of a tool call that holds the
+ * credential lease. When another call saved credentials since this one read
+ * them (`credential_version` moved):
+ * - an invalidation is dropped: the refresh it lost was raced by one that
+ *   won, and wiping the winner's tokens would force a needless reconnect;
+ * - a token save is written: it is the newest grant the provider issued;
+ * - bookkeeping keeps the newer stored tokens instead of this call's stale ones.
+ */
+async function persistToolCallStorage(
+  server: ServerRow,
+  storage: ManagedMcpOAuthStorage,
+  snapshot: ToolCallSnapshot,
+  writeKind: ToolCallOAuthProvider["writeKind"],
+): Promise<void> {
+  const { credential, owner } = await acquireCredentialLease(
+    server.serverId,
+    server.id,
+  );
+  try {
+    if (credential.id !== snapshot.credentialId) {
+      throw new ManagedMcpOAuthError(
+        "MCP OAuth connection changed before credentials were saved",
+        "managed_mcp_oauth_persist_failed",
+      );
+    }
+    if (credential.credentialVersion !== snapshot.version) {
+      snapshot.supersededByConcurrentSave = true;
+      const stored = parseStorage(credential.encryptedOAuth, storage.redirectUrl);
+      if (writeKind === "invalidate") {
+        Object.assign(storage, stored);
+        if (!stored.tokens) delete storage.tokens;
+        snapshot.version = credential.credentialVersion;
+        return;
+      }
+      if (writeKind === "other") {
+        if (stored.tokens) storage.tokens = stored.tokens;
+        else delete storage.tokens;
+      }
+    }
+    const [updated] = await getDb()
+      .update(managedMcpCredentials)
+      .set({
+        encryptedOAuth: encryptManagedMcpSecret(storage),
+        credentialVersion: sql`${managedMcpCredentials.credentialVersion} + 1`,
+        updatedAt: currentDate(),
+      })
+      .where(
+        and(
+          eq(managedMcpCredentials.id, credential.id),
+          eq(managedMcpCredentials.leaseOwner, owner),
+          credentialConnectionExists(server),
+        ),
+      )
+      .returning({ credentialVersion: managedMcpCredentials.credentialVersion });
+    if (!updated) {
+      throw new ManagedMcpOAuthError(
+        "MCP OAuth connection changed before credentials were saved",
+        "managed_mcp_oauth_persist_failed",
+      );
+    }
+    snapshot.version = updated.credentialVersion;
+    if (writeKind === "tokens") {
+      // A newly issued grant proves the connection works. A concurrent call
+      // that lost the same refresh may already have marked the connection
+      // "reconnect required" (its invalidation landed first); undo that so a
+      // good grant never sits behind an error status.
+      await updateFrozenConnection(server, {
+        oauthStatus: "connected",
+        lastCheckError: null,
+        updatedAt: currentDate(),
+      });
+    }
+  } finally {
+    await releaseCredentialLease(credential.id, owner);
+  }
+}
+
+/** Mark the connection expired, fenced on the credential row still being at `snapshot.version`. */
+async function markReconnectRequiredUnlessSuperseded(
+  server: ServerRow,
+  snapshot: ToolCallSnapshot,
+): Promise<boolean> {
+  const rows = await getDb()
+    .update(managedMcpServers)
+    .set({
+      oauthStatus: "error",
+      lastCheckedAt: currentDate(),
+      lastCheckError: "OAuth authorization expired; reconnect required",
+      updatedAt: currentDate(),
+    })
+    .where(and(
+      serverConnectionFence(server),
+      sql`exists (
+        select 1 from ${managedMcpCredentials}
+        where ${managedMcpCredentials.id} = ${snapshot.credentialId}
+          and ${managedMcpCredentials.credentialVersion} = ${snapshot.version}
+      )`,
+    ))
+    .returning({ id: managedMcpServers.id });
+  return rows.length === 1;
+}
+
+function requiresReconnect(error: unknown): boolean {
+  return error instanceof ManagedMcpGatewayError
+    && error.code === "managed_mcp_oauth_required";
+}
+
+/**
+ * Run one MCP tool call (or catalog read) with the connection's OAuth
+ * credentials. The call itself runs on a snapshot of the stored credentials,
+ * outside the credential lease, so calls on one connector run concurrently;
+ * only a write-back the SDK makes mid-call (a refresh, discovery) takes the
+ * lease (`persistToolCallStorage`). A call that needed reconnecting only
+ * because a concurrent call refreshed a rotating refresh token first is run
+ * once more on the newer credentials instead of marking the connection
+ * expired. A call that failed any other way is not repeated: it may have
+ * reached the tool.
+ */
 export async function withManagedMcpOAuth<T>(
   serverId: string,
   mcpServerId: string,
@@ -599,33 +779,58 @@ export async function withManagedMcpOAuth<T>(
   ) => Promise<T>,
   expectedConfigVersion?: number,
 ): Promise<T> {
-  return withOAuthLease(
-    serverId,
-    mcpServerId,
-    undefined,
-    undefined,
-    expectedConfigVersion,
-    async (server, provider, storage) => {
-      if (!storage.tokens)
-        throw new ManagedMcpOAuthError(
-          "MCP OAuth is not connected",
-          "managed_mcp_oauth_required",
-        );
-      try {
-        return await operation(server, provider);
-      } catch (error) {
-        const reconnectRequired = error instanceof ManagedMcpGatewayError
-          && error.code === "managed_mcp_oauth_required";
+  const server = await loadServer(serverId, mcpServerId);
+  if (
+    expectedConfigVersion !== undefined
+    && server.configVersion !== expectedConfigVersion
+  ) {
+    throw new ManagedMcpOAuthError(
+      "MCP OAuth connection changed before the operation began",
+      "managed_mcp_oauth_invalid_state",
+    );
+  }
+  for (let attempt = 0; ; attempt += 1) {
+    const credential = await loadCredentialSnapshot(serverId, mcpServerId);
+    const storage = parseStorage(credential.encryptedOAuth);
+    if (!storage.tokens)
+      throw new ManagedMcpOAuthError(
+        "MCP OAuth is not connected",
+        "managed_mcp_oauth_required",
+      );
+    const snapshot: ToolCallSnapshot = {
+      credentialId: credential.id,
+      version: credential.credentialVersion,
+      supersededByConcurrentSave: false,
+    };
+    const provider: ToolCallOAuthProvider = new ToolCallOAuthProvider(storage, () =>
+      persistToolCallStorage(server, storage, snapshot, provider.writeKind));
+    try {
+      return await operation(server, provider);
+    } catch (error) {
+      if (attempt === 0 && requiresReconnect(error)) {
+        const latest = await loadCredentialSnapshot(serverId, mcpServerId);
+        // Our own write-backs move `snapshot.version`; only someone else's save
+        // makes the stored version differ from it.
+        if (snapshot.supersededByConcurrentSave || latest.credentialVersion !== snapshot.version) {
+          continue;
+        }
+      }
+      const reconnectRequired = requiresReconnect(error);
+      if (reconnectRequired) {
+        // Only while the stored credentials are still the ones this call last
+        // saw: a concurrent call that saved a newer grant in between (and set
+        // the connection back to connected) must not be overwritten by this
+        // call's stale verdict.
+        await markReconnectRequiredUnlessSuperseded(server, snapshot);
+      } else {
         await updateFrozenConnection(server, {
-          oauthStatus: reconnectRequired ? "error" : "connected",
+          oauthStatus: "connected",
           lastCheckedAt: currentDate(),
-          lastCheckError: reconnectRequired
-            ? "OAuth authorization expired; reconnect required"
-            : "MCP request failed; retry without reconnecting",
+          lastCheckError: "MCP request failed; retry without reconnecting",
           updatedAt: currentDate(),
         });
-        throw error;
       }
-    },
-  );
+      throw error;
+    }
+  }
 }

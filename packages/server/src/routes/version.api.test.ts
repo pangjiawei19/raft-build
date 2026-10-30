@@ -1,7 +1,11 @@
-import { createApiTest } from "../test/integration/apiTest.js";
+import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 
-import { openTestApp } from "../test/integration/app.js";
+import { openTestApp } from "../test/integration/app";
+
+// The release version is whatever the package declares; a literal here breaks on every bump.
+const PACKAGE_VERSION = (createRequire(import.meta.url)("../../package.json") as { version: string }).version;
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 
@@ -44,6 +48,7 @@ test("GET /api/version returns the build-time git identity without auth", async 
       const response = await fetch(`${app.baseUrl}/api/version`);
       assert.equal(response.status, 200);
       assert.deepEqual(await response.json(), {
+        version: PACKAGE_VERSION,
         sha: "0123456789abcdef0123456789abcdef01234567",
         builtAt: "2026-07-13T04:52:55Z",
         branch: "staging",

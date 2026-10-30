@@ -79,10 +79,15 @@ interface TranslationState {
   entries: Record<string, TranslationEntry>;
   settings: TranslationSettings;
   settingsServerId: string | null;
+  publicTranslationSlug: string | null;
+  browserLocalPreferences: boolean;
   settingsLoading: boolean;
   settingsError: string | null;
   inFlightBatchKeys: Record<string, true>;
-  loadSettings: (serverId: string | null | undefined) => Promise<void>;
+  loadSettings: (
+    serverId: string | null | undefined,
+    publicServerProjection?: { translationEnabled: boolean; translationAvailable: boolean; serverSlug: string; browserLocalPreferences: boolean },
+  ) => Promise<void>;
   updatePreferredLanguage: (language: string | null) => Promise<void>;
   updatePreferredTimezone: (timezone: string | null) => Promise<void>;
   updateAutoTranslationEnabled: (enabled: boolean) => Promise<void>;
@@ -96,6 +101,7 @@ interface TranslationState {
 }
 
 const PENDING_TIMEOUT_MS = 30_000;
+const PUBLIC_TRANSLATION_PREFERENCES_KEY = "raft:public-translation-preferences:v1";
 const BROWSER_TRANSLATION_TARGET = "browser";
 const FALLBACK_TRANSLATION_TARGET_LANGUAGE = "en";
 /** Static option values (labels are formatted at the call site). */
@@ -284,6 +290,27 @@ function serverTranslationSettings(settings: TranslationSettings) {
   };
 }
 
+function readPublicTranslationPreferences(): Record<string, unknown> {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    const parsed = JSON.parse(localStorage.getItem(PUBLIC_TRANSLATION_PREFERENCES_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writePublicTranslationPreferences(settings: TranslationSettings) {
+  if (typeof localStorage === "undefined") return;
+  localStorage.setItem(PUBLIC_TRANSLATION_PREFERENCES_KEY, JSON.stringify({
+    preferredLanguage: settings.preferredLanguage,
+    preferredTimezone: settings.preferredTimezone,
+    preferredTranslationMode: settings.preferredTranslationMode,
+    preferredTranslationDisplay: settings.preferredTranslationDisplay,
+    preferredTimeFormat: settings.preferredTimeFormat,
+  }));
+}
+
 function normalizeReason(raw: any): TranslationReason | null {
   const reason = raw?.quotaReason ?? raw?.skipReason ?? raw?.failureReason ?? raw?.reason ?? null;
   if (reason === "provider_failed") return "provider";
@@ -370,14 +397,25 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
     canManageServerTranslation: false,
   },
   settingsServerId: null,
+  publicTranslationSlug: null,
+  browserLocalPreferences: false,
   settingsLoading: false,
   settingsError: null,
   inFlightBatchKeys: {},
 
-  loadSettings: async (serverId) => {
+  loadSettings: async (serverId, publicServerProjection) => {
     if (!serverId) return;
     const state = get();
-    if (state.settingsServerId === serverId && !state.settingsLoading) return;
+    if (
+      state.settingsServerId === serverId
+      && !state.settingsLoading
+      && (publicServerProjection
+        ? state.settings.serverTranslationEnabled === publicServerProjection.translationEnabled
+          && state.settings.providerAvailable === publicServerProjection.translationAvailable
+          && state.publicTranslationSlug === publicServerProjection.serverSlug
+          && state.browserLocalPreferences === publicServerProjection.browserLocalPreferences
+        : state.publicTranslationSlug === null && !state.browserLocalPreferences)
+    ) return;
     set((current) => ({
       settingsLoading: true,
       settingsError: null,
@@ -386,11 +424,25 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
         : {}),
     }));
     try {
-      const [{ data: user }, { data: serverSettings }] = await Promise.all([
-        api.get("/auth/me"),
-        api.get(`/servers/${serverId}/translation-settings`),
+      // The signed-in user (with its language/translation preferences) is
+      // already in the auth store from boot; only fetch it when it is not.
+      const knownUser = useAuthStore.getState().user;
+      const browserPreferences = publicServerProjection?.browserLocalPreferences
+        ? readPublicTranslationPreferences()
+        : null;
+      const [user, serverSettings] = await Promise.all([
+        browserPreferences ?? knownUser ?? api.get("/auth/me").then(({ data }) => data),
+        publicServerProjection
+          ? Promise.resolve({
+            translationEnabled: publicServerProjection.translationEnabled,
+            translationAvailable: publicServerProjection.translationAvailable,
+            canManageTranslation: false,
+          })
+          : api.get(`/servers/${serverId}/translation-settings`).then(({ data }) => data),
       ]);
-      useAuthStore.setState((authState) => ({ user: authState.user ? { ...authState.user, ...user } : user }));
+      if (!knownUser && !browserPreferences) {
+        useAuthStore.setState((authState) => ({ user: authState.user ? { ...authState.user, ...user } : user }));
+      }
       set({
         settings: normalizeSettings({
           preferredLanguage: user?.preferredLanguage ?? null,
@@ -404,6 +456,8 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
           canManageTranslation: serverSettings?.canManageTranslation ?? false,
         }),
         settingsServerId: serverId,
+        publicTranslationSlug: publicServerProjection?.serverSlug ?? null,
+        browserLocalPreferences: publicServerProjection?.browserLocalPreferences === true,
         settingsLoading: false,
         settingsError: null,
       });
@@ -437,6 +491,10 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
         ...serverTranslationSettings(state.settings),
       }),
     }));
+    if (get().browserLocalPreferences) {
+      writePublicTranslationPreferences(get().settings);
+      return;
+    }
     try {
       const { data } = await api.patch("/auth/me", { preferredLanguage: nextLanguage });
       useAuthStore.setState((state) => ({ user: state.user ? { ...state.user, ...data } : data }));
@@ -478,6 +536,10 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
         ...serverTranslationSettings(state.settings),
       }),
     }));
+    if (get().browserLocalPreferences) {
+      writePublicTranslationPreferences(get().settings);
+      return;
+    }
     try {
       const { data } = await api.patch("/auth/me", { preferredTimezone: nextTimezone });
       useAuthStore.setState((state) => ({ user: state.user ? { ...state.user, ...data } : data }));
@@ -519,6 +581,10 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
         ...serverTranslationSettings(state.settings),
       }),
     }));
+    if (get().browserLocalPreferences) {
+      writePublicTranslationPreferences(get().settings);
+      return;
+    }
     try {
       const { data } = await api.patch("/auth/me", { autoTranslationEnabled: enabled });
       useAuthStore.setState((state) => ({ user: state.user ? { ...state.user, ...data } : data }));
@@ -560,6 +626,10 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
         ...serverTranslationSettings(state.settings),
       }),
     }));
+    if (get().browserLocalPreferences) {
+      writePublicTranslationPreferences(get().settings);
+      return;
+    }
     try {
       const { data } = await api.patch("/auth/me", { preferredTranslationMode: nextMode });
       useAuthStore.setState((state) => ({ user: state.user ? { ...state.user, ...data } : data }));
@@ -601,6 +671,10 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
         ...serverTranslationSettings(state.settings),
       }),
     }));
+    if (get().browserLocalPreferences) {
+      writePublicTranslationPreferences(get().settings);
+      return;
+    }
     try {
       const { data } = await api.patch("/auth/me", { preferredTranslationDisplay: nextDisplay });
       useAuthStore.setState((state) => ({ user: state.user ? { ...state.user, ...data } : data }));
@@ -690,6 +764,10 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
         ...serverTranslationSettings(state.settings),
       }),
     }));
+    if (get().browserLocalPreferences) {
+      writePublicTranslationPreferences(get().settings);
+      return;
+    }
     try {
       const { data } = await api.patch("/auth/me", { preferredTimeFormat: nextTimeFormat });
       useAuthStore.setState((state) => ({ user: state.user ? { ...state.user, ...data } : data }));
@@ -762,7 +840,10 @@ export const useTranslationStore = create<TranslationState>((set, get) => ({
     schedulePendingTimeout(messageIds);
 
     try {
-      const { data } = await api.post("/message-translations:batch", {
+      const endpoint = state.publicTranslationSlug
+        ? `/public/servers/${encodeURIComponent(state.publicTranslationSlug)}/message-translations:batch`
+        : "/message-translations:batch";
+      const { data } = await api.post(endpoint, {
         messageIds,
         targetLanguage,
         mode: options.force ? "manual" : "auto",

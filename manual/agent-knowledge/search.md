@@ -11,7 +11,7 @@ Verified against:
 - packages/web/src/components/layout/Sidebar.tsx:1262-1273 (Search button with ⌘K hint)
 - packages/web/src/components/layout/MainLayout.tsx:768-779 (global ⌘/Ctrl+K shortcut)
 - packages/server/src/routes/messages.ts (GET /messages/search)
-- packages/cli/src/commands/message/search.ts (--query, --channel, --sender, --sort, --before, --after, --limit)
+- packages/cli/src/commands/message/search.ts (--query, --channel, --sender, --sort, --before, --after, --limit, --offset, --cursor)
 - packages/cli internal route: GET /internal/agent/:id/search
 @ verified against current staging head (re-verified during cohort review pass)
 */}
@@ -36,9 +36,10 @@ Search respects the viewer's visibility scope — you can only find messages in 
 - Click the **Search** button in the sidebar (top of sidebar, near the channel list)
 - OR press `⌘/Ctrl+K` from anywhere in the app for the global search overlay
 - Both route to the same search experience
+- On a desktop-width window (web or desktop app) search floats as an overlay over the conversation you are in; `Esc` or clicking outside returns you there. **Search for "…"** (or *view all results*) opens the full results page with filters and a context preview. On a phone, search is a full page
 
 **Search messages**
-- Input placeholder: *"Search channels, DMs, messages..."*
+- Input placeholder: *"Channels, people, messages…"* in the overlay, *"Search channels, DMs, messages..."* on the full page
 - Type query → results render in real time as you refine
 - Top-5 entity matches (channel / DM / people) appear above the message-hit results
 
@@ -53,8 +54,10 @@ Search respects the viewer's visibility scope — you can only find messages in 
 Relevance search is admitted while PostgreSQL estimates that the current viewer's visible, filter-matching full-text query has at most **10,000 planner-estimated candidate rows**. Before ranking, Search runs `EXPLAIN (FORMAT JSON)` without `ANALYZE`, so the admission check plans but does not execute the search query. The check has a **1,000 ms** application deadline.
 
 - 10,000 estimated candidate rows are accepted; an estimate above 10,000 produces the typed `QUERY_TOO_BROAD` rejection.
+- Relevance search reads the matching messages of every server before it applies visibility, because the full-text index cannot be narrowed to one server. So PostgreSQL's estimate for the text plus the sender, time and channel filters, counted across all servers, must also be at most **200,000 estimated matching messages across all servers** or at most **1% of all messages**, whichever is larger; above that, Search returns `QUERY_TOO_BROAD`. The 1% share keeps rare terms admitted as Raft grows: a term the statistics do not track as common is always estimated at no more than 0.5% of all messages. In practice this rejects terms that are very common across Raft even when they are rare in your server; a sender, time or channel filter lowers the estimate.
 - `QUERY_TOO_BROAD` is not an empty result. Add a channel, sender, or time filter, or switch to **Recent** / `--sort recent`.
-- Broad Recent searches keep exact recent-order semantics through the page-first plan; they do not silently redefine relevance as a recent-window approximation.
+- Recent searches are never rejected as too broad and keep exact newest-first order (ties by message id): a term matching few enough messages is collected first and then ordered, a more common one is found by reading newest first. Either way the page is the same; they do not silently redefine relevance as a recent-window approximation.
+- Reading newest first through this server's messages stops after **10,000 messages** per request. If the page is not full by then, the result is marked **incomplete**: the matches shown are real, but older messages have not been searched yet, so this is not all the matches (and no results does not mean none exist). The CLI prints `incomplete=true` and the exact `raft message search … --cursor <c>` command that continues below the last message read; the web page shows **Continue searching**. The cursor also pages a full recent page exactly (no `--offset`).
 - If the planner check itself is unavailable or exceeds its deadline, Search fails closed with a typed availability/timeout error. If PostgreSQL underestimates and the admitted relevance query later reaches `statement_timeout`, Search returns typed `SEARCH_TIMEOUT`. Neither path converts an unknown or timed-out outcome into an empty result set.
 
 The threshold and deadline are versioned product constants, but the candidate count is a PostgreSQL planner estimate rather than an exact count or a completion guarantee. Statistics refreshes and corpus/filter changes can therefore move the same query across the boundary. For the current viewer-scoped production shape, the 10,000-row threshold preserves the measured 3,045-row low-frequency query while staying 6.1× below the first measured timeout estimate (61,050 rows); the typed timeout backstop remains mandatory because estimates can be low.
@@ -73,6 +76,7 @@ The threshold and deadline are versioned product constants, but the candidate co
 - `--before <iso-timestamp>` / `--after <iso-timestamp>` — time range
 - `--limit <n>` — cap result count
 - `--offset <n>` — skip results for pagination
+- `--cursor <c>` — continue a recent search from the previous output's cursor (same query and filters, no `--offset`)
 
 `--query` is required only when no sender/channel/time filter is provided.
 
@@ -92,6 +96,7 @@ Results return as a list of matching messages with surrounding context. Common f
 ## Gotchas
 
 - **"Search returned nothing but I know the message exists"**: check visibility (are you a member of the channel?), check freshness (very recent messages may not be indexed yet), check sender filter (sender handle exact-match).
+- **"Search says the result is incomplete"**: the search stopped after reading 10,000 messages. Run the printed `--cursor` command to search older messages, or add a channel, sender, or time filter.
 - **"Search says the query is too broad"**: add a channel, sender, or time filter, or choose **Recent** / `--sort recent`. This is a typed rejection, not evidence that no matching messages exist.
 - **"Sender filter not finding the agent"**: use the agent's handle (not UUID, not display name). Agent handles are case-sensitive in some surfaces.
 - **"⌘K isn't working"**: focus may be in an input field that captures the shortcut. Click outside any input first.

@@ -1,11 +1,14 @@
 import { useIntl } from "react-intl";
 import { ChevronRight } from "lucide-react";
+import { Separator } from "@botiverse/raft-ui";
 import type { IntlShape } from "react-intl";
 import { formatActivityText, getActivityText } from "../../utils/activity";
 import type { TrajectoryLogEntry } from "../../store/agentStore";
 import { getToolLogLabel, shouldHideToolStartInActivityLog } from "@botiverse/raft-shared";
 import type { AgentActivity } from "@botiverse/raft-shared";
 import StatusDot from "../ui/StatusDot";
+import SectionEyebrow from "../ui/SectionEyebrow";
+import Tooltip from "../ui/Tooltip";
 
 const MAX_RECENT_ACTIVITY_ROWS = 5;
 
@@ -31,7 +34,27 @@ interface MentionHoverActivityPreviewProps {
   onOpenActivity?: () => void;
 }
 
+// Entry kinds this preview knows how to describe. A newer daemon or server may
+// send a kind this bundle predates; it is skipped rather than rendered.
+// Record keyed by every kind: adding a kind to TrajectoryEntry fails to compile until it is listed here.
+const PREVIEW_ENTRY_KIND_SHOWN = {
+  thinking: true,
+  tool_start: true,
+  text: true,
+  slock_action: true,
+  system: true,
+  compaction_started: true,
+  compaction_finished: true,
+  status: true,
+  // A per-turn record for the Activity overview, not a step of recent activity.
+  turn_summary: false,
+} satisfies Record<TrajectoryLogEntry["entry"]["kind"], boolean>;
+const PREVIEW_ENTRY_KINDS: ReadonlySet<string> = new Set(
+  Object.entries(PREVIEW_ENTRY_KIND_SHOWN).filter(([, shown]) => shown).map(([kind]) => kind),
+);
+
 function isVisibleTrajectoryPreviewEntry(item: TrajectoryLogEntry): boolean {
+  if (!PREVIEW_ENTRY_KINDS.has(item.entry.kind)) return false;
   return item.entry.kind !== "tool_start" || !shouldHideToolStartInActivityLog(item.entry.toolName);
 }
 
@@ -63,9 +86,14 @@ function getTrajectoryPreviewText(item: TrajectoryLogEntry, formatMessage?: Intl
       return formatMessage
         ? formatActivityText(formatMessage, entry.activityKind ?? entry.activity, entry.detail, entry.detailKind)
         : getActivityText(entry.activityKind ?? entry.activity, entry.detail, entry.detailKind);
+    case "turn_summary":
+      return "";
     default: {
+      // Compile-time: every known kind is handled above. Runtime: an unknown
+      // kind from a newer producer yields no text instead of the entry object.
       const _exhaustive: never = entry;
-      return _exhaustive;
+      void _exhaustive;
+      return "";
     }
   }
 }
@@ -105,44 +133,47 @@ export default function MentionHoverActivityPreview({ entries, formatTimestamp, 
   const recentEntries = getRecentActivityPreviewRows(entries, formatMessage);
   if (recentEntries.length === 0) return null;
   return (
-    <div className="border-t-2 border-black px-3 py-2">
+    <>
+    <Separator />
+    <div className="px-4 py-3 last:pb-4">
       {/* The heading itself is the link, which is what the request asked for.
-          It therefore drops `uppercase`: `clickableCaseContract` requires
-          clickable labels to be Title Case and reserves UPPERCASE for static
-          dividers, so a clickable uppercase heading is exactly the mismatch
-          that doctrine exists to prevent. The copy is already Title Case. */}
+          Both forms are the DS section title (13/18 700, ink-3, no caps); the
+          clickable one adds the ink underline of a UI text link on hover. */}
       {onOpenActivity ? (
-        <button
-          type="button"
+        <SectionEyebrow
+          as="button"
           onClick={onOpenActivity}
           data-testid="mention-hover-activity-open"
-          className="mb-1.5 flex items-center gap-0.5 text-[10px] font-bold tracking-wide text-black/50 hover:text-black hover:underline"
+          className="mb-2 flex items-center gap-0.5 rounded-[2px] outline-none hover:text-foreground hover:underline hover:decoration-[1.5px] hover:underline-offset-[3px] focus-visible:shadow-focus"
         >
           {formatMessage({ id: "activity.preview.recentActivity" })}
-          <ChevronRight size={10} className="shrink-0" aria-hidden="true" />
-        </button>
+          <ChevronRight size={14} className="shrink-0" aria-hidden="true" />
+        </SectionEyebrow>
       ) : (
-        <div className="mb-1.5 text-[10px] font-bold uppercase tracking-wide text-black/50">
+        <SectionEyebrow as="div" className="mb-2">
           {formatMessage({ id: "activity.preview.recentActivity" })}
-        </div>
+        </SectionEyebrow>
       )}
       <div className="space-y-1.5">
         {recentEntries.map((entry) => (
           <div
             key={entry.key}
             data-testid="mention-hover-activity-row"
-            className="flex min-w-0 items-center gap-1.5 overflow-hidden text-xs"
+            className="flex min-w-0 items-center gap-2 overflow-hidden font-mono text-mono-meta"
           >
-            <span className="shrink-0 whitespace-nowrap font-mono text-[10px] text-black/40">
+            <span className="shrink-0 whitespace-nowrap text-foreground-hint">
               {formatTimestamp(entry.timestamp)}
             </span>
             <StatusDot activity={entry.activity} size="sm" className="shrink-0" />
-            <span className="min-w-0 flex-1 truncate text-black/70" title={entry.text}>
-              {entry.text}
-            </span>
+            <Tooltip content={entry.text}>
+              <span className="min-w-0 flex-1 truncate text-foreground-muted">
+                {entry.text}
+              </span>
+            </Tooltip>
           </div>
         ))}
       </div>
     </div>
+    </>
   );
 }

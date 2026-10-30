@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
+import "./helpers/domSetup";
 import { act } from "react";
 import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -247,21 +247,30 @@ test("Computer and App rows use the same compact avatar footprint as people and 
   const appRow = screen.getByText("Reminder").closest("button");
   assert.ok(humanRow && computerRow && appRow);
 
-  const humanAvatar = humanRow.querySelector('[class~="size-5"]');
+  const humanAvatar = humanRow.querySelector('[data-slot="avatar"][data-avatar-context="compact-list"]');
   const computerAvatar = computerRow.querySelector('[data-mention-candidate-avatar="computer"]');
   const appAvatar = appRow.querySelector('[data-mention-candidate-avatar="app"]');
   assert.ok(humanAvatar && computerAvatar && appAvatar);
 
-  for (const avatar of [humanAvatar, computerAvatar, appAvatar]) {
-    hasClasses(avatar, ["size-5", "border"]);
-    assert.equal(avatar.classList.contains("size-8"), false);
-    assert.equal(avatar.classList.contains("border-2"), false);
-  }
+  // Every candidate is the same raft-ui suggestion option row.
   for (const row of [humanRow, computerRow, appRow]) {
-    hasClasses(row, ["items-center", "px-3", "py-2", "text-sm"]);
+    assert.equal(row.getAttribute("data-slot"), "composer-suggestion-option");
+    hasClasses(row, ["items-center", "min-h-9"]);
   }
   assert.ok(appRow.textContent?.includes("@system.reminder"), "the stable App id remains visible as the handle");
   assert.equal(screen.queryByText("system.canary"), null, "internal Apps are absent from the mounted picker");
+
+  // One footprint for every candidate: the Raft compact avatar step, 19px
+  // (16 + 2 x 1.5 border), which the people rows take from AvatarSlot's
+  // compact-list context. Computer and App tiles must sit in the same box.
+  for (const avatar of [humanAvatar, computerAvatar, appAvatar]) {
+    assert.match(
+      avatar.className,
+      /(?:^| )!?size-\[19px\](?: |$)/,
+      `${avatar.getAttribute("data-mention-candidate-avatar") ?? "human"} avatar keeps the 19px compact footprint`,
+    );
+    assert.equal(avatar.classList.contains("size-8"), false);
+  }
 });
 
 test("human and agent mention rows render live avatar identity and scoped activity", async () => {
@@ -324,8 +333,9 @@ test("human and agent mention rows render live avatar identity and scoped activi
   assert.ok(peerImage?.src.includes("/avatar/member-gravatar-hash?"), "server-member Gravatar identity reaches AvatarSlot");
   const badgeShell = agentRow.querySelector<HTMLElement>('[data-mention-avatar-badge-shell="true"]');
   assert.ok(badgeShell, "in-channel agent rows mount the scoped activity badge");
-  const activityDot = badgeShell.querySelector<HTMLElement>(".animate-pulse");
-  assert.ok(activityDot, "the mounted agent activity dot pulses at compact-list size");
+  const activityDot = badgeShell;
+  assert.ok(activityDot, "the mounted agent activity dot renders at compact-list size");
+  assert.doesNotMatch(activityDot.className, /animate-pulse/, "@mention candidates no longer pulse regardless of state (task #136)");
   assert.match(activityDot.className, /(^|\s)size-2(\s|$)/);
 });
 
@@ -443,9 +453,11 @@ test("channel autocomplete keeps descriptions tight and left-aligned after natur
   const textGroup = name.parentElement;
 
   assert.ok(textGroup, "channel name and description must share a text group");
-  hasClasses(textGroup, ["min-w-0", "flex-1", "items-baseline", "gap-2", "text-left"]);
-  assert.equal(description.parentElement, textGroup, "description must baseline-align with its channel name");
-  hasClasses(name, ["max-w-[50%]", "flex-none", "truncate"]);
-  assert.equal(name.classList.contains("min-w-[9rem]"), false);
-  hasClasses(description, ["min-w-0", "flex-1", "truncate"]);
+  // Layout is owned by the RUI ComposerSuggestion recipe (flex row, centered,
+  // min-w-0 so both title and meta can shrink); the contract here keeps the
+  // outcome — both texts truncate inside one left-aligned group.
+  hasClasses(textGroup, ["min-w-0", "flex-1", "items-center", "text-left"]);
+  assert.equal(description.parentElement, textGroup, "description must align with its channel name in the RUI content slot");
+  hasClasses(name, ["truncate"]);
+  hasClasses(description, ["truncate"]);
 });

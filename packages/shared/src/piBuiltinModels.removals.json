@@ -1,0 +1,135 @@
+{
+  "_doc": [
+    "Acknowledged removals of preset model ids from piBuiltinModels.generated.ts.",
+    "Removing models is normal upstream behaviour; this file exists so that a removal is SEEN.",
+    "Enforced by scripts/ci/check-builtin-model-removals.mjs (task #320).",
+    "disposition: 'replaced-by' (set 'replacement') | 'no-replacement' | 'successor-not-substitutable'.",
+    "successor-not-substitutable: a same-name successor exists, but consumers pinned to the exact id",
+    "(frozen testbeds, recorded baselines) cannot swap to it without rebuilding their comparison surface.",
+    "If the successor is NOT in this preset catalogue (it lives on the gateway/connection surface, or the vendor changed), use 'no-replacement' and say where it went in 'note'. Do NOT invent an in-catalogue id to satisfy the check: the validation exists to stop a wrong id being recorded, and inventing one to go green is the failure it is meant to prevent."
+  ],
+  "removed": [
+    {
+      "id": "openrouter/deepseek/deepseek-v4-flash-0731:free",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/deepseek/deepseek-v4-flash-0731",
+      "note": "0.86.1 dropped the free-tier VARIANT of this model. The base id is still offered on the SAME provider (openrouter), so the model itself is still available -- what is gone is the ':free' variant. Label changes from '...0731 (free)' to '...0731', hence labelChangeAcknowledged: this is the same model id without the free tier, not a different model wearing the same name. No in-repo consumer pins the ':free' id (checked packages/ fixtures and configs). NEW in 0.86.1; separate from the 33 ids removed in 0.86.0 (#8026), tracked on task #322.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/kwaipilot/kat-coder-pro-v2.5",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.1.0 (bump 1.0.2 -> 1.1.0, task #1235). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). No kwaipilot / KAT-Coder id of any version remains on openrouter in 1.1.0; the vendor is gone from the catalog rather than superseded."
+    },
+    {
+      "id": "openrouter/qwen/qwen3.8-27b:free",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/qwen/qwen3.8-27b",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.1.0 (bump 1.0.2 -> 1.1.0, task #1235). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). Same model, free-tier VARIANT dropped; the base id stays on the same provider (openrouter). Same shape as the deepseek-v4-flash-0731:free removal above.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/stealth/space-bunny-alpha",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.1.0 (bump 1.0.2 -> 1.1.0, task #1235). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). Stealth/alpha preview id with no successor in the 1.1.0 catalog (no 'stealth/' id remains)."
+    },
+    {
+      "id": "openrouter/inclusionai/ling-3.0-flash-sante:free",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/inclusionai/ling-3.0-flash-sante",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The free-tier VARIANT went away at the same time the paid base id was added, so the model graduated from ':free' to the base id on the same provider (openrouter). Label changes from '...Sante (free)' to '...Sante', hence labelChangeAcknowledged: same model without the free tier, not a different model wearing the same name. Same shape as the deepseek-v4-flash-0731:free removal above.",
+      "labelChangeAcknowledged": true
+    },
+    {
+      "id": "openrouter/qwen/qwen3-max",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). Both the qwen3-max and qwen3-max-thinking ids were removed together; the newer qwen3.7-max / qwen3.8-max-* ids that remain are a different generation, not a same-name successor."
+    },
+    {
+      "id": "openrouter/qwen/qwen3-max-thinking",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). Removed together with the plain qwen3-max id; no qwen3-max id of any version remains on openrouter in 1.2.0."
+    },
+    {
+      "id": "openrouter/qwen/qwen3.6-max-preview",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). Preview snapshot retired; no qwen3.6 id remains, and the qwen3.7-max / qwen3.8-max-* ids that remain are a different generation rather than a drop-in successor."
+    },
+    {
+      "id": "openrouter/qwen/qwen3-coder-plus",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). qwen3-coder-next remains on openrouter but is a different model, not a same-name or drop-in successor."
+    },
+    {
+      "id": "openrouter/qwen/qwen3-30b-a3b-thinking-2507",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The thinking variant was removed; qwen3-30b-a3b-instruct-2507 remains (instruct, not thinking), so there is no same-name successor."
+    },
+    {
+      "id": "openrouter/qwen/qwen3-vl-235b-a22b-thinking",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The thinking variant was removed; qwen3-vl-235b-a22b-instruct remains (instruct, not thinking), so there is no same-name successor."
+    },
+    {
+      "id": "openrouter/qwen/qwen3-vl-8b-thinking",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The thinking variant was removed; qwen3-vl-8b-instruct remains (instruct, not thinking), so there is no same-name successor."
+    },
+    {
+      "id": "openrouter/qwen/qwen-plus-2025-07-28",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). Dated snapshot retired; no qwen-plus id remains on openrouter in 1.2.0."
+    },
+    {
+      "id": "openrouter/qwen/qwen3-235b-a22b",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The undated snapshot was removed; the dated qwen3-235b-a22b-2507 and qwen3-235b-a22b-thinking-2507 snapshots remain, which are different snapshots rather than a drop-in replacement."
+    },
+    {
+      "id": "openrouter/qwen/qwen3-vl-32b-instruct",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). No qwen3-vl-32b id of any version remains on openrouter in 1.2.0."
+    },
+    {
+      "id": "openrouter/qwen/qwen3-8b",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). No qwen3-8b id remains; qwen3-32b stays but is a different size, not a successor."
+    },
+    {
+      "id": "openrouter/sao10k/l3.1-euryale-70b",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.2.0 (bump 1.1.0 -> 1.2.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). No sao10k/ id remains on openrouter in 1.2.0; the vendor is gone from the catalog rather than superseded."
+    },
+    {
+      "id": "openrouter/unbiased/pareto",
+      "disposition": "replaced-by",
+      "replacement": "openrouter/~unbiased/pareto-latest",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.3.0 (bump 1.2.0 -> 1.3.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The fixed id was retired in favour of OpenRouter's moving latest-pointer `~unbiased/pareto-latest`, which the same bump added on the same provider; that alias is a different id by design (it follows the newest snapshot), so it is recorded as the replacement rather than a same-id label change."
+    },
+    {
+      "id": "openrouter/unbiased/pareto-26.10-preview",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.3.0 (bump 1.2.0 -> 1.3.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The dated preview snapshot was retired; the same bump added the older-numbered `unbiased/pareto-26.9` alongside the `~unbiased/pareto-latest` pointer, neither of which is a drop-in for this exact id."
+    },
+    {
+      "id": "openrouter/inclusionai/ling-3.0-flash-fin",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.3.0 (bump 1.2.0 -> 1.3.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). The variant left the catalog; `ling-3.0-flash` and `ling-3.0-flash-vl` remain, so the family is still offered but this exact id is not."
+    },
+    {
+      "id": "openrouter/inclusionai/ling-3.0-flash-sante",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.3.0 (bump 1.2.0 -> 1.3.0). This is the id Raft recorded as the replacement for `ling-3.0-flash-sante:free` one bump earlier (1.1.0 -> 1.2.0) and it has now itself been retired, so the two entries stand as a sequence rather than contradicting each other. No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). `ling-3.0-flash` and `ling-3.0-flash-vl` remain; no Sante id of any version is left on openrouter in 1.3.0."
+    },
+    {
+      "id": "openrouter/anthropic/claude-sonnet-4",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.3.0 (bump 1.2.0 -> 1.3.0). No in-repo consumer pins this id: the goldens that mention `anthropic/claude-sonnet-4.5` / `-4.6` / `-4-5` are different ids (git grep over packages/ and apps/, excluding the generated catalog). Newer Sonnet ids (4.5, 4.6, 5, 5.5 and the `~anthropic/claude-sonnet-latest` pointer) remain, but they are different models, not a drop-in for this one."
+    },
+    {
+      "id": "openrouter/apodex/apodex-1.1-mini:free",
+      "disposition": "no-replacement",
+      "note": "Dropped from Pi's openrouter catalog in @earendil-works/pi-ai 1.3.0 (bump 1.2.0 -> 1.3.0). No in-repo consumer pins this id (git grep over packages/ and apps/: only the generated catalog). No apodex/ id of any version remains on openrouter in 1.3.0, so the vendor left the catalog rather than the free-tier variant being dropped in favour of a base id."
+    }
+  ]
+}

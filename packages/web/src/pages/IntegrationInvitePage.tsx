@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { AppSetupPanel, AppSetupRequirement } from "../components/integrations/AppSetup";
+import { useCallback, useEffect, useEffectEvent, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
 import { useNavigate, useParams } from "react-router-dom";
 import { Check, ExternalLink, Link2 } from "lucide-react";
@@ -12,10 +13,13 @@ import {
   SelectList,
   SelectTrigger,
   SelectValue,
-} from "raft-ui";
+  Button,
+  Card,
+  Separator,
+  IconTile,
+} from "@botiverse/raft-ui";
 import api from "../api/client";
 import Banner from "../components/ui/Banner";
-import Button from "../components/ui/Button";
 import RequestedScopeConsent from "../components/oauth/RequestedScopeConsent";
 import SectionEyebrow from "../components/ui/SectionEyebrow";
 import { DEFAULT_DECLARED_OAUTH_SCOPES } from "../lib/oauthScopePresentation";
@@ -33,6 +37,8 @@ type OAuthClientShareInvite = {
     publisherName: string | null;
     sourceServerName: string | null;
     installedAt: string | null;
+    setupUrl?: string | null;
+    setupDescription?: string | null;
   };
   link: {
     id: string;
@@ -81,34 +87,36 @@ export default function IntegrationInvitePage() {
   const [error, setError] = useState("");
   const [installed, setInstalled] = useState(false);
 
-  const loadInvite = async () => {
+  // Effect Event: the fetch re-runs only when the token changes, while still
+  // reading the current formatMessage for its fallback copy.
+  const loadInvite = useEffectEvent(async () => {
     setLoading(true);
     setError("");
     try {
       const { data } = await api.get(`/integration-invites/${encodeURIComponent(token)}`);
       setInvite(data);
       const firstUninstalled = data.manageableServers.find((server: OAuthClientShareInvite["manageableServers"][number]) => !server.installedAt);
-      setSelectedServerId(firstUninstalled?.id ?? data.manageableServers[0]?.id ?? "");
-      setInstalled(!!data.client.installedAt);
+      const selected = firstUninstalled ?? data.manageableServers[0];
+      setSelectedServerId(selected?.id ?? "");
+      setInstalled(Boolean(selected?.installedAt));
     } catch (err: any) {
       setError(err.response?.data?.error || formatMessage({ id: "pages.integrationInvite.inviteNotFound" }));
     } finally {
       setLoading(false);
     }
-  };
+  });
 
   useEffect(() => {
     void loadInvite();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
   const selectedServer = invite?.manageableServers.find((server) => server.id === selectedServerId) ?? null;
-  const manageableServerOptions = invite?.manageableServers.map((server) => ({
+  const manageableServerOptions = useMemo(() => invite?.manageableServers.map((server) => ({
     value: server.id,
     label: `${server.name}${server.installedAt ? formatMessage({ id: "pages.integrationInvite.installedSuffix" }) : ""}`,
-  })) ?? [];
+  })) ?? [], [formatMessage, invite]);
 
-  const install = async () => {
+  const install = useCallback(async () => {
     if (!selectedServerId) return;
     setInstalling(true);
     setError("");
@@ -123,69 +131,86 @@ export default function IntegrationInvitePage() {
     } finally {
       setInstalling(false);
     }
-  };
+  }, [formatMessage, selectedServerId, token]);
+  const handleInstallClick = useCallback(() => {
+    void install();
+  }, [install]);
+  const handleServerChange = useCallback((value: string | null) => {
+    if (value == null) return;
+    setSelectedServerId(value);
+    setInstalled(Boolean(invite?.manageableServers.find((server) => server.id === value)?.installedAt));
+  }, [invite]);
+  const selectedServerSlug = selectedServer?.slug;
+  const openSelectedServerSettings = useCallback(() => {
+    navigate(`/s/${selectedServerSlug}/settings`);
+  }, [navigate, selectedServerSlug]);
 
   return (
     <div
-      className="h-full min-h-0 overflow-y-auto bg-brutal-cream font-display text-black safe-top safe-bottom"
+      className="h-full min-h-0 overflow-y-auto bg-layer-sidebar font-display text-foreground safe-top safe-bottom"
       data-testid="integration-invite-page"
     >
       <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col justify-center px-4 py-8">
-        <div className="border-2 border-black bg-white p-5 shadow-brutal">
-          <div className="flex items-start justify-between gap-4 border-b-2 border-black pb-4">
+        <Card className="p-5">
+          <div className="flex items-start justify-between gap-4 pb-4">
             <div>
               <SectionEyebrow as="div">{formatMessage({ id: "pages.integrationInvite.eyebrow" })}</SectionEyebrow>
-              <h1 className="mt-2 text-2xl font-black">{formatMessage({ id: "pages.integrationInvite.title" })}</h1>
+              <h1 className="mt-1 text-title">{formatMessage({ id: "pages.integrationInvite.title" })}</h1>
             </div>
-            <div className="flex size-12 items-center justify-center border-2 border-black bg-brutal-cyan shadow-brutal-sm">
-              <Link2 size={22} />
-            </div>
+            <IconTile size="lg">
+              <Link2 />
+            </IconTile>
           </div>
+          <Separator />
 
           {loading ? (
-            <div className="py-12 text-center text-sm font-bold text-black/55">{formatMessage({ id: "pages.integrationInvite.loading" })}</div>
+            <div className="py-12 text-center text-callout text-foreground-muted">{formatMessage({ id: "pages.integrationInvite.loading" })}</div>
           ) : error && !invite ? (
-            <Banner intent="warning" className="mt-4 font-bold">{error}</Banner>
+            <Banner intent="warning" className="mt-4">{error}</Banner>
           ) : invite ? (
             <div className="space-y-4 pt-4">
-              {error && <Banner intent="warning" className="font-bold">{error}</Banner>}
+              {error && <Banner intent="warning">{error}</Banner>}
               {installed && (
-                <Banner intent="success" className="font-bold">
+                <Banner intent="success">
                   {invite.client.name} {formatMessage({ id: "pages.integrationInvite.installedBannerMid" })} {selectedServer?.name ?? formatMessage({ id: "pages.integrationInvite.installedBannerFallbackServer" })}.
                 </Banner>
               )}
 
-              <div className="border-2 border-black bg-brutal-cream p-4">
-                <div className="text-xl font-black">{invite.client.name}</div>
-                <div className="mt-1 text-xs font-bold text-black/55">
+              {invite.client.setupUrl ? installed && selectedServerId
+                ? <AppSetupPanel clientId={invite.client.id} serverId={selectedServerId} />
+                : <AppSetupRequirement url={invite.client.setupUrl} description={invite.client.setupDescription} /> : null}
+
+              <div className="rounded-container border border-line-hairline p-4">
+                <div className="text-headline">{invite.client.name}</div>
+                <div className="mt-1 text-caption text-foreground-hint">
                   {formatMessage({ id: "pages.integrationInvite.sharedByPrefix" })} {invite.client.publisherName ?? formatMessage({ id: "pages.integrationInvite.sharedByPublisherFallback" })} {formatMessage({ id: "pages.integrationInvite.sharedByServerMid" })} {invite.client.sourceServerName ?? formatMessage({ id: "pages.integrationInvite.sharedByServerFallback" })}
                 </div>
                 {invite.client.description && (
-                  <p className="mt-3 text-sm leading-relaxed text-black/70">{invite.client.description}</p>
+                  <p className="mt-3 text-callout text-foreground-muted">{invite.client.description}</p>
                 )}
-                <div className="mt-4 grid gap-3 text-xs sm:grid-cols-2">
+                <div className="mt-4 grid gap-3 sm:grid-cols-2">
                   <div>
-                    <div className="font-bold text-black/45">{formatMessage({ id: "pages.integrationInvite.clientIdLabel" })}</div>
-                    <div className="break-all font-mono font-bold">{invite.client.clientId}</div>
+                    <div className="text-footnote font-medium text-foreground-hint">{formatMessage({ id: "pages.integrationInvite.clientIdLabel" })}</div>
+                    <div className="break-all font-mono text-mono-meta text-foreground">{invite.client.clientId}</div>
                   </div>
                   <div>
-                    <div className="font-bold text-black/45">{formatMessage({ id: "pages.integrationInvite.homepageLabel" })}</div>
-                    <div className="break-all font-mono font-bold">{getDomain(invite.client.homepageUrl, formatMessage({ id: "pages.integrationInvite.notConfigured" }))}</div>
+                    <div className="text-footnote font-medium text-foreground-hint">{formatMessage({ id: "pages.integrationInvite.homepageLabel" })}</div>
+                    <div className="break-all font-mono text-mono-meta text-foreground">{getDomain(invite.client.homepageUrl, formatMessage({ id: "pages.integrationInvite.notConfigured" }))}</div>
                   </div>
                   <div>
-                    <div className="font-bold text-black/45">{formatMessage({ id: "pages.integrationInvite.callbackLabel" })}</div>
-                    <div className="break-all font-mono font-bold">{getDomain(invite.client.returnUrl, formatMessage({ id: "pages.integrationInvite.notConfigured" }))}</div>
+                    <div className="text-footnote font-medium text-foreground-hint">{formatMessage({ id: "pages.integrationInvite.callbackLabel" })}</div>
+                    <div className="break-all font-mono text-mono-meta text-foreground">{getDomain(invite.client.returnUrl, formatMessage({ id: "pages.integrationInvite.notConfigured" }))}</div>
                   </div>
                   <div>
-                    <div className="font-bold text-black/45">{formatMessage({ id: "pages.integrationInvite.inviteExpiryLabel" })}</div>
-                    <div className="font-bold">{invite.link.expiresAt ? formatDate(invite.link.expiresAt) : formatMessage({ id: "pages.integrationInvite.noExpiry" })}</div>
+                    <div className="text-footnote font-medium text-foreground-hint">{formatMessage({ id: "pages.integrationInvite.inviteExpiryLabel" })}</div>
+                    <div className="text-callout text-foreground">{invite.link.expiresAt ? formatDate(invite.link.expiresAt) : formatMessage({ id: "pages.integrationInvite.noExpiry" })}</div>
                   </div>
                 </div>
               </div>
 
               <RequestedScopeConsent
                 scopes={invite.client.allowedScopes?.length ? invite.client.allowedScopes : DEFAULT_DECLARED_OAUTH_SCOPES}
-                className="border-2 border-black bg-brutal-cream p-4"
+                className="rounded-container border border-line-hairline p-4"
               />
 
               {invite.manageableServers.length === 0 ? (
@@ -193,16 +218,13 @@ export default function IntegrationInvitePage() {
                   {formatMessage({ id: "pages.integrationInvite.needAdmin" })}
                 </Banner>
               ) : (
-                <div className="border-2 border-black bg-white p-4 shadow-brutal-sm">
+                <div className="rounded-container border border-line-hairline p-4">
                   <SectionEyebrow as="div">{formatMessage({ id: "pages.integrationInvite.installTargetLabel" })}</SectionEyebrow>
                   <div className="mt-3 grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
                     <div className="min-w-0">
                       <Select
                         value={selectedServerId}
-                        onValueChange={(value) => {
-                          if (value == null) return;
-                          setSelectedServerId(value);
-                        }}
+                        onValueChange={handleServerChange}
                         items={manageableServerOptions}
                       >
                         <SelectTrigger className="w-full">
@@ -215,12 +237,12 @@ export default function IntegrationInvitePage() {
                       </Select>
                     </div>
                     {selectedServer?.installedAt ? (
-                      <Button type="button" onClick={() => navigate(`/s/${selectedServer.slug}/settings`)} size="lg" shape="iconText" className="w-full md:w-auto">
+                      <Button type="button" onClick={openSelectedServerSettings} size="lg" className="w-full md:w-auto">
                         <ExternalLink size={14} />
                         {formatMessage({ id: "pages.integrationInvite.openSettings" })}
                       </Button>
                     ) : (
-                      <Button type="button" onClick={() => void install()} disabled={installing || !selectedServerId} size="lg" tone="pink" shape="iconText" className="w-full md:w-auto">
+                      <Button type="button" onClick={handleInstallClick} disabled={installing || !selectedServerId} size="lg" variant="accent" className="w-full md:w-auto">
                         <Check size={14} />
                         {installing ? formatMessage({ id: "pages.integrationInvite.installing" }) : formatMessage({ id: "pages.integrationInvite.installApp" })}
                       </Button>
@@ -230,7 +252,7 @@ export default function IntegrationInvitePage() {
               )}
             </div>
           ) : null}
-        </div>
+        </Card>
       </div>
     </div>
   );

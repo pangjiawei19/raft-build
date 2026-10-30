@@ -1,6 +1,7 @@
 import { forwardRef } from "react";
 import type { ReactNode, MouseEvent, DragEvent } from "react";
 import AvatarSlot from "../AvatarSlot";
+import Tooltip from "../Tooltip";
 import InlineMarkdownPreview from "../../markdown/InlineMarkdownPreview";
 
 type ConversationAuthor =
@@ -83,43 +84,47 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
   onDragStart,
 }, ref) {
   const interactive = Boolean(onClick || onContextMenu);
-  const className = `relative flex w-full items-start gap-3 border-2 p-3 text-left transition-colors hover:border-black hover:shadow-brutal-sm ${
-    interactive ? `active:border-black active:shadow-brutal-sm` : "cursor-default"
+  // Raft Design System › Inbox / ListRow: a preview is content — the card
+  // surface with a hairline and the container radius, never an ink line or a
+  // lift. Hover/press lay the pressed wash over it. The row that is open next
+  // to the list (`active`) and the row you just jumped to (`focused`) are the
+  // same cyan-soft "this one" highlight.
+  const highlighted = focused || active;
+  const className = `relative flex w-full items-start gap-3 rounded-container border border-line-hairline p-3 text-left transition-colors ${
+    highlighted ? "bg-info-soft" : "bg-layer-card"
   } ${
-    focused
-      ? "border-black bg-brutal-cyan/25 shadow-brutal"
-      : active
-      ? "border-black bg-white shadow-brutal-sm"
-      : "border-black/30 bg-white"
+    interactive
+      ? `outline-none focus-visible:shadow-focus ${highlighted ? "" : "hover:press-overlay active:press-overlay"}`
+      : "cursor-default"
   }`;
   const content = (
     <>
       <div className="min-w-0 flex-1">
-        <div className="mb-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs leading-4">
-          <span className="font-bold text-black/50">{channelLabel}</span>
+        <div className="mb-1 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-caption">
+          <span className="text-foreground-hint">{channelLabel}</span>
           {author && !previewAuthor ? (
-            <span className="inline-flex min-w-0 items-center gap-1 font-bold text-black">
+            <span className="inline-flex min-w-0 items-center gap-1 font-semibold text-foreground">
               {author.kind === "agent" ? (
                 <AvatarSlot context="preview-mini" type="agent" agentAvatarUrl={author.avatarUrl ?? null} />
               ) : (
                 <AvatarSlot context="preview-mini" type="human" humanAvatarUrl={author.avatarUrl ?? null} gravatarHash={author.gravatarHash ?? null} />
               )}
-              <span className="truncate">{author.name}</span>
+              <span className="min-w-0 truncate">{author.name}</span>
               {author.subtitle ? (
-                <span className="font-mono text-[10px] text-black/40">{author.subtitle}</span>
+                <span className="min-w-0 flex-1 max-w-fit truncate font-mono text-mono-meta font-normal text-foreground-hint">{author.subtitle}</span>
               ) : null}
             </span>
           ) : null}
           {marker}
-          {timestamp ? <span className="font-mono text-xs leading-4 text-black/40">{timestamp}</span> : null}
+          {timestamp ? <span className="font-mono text-mono-meta text-foreground-hint">{timestamp}</span> : null}
         </div>
-        <p className={`${previewLineClampClassName} text-sm ${emphasized ? "font-bold" : ""} ${previewClassName ?? ""}`}>
+        <p className={`${previewLineClampClassName} text-callout ${emphasized ? "font-bold text-foreground" : "text-foreground-muted"} ${previewClassName ?? ""}`}>
           {previewLeading ? <span className="mr-1 inline-flex align-[-1px]">{previewLeading}</span> : null}
-          {previewAuthor ? <span className="font-bold text-black/70">{previewAuthor}: </span> : null}
+          {previewAuthor ? <span className="font-semibold text-foreground">{previewAuthor}: </span> : null}
           <InlineMarkdownPreview markdown={preview} />
         </p>
         {secondaryPreview ? (
-          <p className={`mt-1 line-clamp-1 text-xs ${secondaryPreviewClassName ?? "text-black/45"}`}>
+          <p className={`mt-1 line-clamp-1 text-caption ${secondaryPreviewClassName ?? "text-foreground-hint"}`}>
             {secondaryPreview}
           </p>
         ) : null}
@@ -130,10 +135,9 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
   );
 
   if (!interactive) {
-    return (
+    const card = (
       <div
         aria-label={ariaLabel}
-        title={title}
         data-testid={testId}
         data-focused={focused ? "true" : undefined}
         data-active={active ? "true" : undefined}
@@ -143,9 +147,10 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
         {content}
       </div>
     );
+    return title ? <Tooltip content={title}>{card}</Tooltip> : card;
   }
 
-  return (
+  const card = (
     <button
       ref={ref}
       type="button"
@@ -154,7 +159,6 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
       draggable={draggable}
       onDragStart={onDragStart}
       aria-label={ariaLabel}
-      title={title}
       data-testid={testId}
       data-focused={focused ? "true" : undefined}
       data-active={active ? "true" : undefined}
@@ -164,6 +168,7 @@ const ConversationPreviewCard = forwardRef<HTMLButtonElement, ConversationPrevie
       {content}
     </button>
   );
+  return title ? <Tooltip content={title}>{card}</Tooltip> : card;
 });
 
 export default ConversationPreviewCard;

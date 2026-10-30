@@ -46,7 +46,7 @@ test("select screenshot renders protected attachment image and reaction chip", a
     host.style.fontFamily = getComputedStyle(document.body).fontFamily;
     host.innerHTML = `
       <div id="message-export-fixture" class="group relative flex gap-3 border-2 border-transparent bg-transparent p-2">
-        <div class="size-8 shrink-0 rounded-full bg-soft-signal border-2 border-black"></div>
+        <div class="size-8 shrink-0 rounded-full bg-palette-yellow border-2 border-black"></div>
         <div class="min-w-0 flex-1">
           <div class="text-sm font-bold text-black">Developer</div>
           <div class="text-sm text-black">download-as-image image + reaction fixture</div>

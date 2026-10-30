@@ -1,32 +1,51 @@
-import { useState, useEffect, useRef } from "react";
-import { Globe, FolderOpen, RefreshCw } from "lucide-react";
-import { InlineCode } from "raft-ui";
+import { Badge, Button, Card, InlineCode } from "@botiverse/raft-ui";
+import { useState, useEffect, useRef, useCallback } from "react";
+import { ChevronDown, ChevronRight, Globe, FolderOpen, RefreshCw } from "lucide-react";
 import { useIntl } from "react-intl";
 import apiClient from "../../api/client";
 import type { SkillInfo } from "@botiverse/raft-shared";
-import SurfaceListItem from "../ui/SurfaceListItem";
-import SectionEyebrow from "../ui/SectionEyebrow";
+import SectionHeader from "../ui/SectionHeader";
 
 interface SkillsData {
   global: SkillInfo[];
   workspace: SkillInfo[];
 }
 
-function SkillCard({ skill }: { skill: SkillInfo }) {
+const EMPTY_SKILLS: SkillInfo[] = [];
+
+/**
+ * One line per skill (name, `/command` badge, truncated description); clicking
+ * expands the full description. Agents commonly carry dozens of skills, and the
+ * old one-card-per-skill layout ran to several screens (xxchan, 2026-10-15).
+ */
+function SkillRow({ skill }: { skill: SkillInfo }) {
+  const [open, setOpen] = useState(false);
+  const Chevron = open ? ChevronDown : ChevronRight;
   return (
-    <SurfaceListItem>
-      <div className="flex items-center gap-2">
-        <span className="font-bold text-sm text-black">{skill.displayName}</span>
-        {skill.userInvocable && (
-          <span className="inline-block border border-black bg-brutal-lime px-1.5 py-0 text-[10px] font-bold uppercase">
-            /{skill.name}
-          </span>
+    <li>
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen(!open)}
+        className="block w-full px-3 py-2 text-left hover:bg-fill-pressed"
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <Chevron size={14} className="shrink-0 text-foreground-hint" />
+          <span className="shrink-0 text-callout font-semibold text-foreground">{skill.displayName}</span>
+          {skill.userInvocable && (
+            <Badge appearance="outline" className="shrink-0">
+              /{skill.name}
+            </Badge>
+          )}
+          {!open && skill.description && (
+            <span className="truncate text-caption text-foreground-muted">{skill.description}</span>
+          )}
+        </span>
+        {open && skill.description && (
+          <span className="mt-1 block pl-[22px] text-caption text-foreground-muted">{skill.description}</span>
         )}
-      </div>
-      {skill.description && (
-        <p className="text-xs text-black/60 mt-1 line-clamp-2">{skill.description}</p>
-      )}
-    </SurfaceListItem>
+      </button>
+    </li>
   );
 }
 
@@ -44,15 +63,21 @@ function groupByPath(skills: SkillInfo[]): Map<string, SkillInfo[]> {
 function PathGroup({ path, skills }: { path: string; skills: SkillInfo[] }) {
   return (
     <div>
-      <div className="flex items-center gap-2 mb-2">
-        <InlineCode className="text-[11px] text-black/40">{path}</InlineCode>
-        <span className="text-[11px] text-black/30 font-mono">({skills.length})</span>
+      <div className="mb-2 flex min-w-0 items-center gap-2">
+        <InlineCode className="min-w-0 text-mono-meta text-foreground-hint">{path}</InlineCode>
+        <span className="shrink-0 font-mono text-mono-meta text-foreground-hint">({skills.length})</span>
       </div>
-      <div className="space-y-2">
+      {/* Fixed-height box that scrolls on its own, so a long list does not
+          stretch the profile page (about ten rows visible). */}
+      <Card
+        render={<ul />}
+        data-testid="agent-skills-list"
+        className="max-h-80 overflow-y-auto divide-y divide-line-hairline"
+      >
         {skills.map((skill) => (
-          <SkillCard key={skill.name} skill={skill} />
+          <SkillRow key={skill.name} skill={skill} />
         ))}
-      </div>
+      </Card>
     </div>
   );
 }
@@ -67,12 +92,12 @@ function SkillSubSection({ label, icon: Icon, skills, emptyText }: {
 
   return (
     <div>
-      <div className="flex items-center gap-1.5 mb-2">
-        <Icon size={12} className="text-black/40" />
-        <span className="text-xs text-black/50 font-medium">
+      <div className="mb-2 flex items-center gap-1.5">
+        <Icon size={14} className="shrink-0 text-foreground-muted" />
+        <span className="text-footnote font-semibold text-foreground-muted">
           {label}
         </span>
-        <span className="text-xs text-black/30 font-mono">({skills.length})</span>
+        <span className="font-mono text-mono-meta text-foreground-hint">({skills.length})</span>
       </div>
       {skills.length > 0 ? (
         <div className="space-y-4">
@@ -81,7 +106,7 @@ function SkillSubSection({ label, icon: Icon, skills, emptyText }: {
           ))}
         </div>
       ) : (
-        <p className="text-xs italic text-black/40">{emptyText}</p>
+        <p className="text-caption text-foreground-hint">{emptyText}</p>
       )}
     </div>
   );
@@ -95,7 +120,7 @@ export default function AgentSkills({ agentId, embedded }: { agentId: string; em
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchSkills = async () => {
+  const fetchSkills = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
@@ -106,33 +131,31 @@ export default function AgentSkills({ agentId, embedded }: { agentId: string; em
     } finally {
       setLoading(false);
     }
-  };
+  }, [agentId]);
 
-  // oxlint-disable react-hooks/exhaustive-deps -- fetch skills only when the agent id changes; `fetchSkills` is recreated each render and closes over the current `agentId`, so depending on it would refetch every render.
   // Async-loader pattern: `loading` is a transient async-fetch indicator, not
   // prop-derived state. Same FP family as AgentDetailPanel L228.
   useEffect(() => {
     // oxlint-disable-next-line react-doctor/no-derived-state
     fetchSkills();
-  }, [agentId]);
-  // oxlint-enable react-hooks/exhaustive-deps
+  }, [fetchSkills]);
 
   if (loading) {
     return (
-      <div className={embedded ? "px-5 py-4" : "flex flex-1 items-center justify-center bg-white"}>
-        <span className="text-sm text-black/40 font-mono">{formatMessage({ id: "agent.skills.loading" })}</span>
+      <div className={embedded ? "px-5 py-4" : "flex flex-1 items-center justify-center bg-layer-canvas"}>
+        <span className="text-callout text-foreground-hint">{formatMessage({ id: "agent.skills.loading" })}</span>
       </div>
     );
   }
 
   if (error) {
     return (
-      <div className={embedded ? "px-5 py-4 flex flex-col items-center gap-3" : "flex flex-1 flex-col items-center justify-center gap-3 bg-white"}>
-        <span className="text-sm text-black/60 font-mono">{error}</span>
-        <button onClick={fetchSkills} className="btn-brutal-sm px-2 py-1 bg-white flex items-center gap-1 text-xs font-bold">
-          <RefreshCw size={12} />
+      <div className={embedded ? "px-5 py-4 flex flex-col items-center gap-3" : "flex flex-1 flex-col items-center justify-center gap-3 bg-layer-canvas"}>
+        <span className="text-footnote font-semibold text-warning-strong">{error}</span>
+        <Button variant="outline" size="sm" onClick={fetchSkills}>
+          <RefreshCw size={16} />
           {formatMessage({ id: "agent.skills.retry" })}
-        </button>
+        </Button>
       </div>
     );
   }
@@ -140,25 +163,31 @@ export default function AgentSkills({ agentId, embedded }: { agentId: string; em
   const totalSkills = (data?.global?.length || 0) + (data?.workspace?.length || 0);
 
   return (
-    <div className={embedded ? "" : "flex-1 overflow-y-auto bg-white"}>
+    <div className={embedded ? "" : "flex-1 overflow-y-auto bg-layer-canvas"}>
       <div className="px-5 py-4">
-        <SectionEyebrow as="div" className="mb-3">
-          {formatMessage({ id: "agent.skills.title" }, { count: totalSkills })}
-        </SectionEyebrow>
+        {/* Same header + count format as the other profile sections; when there
+            are no skills at all, the header's 0 is the whole section. */}
+        <SectionHeader
+          className={totalSkills > 0 ? "mb-3" : undefined}
+          label={formatMessage({ id: "agent.skills.heading" })}
+          count={totalSkills}
+        />
+        {totalSkills > 0 && (
         <div className="space-y-4">
           <SkillSubSection
             label={formatMessage({ id: "agent.skills.global" })}
             icon={Globe}
-            skills={data?.global || []}
+            skills={data?.global || EMPTY_SKILLS}
             emptyText={formatMessage({ id: "agent.skills.globalEmpty" })}
           />
           <SkillSubSection
             label={formatMessage({ id: "agent.skills.workspace" })}
             icon={FolderOpen}
-            skills={data?.workspace || []}
+            skills={data?.workspace || EMPTY_SKILLS}
             emptyText={formatMessage({ id: "agent.skills.workspaceEmpty" })}
           />
         </div>
+        )}
       </div>
     </div>
   );

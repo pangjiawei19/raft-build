@@ -1,12 +1,12 @@
 import { lazy, Suspense } from "react";
 import type { ComponentType, LazyExoticComponent } from "react";
 import { useIntl } from "react-intl";
-import Spinner from "../ui/Spinner";
+import { Spinner } from "@botiverse/raft-ui";
 
 const AboutFeedbackPanel = lazy(async () => {
   const [, panel] = await Promise.all([
     import.meta.env
-      ? import("@botiverse/hands-feedback-react/source/styles.css")
+      ? import("@botiverse/hands-feedback-react/styles.css")
       : Promise.resolve(),
     import("./AboutFeedbackDialog"),
   ]);
@@ -20,10 +20,10 @@ function FeedbackWorkspacePending() {
   return (
     <div
       aria-busy="true"
-      className="flex h-full min-h-40 items-center justify-center gap-3 bg-layer-primary px-4 py-8 text-sm font-medium text-foreground-muted"
+      className="flex h-full min-h-40 items-center justify-center gap-3 bg-layer-canvas px-4 py-8 text-callout text-foreground-hint"
     >
       <div role="status" className="flex items-center gap-3">
-        <Spinner size="md" label={loading} />
+        <Spinner size="md" aria-label={loading} />
         <span>{loading}</span>
       </div>
     </div>

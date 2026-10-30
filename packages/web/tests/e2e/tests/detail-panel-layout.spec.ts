@@ -64,16 +64,17 @@ test.describe("detail panel layout contract", () => {
       expect(panelBox!.width).toBe(page.viewportSize()!.width);
       expect(panelBox!.x).toBe(0);
 
-      // Header height is part of the cross-panel contract.
+      // Header height is part of the cross-panel contract: every Raft head
+      // (phone nav row, panel / sidebar / drawer header) is 56 tall.
       const headerBox = await page.getByTestId("legacy-task-panel-header").boundingBox();
-      expect(headerBox?.height).toBe(62);
+      expect(headerBox?.height).toBe(56);
     });
   });
 
   test.describe("rail-visible viewport (md+): centered modal", () => {
     test.use({ viewport: { width: 1280, height: 800 } });
 
-    test("legacy task panel opens as a centered modal from Tasks and uses the 62px header", async ({
+    test("legacy task panel opens as a centered modal from Tasks and uses the 56px header", async ({
       page,
       request,
     }) => {
@@ -101,9 +102,10 @@ test.describe("detail panel layout contract", () => {
       expect(panelBox!.width).toBeLessThan(page.viewportSize()!.width);
       expect(panelBox!.x).toBeGreaterThan(0);
 
-      // Header height is part of the cross-panel contract.
+      // Header height is part of the cross-panel contract: every Raft head
+      // (phone nav row, panel / sidebar / drawer header) is 56 tall.
       const headerBox = await page.getByTestId("legacy-task-panel-header").boundingBox();
-      expect(headerBox?.height).toBe(62);
+      expect(headerBox?.height).toBe(56);
     });
   });
 });

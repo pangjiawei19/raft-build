@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useIntl } from "react-intl";
 import { SLACK_BRIDGE_FEATURE_FLAG_KEYS } from "@botiverse/raft-shared";
 import {
+  Badge,
+  FormSection,
   Select,
   SelectContent,
   SelectIcon,
@@ -11,7 +13,7 @@ import {
   SelectList,
   SelectTrigger,
   SelectValue,
-} from "raft-ui";
+} from "@botiverse/raft-ui";
 import type { SlackBridgeProvisioningProvider, SlackBridgeSetupSnapshot, SlackBridgeSetupStage } from "../settings/slackBridgeProvisioning";
 import { isSlackBridgePreflightPassed } from "../settings/slackBridgeProvisioning";
 import { slackBridgeProvisioningProvider } from "../settings/slackBridgeProvisioningApi";
@@ -82,10 +84,10 @@ export function useChannelSlackBridgeEditor(input: {
     selectedSlackChannelId: string;
   }>({ snapshot: null, selectedSlackChannelId: "" });
   const { snapshot, selectedSlackChannelId } = state;
-  const setSelectedSlackChannelId = (value: string) => setState((current) => ({
+  const setSelectedSlackChannelId = useCallback((value: string) => setState((current) => ({
     ...current,
     selectedSlackChannelId: value,
-  }));
+  })), []);
 
   useEffect(() => {
     let active = true;
@@ -112,7 +114,7 @@ export function useChannelSlackBridgeEditor(input: {
   const available = launchEnabled
     && isChannelSlackBridgeSelectionAvailable(snapshot?.stage ?? null);
 
-  const apply = async (channelId: string) => {
+  const apply = useCallback(async (channelId: string) => {
     if (!launchEnabled || !snapshot || !available) return;
     const fresh = await slackBridgeProvisioningProvider.load();
     const currentSnapshot = await applyChannelSlackBridgeSelection({
@@ -122,19 +124,28 @@ export function useChannelSlackBridgeEditor(input: {
       selectedSlackChannelId,
     });
     setState((current) => ({ ...current, snapshot: currentSnapshot }));
-  };
+  }, [launchEnabled, snapshot, available, selectedSlackChannelId]);
 
-  return { snapshot, selectedSlackChannelId, setSelectedSlackChannelId, available, apply };
+  return useMemo(
+    () => ({ snapshot, selectedSlackChannelId, setSelectedSlackChannelId, available, apply }),
+    [snapshot, selectedSlackChannelId, setSelectedSlackChannelId, available, apply],
+  );
 }
 
+/** The channel's Slack Bridge pick as a raft-ui FormSection (DS
+ *  `rf-drawer__section`): heading with the provider badge, a line on what it
+ *  does, then the Slack channel field. `className` adjusts the section's own
+ *  spacing for a host that is not a run of sections (the create dialog). */
 export function ChannelSlackBridgeField({
   editor,
   visibility,
   disabled,
+  className,
 }: {
   editor: SlackBridgeEditor;
   visibility: "public" | "private";
   disabled?: boolean;
+  className?: string;
 }) {
   const { formatMessage } = useIntl();
   const options = useMemo(() => editor.snapshot?.slackChannels.filter((channel) =>
@@ -167,28 +178,34 @@ export function ChannelSlackBridgeField({
     }),
   ], [editor.selectedSlackChannelId, formatMessage, options, pairedBySlackId]);
 
+  const { setSelectedSlackChannelId } = editor;
+  const handleValueChange = useCallback((value: string | null) => {
+    if (value != null) {
+      setSelectedSlackChannelId(value === NOT_CONNECTED_VALUE ? "" : value);
+    }
+  }, [setSelectedSlackChannelId]);
+
   if (!editor.available) return null;
 
   return (
-    <section className="space-y-3 border-t-2 border-black pt-4" data-testid="channel-slack-bridge-field">
-      <div>
-        <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-black/65">
-          <span className="border border-black bg-brutal-lavender px-1.5 py-0.5 text-[10px] text-black">
+    <FormSection
+      className={className}
+      data-testid="channel-slack-bridge-field"
+      title={(
+        <span className="flex items-center gap-2">
+          <Badge appearance="outline" data-testid="channel-slack-bridge-provider-badge">
             {formatMessage({ id: "settings.slackBridge.providerBadge" })}
-          </span>
+          </Badge>
           {formatMessage({ id: "channel.bridge.fieldTitle" })}
-        </div>
-        <p className="mt-1 text-xs text-black/60">{formatMessage({ id: "channel.bridge.fieldDescription" })}</p>
-      </div>
+        </span>
+      )}
+      description={formatMessage({ id: "channel.bridge.fieldDescription" })}
+    >
       <FormField label={formatMessage({ id: "channel.bridge.slackChannel" })}>
         <Select
           value={editor.selectedSlackChannelId || NOT_CONNECTED_VALUE}
           disabled={disabled}
-          onValueChange={(value) => {
-            if (value != null) {
-              editor.setSelectedSlackChannelId(value === NOT_CONNECTED_VALUE ? "" : value);
-            }
-          }}
+          onValueChange={handleValueChange}
           items={selectOptions}
         >
           <SelectTrigger className="w-full" aria-label={formatMessage({ id: "channel.bridge.slackChannel" })}>
@@ -207,6 +224,6 @@ export function ChannelSlackBridgeField({
           </SelectContent>
         </Select>
       </FormField>
-    </section>
+    </FormSection>
   );
 }

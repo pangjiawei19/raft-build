@@ -1,7 +1,7 @@
 import { PRO_PACK_ANNUAL_DISCOUNT_PERCENT } from "@botiverse/raft-shared";
 import type { BillingInterval } from "@botiverse/raft-shared";
 import { useIntl } from "react-intl";
-import { SegmentedControl, SegmentedControlCount, SegmentedControlItem, SegmentedControlLabel } from "raft-ui";
+import { SegmentedControl, SegmentedControlCount, SegmentedControlItem, SegmentedControlLabel } from "@botiverse/raft-ui";
 import { MESSAGE_BODY_FONT_SIZE_OPTIONS } from "../../store/appearanceStore";
 import type { MessageBodyFontSize } from "../../store/appearanceStore";
 import type { MessageId } from "../../i18n/messages/en";
@@ -36,12 +36,10 @@ export function BillingIntervalSegmentedControl({
     { value: "monthly" as const, label: formatMessage({ id: "billing.monthly" }), testId: "billing-interval-monthly" },
     {
       value: "annual" as const,
-      label: (
-        <span className="inline-flex items-center gap-1.5">
-          <span>{formatMessage({ id: "billing.yearly" })}</span>
-          <span className="whitespace-nowrap text-[10px] font-mono font-bold uppercase text-black/60">{formatMessage({ id: "billing.saveAnnualPercent" }, { percent: PRO_PACK_ANNUAL_DISCOUNT_PERCENT })}</span>
-        </span>
-      ),
+      label: formatMessage({ id: "billing.yearly" }),
+      // Secondary text slot: rUI themes its type and colour (Space Mono
+      // meta, light/dark, checked/unchecked). Only wrapping is set here.
+      badge: formatMessage({ id: "billing.saveAnnualPercent" }, { percent: PRO_PACK_ANNUAL_DISCOUNT_PERCENT }),
       testId: "billing-interval-annual",
     },
   ];
@@ -60,6 +58,9 @@ export function BillingIntervalSegmentedControl({
           data-testid={option.testId}
         >
           <SegmentedControlLabel>{option.label}</SegmentedControlLabel>
+          {"badge" in option ? (
+            <SegmentedControlCount className="whitespace-nowrap">{option.badge}</SegmentedControlCount>
+          ) : null}
         </SegmentedControlItem>
       ))}
     </SegmentedControl>

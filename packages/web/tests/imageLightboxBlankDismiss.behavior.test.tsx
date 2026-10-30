@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
+import "./helpers/domSetup";
 import { act, Suspense } from "react";
 import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import type { ImageZoomLayoutSettleRequest } from "../src/components/ImageZoom";
@@ -146,12 +146,14 @@ test("ImageLightbox mounts a flow header, flexible stage, bounded image, and com
 
     const download = screen.getByRole("button", { name: "Download" });
     const close = screen.getByRole("button", { name: "Close" });
+    // Raft Design System › Panel head: the title bar's tools are the raft-ui
+    // ghost panel actions (44 square, 22px glyph), not compact boxed buttons.
     for (const control of [download, close]) {
-      assert.ok(control.classList.contains("size-7"));
+      assert.equal(control.getAttribute("data-slot"), "panel-action");
       const icon = control.querySelector("svg");
-      assert.ok(icon, "compact control must render its Lucide icon");
-      assert.equal(icon.getAttribute("width"), "14");
-      assert.equal(icon.getAttribute("height"), "14");
+      assert.ok(icon, "header control must render its Lucide icon");
+      assert.equal(icon.getAttribute("width"), "22");
+      assert.equal(icon.getAttribute("height"), "22");
     }
 
     fireEvent.click(download);
@@ -436,3 +438,48 @@ test("ImageLightbox stage double-click toggles zoom after pointer capture and ex
   assert.equal(image.style.cursor, "zoom-in");
   assert.equal(stage.style.cursor, "default");
 });
+
+test("ImageLightbox clicking disabled navigation arrows does not close the lightbox", async () => {
+  const { ImageLightbox, useImageLightboxStore } = await loadLightboxModules();
+  act(() => {
+    useImageLightboxStore.getState().open(
+      [
+        {
+          id: "first-image",
+          filename: "first.png",
+          mimeType: "image/png",
+          sizeBytes: 1,
+          directUrl: DATA_IMAGE,
+        },
+        {
+          id: "second-image",
+          filename: "second.png",
+          mimeType: "image/png",
+          sizeBytes: 1,
+          directUrl: DATA_IMAGE,
+        },
+      ],
+      0, // index 0: isFirst = true, previous arrow disabled
+    );
+  });
+
+  render(<ImageLightbox />);
+
+  const prevButton = screen.getByRole("button", { name: "Previous image" });
+  assert.ok(prevButton);
+  assert.equal((prevButton as HTMLButtonElement).disabled, true);
+
+  // Give the image a real box so the arrow coordinate is genuinely OUTSIDE it;
+  // without this the rect is 0x0 and every point counts as "inside the image".
+  const image = await screen.findByTestId("image-lightbox-image");
+  setRect(image, rect({ left: 300, top: 100, right: 500, bottom: 400 }));
+
+  // A disabled RUI button is pointer-events-none, so the real click lands on
+  // whatever element is underneath it. Post-fix that is the arrow's wrapper
+  // span; pre-fix it is the stage itself.
+  const underneath = prevButton.parentElement;
+  assert.ok(underneath);
+  fireEvent.click(underneath, { clientX: 40, clientY: 250 });
+  assert.ok(screen.queryByTestId("image-lightbox"), "lightbox must stay open after clicking the disabled previous arrow");
+});
+

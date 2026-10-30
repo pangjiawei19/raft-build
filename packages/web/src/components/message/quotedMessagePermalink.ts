@@ -1,4 +1,4 @@
-import { parseRaftPermalink } from "@botiverse/raft-shared";
+import { parseRaftPermalink, visitOutsideMarkdownCode } from "@botiverse/raft-shared";
 import type { ParsedRaftPermalink } from "@botiverse/raft-shared";
 import type { IntlShape } from "react-intl";
 import type { MessageAttachment } from "../../store/messageStore";
@@ -8,13 +8,6 @@ type FormatMessage = IntlShape["formatMessage"];
 const CJK_URL_BOUNDARY_PUNCTUATION = "，。、；：！？）》」』】》〉”’（《「『【〈“‘";
 const URL_PATTERN = new RegExp(`https?:\\/\\/[^\\s<>"'${CJK_URL_BOUNDARY_PUNCTUATION}]+`, "g");
 const TRAILING_PUNCTUATION = /[),.!?;:，。！？；：]+$/;
-const FENCED_CODE_PATTERN = /```[\s\S]*?```/g;
-const INLINE_CODE_PATTERN = /``[^`]+``|`[^`]+`/g;
-
-interface ProtectedMarkdownCode {
-  text: string;
-  restore: (value: string) => string;
-}
 
 export interface ExtractedQuotedMessagePermalink {
   rawUrl: string;
@@ -43,25 +36,6 @@ export function matchesUnavailableQuotedPermalink(
   );
 }
 
-function protectMarkdownCode(text: string): ProtectedMarkdownCode {
-  const placeholders: string[] = [];
-  const protect = (pattern: RegExp, value: string) =>
-    value.replace(pattern, (match) => {
-      const index = placeholders.length;
-      placeholders.push(match);
-      return `\x00CODE${index}\x00`;
-    });
-
-  const protectedText = protect(INLINE_CODE_PATTERN, protect(FENCED_CODE_PATTERN, text));
-
-  return {
-    text: protectedText,
-    restore: (value: string) =>
-      // oxlint-disable-next-line no-control-regex -- NUL (\u0000) is an intentional private sentinel wrapping placeholder tokens; it never appears in user markdown, so matching it is safe and deliberate
-      value.replace(/\x00CODE(\d+)\x00/g, (_match, index) => placeholders[Number(index)] ?? ""),
-  };
-}
-
 export function extractFirstQuotedMessagePermalink(
   content: string,
   currentHostname: string | undefined,
@@ -69,25 +43,28 @@ export function extractFirstQuotedMessagePermalink(
 ): ExtractedQuotedMessagePermalink | null {
   if (!content?.includes("http") || !currentServerSlug) return null;
 
-  const protectedMarkdown = protectMarkdownCode(content);
-  for (const match of protectedMarkdown.text.matchAll(URL_PATTERN)) {
-    const raw = match[0];
-    const start = match.index ?? -1;
-    if (start < 0) continue;
+  // Code is decided by the markdown parser (task #762), not by fence regexes.
+  let found: ExtractedQuotedMessagePermalink | null = null;
+  visitOutsideMarkdownCode(content, (chunk) => {
+    if (found) return;
+    for (const match of chunk.matchAll(URL_PATTERN)) {
+      const raw = match[0];
+      const start = match.index ?? -1;
+      if (start < 0) continue;
 
-    // Skip markdown links like [text](https://...)
-    if (start > 0 && protectedMarkdown.text[start - 1] === "(") continue;
+      // Skip markdown links like [text](https://...)
+      if (start > 0 && chunk[start - 1] === "(") continue;
 
-    const trailing = raw.match(TRAILING_PUNCTUATION)?.[0] ?? "";
-    const candidate = trailing ? raw.slice(0, -trailing.length) : raw;
-    const parsed = parseRaftPermalink(candidate, currentHostname);
-    if (!parsed || parsed.serverSlug !== currentServerSlug) continue;
+      const trailing = raw.match(TRAILING_PUNCTUATION)?.[0] ?? "";
+      const candidate = trailing ? raw.slice(0, -trailing.length) : raw;
+      const parsed = parseRaftPermalink(candidate, currentHostname);
+      if (!parsed || parsed.serverSlug !== currentServerSlug) continue;
 
-    return {
-      rawUrl: candidate,
-      parsed,
-    };
-  }
+      found = { rawUrl: candidate, parsed };
+      return;
+    }
+  });
+  if (found) return found;
 
   return null;
 }

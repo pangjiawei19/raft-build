@@ -1,4 +1,7 @@
-import { useState } from "react";
+import { Button, Card, DialogSurface } from "@botiverse/raft-ui";
+import CloseButton from "../ui/CloseButton";
+import Tooltip from "../ui/Tooltip";
+import { useCallback, useState } from "react";
 import { useIntl } from "react-intl";
 import { X } from "lucide-react";
 import Modal from "../Modal";
@@ -25,7 +28,7 @@ export default function CommunityAgreementDialog({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
 
-  const handleAgree = async () => {
+  const handleAgree = useCallback(async () => {
     setSubmitting(true);
     setError("");
     try {
@@ -40,59 +43,64 @@ export default function CommunityAgreementDialog({
     } finally {
       setSubmitting(false);
     }
-  };
+  }, [agreement.id, formatMessage, onAgree]);
 
   return (
     <Modal onClose={onClose}>
-      <div className="w-full max-w-lg card-brutal p-5">
+      {/* DS Dialog surface (rf-dialog): raft-ui's DialogSurface draws the frame;
+          20 padding here. The surface rather than raft-ui's Dialog parts because
+          the shared Modal owns Escape/backdrop/focus here. */}
+      <DialogSurface className="w-full max-w-lg p-5">
         <div className="mb-4 flex items-start justify-between gap-3">
-          <div>
-            <h2 className="text-lg font-bold">{agreement.title}</h2>
-            <div className="mt-0.5 text-xs text-black/50">
+          <div className="min-w-0">
+            <h2 className="text-headline">{agreement.title}</h2>
+            <div className="mt-1 font-mono text-mono-meta text-foreground-hint">
               {formatMessage({ id: "server.communityAgreement.version" }, { version: agreement.version })}
             </div>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="btn-brutal-sm shrink-0 bg-white p-1"
-            title={formatMessage({ id: "common.close" })}
-          >
-            <X size={18} />
-          </button>
+          <Tooltip content={formatMessage({ id: "common.close" })}>
+            <CloseButton
+              type="button"
+              onClick={onClose}
+              className="shrink-0"
+              data-slot="button"
+            >
+              <X size={18} />
+            </CloseButton>
+          </Tooltip>
         </div>
 
-        <div className="max-h-[50vh] overflow-y-auto border-2 border-black bg-white p-4 text-sm">
+        <Card className="max-h-[50vh] overflow-y-auto p-4 text-callout text-foreground-muted">
           <AgreementBody source={agreement.bodyMarkdown} />
-        </div>
+        </Card>
 
         {error && (
-          <Banner intent="warning" density="sm" className="mt-4 font-bold">
+          <Banner intent="warning" density="sm" className="mt-4">
             {error}
           </Banner>
         )}
 
-        <div className="mt-5 flex justify-end gap-3">
-          <button
+        <div className="mt-5 flex justify-end gap-2">
+          <Button size="lg"
+            variant="ghost"
             type="button"
             onClick={onClose}
             disabled={submitting}
-            className="btn-brutal bg-white px-3 py-1.5 text-xs disabled:opacity-50"
           >
             {formatMessage({ id: "server.communityAgreement.cancel" })}
-          </button>
-          <button
+          </Button>
+          <Button size="lg"
+            variant="accent"
             type="button"
             onClick={handleAgree}
             disabled={submitting}
-            className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs disabled:opacity-50"
           >
             {submitting
               ? formatMessage({ id: "server.communityAgreement.joining" })
               : formatMessage({ id: "server.communityAgreement.agreeContinue" })}
-          </button>
+          </Button>
         </div>
-      </div>
+      </DialogSurface>
     </Modal>
   );
 }

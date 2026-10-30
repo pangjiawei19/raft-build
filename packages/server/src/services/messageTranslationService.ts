@@ -1,11 +1,12 @@
 import { createHash } from "node:crypto";
-import { and, eq, inArray } from "drizzle-orm";
-import { normalizeTranslationLanguageCode, type ServerId, type TraceAttributes } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
-import { channels, messages, messageTranslations } from "../db/schema.js";
-import * as channelService from "./channelService.js";
-import { evaluateFeatureFlag, LLM_TRANSLATION_FEATURE_FLAG_KEY } from "./featureFlagService.js";
-import { addTraceEvent } from "../tracing/semanticTrace.js";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
+import { alias } from "drizzle-orm/pg-core";
+import { normalizeTranslationLanguageCode, visitOutsideMarkdownCode, type ServerId, type TraceAttributes } from "@botiverse/raft-shared";
+import { getDb } from "../db/index";
+import { channels, messages, messageTranslations, servers } from "../db/schema";
+import * as channelService from "./channelService";
+import { evaluateFeatureFlag, LLM_TRANSLATION_FEATURE_FLAG_KEY } from "./featureFlagService";
+import { addTraceEvent, errorClassOf } from "../tracing/semanticTrace";
 import {
   AzureTranslationProvider,
   bracePlaceholderPolicy,
@@ -18,12 +19,12 @@ import {
   type TranslationProvider,
   type TranslationProviderVersion,
   VolcengineTranslationProvider,
-} from "./translation/index.js";
+} from "./translation/index";
 import {
   CachedTranslationSsmConfig,
   createAwsTranslationSsmReader,
   translationSsmIsConfigured,
-} from "./translation/ssmConfig.js";
+} from "./translation/ssmConfig";
 
 export type TranslationMode = "auto" | "manual";
 export type TranslationStatus = "translated" | "skipped" | "pending" | "failed" | "not_found";
@@ -168,9 +169,10 @@ export function detectMessageTranslationLanguage(content: string): Detection {
 }
 
 export function isMessageTranslationCodeOrLinkOnly(content: string): boolean {
-  const stripped = content
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/`[^`]*`/g, " ")
+  // Code is decided by the markdown parser (task #762), not by fence regexes.
+  let prose = "";
+  visitOutsideMarkdownCode(content, (chunk) => { prose += ` ${chunk}`; });
+  const stripped = prose
     .replace(/https?:\/\/\S+/g, " ")
     .replace(/<a\s+data-(?:mention|channel|task)=[\s\S]*?<\/a>/g, " ")
     .replace(/@[A-Za-z0-9_-]+/g, " ")
@@ -702,6 +704,78 @@ export async function translateMessagesBatch(input: {
   mode: TranslationMode;
   messageIds: string[];
 }): Promise<MessageTranslationBatchResult[]> {
+  return translateVisibleMessagesBatch(input, await listVisibleMessages(input));
+}
+
+/**
+ * Public translation deliberately has its own visibility resolver. It never
+ * calls the member/channel authorization helpers: every request rechecks the
+ * public server toggle plus the ordinary-channel (or public parent-thread)
+ * predicate in the same query that loads the requested messages.
+ */
+export async function translatePublicMessagesBatch(input: {
+  serverSlug: string;
+  targetLanguage: string;
+  mode: TranslationMode;
+  messageIds: string[];
+}): Promise<MessageTranslationBatchResult[]> {
+  const db = getDb();
+  const uniqueIds = [...new Set(input.messageIds)];
+  if (uniqueIds.length === 0) return [];
+  const parentMessages = alias(messages, "public_translation_parent_messages");
+  const parentChannels = alias(channels, "public_translation_parent_channels");
+  const rows = await db
+    .select({ message: messages, serverId: channels.serverId })
+    .from(messages)
+    .innerJoin(channels, eq(messages.channelId, channels.id))
+    .innerJoin(servers, and(
+      eq(servers.id, channels.serverId),
+      eq(servers.slug, input.serverSlug),
+      eq(servers.publiclyVisible, true),
+      eq(servers.translationEnabled, true),
+      isNull(servers.deletedAt),
+    ))
+    .leftJoin(parentMessages, eq(parentMessages.id, channels.parentMessageId))
+    .leftJoin(parentChannels, eq(parentChannels.id, parentMessages.channelId))
+    .where(and(
+      inArray(messages.id, uniqueIds),
+      isNull(channels.deletedAt),
+      isNull(channels.archivedAt),
+      or(
+        and(eq(channels.type, "channel"), eq(channels.guestVisible, true)),
+        and(
+          eq(channels.type, "thread"),
+          eq(parentChannels.serverId, channels.serverId),
+          eq(parentChannels.type, "channel"),
+          eq(parentChannels.guestVisible, true),
+          isNull(parentChannels.deletedAt),
+          isNull(parentChannels.archivedAt),
+        ),
+      ),
+    ));
+  const visible = new Map(rows.map((row) => [row.message.id, { ...row.message, serverId: row.serverId }]));
+  const [server] = await db.select({ id: servers.id }).from(servers)
+    .where(and(
+      eq(servers.slug, input.serverSlug),
+      eq(servers.publiclyVisible, true),
+      eq(servers.translationEnabled, true),
+      isNull(servers.deletedAt),
+    )).limit(1);
+  if (!server) return input.messageIds.map((messageId) => ({
+    messageId,
+    status: "not_found" as const,
+    targetLanguage: normalizeLanguage(input.targetLanguage),
+  }));
+  return translateVisibleMessagesBatch({ ...input, serverId: server.id as ServerId }, visible);
+}
+
+async function translateVisibleMessagesBatch(input: {
+  serverId: ServerId;
+  userId?: string;
+  targetLanguage: string;
+  mode: TranslationMode;
+  messageIds: string[];
+}, visibleMessages: Map<string, VisibleMessage>): Promise<MessageTranslationBatchResult[]> {
   const targetLanguage = normalizeLanguage(input.targetLanguage);
   addTraceEvent("translation.batch.started", {
     target_language: targetLanguage,
@@ -712,7 +786,7 @@ export async function translateMessagesBatch(input: {
   if (process.env.TRANSLATION_PROVIDER?.trim().toLowerCase() === "openai-compatible" || translationSsmIsConfigured()) {
     const gate = await evaluateFeatureFlag({
       key: LLM_TRANSLATION_FEATURE_FLAG_KEY,
-      userId: input.userId,
+      ...(input.userId ? { userId: input.userId } : {}),
       serverId: input.serverId,
     });
     if (!gate.enabled) {
@@ -736,13 +810,12 @@ export async function translateMessagesBatch(input: {
       target_language: targetLanguage,
       mode: input.mode,
       requested_count: input.messageIds.length,
-      error_class: error instanceof Error ? error.name : typeof error,
+      error_class: errorClassOf(error),
     });
     throw error;
   }
   const providerInfo = providerInfoFromResolved(resolvedProvider);
   addTraceEvent("translation.provider.resolved", providerTraceAttrs(providerInfo));
-  const visibleMessages = await listVisibleMessages(input);
   const results: Array<MessageTranslationBatchResult | undefined> = [];
   const providerItems: ProviderQueueItem[] = [];
   const traceCounters: TranslationTraceCounters = {};
@@ -762,6 +835,7 @@ export async function translateMessagesBatch(input: {
     if (
       input.mode === "auto"
       && message.senderType === "user"
+      && !!input.userId
       && message.senderId === input.userId
     ) {
       results[resultIndex] = requestTimeSkipResult({
@@ -967,7 +1041,7 @@ export async function translateMessagesBatch(input: {
         char_count: charCount,
         latency_ms: Date.now() - providerCallStart,
         outcome: "error",
-        error_class: error instanceof Error ? error.name : typeof error,
+        error_class: errorClassOf(error),
         ...(error instanceof TranslationProviderError ? {
           error_code: error.code,
           error_disposition: error.disposition,

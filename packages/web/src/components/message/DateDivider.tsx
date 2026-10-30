@@ -1,3 +1,4 @@
+import { MessageListDateDivider } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 
@@ -7,10 +8,8 @@ import { useTimeFormatter } from "../../hooks/useTimeFormatter";
  * current-day header (task #44), where `sticky` swaps the flat rule for a
  * self-contained pill so it reads over scrolling messages.
  *
- * Composes existing design-system pieces (no new primitive): the brutal
- * `border-t-2 border-black` rule (cf. `ui/ContextMenuDivider`) + the section
- * label treatment (`text-[10px] font-bold uppercase tracking-widest`, cf.
- * `ui/SectionHeader`).
+ * The flat form is the RUI event row (Space Mono 12, ink-3, between hairlines);
+ * the sticky pill keeps the same machine-text treatment on a paper chip.
  */
 export function DateDivider({
   createdAt,
@@ -31,28 +30,16 @@ export function DateDivider({
   });
   if (!label) return null;
 
-  const chip = (
-    <span className="inline-flex items-center bg-white px-2 text-[10px] font-bold uppercase tracking-widest text-black/50">
-      {label}
-    </span>
-  );
-
   if (sticky) {
-    // Floating current-day chip for the sticky header overlay.
     return (
       <div className="pointer-events-none flex justify-center pt-1" data-testid={testId}>
-        {chip}
+        <span className="rounded-chip border border-line-hairline bg-layer-canvas px-2 py-0.5 font-mono text-mono-meta text-foreground-hint">
+          {label}
+        </span>
       </div>
     );
   }
-
-  // Inline divider: centered chip over a full-width rule.
-  return (
-    <div className="relative flex select-none items-center justify-center px-3 py-2" data-testid={testId}>
-      <div className="absolute inset-x-3 top-1/2 border-t-2 border-black/15" aria-hidden />
-      <div className="relative bg-white">{chip}</div>
-    </div>
-  );
+  return <MessageListDateDivider data-testid={testId}>{label}</MessageListDateDivider>;
 }
 
 /** "Today" / "Yesterday" / "Monday, June 30, 2026" in the viewer's timezone. */

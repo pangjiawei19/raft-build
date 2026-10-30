@@ -1,3 +1,4 @@
+import CloseButton from "../ui/CloseButton";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useIntl } from "react-intl";
 import { Bell, Check, X } from "lucide-react";
@@ -9,7 +10,7 @@ import {
   recordWebPushPromptEvent,
 } from "../../utils/pushNotifications";
 import Banner from "../ui/Banner";
-import Button from "../ui/Button";
+import { Button } from "@botiverse/raft-ui";
 import type { MessageId } from "../../i18n/messages";
 
 export const NOTIFICATION_ACTIVATION_DISMISSED_SESSION_KEY =
@@ -153,7 +154,7 @@ export default function NotificationActivationBanner({
     });
   }, [permission, visible]);
 
-  const handleEnable = async () => {
+  const handleEnable = useCallback(async () => {
     const permissionBefore = getPushPermissionState();
     setBusy(true);
     setErrorId(null);
@@ -193,17 +194,22 @@ export default function NotificationActivationBanner({
 
     setPermission(permissionAfter);
     setBusy(false);
-  };
+  }, []);
 
-  const handleDismiss = () => {
+  const handleDismiss = useCallback(() => {
     rememberDismissalForSession();
     setErrorId(null);
     setConfirmingDismissal(true);
-  };
+  }, []);
 
   if (!visible) return null;
 
-  const placementClassName = placement === "desktop" ? "mx-3 mb-3" : "";
+  // Equal 8px open bands above and below the banner, on the composer stack's
+  // own scale: the pinned top margin matches the column's 8px gap that
+  // already separates the banner from the form. Measuring the bottom spacing
+  // through the form's border and pt-3 padding hid the real gap behind the
+  // composer line and made the two sides read asymmetric in every theme.
+  const placementClassName = placement === "desktop" ? "mx-3 mb-0 mt-2 w-auto min-w-0" : "";
   if (confirmingDismissal) {
     return (
       <Banner
@@ -218,13 +224,13 @@ export default function NotificationActivationBanner({
         <button
           type="button"
           onClick={() => nav.toSettings("notifications")}
-          className="font-bold underline"
+          className="font-semibold underline decoration-[1.5px] underline-offset-[3px]"
         >
           {formatMessage({ id: "message.notificationActivation.settingsNotifications" })}
         </button>
         <div
           aria-hidden="true"
-          className="notification-activation-progress absolute inset-x-0 bottom-0 h-1 bg-brutal-black"
+          className="notification-activation-progress absolute inset-x-0 bottom-0 h-1 bg-foreground"
         />
         {/* Functional clock: this hidden animation's end event is the only
             three-second auto-dismiss path. Do not remove it as decoration. */}
@@ -238,44 +244,24 @@ export default function NotificationActivationBanner({
   }
 
   const isMobile = placement === "mobile";
-  const actions = isMobile ? (
-    <>
-      <button
-        type="button"
-        onClick={handleDismiss}
-        className="order-3 inline-flex size-7 shrink-0 items-center justify-center"
-        aria-label={formatMessage({ id: "message.notificationActivation.hideReminderAria" })}
-      >
-        <X size={16} />
-      </button>
-      <Button
-        size="sm"
-        tone="pink"
-        className="order-4 basis-full"
-        disabled={busy}
-        onClick={() => void handleEnable()}
-      >
-        {formatMessage({ id: busy ? "message.notificationActivation.enabling" : "message.notificationActivation.enable" })}
-      </Button>
-    </>
-  ) : (
+  const actions = (
     <div className="flex items-center gap-2">
       <Button
         size="sm"
-        tone="pink"
+        variant="outline"
         disabled={busy}
-        onClick={() => void handleEnable()}
+        onClick={handleEnable}
       >
         {formatMessage({ id: busy ? "message.notificationActivation.enabling" : "message.notificationActivation.enable" })}
       </Button>
-      <button
+      <CloseButton
         type="button"
         onClick={handleDismiss}
-        className="inline-flex size-7 shrink-0 items-center justify-center"
+        className="shrink-0"
         aria-label={formatMessage({ id: "message.notificationActivation.hideReminderAria" })}
       >
         <X size={16} />
-      </button>
+      </CloseButton>
     </div>
   );
 
@@ -288,16 +274,14 @@ export default function NotificationActivationBanner({
         ? formatMessage({ id: "message.notificationActivation.mobileTitle" })
         : formatMessage({ id: "message.notificationActivation.desktopTitle" })}
       actions={actions}
-      className={`${isMobile
-        ? "flex-wrap [&>div:last-child]:contents"
-        : "[&>div:last-child]:self-center"} ${placementClassName}`}
+      className={`[&>div:last-child]:self-center ${placementClassName}`}
       data-testid={`notification-activation-banner-${placement}`}
     >
       {isMobile
         ? formatMessage({ id: "message.notificationActivation.mobileBody" })
         : formatMessage({ id: "message.notificationActivation.desktopBody" })}
       {errorId ? (
-        <div role="alert" className="mt-1 font-bold text-brutal-red">
+        <div role="alert" className="mt-1 font-semibold text-danger-strong">
           {formatMessage({ id: errorId })}
         </div>
       ) : null}

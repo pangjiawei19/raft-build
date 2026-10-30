@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useCallback, useState, useEffect } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import type { MessageId } from "../../i18n/messages";
@@ -9,7 +9,7 @@ import api from "../../api/client";
 import { storePendingInvite } from "../../utils/socialAuth";
 import { ArrowLeft, LogIn, UserPlus } from "lucide-react";
 import Banner from "../ui/Banner";
-import Button from "../ui/Button";
+import { Button, Card } from "@botiverse/raft-ui";
 import CenteredCardFrame from "./CenteredCardFrame";
 import { AuthPageIntro } from "./AuthPageFrame";
 import AgreementBody from "../server/AgreementBody";
@@ -127,7 +127,7 @@ export default function InviteAcceptPage({
     loadInfo();
   }, [token]);
 
-  const handleAccept = async (agreementId?: string | null) => {
+  const handleAccept = useCallback(async (agreementId?: string | null) => {
     setAccepting(true);
     setError("");
     setErrorId(null);
@@ -168,9 +168,9 @@ export default function InviteAcceptPage({
     } finally {
       setAccepting(false);
     }
-  };
+  }, [token, acceptInvite, loadServers, setCurrent, navigate, onInviteConsumed]);
 
-  const handleContinue = () => {
+  const handleContinue = useCallback(() => {
     const joinedServer = useServerStore.getState().servers.find((server) => server.id === acceptedServerId);
     if (joinedServer) {
       setCurrent(joinedServer);
@@ -178,7 +178,29 @@ export default function InviteAcceptPage({
       return;
     }
     window.location.reload();
-  };
+  }, [acceptedServerId, setCurrent, navigate]);
+
+  const handleJoin = useCallback(() => {
+    void handleAccept(inviteInfo?.agreement?.id);
+  }, [inviteInfo, handleAccept]);
+
+  const handleSignIn = useCallback(() => {
+    // Store invite token for after login, then clear URL and switch view
+    storePendingInvite(token);
+    clearInviteUrl();
+    onSwitchToLogin();
+  }, [token, onSwitchToLogin]);
+
+  const handleCreateAccount = useCallback(() => {
+    storePendingInvite(token);
+    clearInviteUrl();
+    onSwitchToRegister();
+  }, [token, onSwitchToRegister]);
+
+  const handleReload = useCallback(() => {
+    clearInviteUrl();
+    window.location.reload();
+  }, []);
 
   if (loadingInfo) {
     return (
@@ -203,8 +225,8 @@ export default function InviteAcceptPage({
           />
           <Button
             onClick={handleContinue}
-            size="lg"
-            tone="pink"
+            size="xl"
+            variant="accent"
             className="w-full"
           >
             {formatMessage({ id: "pages.invite.continueToRaft" })}
@@ -220,7 +242,7 @@ export default function InviteAcceptPage({
         {errorText ? (
           <>
             <AuthPageIntro title={formatMessage({ id: "pages.invite.errorTitle" })} />
-            <Banner intent="warning" className="mb-6 font-bold">
+            <Banner intent="warning" className="mb-6">
               {errorText}
             </Banner>
           </>
@@ -246,29 +268,29 @@ export default function InviteAcceptPage({
                   )}
             >
               {insidePreview && (
-                <p className="mt-2 text-sm text-black/60">
+                <p className="mt-2 text-callout text-foreground-muted">
                   {insidePreview}
                 </p>
               )}
             </AuthPageIntro>
             {inviteInfo.agreement && (
-              <div className="card-brutal mb-4 p-4 text-left">
+              <Card className="mb-4 p-4 text-left">
                 <div className="mb-3">
-                  <div className="text-sm font-bold text-black">{inviteInfo.agreement.title}</div>
-                  <div className="mt-0.5 text-xs text-black/50">
+                  <div className="text-subhead font-bold text-foreground">{inviteInfo.agreement.title}</div>
+                  <div className="mt-0.5 font-mono text-mono-meta text-foreground-hint">
                     {formatMessage(
                       { id: "pages.invite.agreementVersion" },
                       { version: inviteInfo.agreement.version },
                     )}
                   </div>
                 </div>
-                <div className="max-h-56 overflow-y-auto border-2 border-black/30 bg-brutal-cream p-3 text-sm">
+                <div className="max-h-56 overflow-y-auto border-t border-line-hairline pt-3 text-callout text-foreground-muted">
                   <AgreementBody source={inviteInfo.agreement.bodyMarkdown} />
                 </div>
-              </div>
+              </Card>
             )}
             {humanSeatLimitReached && (
-              <Banner intent="warning" className="mb-6 font-bold">
+              <Banner intent="warning" className="mb-6">
                 {formatMessage({ id: "pages.invite.humanSeatLimit" })}
               </Banner>
             )}
@@ -276,17 +298,17 @@ export default function InviteAcceptPage({
         ) : null}
 
         {accepting && (
-          <div className="mb-4 text-center text-sm text-black/60">
+          <div className="mb-4 text-center text-callout text-foreground-muted">
             {formatMessage({ id: "pages.invite.joiningServer" })}
           </div>
         )}
 
         {user && inviteInfo && !errorText && !humanSeatLimitReached && (
           <Button
-            onClick={() => void handleAccept(inviteInfo.agreement?.id)}
+            onClick={handleJoin}
             disabled={accepting}
-            size="lg"
-            tone="pink"
+            size="xl"
+            variant="accent"
             className="w-full"
           >
             {accepting
@@ -297,49 +319,38 @@ export default function InviteAcceptPage({
 
         {!user && inviteInfo && !errorText && !humanSeatLimitReached && (
           <div className="space-y-3">
-            <p className="text-center text-sm text-black/60 mb-4">
+            <p className="mb-4 text-center text-callout text-foreground-muted">
               {formatMessage({ id: "pages.invite.signInPrompt" })}
             </p>
             <Button
-              onClick={() => {
-                // Store invite token for after login, then clear URL and switch view
-                storePendingInvite(token);
-                clearInviteUrl();
-                onSwitchToLogin();
-              }}
-              size="lg"
-              shape="iconText"
-              tone="pink"
+              onClick={handleSignIn}
+              size="xl"
+              variant="accent"
               className="w-full"
             >
               <LogIn size={16} />
               {formatMessage({ id: "pages.invite.signIn" })}
             </Button>
-            <button
-              onClick={() => {
-                storePendingInvite(token);
-                clearInviteUrl();
-                onSwitchToRegister();
-              }}
-              className="btn-brutal-sm flex w-full items-center justify-center gap-2 bg-white p-2 text-sm"
+            <Button size="lg"
+              variant="outline"
+              className="w-full"
+              onClick={handleCreateAccount}
             >
-              <UserPlus size={14} />
+              <UserPlus size={18} />
               {formatMessage({ id: "pages.invite.createAccount" })}
-            </button>
+            </Button>
           </div>
         )}
 
         {(errorText || humanSeatLimitReached) && (
-          <button
-            onClick={() => {
-              clearInviteUrl();
-              window.location.reload();
-            }}
-            className="btn-brutal flex w-full items-center justify-center gap-2 bg-white px-3 py-2 text-sm"
+          <Button size="lg"
+            variant="outline"
+            className="w-full"
+            onClick={handleReload}
           >
-            <ArrowLeft size={16} />
+            <ArrowLeft size={18} />
             {formatMessage({ id: "pages.invite.goToRaft" })}
-          </button>
+          </Button>
         )}
       </div>
     </CenteredCardFrame>

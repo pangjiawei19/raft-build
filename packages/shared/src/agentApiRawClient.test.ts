@@ -1,45 +1,24 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
 import {
   agentApiContract,
   type AgentApiRouteKey,
-} from "./agentApiContract.js";
-import { asChannelId, asMessageId } from "./brandedIds.js";
+} from "./agentApiContract";
+import { asChannelId, asMessageId } from "./brandedIds";
 import {
   buildAgentApiRawRoutePath,
   createAgentApiRawClient,
   type AgentApiRawTransport,
   type AgentApiRawTransportRequest,
-} from "./agentApiRawClient.js";
-const migrationResponse = {
-  migration: {
-    id: "migration-1",
-    agentId: "agent-1",
-    sourceMachineId: "machine-a",
-    targetMachineId: "machine-b",
-    state: "prep",
-    manifestPath: null,
-    manifestSha256: null,
-    arrivalReportPath: null,
-    arrivalReportSha256: null,
-    abortReason: null,
-    failureReason: null,
-    prepDeadlineAt: "2026-06-29T04:10:00.000Z",
-    transferDeadlineAt: "2026-06-29T05:00:00.000Z",
-    arrivalDeadlineAt: "2026-06-29T05:10:00.000Z",
-    readyAt: null,
-    flippedAt: null,
-    arrivedAt: null,
-    completedAt: null,
-    abortedAt: null,
-    revision: 1,
-    createdAt: "2026-06-29T04:00:00.000Z",
-    updatedAt: "2026-06-29T04:00:00.000Z",
-  },
-};
-
+} from "./agentApiRawClient";
+const raftbenchRunId = "00000000-0000-4000-8000-000000000001";
+const raftbenchCoverage = { from: "2026-10-17T00:00:00Z", to: "2026-10-18T00:00:00Z", fetchedMessages: 0, exhausted: true, stopReason: "window_end", notRead: ["Tool outcomes not read"] };
+const raftbenchContext = { runId: raftbenchRunId, revision: 1, sourceText: "Coverage: no synthetic source messages", sources: [], coverage: raftbenchCoverage, nextCursor: null };
+const raftbenchReport = { runId: raftbenchRunId, revision: 1, status: "complete", patterns: [], gaps: [] };
+const raftbenchReceipt = { runId: raftbenchRunId, revision: 1, status: "complete", receiptId: "00000000-0000-4000-8000-000000000002", coverage: raftbenchCoverage };
 const validResponses: Record<AgentApiRouteKey, unknown> = {
+  raftbenchContext,
+  raftbenchSubmit: raftbenchReceipt,
   feedbackLocatorIngest: {
     status: "accepted",
     receipt_id: "00000000-0000-4000-8000-000000000001",
@@ -80,43 +59,6 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
       title: "Spin up a preview environment",
       firstScreen: "# Spin up a preview environment",
     }],
-  },
-  wikiManifestGet: {
-    configured: true,
-    wikiSpaceId: "11111111-1111-4111-8111-111111111111",
-    etag: null,
-    manifest: null,
-  },
-  wikiArtifactRead: {
-    configured: true,
-    wikiSpaceId: "11111111-1111-4111-8111-111111111111",
-    etag: "\"manifest-v1\"",
-    artifact: {
-      id: "22222222-2222-4222-8222-222222222222",
-      artifactType: "page",
-      slug: "architecture",
-      title: "Architecture",
-      summary: "Summary",
-      currentUnderstanding: "Current understanding",
-      status: "current",
-      confidence: "high",
-      sourcePolicy: "cached_summary",
-      sourceRefs: [],
-      revision: {
-        id: "33333333-3333-4333-8333-333333333333",
-        key: "servers/server/wiki/revisions/artifact/revision.md",
-        sha256: "a".repeat(64),
-        bytes: 15,
-      },
-      updatedAt: "2026-07-26T00:00:00.000Z",
-    },
-    markdown: "# Architecture\n",
-  },
-  wikiManifestPublish: {
-    configured: true,
-    wikiSpaceId: "11111111-1111-4111-8111-111111111111",
-    etag: "\"manifest-v1\"",
-    manifest: {},
   },
   managedMcpTools: { catalogVersion: 1, tools: [] },
   managedMcpCall: { content: [{ type: "text", text: "found" }], isError: false },
@@ -177,6 +119,10 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
     archivedAt: null,
     archivedByUserId: null,
   },
+  channelCreate: { id: "chan-2", name: "design", type: "private", description: "Design reviews" },
+  channelUpdate: { id: "chan-2", name: "design", type: "private", description: "Design reviews" },
+  channelMemberAdd: { ok: true, alreadyMember: false, channelId: "chan-2", member: { type: "agent", id: "agent-2", name: "Kirby" } },
+  channelMemberRemove: { ok: true, wasMember: true, channelId: "chan-2", member: { type: "agent", id: "agent-2", name: "Kirby" } },
   channelMembers: {
     channel: { ref: "#wg-raft-cli", type: "channel" },
     agents: [],
@@ -188,11 +134,76 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
   threadUnfollow: {
     ok: true,
   },
+  threadList: {
+    threads: [{
+      target: "#wg-raft-cli:abcd1234",
+      threadChannelId: "11111111-2222-4333-8444-555555555555",
+      parentChannelRef: "#wg-raft-cli",
+      parentMessageId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      parentMessageShortId: "abcd1234",
+      followedAt: "2026-09-10T12:00:00.000Z",
+      reason: "mentioned",
+      doneAt: null,
+    }],
+  },
+  assistantOwnerInbox: {
+    owner: { userId: "33333333-3333-4333-8333-333333333333" },
+    filter: "unread",
+    items: [{
+      kind: "thread",
+      channelId: "44444444-4444-4444-8444-444444444444",
+      channelName: "proj-runtime",
+      channelType: "channel",
+      parentChannelId: "55555555-5555-4555-8555-555555555555",
+      parentMessageId: "22222222-2222-4222-8222-222222222222",
+      unread: 2,
+      hasMention: true,
+      latestAt: "2026-09-10T12:00:00.000Z",
+      latestSenderName: "richard",
+      latestPreview: "ship it",
+      firstUnreadMessageId: "66666666-6666-4666-8666-666666666666",
+    }],
+    hasMore: false,
+    nextOffset: null,
+  },
+  assistantOwnerMessages: {
+    owner: { userId: "33333333-3333-4333-8333-333333333333" },
+    channelId: "55555555-5555-4555-8555-555555555555",
+    messages: [],
+    hasMore: false,
+    hasOlder: false,
+    hasNewer: false,
+  },
+  inboxList: {
+    view: "unread",
+    items: [{
+      target: "dm:@richard",
+      kind: "dm",
+      unread: 3,
+      mentions: 0,
+      lastReadSeq: 1199,
+      activitySeq: 1203,
+      latestSenderName: "richard",
+      latestAt: "2026-09-10T12:00:00.000Z",
+    }],
+    hasMore: false,
+    nextBeforeSeq: null,
+    totals: { conversations: 1, dms: 1, mentions: 0 },
+  },
   serverUpdate: {
     id: "server-1",
     name: "Renamed Server",
     hideHumansFromMembers: true,
     avatarUrl: null,
+  },
+  serverLabs: { serverId: "server-1", accessEnabled: true, version: 3, canManageAccess: false, canManageEnrollments: true, labs: [{ labKey: "agent-panel-v2", name: "Agent panel v2", description: "The new Agent panel", state: "open", enrolled: false, effective: false, updatedAt: null }] },
+  serverLabsAccess: { applied: true, auditEventId: "audit-1", serverId: "server-1", accessEnabled: true, version: 4, canManageAccess: false, canManageEnrollments: true, labs: [{ labKey: "agent-panel-v2", name: "Agent panel v2", description: "The new Agent panel", state: "open", enrolled: true, effective: true, updatedAt: "2026-10-11T09:30:00.000Z" }] },
+  serverLabEnrollment: { applied: true, auditEventId: "audit-1", serverId: "server-1", accessEnabled: true, version: 4, canManageAccess: false, canManageEnrollments: true, labs: [{ labKey: "agent-panel-v2", name: "Agent panel v2", description: "The new Agent panel", state: "open", enrolled: true, effective: true, updatedAt: "2026-10-11T09:30:00.000Z" }] },
+  agentContext: {
+    agent: { id: "agent-1", name: "alice", displayName: "Alice", description: "Reviewer", runtime: "external", external: true },
+    server: { id: "server-1", slug: "acme", name: "Acme" },
+    credential: { capabilities: ["read", "send"] },
+    prompt: { audience: "self-hosted-runner", text: "# Raft CLI operating guide" },
   },
   serverInfo: {
     runtimeContext: {
@@ -202,6 +213,17 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
     channels: [],
     agents: [],
     humans: [],
+  },  userChannels: {
+    user: { name: "xxchan", role: "owner" },
+    kind: "human",
+    memberships: [],
+    uncheckedCount: 0,
+    page: { total: 0, offset: 0, limit: 50 },
+  },
+
+  senderMentionDeliveries: {
+    messageId: "11111111-1111-4111-8111-111111111111",
+    deliveries: [],
   },
   mentionActionsPending: {
     pendingMentionActions: [],
@@ -285,35 +307,6 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
   taskHistory: {
     task: { taskNumber: 24, title: "Current title", description: null, revision: 2 },
     events: [],
-  },
-  migrationBegin: migrationResponse,
-  migrationStatus: migrationResponse,
-  migrationReady: {
-    migration: {
-      ...migrationResponse.migration,
-      state: "ready",
-      manifestPath: "MIGRATION-MANIFEST.json",
-      manifestSha256: "sha256:manifest",
-      readyAt: "2026-06-29T04:02:00.000Z",
-      revision: 2,
-      updatedAt: "2026-06-29T04:02:00.000Z",
-    },
-  },
-  migrationArrived: {
-    migration: {
-      ...migrationResponse.migration,
-      state: "completed",
-      manifestPath: "MIGRATION-MANIFEST.json",
-      manifestSha256: "sha256:manifest",
-      arrivalReportPath: "MIGRATION-ARRIVED.json",
-      arrivalReportSha256: "sha256:arrived",
-      readyAt: "2026-06-29T04:02:00.000Z",
-      flippedAt: "2026-06-29T04:04:00.000Z",
-      arrivedAt: "2026-06-29T04:06:00.000Z",
-      completedAt: "2026-06-29T04:06:00.000Z",
-      revision: 4,
-      updatedAt: "2026-06-29T04:06:00.000Z",
-    },
   },
   reminderList: {
     reminders: [{
@@ -496,6 +489,8 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
     services: [{
       id: "client-1",
       clientId: "drive9",
+      official: false,
+      purpose: "",
       name: "Drive9",
       description: null,
       homepageUrl: null,
@@ -525,13 +520,18 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
       logoUrl: null,
       installedOnServer: false,
       updatedAt: "2026-06-28T02:00:00.000Z",
+      official: false,
+      purpose: "",
     }],
   },
+  integrationToken: { access_token: "fixture.jwt.token", token_type: "Bearer", audience: "drive9", expires_in: 300, expires_at: "2026-10-05T00:05:00.000Z" },
   integrationLogin: {
     status: "logged_in",
     service: {
       id: "client-1",
       clientId: "drive9",
+      official: false,
+      purpose: "",
       name: "Drive9",
       description: null,
       homepageUrl: null,
@@ -621,6 +621,7 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
   attachmentUploadSessionCancel: { uploadId: "33333333-3333-4333-8333-333333333333", state: "canceled", expiresAt: "2026-06-29T04:15:00.000Z", attachment: null, terminalReason: "Canceled." },
   attachmentUploadSessionStatus: { uploadId: "33333333-3333-4333-8333-333333333333", state: "pending", expiresAt: "2026-06-29T04:15:00.000Z", attachment: null, terminalReason: null },
   attachmentDownload: new Uint8Array([1, 2, 3]),
+  attachmentDownloadUrl: { url: "https://objects.example.test/a?X-Amz-Signature=sig", expiresAt: "2026-10-04T08:00:00.000Z", filename: "report.pdf", mimeType: "application/pdf" },
   attachmentCommentsList: {
     comments: [{
       id: "msg-comment-1",
@@ -651,9 +652,15 @@ const validResponses: Record<AgentApiRouteKey, unknown> = {
       resolveAction: { type: "reaction", emoji: "✅" },
     },
   },
+  pushWebhookStatus: { registered: true, url: "https://hooks.example.test/raft", enabled: true, disabledReason: null, disabledAt: null, lastAttemptAt: null, lastDeliveryAt: "2026-06-29T04:00:00.000Z", lastError: null, consecutiveFailures: 0, nextAttemptAt: null },
+  pushWebhookRegister: { registered: true, url: "https://hooks.example.test/raft", enabled: true, disabledReason: null, disabledAt: null, lastAttemptAt: null, lastDeliveryAt: "2026-06-29T04:00:00.000Z", lastError: null, consecutiveFailures: 0, nextAttemptAt: null },
+  pushWebhookDelete: null,
+  mentionsList: { mentions: [], has_more: false },
 };
 
 const methodInputs: Record<AgentApiRouteKey, unknown[]> = {
+  raftbenchContext: [{ runId: raftbenchRunId }],
+  raftbenchSubmit: [raftbenchReport],
   feedbackLocatorIngest: [{
     artifact_kind: "raft-feedback-locator-v0",
     event_kind: "feedback-locator:created",
@@ -672,15 +679,6 @@ const methodInputs: Record<AgentApiRouteKey, unknown[]> = {
     scope: "recipes",
     intent: "Safely preview the user's change before merge",
     reason: "Need the recommended preview workflow right now",
-  }],
-  wikiManifestGet: [],
-  wikiArtifactRead: [{
-    artifactId: "22222222-2222-4222-8222-222222222222",
-  }],
-  wikiManifestPublish: [{
-    expectedEtag: null,
-    manifest: {},
-    revisionBodies: [],
   }],
   managedMcpTools: [],
   managedMcpCall: [{
@@ -702,21 +700,32 @@ const methodInputs: Record<AgentApiRouteKey, unknown[]> = {
   channelUnmute: [{ channelId: asChannelId("chan-1") }],
   channelArchive: [{ target: "#engineering" }],
   channelUnarchive: [{ target: "#engineering" }],
+  channelCreate: [{ name: "design", visibility: "private" }],
+  channelUpdate: [{ channelId: asChannelId("chan-2") }, { name: "design-reviews" }],
+  channelMemberAdd: [{ channelId: asChannelId("chan-2") }, { agent: "Kirby" }],
+  channelMemberRemove: [{ channelId: asChannelId("chan-2") }, { user: "wenyi" }],
   channelMembers: [{ channel: "#wg-raft-cli" }],
   resolveChannel: [{ target: "#wg-raft-cli" }],
   threadUnfollow: [{ thread: "#wg-raft-cli:abcd1234" }],
+  threadList: [],
+  assistantOwnerInbox: [{ filter: "all", offset: "20" }],
+  assistantOwnerMessages: [{ channelId: "55555555-5555-4555-8555-555555555555", around: "abcd1234" }],
+  inboxList: [{ view: "mentions", before_seq: "1099", limit: "20" }],
+  agentContext: [],
   serverInfo: [],
+  userChannels: [{ name: "Hao Hao/x" }, { offset: "50", limit: "200" }],
   serverUpdate: [{ name: "Renamed Server", hideHumansFromMembers: true }],
+  serverLabs: [],
+  serverLabsAccess: [{ enabled: false, expectedVersion: 3 }],
+  serverLabEnrollment: [{ labKey: "agent-panel-v2" }, { enabled: true, expectedVersion: 3 }],
+  senderMentionDeliveries: [{ messageId: "11111111-1111-4111-8111-111111111111" }],
   mentionActionsPending: [{ limit: "20" }],
   mentionActionsExecute: [{ action: "notify", resolutionIds: ["res-1"] }],
   taskClaim: [{ channel: "#wg-raft-cli", task_numbers: [24] }],
   taskList: [{ channel: "#wg-raft-cli", status: "in_progress" }],
   taskCreate: [{ channel: "#wg-raft-cli", tasks: [{ title: "Raw SDK conformance" }] }],
   taskUnclaim: [{ channel: "#wg-raft-cli", task_number: 24 }],
-  taskAssign: [
-    { channel: "#wg-raft-cli", task_number: 24, assignee: "@akko" },
-    { channel: "#wg-raft-cli", task_number: 24, assignee: null },
-  ],
+  taskAssign: [{ channel: "#wg-raft-cli", task_number: 24, assignee: "@akko" }],
   taskUpdateStatus: [{ channel: "#wg-raft-cli", task_number: 24, status: "in_review" }],
   taskResourceReceipt: [{
     channel: "#wg-raft-cli",
@@ -735,10 +744,6 @@ const methodInputs: Record<AgentApiRouteKey, unknown[]> = {
   taskConvert: [{ channel: "#wg-raft-cli", message_id: "11111111" }],
   taskAmend: [{ channel: "#wg-raft-cli", task_number: 24, title: "Current title" }],
   taskHistory: [{ channel: "#wg-raft-cli", task_number: 24 }],
-  migrationBegin: [{ targetMachineId: "machine-b" }],
-  migrationStatus: [],
-  migrationReady: [{ manifestPath: "MIGRATION-MANIFEST.json", manifestSha256: "sha256:manifest" }],
-  migrationArrived: [{ reportPath: "MIGRATION-ARRIVED.json", reportSha256: "sha256:arrived" }],
   reminderList: [{ status: "scheduled,fired" }],
   reminderCreate: [{ title: "check CI", delaySeconds: 60, msgId: "abcd1234" }],
   reminderCancel: [{ reminderId: "reminder-1" }],
@@ -759,6 +764,7 @@ const methodInputs: Record<AgentApiRouteKey, unknown[]> = {
   profileAvatarUpdate: [],
   integrationList: [],
   integrationMarketplaceSearch: [{ query: "drive", limit: "10" }],
+  integrationToken: [{ service: "drive9" }],
   integrationLogin: [{ service: "drive9", scopes: ["openid", "profile"], target: "#wg-raft-cli" }],
   integrationAppPrepare: [{
     mode: "register",
@@ -786,7 +792,12 @@ const methodInputs: Record<AgentApiRouteKey, unknown[]> = {
   attachmentUploadSessionCancel: [{ uploadId: "33333333-3333-4333-8333-333333333333" }],
   attachmentUploadSessionStatus: [{ uploadId: "33333333-3333-4333-8333-333333333333" }],
   attachmentDownload: [{ attachmentId: "attachment/with space" }],
+  attachmentDownloadUrl: [{ attachmentId: "attachment/with space" }],
   attachmentCommentsList: [{ attachmentId: "attachment/with space" }, { limit: "25" }],
+  pushWebhookStatus: [],
+  pushWebhookRegister: [{ url: "https://hooks.example.test/raft", secret: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" }],
+  pushWebhookDelete: [],
+  mentionsList: [{ limit: "50" }],
 };
 
 function methodForRoute(client: unknown, routeKey: AgentApiRouteKey): (...args: unknown[]) => Promise<unknown> {
@@ -820,6 +831,8 @@ test("raw client exposes every contract client binding and sends generated route
   assert.deepEqual(
     requests.map(({ routeKey, method, path, body }) => ({ routeKey, method, path, body })),
     [
+      { routeKey: "raftbenchContext", method: "GET", path: `/internal/agent-api/raftbench/context?runId=${raftbenchRunId}`, body: undefined },
+      { routeKey: "raftbenchSubmit", method: "POST", path: "/internal/agent-api/raftbench/submit", body: raftbenchReport },
       {
         routeKey: "feedbackLocatorIngest",
         method: "POST",
@@ -840,19 +853,6 @@ test("raw client exposes every contract client binding and sends generated route
       { routeKey: "historyRead", method: "GET", path: "/internal/agent-api/history?channel=%23wg-raft-cli", body: undefined },
       { routeKey: "knowledgeGet", method: "GET", path: "/internal/agent-api/knowledge?topic=index&intent=Learn+which+Raft+workflows+are+documented&reason=Need+the+Manual+topic+catalog+before+answering", body: undefined },
       { routeKey: "knowledgeSearch", method: "GET", path: "/internal/agent-api/knowledge/search?query=preview+before+merge&scope=recipes&intent=Safely+preview+the+user%27s+change+before+merge&reason=Need+the+recommended+preview+workflow+right+now", body: undefined },
-      { routeKey: "wikiManifestGet", method: "GET", path: "/internal/agent-api/wiki/manifest", body: undefined },
-      {
-        routeKey: "wikiArtifactRead",
-        method: "GET",
-        path: "/internal/agent-api/wiki/artifacts/22222222-2222-4222-8222-222222222222",
-        body: undefined,
-      },
-      {
-        routeKey: "wikiManifestPublish",
-        method: "POST",
-        path: "/internal/agent-api/wiki/publish",
-        body: { expectedEtag: null, manifest: {}, revisionBodies: [] },
-      },
       { routeKey: "managedMcpTools", method: "GET", path: "/internal/agent-api/mcp/tools", body: undefined },
       {
         routeKey: "managedMcpCall",
@@ -878,12 +878,26 @@ test("raw client exposes every contract client binding and sends generated route
       { routeKey: "channelUnmute", method: "POST", path: "/internal/agent-api/channels/chan-1/unmute", body: undefined },
       { routeKey: "channelArchive", method: "POST", path: "/internal/agent-api/channels/archive", body: { target: "#engineering" } },
       { routeKey: "channelUnarchive", method: "POST", path: "/internal/agent-api/channels/unarchive", body: { target: "#engineering" } },
+      { routeKey: "channelCreate", method: "POST", path: "/internal/agent-api/channels", body: { name: "design", visibility: "private" } },
+      { routeKey: "channelUpdate", method: "PATCH", path: "/internal/agent-api/channels/chan-2", body: { name: "design-reviews" } },
+      { routeKey: "channelMemberAdd", method: "POST", path: "/internal/agent-api/channels/chan-2/members", body: { agent: "Kirby" } },
+      { routeKey: "channelMemberRemove", method: "DELETE", path: "/internal/agent-api/channels/chan-2/members", body: { user: "wenyi" } },
       { routeKey: "channelMembers", method: "GET", path: "/internal/agent-api/channel-members?channel=%23wg-raft-cli", body: undefined },
       { routeKey: "resolveChannel", method: "POST", path: "/internal/agent-api/resolve-channel", body: { target: "#wg-raft-cli" } },
       { routeKey: "threadUnfollow", method: "POST", path: "/internal/agent-api/threads/unfollow", body: { thread: "#wg-raft-cli:abcd1234" } },
+      { routeKey: "threadList", method: "GET", path: "/internal/agent-api/threads", body: undefined },
+      { routeKey: "inboxList", method: "GET", path: "/internal/agent-api/inbox/conversations?view=mentions&before_seq=1099&limit=20", body: undefined },
+      { routeKey: "assistantOwnerInbox", method: "GET", path: "/internal/agent-api/assistant/owner-inbox?filter=all&offset=20", body: undefined },
+      { routeKey: "assistantOwnerMessages", method: "GET", path: "/internal/agent-api/assistant/owner-messages?channelId=55555555-5555-4555-8555-555555555555&around=abcd1234", body: undefined },
+      { routeKey: "agentContext", method: "GET", path: "/internal/agent-api/context", body: undefined },
       { routeKey: "serverInfo", method: "GET", path: "/internal/agent-api/server", body: undefined },
+      { routeKey: "userChannels", method: "GET", path: "/internal/agent-api/users/Hao%20Hao%2Fx/channels?offset=50&limit=200", body: undefined },
       { routeKey: "serverUpdate", method: "PATCH", path: "/internal/agent-api/server", body: { name: "Renamed Server", hideHumansFromMembers: true } },
+      { routeKey: "serverLabs", method: "GET", path: "/internal/agent-api/labs", body: undefined },
+      { routeKey: "serverLabsAccess", method: "PATCH", path: "/internal/agent-api/labs/access", body: { enabled: false, expectedVersion: 3 } },
+      { routeKey: "serverLabEnrollment", method: "PUT", path: "/internal/agent-api/labs/agent-panel-v2", body: { enabled: true, expectedVersion: 3 } },
       { routeKey: "mentionActionsPending", method: "GET", path: "/internal/agent-api/mention-actions/pending?limit=20", body: undefined },
+      { routeKey: "senderMentionDeliveries", method: "GET", path: "/internal/agent-api/messages/11111111-1111-4111-8111-111111111111/mention-deliveries", body: undefined },
       { routeKey: "mentionActionsExecute", method: "POST", path: "/internal/agent-api/mention-actions/execute", body: { action: "notify", resolutionIds: ["res-1"] } },
       { routeKey: "taskClaim", method: "POST", path: "/internal/agent-api/tasks/claim", body: { channel: "#wg-raft-cli", task_numbers: [24] } },
       { routeKey: "taskList", method: "GET", path: "/internal/agent-api/tasks?channel=%23wg-raft-cli&status=in_progress", body: undefined },
@@ -896,10 +910,6 @@ test("raw client exposes every contract client binding and sends generated route
       { routeKey: "taskConvert", method: "POST", path: "/internal/agent-api/tasks/convert", body: { channel: "#wg-raft-cli", message_id: "11111111" } },
       { routeKey: "taskAmend", method: "POST", path: "/internal/agent-api/tasks/amend", body: { channel: "#wg-raft-cli", task_number: 24, title: "Current title" } },
       { routeKey: "taskHistory", method: "GET", path: "/internal/agent-api/tasks/history?channel=%23wg-raft-cli&task_number=24", body: undefined },
-      { routeKey: "migrationBegin", method: "POST", path: "/internal/agent-api/migrations", body: { targetMachineId: "machine-b" } },
-      { routeKey: "migrationStatus", method: "GET", path: "/internal/agent-api/migrations/current", body: undefined },
-      { routeKey: "migrationReady", method: "POST", path: "/internal/agent-api/migrations/ready", body: { manifestPath: "MIGRATION-MANIFEST.json", manifestSha256: "sha256:manifest" } },
-      { routeKey: "migrationArrived", method: "POST", path: "/internal/agent-api/migrations/arrived", body: { reportPath: "MIGRATION-ARRIVED.json", reportSha256: "sha256:arrived" } },
       { routeKey: "reminderList", method: "GET", path: "/internal/agent-api/reminders?status=scheduled%2Cfired", body: undefined },
       { routeKey: "reminderCreate", method: "POST", path: "/internal/agent-api/reminders", body: { title: "check CI", delaySeconds: 60, msgId: "abcd1234" } },
       { routeKey: "reminderCancel", method: "DELETE", path: "/internal/agent-api/reminders/reminder-1", body: undefined },
@@ -935,6 +945,7 @@ test("raw client exposes every contract client binding and sends generated route
       { routeKey: "profileAvatarUpdate", method: "POST", path: "/internal/agent-api/profile/avatar", body: undefined },
       { routeKey: "integrationList", method: "GET", path: "/internal/agent-api/integrations", body: undefined },
       { routeKey: "integrationMarketplaceSearch", method: "GET", path: "/internal/agent-api/integrations/marketplace?query=drive&limit=10", body: undefined },
+      { routeKey: "integrationToken", method: "POST", path: "/internal/agent-api/integrations/token", body: { service: "drive9" } },
       { routeKey: "integrationLogin", method: "POST", path: "/internal/agent-api/integrations/login", body: { service: "drive9", scopes: ["openid", "profile"], target: "#wg-raft-cli" } },
       {
         routeKey: "integrationAppPrepare",
@@ -1007,7 +1018,12 @@ test("raw client exposes every contract client binding and sends generated route
       { routeKey: "attachmentUploadSessionCancel", method: "DELETE", path: "/internal/agent-api/attachment-upload-sessions/33333333-3333-4333-8333-333333333333", body: undefined },
       { routeKey: "attachmentUploadSessionStatus", method: "GET", path: "/internal/agent-api/attachment-upload-sessions/33333333-3333-4333-8333-333333333333", body: undefined },
       { routeKey: "attachmentDownload", method: "GET", path: "/internal/agent-api/attachments/attachment%2Fwith%20space", body: undefined },
+      { routeKey: "attachmentDownloadUrl", method: "GET", path: "/internal/agent-api/attachments/attachment%2Fwith%20space/url", body: undefined },
       { routeKey: "attachmentCommentsList", method: "GET", path: "/internal/agent-api/attachments/attachment%2Fwith%20space/comments?limit=25", body: undefined },
+      { routeKey: "pushWebhookStatus", method: "GET", path: "/internal/agent-api/push-webhook", body: undefined },
+      { routeKey: "pushWebhookRegister", method: "PUT", path: "/internal/agent-api/push-webhook", body: { url: "https://hooks.example.test/raft", secret: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" } },
+      { routeKey: "pushWebhookDelete", method: "DELETE", path: "/internal/agent-api/push-webhook", body: undefined },
+      { routeKey: "mentionsList", method: "GET", path: "/internal/agent-api/mentions?limit=50", body: undefined },
     ],
   );
 });
@@ -1113,4 +1129,48 @@ test("raw client normalizes transport and HTTP failures into the error envelope"
     errorCode: "SCOPE_DENIED",
     suggestedNextAction: "Ask a human to re-enable send.",
   });
+});
+
+test("raw client never sends a write without its body: extra positional args and a missing required body are refused", async () => {
+  const sent: unknown[] = [];
+  const client = createAgentApiRawClient({
+    request: async (input) => {
+      sent.push(input);
+      return { ok: true, status: 200, error: null, data: { messageId: "m", metadata: { kind: "action-card" } } };
+    },
+  });
+  const body = { target: "#wg-raft-cli", action: { type: "channel:create", name: "x", visibility: "public" } };
+  const threeArgs = await (client.actions.prepare as unknown as (...args: unknown[]) => Promise<{ ok: boolean; reason?: string }>)(undefined, undefined, body);
+  assert.equal(threeArgs.ok, false);
+  assert.equal(threeArgs.reason, "request_contract_mismatch");
+  const missing = await (client.actions.prepare as unknown as (...args: unknown[]) => Promise<{ ok: boolean; reason?: string }>)();
+  assert.equal(missing.ok, false);
+  assert.equal(missing.reason, "request_contract_mismatch");
+  assert.equal(sent.length, 0, "nothing reached the transport");
+
+  const ok = await client.actions.prepare(body as never);
+  assert.equal(ok.ok, true);
+  assert.deepEqual((sent[0] as { body: unknown }).body, body);
+});
+
+test("every POST/PUT/PATCH route called through the raw client carries its body", async () => {
+  const sent: Array<{ routeKey: string; method: string; body: unknown }> = [];
+  const client = createAgentApiRawClient({
+    request: async (input) => {
+      sent.push({ routeKey: input.routeKey, method: input.method, body: input.body });
+      return { ok: true, status: 200, error: null, data: validResponses[input.routeKey as AgentApiRouteKey] };
+    },
+  });
+  for (const routeKey of Object.keys(agentApiContract) as AgentApiRouteKey[]) {
+    const route = agentApiContract[routeKey];
+    if (!("body" in route.request) || !["POST", "PUT", "PATCH"].includes(route.method)) continue;
+    const bodyOptional = route.request.body.safeParse(undefined).success || route.request.body.safeParse({}).success;
+    const args = methodInputs[routeKey];
+    const bodyArgIndex = (["params", "query", "body"] as const).filter((part) => part in route.request).length - 1;
+    if (bodyOptional && args[bodyArgIndex] === undefined) continue; // e.g. channelMute: body is optional and omitted
+    await methodForRoute(client, routeKey)(...args);
+    const request = sent.find((r) => r.routeKey === routeKey);
+    assert.ok(request, `${routeKey} was sent`);
+    assert.notEqual(request!.body, undefined, `${routeKey} (${route.method}) carries a body`);
+  }
 });

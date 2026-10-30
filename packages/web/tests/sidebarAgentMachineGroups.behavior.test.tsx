@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import api from "../src/api/client";
-import Sidebar from "../src/components/layout/Sidebar.js";
+import Sidebar from "../src/components/layout/Sidebar";
 import { sidebarAgentMachineGroupCollapsedStorageKey } from "../src/components/layout/sidebarCollapsedSections";
 import { TestIntlProvider } from "./helpers/intl";
 import type { Agent } from "../src/store/agentStore";
@@ -228,4 +227,33 @@ test("machine-less agents collapse under their own group", () => {
   fireEvent.click(toggleOrphan);
   assert.equal(screen.queryByRole("button", { name: "Loose" }), null);
   assert.ok(screen.getByRole("button", { name: "Alpha" }), "machine groups are independent");
+});
+
+test("cloud agents group as cloud, not as no computer", () => {
+  const cloudAgent: Agent = {
+    ...makeAgent("Nimbus", null),
+    runtime: "external",
+    external: true,
+    hostedRuntime: {
+      provider: "antiproton",
+      state: "active",
+      providerAgentId: "provider-agent",
+      syncPending: false,
+      push: { registered: true, error: null },
+      lastError: null,
+      attemptCount: 0,
+      nextAttemptAt: null,
+      activatedAt: "2026-06-28T00:00:00.000Z",
+      retryNeedsModel: false,
+    },
+  };
+  seedSidebar([cloudAgent, makeAgent("Loose", null)], []);
+  renderSidebar();
+
+  const cloud = screen.getByTestId("sidebar-agent-machine-group-toggle-__cloud__");
+  assert.match(cloud.textContent ?? "", /^cloud1$/);
+  assert.match(screen.getByTestId("sidebar-agent-machine-group-toggle-__no_machine__").textContent ?? "", /^no computer1$/);
+  fireEvent.click(cloud);
+  assert.ok(screen.queryByRole("button", { name: "Nimbus" }) === null);
+  assert.ok(screen.getByRole("button", { name: "Loose" }), "the no-computer group is separate");
 });

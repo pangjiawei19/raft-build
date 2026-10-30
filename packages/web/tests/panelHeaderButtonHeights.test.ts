@@ -1,33 +1,34 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
-test("thread panel header action buttons share fixed h-7 height", () => {
+test("thread panel header close is the raft-ui PanelAction head icon button", () => {
   const source = readFileSync(
     resolve(repoRoot, "src/components/message/ThreadPanel.tsx"),
     "utf8",
   );
 
-  // View-in-channel fallback: task #187 keeps the flag-off action as the
-  // canonical square size-7 icon at every width. Under the flag it moves into
-  // ThreadOverflowMenu instead of expanding into a header text button.
-  assert.match(
-    source,
-    /className="btn-brutal-sm flex size-7 shrink-0 items-center justify-center bg-white"/,
-  );
+
   // X close button: visible in modal (centered dialog), hidden in
   // mobile-modal (full-screen, back chevron), and `hidden lg:flex` in side
-  // (msg=804c045d clarification).
+  // (msg=804c045d clarification). The class carries visibility only: the
+  // size is raft-ui's PanelAction (44 on a phone, the DS small 32 on
+  // desktop), not a hand-set square or a Button size.
   assert.match(
     source,
-    /const closeButtonClassName = presentation === "modal"\s*\?\s*"btn-brutal-sm flex size-7 items-center justify-center bg-white"\s*:\s*"btn-brutal-sm hidden size-7 items-center justify-center bg-white lg:flex"/,
+    /const closeButtonClassName = presentation === "modal"\s*\?\s*"flex"\s*:\s*"hidden lg:flex"/,
   );
+  assert.match(
+    source,
+    /<PanelAction\s+onClick=\{handleClose\}\s+className=\{closeButtonClassName\}\s+aria-label=\{formatMessage\(\{ id: "common\.close" \}\)\}\s+data-testid="thread-close"/,
+  );
+  assert.doesNotMatch(source, /<CloseButton\s+size="icon-lg"/);
+  assert.doesNotMatch(source, /size-7 items-center justify-center/);
 });
 
-test("profile panel header action buttons share fixed h-7 height", () => {
+test("profile panel header actions are raft-ui PanelAction head icon buttons", () => {
   const agentSource = readFileSync(
     resolve(repoRoot, "src/components/agent/AgentDetailPanel.tsx"),
     "utf8",
@@ -37,16 +38,11 @@ test("profile panel header action buttons share fixed h-7 height", () => {
     "utf8",
   );
 
-  assert.match(
-    agentSource,
-    /className="btn-brutal-sm flex size-7 items-center justify-center bg-white"/,
-  );
-  assert.match(
-    humanSource,
-    /className="btn-brutal-sm flex size-7 items-center justify-center bg-white"/,
-  );
+  // The profile header actions are DS header icon buttons: raft-ui's
+  // PanelAction (44 with a 22px glyph on a phone, the DS small 32 with an
+  // 18px glyph on desktop) for Message and Close.
   const messageButtonIdx = humanSource.search(
-    /title=\{formatMessage\(\{ id: "member\.detail\.message" \}\)\}\s+aria-label=\{formatMessage\(\{ id: "member\.detail\.message" \}\)\}\s*>\s*<MessageSquare size=\{14\} \/>\s*<\/button>/,
+    /<PanelAction\s+onClick=\{handleMessage\}\s+aria-label=\{formatMessage\(\{ id: "member\.detail\.message" \}\)\}\s*>\s*<DirectMessageIcon width=\{22\} height=\{22\} aria-hidden="true" \/>\s*<\/PanelAction>/,
   );
   assert.ok(messageButtonIdx >= 0, "human profile Message icon-button anchor not found");
   assert.doesNotMatch(
@@ -55,11 +51,11 @@ test("profile panel header action buttons share fixed h-7 height", () => {
   );
   assert.match(
     agentSource,
-    /className=\{`btn-brutal-sm size-7 items-center justify-center bg-white \$\{onBack \? "flex" : "hidden md:flex"\}`\}/,
+    /<PanelAction\s+onClick=\{onClose\}\s+className=\{onBack \? "flex" : "hidden md:flex"\}/,
   );
   assert.match(
     humanSource,
-    /className=\{`btn-brutal-sm size-7 items-center justify-center bg-white \$\{onBack \? "flex" : "hidden md:flex"\}`\}/,
+    /<PanelAction\s+onClick=\{onClose\}\s+className=\{onBack \? "flex" : "hidden md:flex"\}/,
   );
   assert.doesNotMatch(
     agentSource,
@@ -86,9 +82,22 @@ test("secondary panel header icon actions use the shared h-7 icon button contrac
     assert.doesNotMatch(source, /h-panel-header[\s\S]{0,1200}btn-brutal-sm[^"]*p-1\.5/);
   }
 
-  const buttonSource = readFileSync(resolve(repoRoot, "src/components/ui/Button.tsx"), "utf8");
-  assert.match(buttonSource, /icon: "size-7 text-xs"/);
-  assert.match(buttonSource, /text: "h-7 px-2\.5 text-xs"/);
-  assert.match(buttonSource, /iconText: "h-7 gap-1\.5 px-2\.5 text-xs"/);
-  assert.doesNotMatch(buttonSource, /\bcount:/);
+  assert.equal(existsSync(resolve(repoRoot, "src/components/ui/Button.tsx")), false);
+});
+
+test("task #1298: server-switcher triggers shrink their full-bleed avatar on selected so the card frame shows", () => {
+  const source = readFileSync(
+    resolve(repoRoot, "src/components/layout/LeftRail.tsx"),
+    "utf8",
+  );
+  // Both triggers (public rail + authenticated rail) host a full-bleed avatar
+  // image, so the recipe's selected card (light bg + shadow) is invisible
+  // behind it and the shadow reads as a doubled edge. The fix: the trigger is
+  // a `group` and the avatar shrinks one step on selected.
+  const triggers = source.match(/className="group size-10[^\n]*"[^]*?group-data-\[selected=true\]:!size-8/g) ?? [];
+  assert.equal(
+    triggers.length,
+    2,
+    "both server-switcher triggers (public + authenticated rail) must carry the group + selected-shrink pair",
+  );
 });

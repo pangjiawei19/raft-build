@@ -1,7 +1,9 @@
-import { useMemo, useRef, useState } from "react";
-import { Check, GitBranch, Plus, Search, Trash2 } from "lucide-react";
+import { Input, InputGroup, InputGroupAddon, InputGroupInput, Textarea, Card, Button, CheckboxIndicator } from "@botiverse/raft-ui";
+import { useCallback, useMemo, useRef, useState } from "react";
+import { GitBranch, Plus, Search } from "lucide-react";
 import { MAX_JOINT_CHANNEL_SERVERS, validateNameReason } from "@botiverse/raft-shared";
 import { useIntl } from "react-intl";
+import type { IntlShape } from "react-intl";
 import { formatNameValidationError } from "../../i18n/nameValidation";
 import { useAgentStore } from "../../store/agentStore";
 import { useAuthStore } from "../../store/authStore";
@@ -11,11 +13,14 @@ import { useAppNavigate } from "../../hooks/useAppNavigate";
 import AvatarSlot from "../ui/AvatarSlot";
 import Banner from "../ui/Banner";
 import FormField from "../ui/FormField";
+import TextLink from "../ui/TextLink";
 import SectionEyebrow from "../ui/SectionEyebrow";
-import SlugInput from "../ui/SlugInput";
 import DialogCard from "../ui/DialogCard";
 import { usePeopleSuggestionSearch } from "../../hooks/usePeopleSuggestionSearch";
 import type { PeopleSuggestionCandidate } from "../../utils/peopleSuggestionSearch";
+import { JointInviteDraftCard } from "./JointInviteDraftCard";
+import { PICKER_GROUP_LABEL_CLASS, PICKER_ROW_CLASS } from "./memberPickerClasses";
+import { findSameAdminJointTarget, parseInvitedPeopleText } from "../../utils/jointSameAdmin";
 
 interface ArchivedCollision {
   archivedChannelId: string;
@@ -23,15 +28,19 @@ interface ArchivedCollision {
   canUnarchiveArchivedChannel: boolean;
 }
 
-interface JointInviteDraft {
+export interface JointInviteDraft {
   id: string;
   targetServerSlug: string;
   invitedPeopleText: string;
+  /** The inviter confirmed connecting directly as admin of both servers. */
+  sameAdminConfirmed?: boolean;
 }
 
 function isBillingGateError(error: string) {
   return error.includes("requires the Pro plan");
 }
+
+export type JointInviteDraftUpdate = Partial<Omit<JointInviteDraft, "id">>;
 
 export default function CreateJointChannelDialog({ onClose }: { onClose: () => void }) {
   const { formatMessage } = useIntl();
@@ -51,18 +60,21 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
   const nextInviteIdRef = useRef(2);
   const createChannel = useChannelStore((s) => s.createChannel);
   const unarchiveChannel = useChannelStore((s) => s.unarchiveChannel);
-  const hasActiveHostedJointChannel = useChannelStore((s) => s.channels.some((channel) => (
-    channel.type === "joint"
-    && channel.jointRole === "host"
-    && !channel.archivedAt
-  )));
   const allAgents = useAgentStore((s) => s.agents);
   const members = useServerStore((s) => s.members);
   const plan = useServerStore((s) => s.current?.plan) || "free";
+  const currentServerSlug = useServerStore((s) => s.current?.slug ?? null);
+  const currentServerName = useServerStore((s) => s.current?.name ?? "");
+  const servers = useServerStore((s) => s.servers);
   const currentUser = useAuthStore((s) => s.user);
   const nav = useAppNavigate();
+  const openBillingSettings = useCallback(() => {
+    onClose();
+    nav.toSettings("billing");
+  }, [nav, onClose]);
+  // Contract v0.3: free servers may host any number of joint channels; the
+  // limit is at most 2 free servers per joint channel, enforced by the server.
   const freeAllowance = plan === "free";
-  const freeLimitReached = freeAllowance && hasActiveHostedJointChannel;
 
   const memberSearchCandidates = useMemo<PeopleSuggestionCandidate<(typeof allAgents)[number] | (typeof members)[number]>[]>(() => [
       ...allAgents.filter((agent) => !agent.deletedAt).map((agent) => ({
@@ -91,22 +103,45 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
   const filteredHumans = rankedMembers.filter((candidate) => candidate.kind === "human").map((candidate) => candidate.value as (typeof members)[number]);
   const hasMembers = memberSearchEntries.length > 0;
   const hasFilteredMembers = filteredAgents.length > 0 || filteredHumans.length > 0;
+  // RFC 075 §4.5: per draft, the server the inviter administers when they are
+  // inviting themselves there; the draft then needs an explicit confirmation.
+  const sameAdminTargets = useMemo(() => new Map(jointInviteDrafts.map((draft) => [
+    draft.id,
+    findSameAdminJointTarget({
+      servers,
+      currentServerSlug,
+      user: currentUser,
+      targetServerSlug: draft.targetServerSlug,
+      invitedPeople: parseInvitedPeopleText(draft.invitedPeopleText),
+    }),
+  ])), [currentServerSlug, currentUser, jointInviteDrafts, servers]);
   const maxJointInviteDrafts = MAX_JOINT_CHANNEL_SERVERS - 1;
   const canAddJointInviteDraft = jointInviteDrafts.length < maxJointInviteDrafts;
 
-  const updateJointInviteDraft = (id: string, updates: Partial<Omit<JointInviteDraft, "id">>) => {
-    setJointInviteDrafts((prev) => prev.map((draft) => draft.id === id ? { ...draft, ...updates } : draft));
-  };
+  // A submit error is about the invite list it was submitted with (e.g. the
+  // free-server limit). Once that list changes, the error no longer describes
+  // it, so clear it rather than leave a stale reason on screen.
+  const clearSubmitError = useCallback(() => {
+    setError("");
+    setBillingError(false);
+  }, []);
 
-  const addJointInviteDraft = () => {
+  const updateJointInviteDraft = useCallback((id: string, updates: JointInviteDraftUpdate) => {
+    clearSubmitError();
+    setJointInviteDrafts((prev) => prev.map((draft) => draft.id === id ? { ...draft, ...updates } : draft));
+  }, [clearSubmitError]);
+
+  const addJointInviteDraft = useCallback(() => {
     if (!canAddJointInviteDraft) return;
+    clearSubmitError();
     const id = `invite-${nextInviteIdRef.current++}`;
     setJointInviteDrafts((prev) => [...prev, { id, targetServerSlug: "", invitedPeopleText: "" }]);
-  };
+  }, [canAddJointInviteDraft, clearSubmitError]);
 
-  const removeJointInviteDraft = (id: string) => {
+  const removeJointInviteDraft = useCallback((id: string) => {
+    clearSubmitError();
     setJointInviteDrafts((prev) => prev.length > 1 ? prev.filter((draft) => draft.id !== id) : prev);
-  };
+  }, [clearSubmitError]);
 
   const toggleAgent = (agentId: string) => {
     setSelectedAgentIds((prev) => {
@@ -132,7 +167,6 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
     setError("");
     setBillingError(false);
     setArchivedCollision(null);
-    if (freeLimitReached) return;
 
     const nameError = formatNameValidationError(
       validateNameReason(name),
@@ -145,10 +179,8 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
     }
     const jointInvites = jointInviteDrafts.map((draft) => ({
       targetServerSlug: draft.targetServerSlug.trim(),
-      invitedPeople: draft.invitedPeopleText
-        .split(/[\n,]+/)
-        .map((person) => person.trim())
-        .filter(Boolean),
+      invitedPeople: parseInvitedPeopleText(draft.invitedPeopleText),
+      ...(sameAdminTargets.get(draft.id) ? { sameAdmin: true } : {}),
     }));
     const incompleteInvite = jointInvites.find((invite) => !invite.targetServerSlug || invite.invitedPeople.length === 0);
     if (incompleteInvite?.targetServerSlug === "") {
@@ -157,6 +189,10 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
     }
     if (incompleteInvite) {
       setError(formatMessage({ id: "channel.edit.inviteePersonRequired" }));
+      return;
+    }
+    if (jointInviteDrafts.some((draft) => sameAdminTargets.get(draft.id) && !draft.sameAdminConfirmed)) {
+      setError(formatMessage({ id: "channel.jointInvite.sameAdmin.confirmRequired" }));
       return;
     }
 
@@ -177,6 +213,8 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
           data?: {
             error?: string;
             code?: string;
+            targetServerSlug?: string;
+            invitee?: string;
             archivedChannelId?: string;
             archivedChannelName?: string;
             archivedChannelType?: string;
@@ -185,6 +223,7 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
         };
       };
       const body = axiosErr.response?.data;
+      const inviteError = describeJointInviteError(body, currentServerSlug, formatMessage);
       if (
         body?.code === "archived_name_collision"
         && body.archivedChannelId
@@ -196,9 +235,13 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
           archivedChannelName: body.archivedChannelName,
           canUnarchiveArchivedChannel: body.canUnarchiveArchivedChannel === true,
         });
-      } else if (body?.code === "joint_channel_free_limit_reached") {
-        setError(formatMessage({ id: "channel.createJoint.freeLimitReached" }));
+      } else if (body?.code === "joint_free_server_limit") {
+        setError(formatMessage({ id: "channel.joint.freeServerLimit" }));
         setBillingError(true);
+      } else if (body?.code === "joint_server_limit") {
+        setError(formatMessage({ id: "channel.joint.serverLimit" }, { max: MAX_JOINT_CHANNEL_SERVERS }));
+      } else if (inviteError) {
+        setError(inviteError);
       } else {
         const nextError = body?.error || formatMessage({ id: "channel.createJoint.failedCreate" });
         setError(nextError);
@@ -210,7 +253,7 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
     }
   };
 
-  const handleUnarchiveCollision = async () => {
+  const handleUnarchiveCollision = useCallback(async () => {
     if (!archivedCollision) return;
     setSubmitting(true);
     try {
@@ -223,11 +266,28 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
     } finally {
       setSubmitting(false);
     }
-  };
+  }, [archivedCollision, unarchiveChannel, onClose, nav, formatMessage]);
+
+  const handleChangeCollidingName = useCallback(() => {
+    setArchivedCollision(null);
+    setName("");
+  }, []);
+  const handleNameChange = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => setName(event.target.value),
+    [],
+  );
+  const handleDescriptionChange = useCallback(
+    (event: React.ChangeEvent<HTMLTextAreaElement>) => setDescription(event.target.value),
+    [],
+  );
+  const handleMemberSearchChange = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => setMemberSearch(event.target.value),
+    [],
+  );
 
   const dialogTitle = (
     <span className="flex min-w-0 items-center gap-2">
-      <GitBranch size={18} className="shrink-0" />
+      <GitBranch size={18} aria-hidden="true" className="shrink-0" />
       <span className="truncate">{formatMessage({ id: "channel.createJoint.title" })}</span>
     </span>
   );
@@ -239,87 +299,67 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
       maxWidthClass="max-w-lg"
     >
         <form onSubmit={handleSubmit} className="space-y-4">
-          {freeLimitReached ? (
-            <Banner intent="warning" className="font-bold">
-              {formatMessage({ id: "channel.createJoint.freeLimitReached" })}{" "}
-              <button
-                type="button"
-                onClick={() => {
-                  onClose();
-                  nav.toSettings("billing");
-                }}
-                className="font-bold text-black underline"
-              >
-                {formatMessage({ id: "channel.createJoint.viewBilling" })}
-              </button>
-            </Banner>
-          ) : freeAllowance && (
-            <Banner intent="info" className="font-bold">
+          {freeAllowance && (
+            <Banner intent="info">
               {formatMessage({ id: "channel.createJoint.freeAllowance" })}
             </Banner>
           )}
           {error && (
-            <Banner intent="warning" className="font-bold">
+            <Banner intent="warning">
               {error}
               {billingError && (
                 <>
                   {" "}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      onClose();
-                      nav.toSettings("billing");
-                    }}
-                    className="font-bold text-black underline"
+                  <TextLink
+                    variant="primary"
+                    onClick={openBillingSettings}
                   >
                     {formatMessage({ id: "channel.createJoint.viewBilling" })}
-                  </button>
+                  </TextLink>
                 </>
               )}
             </Banner>
           )}
           {archivedCollision && (
-            <Banner intent="warning" className="space-y-2">
-              <p className="font-bold">
-                {formatMessage(
-                  { id: "channel.create.archivedNameHeld" },
-                  {
-                    name: archivedCollision.archivedChannelName,
-                    mono: (chunks: React.ReactNode) => <span key="mono" className="font-mono">{chunks}</span>,
-                  },
-                )}
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {archivedCollision.canUnarchiveArchivedChannel && (
-                  <button
+            <Banner
+              intent="warning"
+              title={formatMessage(
+                { id: "channel.create.archivedNameHeld" },
+                {
+                  name: archivedCollision.archivedChannelName,
+                  mono: (chunks: React.ReactNode) => <span key="mono" className="font-mono">{chunks}</span>,
+                },
+              )}
+              actions={(
+                <>
+                  {archivedCollision.canUnarchiveArchivedChannel && (
+                    <Button size="sm"
+                      variant="outline"
+                      type="button"
+                      onClick={handleUnarchiveCollision}
+                      disabled={submitting}
+                    >
+                      {formatMessage({ id: "channel.create.unarchive" })}
+                    </Button>
+                  )}
+                  <Button size="sm"
+                    variant="ghost"
                     type="button"
-                    onClick={handleUnarchiveCollision}
-                    disabled={submitting}
-                    className="btn-brutal-sm bg-brutal-lime px-2 py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={handleChangeCollidingName}
                   >
-                    {formatMessage({ id: "channel.create.unarchive" })}
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setArchivedCollision(null);
-                    setName("");
-                  }}
-                  className="btn-brutal-sm bg-white px-2 py-1 text-xs"
-                >
-                  {formatMessage({ id: "channel.create.changeName" })}
-                </button>
-              </div>
-            </Banner>
+                    {formatMessage({ id: "channel.create.changeName" })}
+                  </Button>
+                </>
+              )}
+            />
           )}
 
           <FormField label={formatMessage({ id: "channel.create.nameLabel" })} required>
-            <input
+            <Input
               type="text"
               value={name}
-              onChange={(event) => setName(event.target.value)}
-              className="input-brutal w-full"
+              onChange={handleNameChange}
+              className="w-full"
               placeholder={formatMessage({ id: "channel.createJoint.namePlaceholder" })}
               required
               autoFocus
@@ -327,100 +367,76 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
           </FormField>
 
           <FormField label={formatMessage({ id: "channel.create.descriptionLabel" })} optional>
-            <textarea
+            <Textarea
               value={description}
-              onChange={(event) => setDescription(event.target.value)}
-              className="input-brutal w-full"
+              onChange={handleDescriptionChange}
+              className="w-full"
               placeholder={formatMessage({ id: "channel.createJoint.descriptionPlaceholder" })}
               rows={2}
             />
           </FormField>
 
-          <div className="space-y-3 border-2 border-black bg-white p-3 shadow-brutal-sm">
+          {/* The invites are one section of the form: a 13/18 700 ink-2 heading
+              with its add action, then one inset card per server. */}
+          <section className="space-y-3">
             <div className="flex items-center justify-between gap-3">
-              <div className="flex items-center gap-2 text-xs font-bold uppercase tracking-wide text-black/60">
-                <GitBranch size={14} />
+              <SectionEyebrow as="div" tone="muted" className="flex items-center gap-2">
+                <GitBranch size={16} aria-hidden="true" />
                 {formatMessage({ id: "channel.createJoint.inviteServersSection" })}
-              </div>
-              <button
+              </SectionEyebrow>
+              <Button size="sm"
+                variant="outline"
                 type="button"
                 onClick={addJointInviteDraft}
                 disabled={submitting || !canAddJointInviteDraft}
-                className="btn-brutal-sm flex items-center gap-1 bg-white px-2 py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                <Plus size={14} />
+                <Plus size={16} aria-hidden="true" />
                 {formatMessage({ id: "channel.createJoint.addServer" })}
-              </button>
+              </Button>
             </div>
-            <p className="text-xs font-bold text-black/60">
-              {formatMessage(
-                { id: "channel.createJoint.maxServers" },
-                { max: MAX_JOINT_CHANNEL_SERVERS },
-              )}
-            </p>
+            {/* Only at the cap, as in EditChannelDialog: it explains why "Add server" is disabled. */}
+            {!canAddJointInviteDraft && (
+              <p className="text-caption text-foreground-hint" data-testid="create-joint-max-servers-hint">
+                {formatMessage(
+                  { id: "channel.createJoint.maxServers" },
+                  { max: MAX_JOINT_CHANNEL_SERVERS },
+                )}
+              </p>
+            )}
             {jointInviteDrafts.map((draft, index) => (
-              <div key={draft.id} className="space-y-3 border-2 border-black bg-brutal-gray/20 p-3">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="text-xs font-bold uppercase text-black/60">
-                    {formatMessage({ id: "channel.createJoint.serverInviteIndex" }, { n: index + 1 })}
-                  </div>
-                  {jointInviteDrafts.length > 1 && (
-                    <button
-                      type="button"
-                      onClick={() => removeJointInviteDraft(draft.id)}
-                      disabled={submitting}
-                      className="btn-brutal-sm bg-white p-1 disabled:opacity-50 disabled:cursor-not-allowed"
-                      aria-label={formatMessage({ id: "channel.createJoint.removeServerInvite" }, { n: index + 1 })}
-                    >
-                      <Trash2 size={14} />
-                    </button>
-                  )}
-                </div>
-                <FormField label={formatMessage({ id: "channel.edit.serverSlugLabel" })} required>
-                  <SlugInput
-                    type="text"
-                    value={draft.targetServerSlug}
-                    onChange={(event) => updateJointInviteDraft(draft.id, { targetServerSlug: event.target.value })}
-                    placeholder="partner-workspace"
-                    required
-                  />
-                </FormField>
-                <FormField
-                  label={formatMessage({ id: "channel.edit.invitedPeopleLabel" })}
-                  required
-                  hint={formatMessage({ id: "channel.edit.invitedPeopleHint" })}
-                >
-                  <textarea
-                    value={draft.invitedPeopleText}
-                    onChange={(event) => updateJointInviteDraft(draft.id, { invitedPeopleText: event.target.value })}
-                    className="input-brutal w-full"
-                    placeholder={formatMessage({ id: "channel.edit.invitedPeoplePlaceholder" })}
-                    rows={2}
-                    required
-                  />
-                </FormField>
-              </div>
+              <JointInviteDraftCard
+                key={draft.id}
+                draft={draft}
+                index={index}
+                canRemove={jointInviteDrafts.length > 1}
+                submitting={submitting}
+                sameAdminTarget={sameAdminTargets.get(draft.id) ?? null}
+                sourceServerName={currentServerName}
+                onUpdate={updateJointInviteDraft}
+                onRemove={removeJointInviteDraft}
+              />
             ))}
-          </div>
+          </section>
 
           <FormField label={formatMessage({ id: "channel.createJoint.currentServerMembers" })} optional>
             {hasMembers ? (
               <div className="space-y-2">
-                <div className="relative">
-                  <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-black/40" />
-                  <input
+                <InputGroup>
+                  <InputGroupAddon align="inline-start">
+                    <Search aria-hidden="true" />
+                  </InputGroupAddon>
+                  <InputGroupInput
                     type="text"
                     value={memberSearch}
-                    onChange={(event) => setMemberSearch(event.target.value)}
-                    className="input-brutal input-member-search w-full pl-9"
+                    onChange={handleMemberSearchChange}
                     placeholder={formatMessage({ id: "channel.create.membersSearchPlaceholder" })}
                   />
-                </div>
+                </InputGroup>
 
-                <div className="max-h-48 overflow-y-auto border-2 border-black bg-white shadow-brutal-sm">
+                <Card className="max-h-48 overflow-y-auto p-1.5">
                   {filteredAgents.length > 0 && (
                     <>
-                      <SectionEyebrow as="div" className="bg-white/50 px-3 py-1.5">
+                      <SectionEyebrow as="div" className={PICKER_GROUP_LABEL_CLASS}>
                         {formatMessage({ id: "channel.create.agents" })}
                       </SectionEyebrow>
                       {filteredAgents.map((agent) => {
@@ -430,13 +446,11 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
                             key={agent.id}
                             type="button"
                             onClick={() => toggleAgent(agent.id)}
-                            className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm font-medium text-black transition-colors ${
-                              selected ? "bg-brutal-pink/20" : "hover:bg-soft-signal"
-                            }`}
+                            className={PICKER_ROW_CLASS}
                           >
+                            <CheckboxIndicator checked={selected} />
                             <AvatarSlot context="sidebar-list" type="agent" agentAvatarUrl={agent.avatarUrl} />
-                            <span className="flex-1 truncate text-left">{agent.displayName || agent.name}</span>
-                            {selected && <Check size={14} className="shrink-0 text-brutal-pink" />}
+                            <span className="min-w-0 flex-1 truncate">{agent.displayName || agent.name}</span>
                           </button>
                         );
                       })}
@@ -445,7 +459,7 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
 
                   {filteredHumans.length > 0 && (
                     <>
-                      <SectionEyebrow as="div" className="bg-white/50 px-3 py-1.5">
+                      <SectionEyebrow as="div" className={PICKER_GROUP_LABEL_CLASS}>
                         {formatMessage({ id: "channel.create.humans" })}
                       </SectionEyebrow>
                       {filteredHumans.map((human) => {
@@ -455,13 +469,11 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
                             key={human.userId}
                             type="button"
                             onClick={() => toggleHuman(human.userId)}
-                            className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm font-medium text-black transition-colors ${
-                              selected ? "bg-brutal-pink/20" : "hover:bg-soft-signal"
-                            }`}
+                            className={PICKER_ROW_CLASS}
                           >
+                            <CheckboxIndicator checked={selected} />
                             <AvatarSlot context="sidebar-list" type="human" humanPlaceholder />
-                            <span className="flex-1 truncate text-left">{human.displayName || human.name}</span>
-                            {selected && <Check size={14} className="shrink-0 text-brutal-pink" />}
+                            <span className="min-w-0 flex-1 truncate">{human.displayName || human.name}</span>
                           </button>
                         );
                       })}
@@ -469,42 +481,88 @@ export default function CreateJointChannelDialog({ onClose }: { onClose: () => v
                   )}
 
                   {!hasFilteredMembers && (
-                    <div className="px-3 py-4 text-center font-mono text-sm text-black/50">
+                    <div className="px-2.5 py-2 text-callout text-foreground-hint">
                       {formatMessage(
                         { id: "channel.create.noMatchesFor" },
                         { query: memberSearch.trim() },
                       )}
                     </div>
                   )}
-                </div>
+                </Card>
               </div>
             ) : (
-              <div className="font-mono text-sm text-black/50">
+              <div className="text-callout text-foreground-hint">
                 {formatMessage({ id: "channel.create.noMembersAvailable" })}
               </div>
             )}
           </FormField>
 
-          <div className="flex justify-end gap-3">
-            <button
+          <div className="flex flex-wrap justify-end gap-2 pt-1">
+            <Button size="lg"
+              variant="ghost"
               type="button"
               onClick={onClose}
               disabled={submitting}
-              className="btn-brutal bg-white px-4 py-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {formatMessage({ id: "settings.common.cancel" })}
-            </button>
-            <button
+            </Button>
+            <Button size="lg"
+              variant="accent"
               type="submit"
-              disabled={submitting || freeLimitReached}
-              className="btn-brutal bg-brutal-pink px-4 py-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={submitting}
             >
               {submitting
                 ? formatMessage({ id: "channel.create.creating" })
                 : formatMessage({ id: "channel.createJoint.title" })}
-            </button>
+            </Button>
           </div>
         </form>
     </DialogCard>
   );
+}
+
+/**
+ * Localizes the server's typed joint-invite rejections (`sendJointInviteValidationError`,
+ * PR #7654). The server's own `error` string is English-only and names the invitee,
+ * so showing it verbatim leaves zh users an untranslated sentence. The body carries
+ * `targetServerSlug` and, for invitee-scoped codes, `invitee` — the exact person the
+ * server rejected. The response's `inviteeIndex` is deliberately not used: it indexes
+ * the server's deduplicated invitee list, not the list this dialog submitted.
+ *
+ * Returns null for anything it cannot describe precisely; the caller then keeps the
+ * existing fallback (server text, else the generic failure).
+ */
+function describeJointInviteError(
+  body: { code?: string; targetServerSlug?: string; invitee?: string } | undefined,
+  currentServerSlug: string | null,
+  formatMessage: IntlShape["formatMessage"],
+): string | null {
+  const server = body?.targetServerSlug;
+  switch (body?.code) {
+    case "joint_invitee_not_found":
+    case "joint_invitee_not_admin": {
+      const invitee = body.invitee;
+      if (!server || !invitee) return null;
+      return formatMessage(
+        {
+          id: body.code === "joint_invitee_not_found"
+            ? "channel.jointInvite.error.inviteeNotFound"
+            : "channel.jointInvite.error.inviteeNotAdmin",
+        },
+        { invitee, server },
+      );
+    }
+    case "joint_target_server_invalid":
+      // One code, two causes: the server says "Target server not found" or "Cannot
+      // invite the current server". Only the slug tells them apart.
+      if (server && currentServerSlug && server === currentServerSlug) {
+        return formatMessage({ id: "channel.jointInvite.error.cannotInviteSelf" });
+      }
+      if (!server) return null;
+      return formatMessage({ id: "channel.jointInvite.error.serverNotFound" }, { server });
+    case "joint_invite_required":
+      return formatMessage({ id: "channel.edit.inviteePersonRequired" });
+    default:
+      return null;
+  }
 }

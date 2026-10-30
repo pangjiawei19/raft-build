@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
@@ -78,12 +77,12 @@ function makeAgent(overrides: Partial<Agent> = {}): Agent {
   };
 }
 
-test("stale agent profile overlay falls through to an unavailable panel instead of the root error UI", async (t) => {
+test("stale agent profile overlay falls through to an unavailable panel instead of the root error UI", async () => {
   seedShell();
   useProfileStore.getState().openProfile("agent", "terminated-agent-1");
 
   const requestedUrls: string[] = [];
-  t.mock.method(api, "get", async (url: string) => {
+  vi.spyOn(api, "get").mockImplementation(async (url: string) => {
     requestedUrls.push(url);
     if (url === "/agents/terminated-agent-1") throw Object.assign(new Error("Agent not found"), { response: { status: 404 } });
     throw new Error(`unexpected GET ${url}`);
@@ -105,11 +104,12 @@ test("stale agent profile overlay falls through to an unavailable panel instead 
   await waitFor(() => assert.deepEqual(requestedUrls, ["/agents/terminated-agent-1"]));
 });
 
-test("stale agent profile overlay treats a 200 deleted fallback response as unavailable", async (t) => {
+// Agent archive: an archived (deleted) agent keeps a read-only profile.
+test("stale agent profile overlay renders an archived agent from a 200 deleted fallback response", async () => {
   seedShell();
   useProfileStore.getState().openProfile("agent", "terminated-agent-1");
 
-  t.mock.method(api, "get", async (url: string) => {
+  vi.spyOn(api, "get").mockImplementation(async (url: string) => {
     if (url === "/agents/terminated-agent-1") {
       return { data: makeAgent({ id: "terminated-agent-1", deletedAt: "2026-08-12T00:00:00.000Z" }) };
     }
@@ -124,16 +124,17 @@ test("stale agent profile overlay treats a 200 deleted fallback response as unav
     </MemoryRouter>,
   );
 
-  assert.ok(await screen.findByTestId("agent-unavailable-panel"));
+  assert.ok((await screen.findAllByText("Archived")).length >= 1);
+  assert.ok(screen.queryByTestId("agent-unavailable-panel") === null);
   assert.equal(screen.queryByText("Something went wrong"), null);
   assert.equal(screen.queryByText(/Cannot read properties of undefined/), null);
 });
 
-test("stale agent profile overlay treats a 200 incomplete fallback response as unavailable", async (t) => {
+test("stale agent profile overlay treats a 200 incomplete fallback response as unavailable", async () => {
   seedShell();
   useProfileStore.getState().openProfile("agent", "partial-agent-1");
 
-  t.mock.method(api, "get", async (url: string) => {
+  vi.spyOn(api, "get").mockImplementation(async (url: string) => {
     if (url === "/agents/partial-agent-1") {
       return { data: { id: "partial-agent-1", name: "partial-agent", deletedAt: null } };
     }
@@ -153,7 +154,7 @@ test("stale agent profile overlay treats a 200 incomplete fallback response as u
   assert.equal(screen.queryByText(/Cannot read properties of undefined/), null);
 });
 
-test("joint peer partial profile remains readable without querying the current server agent endpoint", async (t) => {
+test("joint peer partial profile remains readable without querying the current server agent endpoint", async () => {
   seedShell();
   const remotePartial = {
     id: "peer-agent-1",
@@ -170,7 +171,7 @@ test("joint peer partial profile remains readable without querying the current s
   useProfileStore.getState().openProfile("agent", remotePartial.id);
 
   const requestedUrls: string[] = [];
-  t.mock.method(api, "get", async (url: string) => {
+  vi.spyOn(api, "get").mockImplementation(async (url: string) => {
     requestedUrls.push(url);
     throw new Error(`unexpected GET ${url}`);
   });
@@ -184,7 +185,7 @@ test("joint peer partial profile remains readable without querying the current s
   );
 
   assert.ok((await screen.findAllByText("Peer Agent")).length > 0);
-  assert.equal(screen.queryByTestId("agent-unavailable-panel"), null);
+  assert.ok(screen.queryByTestId("agent-unavailable-panel") === null);
   assert.equal(requestedUrls.includes(`/agents/${remotePartial.id}`), false);
   assert.equal(canRenderAgentDetail(remotePartial, "server-1"), true);
   assert.equal(canRenderAgentDetail(remotePartial, "server-2"), false);
@@ -204,7 +205,7 @@ test("joint peer partial profile remains readable without querying the current s
   assert.equal(canRenderAgentDetail({ ...channelSummary, profileProjection: undefined }, "server-1"), false);
 });
 
-test("store-retained deleted agent profile overlay renders unavailable instead of AgentDetailPanel", async () => {
+test("store-retained archived agent profile overlay renders the read-only AgentDetailPanel", async () => {
   seedShell();
   useAgentStore.setState({
     agents: [makeAgent({ id: "terminated-agent-1", deletedAt: "2026-08-12T00:00:00.000Z" })],
@@ -219,7 +220,8 @@ test("store-retained deleted agent profile overlay renders unavailable instead o
     </MemoryRouter>,
   );
 
-  assert.ok(await screen.findByTestId("agent-unavailable-panel"));
+  assert.ok((await screen.findAllByText("Archived")).length >= 1);
+  assert.ok(screen.queryByTestId("agent-unavailable-panel") === null);
   assert.equal(screen.queryByText("Something went wrong"), null);
   assert.equal(screen.queryByText(/Cannot read properties of undefined/), null);
 });
@@ -264,10 +266,10 @@ function renderRoute(agentId: string) {
   );
 }
 
-test("full-page route renders a peer-server agent from the viewer-scoped projection, without asking this server for it", async (t) => {
+test("full-page route renders a peer-server agent from the viewer-scoped projection, without asking this server for it", async () => {
   seedShell();
   const requestedUrls: string[] = [];
-  t.mock.method(api, "get", async (url: string) => {
+  vi.spyOn(api, "get").mockImplementation(async (url: string) => {
     requestedUrls.push(url);
     throw new Error(`unexpected GET ${url}`);
   });
@@ -286,7 +288,7 @@ test("full-page route renders a peer-server agent from the viewer-scoped project
   assert.ok(shown.length >= 1, "the peer-server agent's profile must actually render");
 
   // Supporting, not load-bearing.
-  assert.equal(screen.queryByTestId("agent-unavailable-panel"), null);
+  assert.ok(screen.queryByTestId("agent-unavailable-panel") === null);
   assert.equal(screen.queryByText("This agent has been terminated or is no longer available in this server."), null);
   // The contract is specifically that this server is never asked to resolve a
   // FOREIGN agent id: `/agents/:id` 404s for it.
@@ -300,14 +302,15 @@ test("full-page route still shows unavailable for a direct hit with no bounded p
   assert.ok(await screen.findByTestId("agent-unavailable-panel"));
 });
 
-test("full-page route still shows unavailable for a same-server deleted agent", async () => {
+test("full-page route renders a same-server archived agent read-only", async () => {
   seedShell();
   useAgentStore.setState({
     agents: [makeAgent({ id: "gone-agent", deletedAt: "2026-08-12T00:00:00.000Z" })],
     activityLogs: {},
   } as never);
   renderRoute("gone-agent");
-  assert.ok(await screen.findByTestId("agent-unavailable-panel"));
+  assert.ok((await screen.findAllByText("Archived")).length >= 1);
+  assert.ok(screen.queryByTestId("agent-unavailable-panel") === null);
 });
 
 test("full-page route: a cached projection for a DIFFERENT viewer server does not leak in", async () => {
@@ -322,13 +325,13 @@ test("full-page route: a cached projection for a DIFFERENT viewer server does no
 // panel already hid every operational control for a remote joint agent, yet
 // still asked THIS server for that FOREIGN agent's runtime options.
 
-test("full-page route: peer-server profile does not request this server's private agent subresources", async (t) => {
+test("full-page route: peer-server profile does not request this server's private agent subresources", async () => {
   seedShell();
   useServerStore.setState((state) => ({
     current: state.current ? { ...state.current, role: "owner" } : state.current,
   }) as never);
   const requestedUrls: string[] = [];
-  t.mock.method(api, "get", async (url: string) => {
+  vi.spyOn(api, "get").mockImplementation(async (url: string) => {
     requestedUrls.push(url);
     throw new Error(`unexpected GET ${url}`);
   });
@@ -358,10 +361,10 @@ test("full-page route: peer-server profile does not request this server's privat
     `a peer-server public profile must issue no private loaders, saw: ${leaked.join(", ")}`);
 });
 
-test("same-server agent KEEPS its private loaders (positive control for the gate)", async (t) => {
+test("same-server agent KEEPS its private loaders (positive control for the gate)", async () => {
   seedShell();
   const requestedUrls: string[] = [];
-  t.mock.method(api, "get", async (url: string) => {
+  vi.spyOn(api, "get").mockImplementation(async (url: string) => {
     requestedUrls.push(url);
     if (url === "/reminders") return { data: { reminders: [] } };
     return { data: {} };
@@ -417,10 +420,10 @@ function reminderRow(title: string, ownerAgentId: string) {
   return { reminderId: `rem-${title}`, ownerAgentId, title, fireAt: new Date(10_000).toISOString(), status: "scheduled" };
 }
 
-test("A→B: B's fresh row arrives and SURVIVES a late resolve from the abandoned scope", async (t) => {
+test("A→B: B's fresh row arrives and SURVIVES a late resolve from the abandoned scope", async () => {
   seedShell();
   let resolveA: ((v: unknown) => void) | null = null;
-  t.mock.method(api, "get", async (url: string, config?: any) => {
+  vi.spyOn(api, "get").mockImplementation(async (url: string, config?: any) => {
     if (url !== "/reminders") return { data: {} };
     if (config?.params?.ownerAgentId === "local-a") return new Promise((r) => { resolveA = r; });
     return { data: { reminders: [reminderRow(FRESH_B, "local-b")] } };
@@ -461,11 +464,11 @@ test("A→B: B's fresh row arrives and SURVIVES a late resolve from the abandone
   assert.equal(screen.queryByText(STALE_A), null, "scope A must not commit anything");
 });
 
-test("server-only switch: old row clears while pending, then B's fresh row appears", async (t) => {
+test("server-only switch: old row clears while pending, then B's fresh row appears", async () => {
   seedShell();
   let resolveB: ((v: unknown) => void) | null = null;
   let call = 0;
-  t.mock.method(api, "get", async (url: string) => {
+  vi.spyOn(api, "get").mockImplementation(async (url: string) => {
     if (url !== "/reminders") return { data: {} };
     call += 1;
     if (call === 1) return { data: { reminders: [reminderRow(STALE_A, "shared-agent")] } };

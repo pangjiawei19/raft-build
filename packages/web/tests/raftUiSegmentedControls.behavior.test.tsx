@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import "./helpers/domSetup";
 import { TestIntlProvider } from "./helpers/intl";
-import { afterEach, test } from "node:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { ExternalSetupTabSegmentedControl } from "../src/components/agent/ExternalSetupTabSegmentedControl";
 import {
@@ -92,6 +91,22 @@ test("billing interval segmented control keeps monthly and annual actions addres
   assert.equal(screen.getByTestId("billing-interval-monthly").textContent, "Monthly");
   assert.match(screen.getByTestId("billing-interval-annual").textContent ?? "", /Yearly/);
   assert.match(screen.getByTestId("billing-interval-annual").textContent ?? "", /Save/);
+});
+
+test("billing interval annual savings uses rUI's themed secondary text slot", () => {
+  // A hard-coded `text-black/60` made "Save 12%" unreadable in dark mode; the
+  // colour must come from SegmentedControlCount, never from slock.
+  render(
+    <TestIntlProvider locale="en">
+      <BillingIntervalSegmentedControl value="annual" onValueChange={noop} />
+    </TestIntlProvider>,
+  );
+
+  const badge = screen.getByTestId("billing-interval-annual").querySelector('[data-slot="segmented-control-count"]');
+  assert.ok(badge !== null);
+  assert.match(badge.textContent ?? "", /Save/);
+  assert.doesNotMatch(badge.className, /text-black/);
+  assert.ok(screen.getByTestId("billing-interval-monthly").querySelector('[data-slot="segmented-control-count"]') === null);
 });
 
 test("connected apps segmented control renders counts only when non-zero", () => {

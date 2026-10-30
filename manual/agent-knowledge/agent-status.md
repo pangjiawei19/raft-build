@@ -10,6 +10,9 @@ Verified against current staging head:
 - packages/server/src/services/agentLifecycleEvents.ts (internal event taxonomy: runtime_interrupted, machine_disconnected, runtime_starting, runtime_idle, runtime_ready; reasons incl. migration_pending, heartbeat_timeout)
 - packages/server/src/db/schema.ts (agents.status: active | inactive — DB identity flag, distinct from Activity Log labels)
 - CLAUDE.md Agent Lifecycle (inactive → active → idle → auto-wake on new message via --resume)
+- packages/server/src/services/wakeCrashLoopBreaker.ts (start failures: reasons retrying cannot fix pause at once, including a runtime the computer does not have; model_not_found retries once after a minute, then pauses; any reason pauses after 5 failed starts in a row; a model/key change or a manual restart lifts it, and a missing-runtime pause also lifts when the computer reports that runtime)
+- packages/server/src/services/legacySpawnFailure.ts (failed starts from Computers older than 1.0.34, which carry no reason, are counted too)
+- packages/web/src/utils/activity.ts formatSpawnFailureDetail + i18n activity.status.modelNotFound / activity.status.autoRestartPaused (the shown copy)
 Note: the human reads display labels, not the internal snake_case event types. This doc uses the display labels.
 */}
 
@@ -19,7 +22,7 @@ Note: the human reads display labels, not the internal snake_case event types. T
 
 In Raft, an agent's `status: active` is a database-level identity flag. It does not guarantee the runtime can reply right now. Three independent layers sit between "active" and "the next message gets answered":
 
-1. **Turn in progress** — the runtime is composing a reply to the previous message. New messages arrive into a queue and wait until the current turn ends.
+1. **Turn in progress** — the runtime is composing a reply to the previous message. While an agent is working, handling of new messages depends on its runtime and current state: a message may be passed into the ongoing turn, or wait until the runtime can accept it. Delivery does not guarantee an immediate reply.
 2. **Runtime stalled** — the agent process is alive but the model layer is blocked. Common causes: a model `Prompt is too long` error, a compaction loop that doesn't return, a launcher resolving to the wrong binary, or a model provider 5xx with long retry.
 3. **Migration pending** — the runtime profile is upgrading (model swap, daemon roll). The agent appears idle, but inbound messages are gated until the migration completes.
 
@@ -66,6 +69,26 @@ So an agent has exactly one active session at a time; you can replace that sessi
 - **Check first:** does the Activity Log show a recent runtime profile change just before the hold?
 - **Do not claim:** the messages were lost — held messages are released to the agent after the migration completes.
 - **Escalate when:** the hold persists more than ~10 minutes, or messages sent before the hold also stay unanswered.
+
+### If a human asks: "My agent won't start. It says the model is not available, or that automatic restarts are paused."
+
+- **Use this answer:** "The agent failed to start for a reason that restarting won't fix on its own, so Raft stopped starting it on every new message. The status line names the reason. 'Model not available' usually means the model was renamed or removed in the runtime's latest version, or the model's provider has no working API key on that computer. Change the model or fix the key in the agent's settings, or restart the agent from its page; either one lets it start again."
+- **Check first:** the reason on the agent's status line, and whether the model name still appears in the agent's model picker.
+- **Do not claim:** that messages sent while it was paused are lost — they stay unread and the agent catches up on them when it next starts.
+- **Escalate when:** the agent still fails to start after a model or key change, or the status shows an unclassified "Runtime failed to start" after a restart.
+
+### If a human asks: "My agent says its runtime is not available on this computer."
+
+- **Use this answer:** "The computer the agent is assigned to does not have the agent's runtime (for example, the Codex CLI is not installed there, or not on the PATH Raft Computer sees). Starting again cannot fix that, so Raft paused automatic starts and told the owner once. Make the runtime available on that computer (installed, and on the PATH Raft Computer sees) and restart Raft Computer there, move the agent to a computer that has it, or switch the agent's runtime. Automatic starts resume by themselves once the computer reports the runtime."
+- **Do not claim:** that messages sent while it was paused are lost — they stay unread and the agent catches up on them when it next starts.
+- **Escalate when:** the computer lists the runtime but the agent still cannot start.
+
+### If a human asks: "My agent says its input is too large, or that its conversation no longer fits the model. What do I do?"
+
+- **Use this answer:** "The agent's runtime conversation has grown past what its model accepts, and context compaction, which summarizes the older part, could not bring it back under the limit. Restarting resumes the same conversation, so it fails again. To start a new conversation, open Restart / Reset on the agent's page and choose Reset Session & Restart (members see Reset Model). That keeps Raft messages and the agent's workspace files, including MEMORY.md; only the runtime's own conversation context starts fresh."
+- **Check first:** whether the status mentions input that is too large, a context compaction failure, or that the session needs a reset. Pi and Built-in Pi agents stop resuming such a session on their own after it fails compaction three times in a row.
+- **Do not claim:** that Reset Session deletes Raft messages or workspace files — it does not.
+- **Escalate when:** a new session fails the same way right away, which points to a model or gateway limit that is smaller than the configured one, or to a very large startup context.
 
 ### If a human asks: "How do I share what's wrong with my agent so someone can help?"
 

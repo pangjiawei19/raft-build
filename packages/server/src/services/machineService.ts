@@ -1,11 +1,14 @@
 import { eq, and, inArray, isNotNull, isNull, lt, or, sql, asc } from "drizzle-orm";
 import { createHash, randomBytes } from "node:crypto";
 import argon2 from "argon2";
-import { getDb } from "../db/index.js";
-import { computers, machines, servers, agents, agentMigrations, agentRuntimeProfiles } from "../db/schema.js";
-import { withServerLock } from "./planService.js";
-import { PLAN_CONFIG, currentDate, getEffectiveLimits, type MachineId, type ServerPlan } from "@botiverse/raft-shared";
-import { untracedDbQuery, type DbQueryTracer } from "../tracing/dbQueryTrace.js";
+import { timedArgon2Verify, type Argon2VerifyStats } from "./argon2VerifyStats";
+import { getDb, type DatabaseExecutor } from "../db/index";
+import { computers, machines, servers, agents, agentMigrations, agentRuntimeProfiles } from "../db/schema";
+import { withServerLock, acquireServerLock } from "./planService";
+import { FencedAuthorizationDeniedError, lockActorMembershipRow } from "../lib/actorMembershipFence";
+import { actorRoleHasServerCapability } from "../lib/actorPermissions";
+import { PLAN_CONFIG, currentDate, getEffectiveLimits, type DeviceClass, type MachineId, type ServerPlan } from "@botiverse/raft-shared";
+import { untracedDbQuery, type DbQueryTracer } from "../tracing/dbQueryTrace";
 
 /** Extract a short prefix from an API key for indexed DB lookup. */
 export function extractApiKeyPrefix(apiKey: string): string {
@@ -35,15 +38,89 @@ export function clearAuthCache(machineId: string) {
   }
 }
 
-export async function registerMachine(serverId: string, userId: string, name: string) {
-  // Generate API key outside the lock (argon2 is slow, don't hold the lock during hashing)
+export type MachineKeyMaterial = {
+  apiKey: string;
+  apiKeyHash: string;
+  apiKeyPrefix: string;
+  apiKeyFingerprint: string;
+};
+
+/** Generates a raw `sk_machine_*` key and its stored hash. argon2 is slow: never call this while holding row locks. */
+export async function generateMachineKeyMaterial(): Promise<MachineKeyMaterial> {
   const apiKey = `sk_machine_${randomBytes(32).toString("hex")}`;
-  const apiKeyHash = await argon2.hash(apiKey);
-  const apiKeyPrefix = extractApiKeyPrefix(apiKey);
-  const apiKeyFingerprint = extractApiKeyFingerprint(apiKey);
+  return {
+    apiKey,
+    apiKeyHash: await argon2.hash(apiKey),
+    apiKeyPrefix: extractApiKeyPrefix(apiKey),
+    apiKeyFingerprint: extractApiKeyFingerprint(apiKey),
+  };
+}
+
+declare const machineCreateLockBrand: unique symbol;
+
+/**
+ * Opaque proof that the machines advisory lock (namespace 2) is held on a specific transaction for a specific Server.
+ * The token carries no readable state: the transaction and Server id live in `machineCreateLocks`, keyed by the token's
+ * identity and written only by acquireMachineCreateLock. A spread copy, a raw cast or any other fabricated object is not
+ * a key in that map, so registerMachine refuses it before writing anything. Construction is enrolled in
+ * scripts/ci/check-branded-mint-sites.mjs: `as MachineCreateLock` is allowed only in this file.
+ */
+export type MachineCreateLock = { readonly [machineCreateLockBrand]: true };
+
+const machineCreateLocks = new WeakMap<object, { tx: DatabaseExecutor; serverId: string }>();
+
+/** Takes the machines advisory lock on the caller's transaction exactly once and returns the token registerMachine needs. */
+export async function acquireMachineCreateLock(tx: DatabaseExecutor, serverId: string): Promise<MachineCreateLock> {
+  await acquireServerLock(tx, serverId, 2);
+  const token = Object.freeze(Object.create(null)) as MachineCreateLock;
+  machineCreateLocks.set(token, { tx, serverId });
+  return token;
+}
+
+/** Resolves a token issued by acquireMachineCreateLock for `serverId`; throws for anything else. */
+function resolveMachineCreateLock(token: MachineCreateLock, serverId: string): DatabaseExecutor {
+  const held = typeof token === "object" && token !== null ? machineCreateLocks.get(token) : undefined;
+  if (!held) {
+    throw new Error("registerMachine: not a machine create lock issued by acquireMachineCreateLock");
+  }
+  if (held.serverId !== serverId) {
+    throw new Error("registerMachine: the machine create lock was acquired for a different Server");
+  }
+  return held.tx;
+}
+
+export async function registerMachine(
+  serverId: string,
+  userId: string,
+  name: string,
+  options: {
+    /**
+     * Join the caller's transaction, which already holds the machines advisory lock for this Server (single acquisition
+     * point). A handle for another Server is refused.
+     */
+    machineCreateLock?: MachineCreateLock;
+    /**
+     * Task #93 line G: re-authorize the registering human under a share lock on their own `server_members` row inside
+     * the create transaction (advisory lock → member row → insert), so a removal or demotion that commits first leaves
+     * zero registered Machines.
+     */
+    capability?: "registerMachines";
+    /** Pre-generated key material, so a caller that already holds locks never hashes inside them. */
+    material?: MachineKeyMaterial;
+  } = {},
+) {
+  // Generate API key outside the lock (argon2 is slow, don't hold the lock during hashing)
+  const { apiKey, apiKeyHash, apiKeyPrefix, apiKeyFingerprint } = options.material ?? await generateMachineKeyMaterial();
 
   // Atomic quota check + insert under advisory lock (namespace 2 = machines)
-  const machine = await withServerLock(serverId, 2, async (tx) => {
+  const lockedTx = options.machineCreateLock ? resolveMachineCreateLock(options.machineCreateLock, serverId) : undefined;
+  const register = async (tx: DatabaseExecutor) => {
+    if (options.capability) {
+      const lockedRole = await lockActorMembershipRow(tx, serverId, userId, "share");
+      if (!actorRoleHasServerCapability(lockedRole, options.capability)) {
+        throw new FencedAuthorizationDeniedError("forbidden");
+      }
+    }
     // Check plan quota
     const [serverRow] = await tx.select({ plan: servers.plan }).from(servers).where(eq(servers.id, serverId));
     const plan = (serverRow?.plan as ServerPlan) || "free";
@@ -66,7 +143,10 @@ export async function registerMachine(serverId: string, userId: string, name: st
     }).returning();
 
     return newMachine;
-  });
+  };
+  const machine = lockedTx
+    ? await register(lockedTx)
+    : await withServerLock(serverId, 2, register);
 
   return { machine, apiKey };
 }
@@ -89,7 +169,10 @@ export async function listMachines(
       runtimes: machines.runtimes,
       hostname: machines.hostname,
       os: machines.os,
+      deviceClass: machines.deviceClass,
       daemonVersion: machines.daemonVersion,
+      computerVersion: machines.computerVersion,
+      computerVersionReportedAt: machines.computerVersionReportedAt,
       lastHeartbeat: machines.lastHeartbeat,
       createdAt: machines.createdAt,
     }).from(machines).where(eq(machines.serverId, serverId)).orderBy(asc(machines.createdAt)),
@@ -169,8 +252,9 @@ export async function renameMachine(machineId: string, name: string) {
 export async function updateMachine(
   machineId: string,
   fields: { name?: string; description?: string | null },
+  options: { executor?: DatabaseExecutor } = {},
 ) {
-  const db = getDb();
+  const db = options.executor ?? getDb();
   const [updated] = await db.update(machines).set(fields).where(eq(machines.id, machineId)).returning();
   return updated;
 }
@@ -181,12 +265,14 @@ export async function updateMachineRuntimes(
   hostname?: string,
   os?: string,
   daemonVersion?: string | null,
+  deviceClass?: DeviceClass | null,
 ) {
   const db = getDb();
   await db.update(machines).set({
     runtimes,
     ...(hostname !== undefined ? { hostname } : {}),
     ...(os !== undefined ? { os } : {}),
+    ...(deviceClass !== undefined ? { deviceClass } : {}),
     ...(daemonVersion !== undefined ? { daemonVersion } : {}),
   }).where(eq(machines.id, machineId));
   if (daemonVersion !== undefined) {
@@ -238,19 +324,21 @@ export async function updateHeartbeat(machineId: string) {
   }).where(eq(machines.id, machineId));
 }
 
-export async function regenerateApiKey(machineId: string) {
-  const db = getDb();
-  clearAuthCache(machineId);
+export async function regenerateApiKey(machineId: string, options: { executor?: DatabaseExecutor } = {}) {
+  const db = options.executor ?? getDb();
   const apiKey = `sk_machine_${randomBytes(32).toString("hex")}`;
   const apiKeyHash = await argon2.hash(apiKey);
   const apiKeyPrefix = extractApiKeyPrefix(apiKey);
   const apiKeyFingerprint = extractApiKeyFingerprint(apiKey);
   await db.update(machines).set({ apiKeyHash, apiKeyPrefix, apiKeyFingerprint }).where(eq(machines.id, machineId));
+  // Evict only after the new hash is written, so a concurrent auth cannot re-cache the old key. Inside a caller's
+  // transaction the caller must evict after that transaction commits.
+  if (!options.executor) clearAuthCache(machineId);
   return apiKey;
 }
 
 /** Prefix-indexed key verification with live authorization state on every call. */
-export async function findMachineByApiKey(apiKey: string) {
+export async function findMachineByApiKey(apiKey: string, argon2Stats?: Argon2VerifyStats) {
   const db = getDb();
   const cached = authCache.get(apiKey);
   if (cached && cached.expiresAt > Date.now()) {
@@ -271,7 +359,7 @@ export async function findMachineByApiKey(apiKey: string) {
   for (const candidate of candidates) {
     let valid: boolean;
     try {
-      valid = await argon2.verify(candidate.apiKeyHash, apiKey);
+      valid = await timedArgon2Verify(candidate.apiKeyHash, apiKey, argon2Stats);
     } catch {
       continue;
     }
@@ -295,8 +383,8 @@ export async function findMachineByApiKey(apiKey: string) {
   return null;
 }
 
-export async function deleteMachine(machineId: string) {
-  const db = getDb();
+export async function deleteMachine(machineId: string, options: { executor?: DatabaseExecutor } = {}) {
+  const db = options.executor ?? getDb();
 
   await db.transaction(async (tx) => {
     // Serialize deletion with migration creation. Migration creation takes the
@@ -387,6 +475,8 @@ export async function deleteMachine(machineId: string) {
       ));
     const completedMoveTargetsByAgent = new Map<string, Set<string>>();
     for (const row of completedMoves) {
+      // A move to hosted leaves the agent on no machine; nothing to match.
+      if (!row.targetMachineId) continue;
       const targets = completedMoveTargetsByAgent.get(row.agentId) ?? new Set<string>();
       targets.add(row.targetMachineId);
       completedMoveTargetsByAgent.set(row.agentId, targets);

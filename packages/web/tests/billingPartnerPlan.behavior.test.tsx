@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import {
   getBillingPlanPresentation,
   getBillingControlsState,
@@ -129,9 +128,9 @@ test("billing plan presentation keeps Partner distinct from Founder, Pro, and Fr
       "billing.limitedTimeFreeJointChannel",
     ],
     notIncludedFeatures: [
+      "billing.agentMigration",
       "billing.higherFileUploadLimits",
       "billing.unlimitedMessageHistory",
-      "billing.unlimitedJointChannels",
       "billing.moreProfessionalFeaturesComingSoon",
     ],
     hasProFeatures: false,
@@ -160,6 +159,7 @@ test("billing plan presentation keeps Partner distinct from Founder, Pro, and Fr
     description: "billing.forBuildersAndTeamsScalingAgentCollaboration",
     includedFeatures: [
       "billing.everythingInFree",
+      "billing.agentMigration",
       "billing.unlimitedMessageHistory",
       "billing.higherFileUploadLimits",
       "billing.unlimitedJointChannels",
@@ -184,6 +184,7 @@ test("billing plan presentation keeps Partner distinct from Founder, Pro, and Fr
     descriptionValues: { count: 1, fraction: "0.1" },
     includedFeatures: [
       "billing.everythingInFree",
+      "billing.agentMigration",
       "billing.unlimitedMessageHistory",
       "billing.higherFileUploadLimits",
       "billing.unlimitedJointChannels",

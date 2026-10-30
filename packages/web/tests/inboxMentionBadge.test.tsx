@@ -1,10 +1,9 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import type { InboxItem } from "../src/store/inboxStore.js";
+import type { InboxItem } from "../src/store/inboxStore";
 import ThreadsInbox from "../src/components/thread/ThreadsInbox";
 import { TestIntlProvider } from "./helpers/intl";
 
@@ -33,15 +32,15 @@ Object.defineProperty(globalThis, "sessionStorage", {
   configurable: true,
 });
 
-const { useInboxStore, getInboxItemKey, decrementInboxGroupCounts, sortInboxGroupsByRecentActivity } = await import("../src/store/inboxStore.js");
-const { useMessageStore } = await import("../src/store/messageStore.js");
-const { useServerStore } = await import("../src/store/serverStore.js");
-const { useThreadStore } = await import("../src/store/threadStore.js");
-const { useAuthStore } = await import("../src/store/authStore.js");
-const { useChannelStore } = await import("../src/store/channelStore.js");
-const { useAgentStore } = await import("../src/store/agentStore.js");
-const { triggerServerReset } = await import("../src/store/serverResetRegistry.js");
-const { default: api } = await import("../src/api/client.js");
+const { useInboxStore, getInboxItemKey, decrementInboxGroupCounts, sortInboxGroupsByRecentActivity } = await import("../src/store/inboxStore");
+const { useMessageStore } = await import("../src/store/messageStore");
+const { useServerStore } = await import("../src/store/serverStore");
+const { useThreadStore } = await import("../src/store/threadStore");
+const { useAuthStore } = await import("../src/store/authStore");
+const { useChannelStore } = await import("../src/store/channelStore");
+const { useAgentStore } = await import("../src/store/agentStore");
+const { triggerServerReset } = await import("../src/store/serverResetRegistry");
+const { default: api } = await import("../src/api/client");
 
 const originalPost = api.post.bind(api);
 const originalGet = api.get.bind(api);
@@ -239,7 +238,8 @@ test("ordinary unread row shows the mention-you badge only when hasMention is tr
   resetInbox([makeChannelItem({ unreadCount: 2, hasMention: true, firstMentionMessageId: "message-1" })]);
   renderInbox();
   const badge = screen.getByTestId("inbox-mention-badge");
-  assert.equal(badge.getAttribute("title"), "Unread messages mention you");
+  assert.equal(badge.getAttribute("title"), null);
+  assert.ok(badge.hasAttribute("data-base-ui-tooltip-trigger"), "mention badge hint now rides the RUI tooltip trigger");
   assert.match(badge.textContent ?? "", /you/);
   cleanup();
 
@@ -255,10 +255,16 @@ test("mentions filter hides the redundant mention-you badge", () => {
   assert.equal(screen.queryByTestId("inbox-mention-badge"), null);
 });
 
-// Independent of raft-ui Badge recipes in product source. Brutal
-// outline+muted currently renders these tokens; shrinking or swapping the
-// production pairing must still fail this expected set.
-const EXPECTED_DRAFT_BADGE_TOKENS = ["bg-transparent", "text-secondary-900"] as const;
+// Independent of raft-ui Badge recipes in product source. Raft
+// outline+muted renders these tokens (transparent fill, muted text, hairline
+// inset edge); shrinking or swapping the production pairing must still fail
+// this expected set.
+const EXPECTED_DRAFT_BADGE_TOKENS = [
+  "bg-transparent",
+  "text-foreground-muted",
+  "inset-ring",
+  "inset-ring-line-hairline",
+] as const;
 
 test("thread inbox row surfaces a local thread draft as a muted outline badge", () => {
   const threadItem = makeThreadItem({ unreadCount: 0, hasMention: false });
@@ -267,7 +273,8 @@ test("thread inbox row surfaces a local thread draft as a muted outline badge", 
   renderInbox();
   const draft = screen.getByTestId("inbox-thread-draft-badge");
   assert.equal(draft.getAttribute("aria-label"), "Thread has an unsent draft");
-  assert.equal(draft.getAttribute("title"), "Thread has an unsent draft");
+  assert.equal(draft.getAttribute("title"), null);
+  assert.ok(draft.hasAttribute("data-base-ui-tooltip-trigger"), "draft badge hint now rides the RUI tooltip trigger");
   for (const token of EXPECTED_DRAFT_BADGE_TOKENS) {
     assert.match(
       draft.className,
@@ -1165,7 +1172,9 @@ test("thread read canonical reconcile cannot publish a parked server A response 
   }>();
   let inboxLoads = 0;
   api.post = (() => persisted.promise) as typeof api.post;
-  api.get = (() => {
+  api.get = ((url: string) => {
+    // Server reset also refreshes announcements; only inbox reads own this counter.
+    if (url.startsWith("/announcements")) return Promise.resolve({ data: { announcements: [] } });
     inboxLoads += 1;
     return inboxResponse.promise;
   }) as typeof api.get;
@@ -2819,8 +2828,9 @@ test("stale inbox filter response cannot overwrite the current filter view", asy
   const allResponse = deferred<{ data: { items: InboxItem[]; hasMore: boolean; totalCount: number; totalUnreadCount: number } }>();
   const requestedFilters: string[] = [];
 
-  api.get = ((url: string, config?: { params?: { filter?: string } }) => {
+  api.get = ((url: string, config?: { params?: { filter?: string; limit?: number } }) => {
     if (url !== "/channels/inbox") return Promise.resolve({ data: {} });
+    if (config?.params?.limit === 1) return Promise.resolve({ data: { totalCount: 1 } });
     const filter = config?.params?.filter ?? "all";
     requestedFilters.push(filter);
     if (filter === "unread") return unreadResponse.promise;
@@ -2875,8 +2885,9 @@ test("stale inbox channel response cannot overwrite the current channel facet", 
   const allResponse = deferred<GroupResponse>();
   const requestedChannelIds: Array<string | undefined> = [];
 
-  api.get = ((url: string, config?: { params?: { channelId?: string } }) => {
+  api.get = ((url: string, config?: { params?: { channelId?: string; limit?: number } }) => {
     if (url !== "/channels/inbox") return Promise.resolve({ data: {} });
+    if (config?.params?.limit === 1) return Promise.resolve({ data: { totalCount: 1 } });
     const channelId = config?.params?.channelId;
     requestedChannelIds.push(channelId);
     return channelId === "selected-channel" ? selectedResponse.promise : allResponse.promise;

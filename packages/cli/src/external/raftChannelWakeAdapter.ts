@@ -1,15 +1,17 @@
+import type {
+  ExternalAgentAdapterFailure,
+  ExternalAgentWakeAdapter,
+  ExternalAgentWakeAttemptInput,
+  ExternalAgentWakeEventEnvelope,
+  ExternalRuntimeIntegrationManifest,
+} from "@botiverse/raft-shared";
 import {
   EXTERNAL_AGENT_COMMS_PROTOCOL_VERSION,
   EXTERNAL_AGENT_PROOF_SCHEMA_VERSION,
   EXTERNAL_RUNTIME_INTEGRATION_MANIFEST_SCHEMA,
   validateExternalAgentWakeEventEnvelope,
   validateExternalRuntimeIntegrationManifest,
-  type ExternalAgentAdapterFailure,
-  type ExternalAgentWakeAdapter,
-  type ExternalAgentWakeAttemptInput,
-  type ExternalAgentWakeEventEnvelope,
-  type ExternalRuntimeIntegrationManifest,
-} from "@botiverse/raft-shared";
+} from "@botiverse/raft-shared/src/agentCliSurface";
 
 export const RAFT_CHANNEL_WAKE_PROTOCOL = "raft-channel.v0" as const;
 

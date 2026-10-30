@@ -72,7 +72,12 @@ export function buildFetchDispatcher(
   const cached = fetchDispatcherCache.get(proxyUrl);
   if (cached) return cached;
 
-  const dispatcher = new ProxyAgent(proxyUrl);
+  const dispatcher = new ProxyAgent({
+    uri: proxyUrl,
+    // undici 8 forwards plain-http requests to the proxy without CONNECT
+    // unless asked; keep 7.x's tunnel-everything behavior (as the daemon does).
+    proxyTunnel: true,
+  });
   fetchDispatcherCache.set(proxyUrl, dispatcher);
   return dispatcher;
 }

@@ -1,13 +1,13 @@
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { test } from "vitest";
 import assert from "node:assert/strict";
 import {
   deleteWorkspaceDirectory,
   resolveWorkspaceDirectoryPath,
   scanWorkspaceDirectories,
-} from "./workspaces.js";
+  workspaceDisplayPath,
+} from "./workspaces";
 
 test("scanWorkspaceDirectories summarizes workspace directories recursively", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "daemon-workspaces-"));
@@ -37,6 +37,7 @@ test("scanWorkspaceDirectories summarizes workspace directories recursively", as
     assert.ok(second);
     assert.equal(second.fileCount, 1);
     assert.equal(second.totalSizeBytes, 1);
+    assert.equal(second.displayPath, workspaceDisplayPath(secondDir));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -61,4 +62,58 @@ test("deleteWorkspaceDirectory removes only valid workspace directories", async 
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+// The blocklist that used to guard this rejected "/", "\\" and ".." -- every traversal
+// string and nothing else. "." and "" are neither traversal nor a child: path.join
+// collapses both to dataDir itself, so a request naming ONE workspace deleted the root
+// holding EVERY agent workspace on the machine, and returned the same success as an
+// ordinary delete.
+//
+// These cases are why the guard is now a containment assertion rather than a longer
+// blocklist. A blocklist can only reject the inputs its author thought of, and here the
+// failure mode is silent, total and irreversible.
+test("resolveWorkspaceDirectoryPath rejects names that resolve to the root itself", () => {
+  assert.equal(resolveWorkspaceDirectoryPath("/tmp/daemon", "."), null);
+  assert.equal(resolveWorkspaceDirectoryPath("/tmp/daemon", ""), null);
+  assert.equal(resolveWorkspaceDirectoryPath("/tmp/daemon", "./"), null);
+  assert.equal(resolveWorkspaceDirectoryPath("/tmp/daemon", "agent-1/.."), null);
+  // Must not over-reject: these are still ordinary children.
+  assert.equal(resolveWorkspaceDirectoryPath("/tmp/daemon", "agent-1"), path.join("/tmp/daemon", "agent-1"));
+  assert.equal(resolveWorkspaceDirectoryPath("/tmp/daemon", ".hidden-agent"), path.join("/tmp/daemon", ".hidden-agent"));
+  // Deliberate, and the one behaviour the containment guard widens: the old blocklist
+  // rejected this purely because it contains "/". It names the same directory as
+  // "agent-1" and resolves one level below the root, so it is accepted now. Pinned here
+  // so the change is a decision on the record rather than a side effect.
+  assert.equal(resolveWorkspaceDirectoryPath("/tmp/daemon", "agent-1/"), path.join("/tmp/daemon", "agent-1"));
+});
+
+test("deleteWorkspaceDirectory leaves the root intact when asked to delete '.'", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "daemon-workspaces-root-"));
+  try {
+    const targetDir = path.join(root, "agent-keep");
+    await mkdir(targetDir);
+    await writeFile(path.join(targetDir, "notes.md"), "must survive");
+
+    assert.equal(await deleteWorkspaceDirectory(root, "."), false);
+    assert.equal(await deleteWorkspaceDirectory(root, ""), false);
+
+    // The assertion with teeth. `false` alone is not the property that matters --
+    // what matters is that the root and its contents are still there afterwards.
+    assert.deepEqual(
+      (await scanWorkspaceDirectories(root)).map((d) => d.directoryName),
+      ["agent-keep"],
+      "deleting '.' must not remove every workspace on the machine",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("workspace display paths are ~-relative under the user's home, absolute elsewhere", () => {
+  assert.equal(workspaceDisplayPath("/home/alice/.raft/agents/a1", "/home/alice"), "~/.raft/agents/a1/");
+  assert.equal(workspaceDisplayPath("/home/alice/.slock/agents/a1", "/home/alice"), "~/.slock/agents/a1/");
+  assert.equal(workspaceDisplayPath("/srv/raft/agents/a1", "/home/alice"), "/srv/raft/agents/a1/");
+  // A sibling that merely shares the prefix is not under the home.
+  assert.equal(workspaceDisplayPath("/home/alice2/agents/a1", "/home/alice"), "/home/alice2/agents/a1/");
 });

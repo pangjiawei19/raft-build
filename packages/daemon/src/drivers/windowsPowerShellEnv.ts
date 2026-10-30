@@ -1,7 +1,9 @@
+import { ambientProcessEnv } from "../processEnvPatch";
+
 export function createWindowsPowerShellChildEnv(
   env: NodeJS.ProcessEnv | undefined,
 ): NodeJS.ProcessEnv {
-  const childEnv = { ...(env ?? process.env) };
+  const childEnv = { ...(env ?? ambientProcessEnv()) };
   // PowerShell 7 exports a module path that can break Windows PowerShell 5.1 startup.
   // Omitting it lets the child initialize the module path for its own edition.
   for (const key of Object.keys(childEnv)) {

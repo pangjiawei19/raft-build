@@ -20,28 +20,62 @@
 //     the inverse of StartService's NEVER-SIGKILL invariant. Stop owns
 //     the service termination path; everything else (terminal close,
 //     UI close, Electron quit) MUST leave the service running.
-//   - AbortSignal honored before the SIGTERM call; once the signal is
-//     sent the service's lifecycle is committed and the wait-for-exit
-//     loop respects abort by returning early (status="stopped" if dead,
-//     re-throwing AbortError if still alive — abort never SIGKILLs).
+//   - AbortSignal honored before the best-effort host-lifecycle record. After
+//     it, stop proceeds to SIGTERM without reopening
+//     an abort gap. The wait-for-exit loop respects abort by returning early
+//     (status="stopped" if dead, re-throwing AbortError if still alive — abort
+//     never SIGKILLs).
 import {
   clearPidfileAt,
   isProcessAlive,
   readPidfileAt,
-} from "../internal/process-primitives.js";
-import { findLiveServicePid } from "../internal/service-pid-fallback.js";
-import type { ComputerApiEvent } from "../lib/events.js";
-import { ComputerServiceError } from "./errors.js";
-import { servicePidPath } from "../paths.js";
+  writePidfileAt,
+} from "../internal/process-primitives";
+import { findLiveServicePid } from "../internal/service-pid-fallback";
+import { connectService } from "../lib/ipc-client";
+import type { ComputerApiEvent } from "../lib/events";
+import { ComputerServiceError } from "./errors";
+import { servicePidPath } from "../paths";
+import {
+  describeSupervisorUnreachable,
+  inspectSupervisor,
+  runSystemctl,
+  type SupervisorInspection,
+  type SystemctlRunner,
+} from "../externalSupervisor";
 import { currentTimeMs } from "@botiverse/raft-shared";
 import {
   convergeCliHostLifecycle,
-  resolveStableDispatcherPath,
+  hostLifecycleSkipped,
   type MacosHostLifecycleDeps,
-} from "../macosLoginCarrier.js";
+} from "../macosLoginCarrier";
 
 const STOP_POLL_INTERVAL_MS = 200;
 const STOP_TIMEOUT_MS = 5000;
+/** Bound for asking a service that still answers on the IPC endpoint who it is. */
+const STOP_IPC_PROBE_TIMEOUT_MS = 1000;
+
+/**
+ * Ask whoever answers on the service IPC endpoint for its live pid
+ * (`machine-attestation` reports `process.pid` of the answering service).
+ * Used when the pidfile names a dead process: after a failed self-restart
+ * the pidfile can point at the killed replacement while the incumbent
+ * service still owns the endpoint and its runners (task #912). Returns null
+ * when nothing answers or the answer is unusable; never throws.
+ */
+async function probeLiveServicePidViaIpc(slockHome: string): Promise<number | null> {
+  let client: Awaited<ReturnType<typeof connectService>> | null = null;
+  try {
+    client = await connectService(slockHome, { timeoutMs: STOP_IPC_PROBE_TIMEOUT_MS });
+    const attestation = await client.request("machine-attestation", undefined, { timeoutMs: STOP_IPC_PROBE_TIMEOUT_MS });
+    const pid = attestation?.servicePid;
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  } finally {
+    await client?.close().catch(() => undefined);
+  }
+}
 
 export interface StopInput {
   /** Reserved for future per-server stop. Unused in v0; the root stop
@@ -86,6 +120,14 @@ export interface StopDeps {
   signal?: AbortSignal;
   convergeHostLifecycle?: typeof convergeCliHostLifecycle;
   hostLifecycleDeps?: MacosHostLifecycleDeps;
+  /** Test seam for the IPC identity probe used when the pidfile is stale.
+   *  Defaults to `machine-attestation` over the service endpoint. */
+  probeLiveServicePid?: (slockHome: string) => Promise<number | null>;
+  /** Test seam for re-registering a pid the IPC probe found. */
+  writePidfile?: typeof writePidfileAt;
+  /** task #917 seams: the systemd unit (if any) that owns the service, and systemctl. */
+  inspectSupervisor?: (slockHome: string) => Promise<SupervisorInspection | null>;
+  systemctl?: SystemctlRunner;
 }
 
 export interface StopOptions extends StopDeps {
@@ -110,18 +152,18 @@ export async function stop(
   options.signal?.throwIfAborted?.();
 
   const { slockHome } = input;
+  // Best effort: a host-lifecycle failure never blocks the stop.
   const disableHostLifecycle = async (): Promise<void> => {
     if ((input.hostLifecycleOwner ?? "none") === "none") return;
-    const hostDeps = { ...(options.hostLifecycleDeps ?? {}) };
-    if (hostDeps.platform === undefined) hostDeps.platform = process.platform;
-    if (hostDeps.platform === "darwin" && hostDeps.dispatcherPath === undefined) {
-      hostDeps.dispatcherPath = resolveStableDispatcherPath(slockHome);
+    try {
+      await (options.convergeHostLifecycle ?? convergeCliHostLifecycle)(
+        slockHome,
+        "disabled",
+        options.hostLifecycleDeps ?? {},
+      );
+    } catch (error) {
+      emit(options, hostLifecycleSkipped("stop", error));
     }
-    await (options.convergeHostLifecycle ?? convergeCliHostLifecycle)(
-      slockHome,
-      "disabled",
-      hostDeps,
-    );
   };
   const readPidfile = options.readPidfile ?? readPidfileAt;
   const isAlive = options.isProcessAlive ?? isProcessAlive;
@@ -151,11 +193,26 @@ export async function stop(
   // alone (instead of by liveness) would let a stale current pidfile
   // mask a still-live legacy service — see
   // `internal/service-pid-fallback.ts` doc-comment.
-  const { pid, pidfilePath, firstStalePidfile, firstStalePid } =
-    await findLiveServicePid(slockHome, {
-      readPidfile,
-      isProcessAlive: isAlive,
-    });
+  const walk = await findLiveServicePid(slockHome, {
+    readPidfile,
+    isProcessAlive: isAlive,
+  });
+  const { pidfilePath, firstStalePidfile, firstStalePid } = walk;
+  let pid = walk.pid;
+  options.signal?.throwIfAborted?.();
+
+  // 0. The pidfile named nothing alive, but a service may still own the IPC
+  //    endpoint: after a failed self-restart the pidfile can carry the killed
+  //    replacement's pid while the incumbent keeps running with its runners
+  //    (task #912). Ask the endpoint who answers; a live answer is the
+  //    service to stop, and it gets its pidfile back so later reads agree.
+  if (pid === null) {
+    const probed = await (options.probeLiveServicePid ?? probeLiveServicePidViaIpc)(slockHome);
+    if (probed !== null && isAlive(probed)) {
+      pid = probed;
+      await (options.writePidfile ?? writePidfileAt)(pidfilePath, probed).catch(() => undefined);
+    }
+  }
   options.signal?.throwIfAborted?.();
 
   emit(options, { kind: "stop.stopping", pid });
@@ -181,28 +238,52 @@ export async function stop(
   }
 
   // 3. Pre-signal AbortSignal check (last opportunity before we commit
-  //    to terminating the service). Once SIGTERM is sent the
-  //    service's lifecycle is committed and an in-flight abort can
-  //    only race with the natural exit.
+  //    to terminating the service).
   options.signal?.throwIfAborted?.();
 
-  // 4. Send SIGTERM. The service's signal handler clears its own
-  //    pidfile + process.exit(0). We poll for liveness rather than
-  //    pidfile-absence because pidfile clear is best-effort during
-  //    emergency shutdown.
-  try {
-    killer(pid);
-  } catch (err) {
-    const cause = err instanceof Error ? err : new Error(String(err));
+  // 4. Record the disabled host lifecycle (best effort, never blocks).
+  await disableHostLifecycle();
+
+  // 5. task #917: when a systemd unit owns this very pid, the stop goes
+  //    through systemd. A SIGTERM from here would be answered by the unit's
+  //    Restart= policy with a relaunch, and the unit would never learn the
+  //    operator meant "stay stopped". An unreachable manager is reported, never
+  //    worked around (archer: no fallback to acting beside the unit).
+  const supervision = await (options.inspectSupervisor ?? ((home: string) => inspectSupervisor(home, { systemctl: options.systemctl })))(slockHome);
+  if (supervision && !supervision.reachable) {
     throw new ComputerServiceError(
-      "STOP_SIGNAL_FAILED",
-      `Failed to send SIGTERM to service (pid ${pid}): ${cause.message}. Check process permissions or run: kill ${pid}`,
-      err,
+      "STOP_SUPERVISOR_UNREACHABLE",
+      describeSupervisorUnreachable(supervision.record, "systemctl did not answer"),
     );
   }
-  emit(options, { kind: "stop.signaled", pid });
+  if (supervision && supervision.unitLoaded && supervision.mainPid === pid) {
+    const result = await (options.systemctl ?? runSystemctl)(supervision.record.scope, ["stop", supervision.record.unit]);
+    if (result.code !== 0) {
+      throw new ComputerServiceError(
+        "STOP_SUPERVISOR_FAILED",
+        describeSupervisorUnreachable(supervision.record, `\`systemctl stop ${supervision.record.unit}\` exited ${result.code ?? "without a code"}: ${result.stderr.trim() || result.stdout.trim() || "no output"}`),
+      );
+    }
+    emit(options, { kind: "stop.signaled", pid });
+  } else {
+    // Send SIGTERM. The service's signal handler clears its own
+    // pidfile + process.exit(0). We poll for liveness rather than
+    // pidfile-absence because pidfile clear is best-effort during
+    // emergency shutdown.
+    try {
+      killer(pid);
+    } catch (err) {
+      const cause = err instanceof Error ? err : new Error(String(err));
+      throw new ComputerServiceError(
+        "STOP_SIGNAL_FAILED",
+        `Failed to send SIGTERM to service (pid ${pid}): ${cause.message}. Check process permissions or run: kill ${pid}`,
+        err,
+      );
+    }
+    emit(options, { kind: "stop.signaled", pid });
+  }
 
-  // 5. Wait for the service to exit. AbortSignal aborts the wait
+  // 6. Wait for the service to exit. AbortSignal aborts the wait
   //    early but does NOT escalate to SIGKILL — the kill is already
   //    in flight, and StopService's contract is "ask politely with
   //    SIGTERM then time out", not "force-kill".
@@ -215,7 +296,6 @@ export async function stop(
       options.signal?.throwIfAborted?.();
       await clearPidfileAt(pidfilePath);
       options.signal?.throwIfAborted?.();
-      await disableHostLifecycle();
       emit(options, { kind: "stop.stopped", pid });
       return { status: "stopped", pid, pidfilePath };
     }

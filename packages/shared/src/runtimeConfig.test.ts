@@ -1,4 +1,3 @@
-import test from "node:test";
 import assert from "node:assert/strict";
 import {
   buildLaunchPlan,
@@ -9,7 +8,7 @@ import {
   runtimeConfigToLaunchFields,
   stripControlledRuntimeEnvVars,
   type ReasoningEffort,
-} from "./index.js";
+} from "./index";
 
 test("hydrates legacy Claude env vars into structured provider config", () => {
   const config = hydrateRuntimeConfig({
@@ -940,11 +939,12 @@ test("legacy hydration sanitizes nested unknown variant fields with the parser f
   assert.equal(JSON.stringify(launch).includes("should-not-survive"), false);
 });
 
-test("write validation gates reasoning effort per preset model — max/ultra can't leak to Claude (task #496)", () => {
+test("write validation gates reasoning effort per preset model — ultra can't leak to Claude, max only where declared (task #496)", () => {
   // parseRuntimeConfig is the strict WRITE validator (create/update). The real form
-  // sends a structured `{ kind: "preset", id }` model. Claude declares no
-  // supportedReasoningEfforts → BASE set, so a max/ultra effort (Codex-GPT-5.6-only)
-  // must fail-closed to null rather than persist, even though the raw enum accepts it.
+  // sends a structured `{ kind: "preset", id }` model. Claude models declare
+  // low..max (Claude Code's `--effort`), never ultra; Haiku 4.5 declares nothing and
+  // keeps the BASE set. An undeclared effort must fail-closed to null rather than
+  // persist, even though the raw enum accepts it.
   const parsePreset = (runtime: string, modelId: string, reasoningEffort: ReasoningEffort, provider?: unknown) => {
     const r = parseRuntimeConfig({
       runtimeConfig: {
@@ -961,7 +961,9 @@ test("write validation gates reasoning effort per preset model — max/ultra can
     return r.config.reasoningEffort;
   };
   assert.equal(parsePreset("claude", "sonnet", "ultra", { kind: "default" }), null);
-  assert.equal(parsePreset("claude", "sonnet", "max", { kind: "default" }), null);
+  assert.equal(parsePreset("claude", "sonnet", "max", { kind: "default" }), "max");
+  assert.equal(parsePreset("claude", "claude-opus-5-5", "max", { kind: "default" }), "max");
+  assert.equal(parsePreset("claude", "claude-haiku-4-5", "max", { kind: "default" }), null);
   // A base-level effort on Claude is preserved.
   assert.equal(parsePreset("claude", "sonnet", "high", { kind: "default" }), "high");
   // Codex Astra and GPT-5.6 sol DECLARE ultra via supportedReasoningEfforts → it is kept;
@@ -969,6 +971,12 @@ test("write validation gates reasoning effort per preset model — max/ultra can
   assert.equal(parsePreset("codex", "gpt-6-astra", "ultra"), "ultra");
   assert.equal(parsePreset("codex", "gpt-5.6-sol", "ultra"), "ultra");
   assert.equal(parsePreset("codex", "gpt-5.6-luna", "ultra"), null);
+  // GPT-6.1 Sol and GPT-6 Sol declare max/ultra; GPT-6 Luna stops at max.
+  assert.equal(parsePreset("codex", "gpt-6.1-sol", "ultra"), "ultra");
+  assert.equal(parsePreset("codex", "gpt-6.1-sol", "max"), "max");
+  assert.equal(parsePreset("codex", "gpt-6-sol", "ultra"), "ultra");
+  assert.equal(parsePreset("codex", "gpt-6-luna", "max"), "max");
+  assert.equal(parsePreset("codex", "gpt-6-luna", "ultra"), null);
 });
 
 test("Kimi keeps live-declared open effort values without inheriting another model's defaults", () => {
@@ -1028,4 +1036,80 @@ test("malformed Built-in runtimeConfig hydrates without inventing a provider", (
 
   assert.equal(config.runtime, "builtin");
   assert.equal("provider_id" in trace, false);
+});
+
+test("Built-in local plugins opt-in survives writes and launch hydration without changing provider configuration", () => {
+  const base = {
+    version: 1,
+    runtime: "builtin",
+    provider: { kind: "gateway", providerId: "openai-compatible", baseUrl: "http://localhost:9876/v1", apiKey: "test-key" },
+    model: { kind: "custom", name: "test-model" },
+    mode: { kind: "default" },
+  };
+  for (const enabled of [undefined, false, true]) {
+    const runtimeConfig = { ...base, ...(enabled !== undefined ? { loadLocalPlugins: enabled } : {}) };
+    const parsed = parseRuntimeConfig({ runtimeConfig });
+    assert.equal(parsed.ok, true);
+    if (!parsed.ok || parsed.config.runtime !== "builtin") throw new Error("Expected Built-in config");
+    assert.equal(parsed.config.loadLocalPlugins, enabled);
+    const hydrated = hydrateRuntimeConfig({ runtimeConfig: parsed.config });
+    assert.equal(hydrated.runtime, "builtin");
+    assert.ok(hydrated.runtime === "builtin");
+    assert.equal(hydrated.loadLocalPlugins, enabled);
+    assert.deepEqual(hydrated.provider, parsed.config.provider);
+    assert.equal(hydrated.hostUserState, "forbidden");
+  }
+  assert.equal(parseRuntimeConfig({ runtimeConfig: { ...base, loadLocalPlugins: "true" } }).ok, false);
+  assert.equal(parseRuntimeConfig({ runtimeConfig: { ...base, runtime: "pi", loadLocalPlugins: true } }).ok, false);
+});
+
+// artin 2026-09-27: every installed mobile client failed to save a model (PATCH
+// 400 "runtimeConfig.loadLocalPlugins must be a boolean"). The mobile PATCH
+// encoder (kotlinx.serialization, encodeDefaults + explicit nulls) sends every
+// optional field, unset ones as null. These are the exact wire shapes.
+const MOBILE_NULLS = { reasoningEffort: null, envVars: null, command: null, loadLocalPlugins: null, hostUserState: null };
+
+test("mobile-serialized runtime configs with null optional fields are accepted", () => {
+  const claude = parseRuntimeConfig({
+    runtimeConfig: {
+      version: 1,
+      runtime: "claude",
+      provider: { kind: "default" },
+      model: { kind: "preset", id: "sonnet" },
+      mode: { kind: "default" },
+      ...MOBILE_NULLS,
+    },
+  });
+  assert.equal(claude.ok, true, JSON.stringify(claude));
+
+  const builtin = parseRuntimeConfig({
+    runtimeConfig: {
+      version: 1,
+      runtime: "builtin",
+      provider: { kind: "gateway", providerId: "openai-compatible", baseUrl: "http://localhost:9876/v1", apiKey: "k", supportsImageInput: false },
+      model: { kind: "custom", name: "test-model" },
+      mode: { kind: "default" },
+      ...MOBILE_NULLS,
+    },
+  });
+  assert.equal(builtin.ok, true, JSON.stringify(builtin));
+  if (!builtin.ok || builtin.config.runtime !== "builtin") throw new Error("Expected Built-in config");
+  // A null never turns local extensions on.
+  assert.equal(builtin.config.loadLocalPlugins, undefined);
+  assert.equal(builtin.config.hostUserState, "forbidden");
+});
+
+test("only null is read as unset: wrong types for the two optional fields are still refused", () => {
+  const base = {
+    version: 1,
+    runtime: "builtin",
+    provider: { kind: "gateway", providerId: "openai-compatible", baseUrl: "http://localhost:9876/v1", apiKey: "k" },
+    model: { kind: "custom", name: "test-model" },
+    mode: { kind: "default" },
+  };
+  for (const bad of ["true", 1, 0, {}]) {
+    assert.equal(parseRuntimeConfig({ runtimeConfig: { ...base, loadLocalPlugins: bad } }).ok, false, JSON.stringify(bad));
+  }
+  assert.equal(parseRuntimeConfig({ runtimeConfig: { ...base, hostUserState: "allowed" } }).ok, false);
+  assert.equal(parseRuntimeConfig({ runtimeConfig: { ...base, runtime: "claude", provider: { kind: "default" }, model: { kind: "preset", id: "sonnet" }, loadLocalPlugins: false } }).ok, false);
 });

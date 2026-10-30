@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 // The page now calls useIntl(), so every mount needs the intl context. Using the
@@ -90,7 +89,7 @@ test("verified password users get identity previews for channel and profile impa
   // it). Both used to be asserted absent, back when this page owned its own frame.
   assert.ok(container.querySelector("aside"));
   const previewPane = screen.getByTestId("identity-preview-pane");
-  assert.ok(previewPane.className.includes("bg-brutal-cream"));
+  assert.ok(previewPane.className.includes("bg-layer-frame"));
   assert.ok(previewPane.innerHTML.includes("radial-gradient"));
   assert.ok(screen.getByTestId("identity-impact-preview"));
   assert.ok(screen.getByTestId("identity-channel-preview"));

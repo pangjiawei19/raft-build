@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import {
   CHANNEL_ADMIN_CAPABILITIES,
   CHANNEL_MANAGEMENT_CAPABILITIES,
@@ -9,7 +8,9 @@ import {
   canGuestReadChannel,
   getChannelAdminBasis,
   hasEffectiveChannelCapability,
-} from "./channelPermissions.js";
+  JOINT_CHANNEL_ADMIN_CAPABILITIES,
+  channelSupportsRoles,
+} from "./channelPermissions";
 
 test("stored channel admin grants only the closed local capability set", () => {
   for (const capability of CHANNEL_ADMIN_CAPABILITIES) {
@@ -19,6 +20,7 @@ test("stored channel admin grants only the closed local capability set", () => {
       isChannelMember: true,
       supportsChannelRoles: true,
       capability,
+      channelType: "channel",
     }), true, capability);
   }
 
@@ -29,8 +31,29 @@ test("stored channel admin grants only the closed local capability set", () => {
       isChannelMember: true,
       supportsChannelRoles: true,
       capability,
+      channelType: "channel",
     }), false, capability);
   }
+});
+
+test("a stored admin on a joint channel grants only the joint allowlist", () => {
+  for (const capability of CHANNEL_ADMIN_CAPABILITIES) {
+    assert.equal(hasEffectiveChannelCapability({
+      serverRole: "member",
+      channelRole: "admin",
+      isChannelMember: true,
+      supportsChannelRoles: true,
+      capability,
+      channelType: "joint",
+    }), (JOINT_CHANNEL_ADMIN_CAPABILITIES as readonly string[]).includes(capability), capability);
+  }
+  assert.deepEqual([...JOINT_CHANNEL_ADMIN_CAPABILITIES], ["editChannelMetadata", "changeChannelMemberRoles"]);
+});
+
+test("channel roles exist on public, private and joint channels, never on #all", () => {
+  for (const type of ["channel", "private", "joint"]) assert.equal(channelSupportsRoles(type, "room"), true, type);
+  for (const type of ["dm", "thread"]) assert.equal(channelSupportsRoles(type, "room"), false, type);
+  assert.equal(channelSupportsRoles("channel", "all"), false);
 });
 
 test("Guest role rejects stale stored channel-admin grants", () => {
@@ -41,6 +64,7 @@ test("Guest role rejects stale stored channel-admin grants", () => {
       isChannelMember: true,
       supportsChannelRoles: true,
       capability,
+      channelType: "channel",
     }), false, capability);
   }
 
@@ -130,7 +154,7 @@ test("channel projection includes local and server-only management capabilities"
   ]);
 });
 
-test("guest channel policy separates read, join, and post authority", () => {
+test("guest channel policy separates read and join from fixed read-only post authority", () => {
   const base = {
     gateEnabled: true,
     serverRole: "guest" as const,
@@ -145,7 +169,7 @@ test("guest channel policy separates read, join, and post authority", () => {
   assert.equal(canGuestReadChannel(base), true);
   assert.equal(canGuestJoinChannel(base), true);
   assert.equal(canGuestPostToChannel(base), false);
-  assert.equal(canGuestPostToChannel({ ...base, isChannelMember: true }), true);
+  assert.equal(canGuestPostToChannel({ ...base, isChannelMember: true }), false);
 });
 
 test("guest channel policy fails closed for rollout, shape, archive, and hidden all boundaries", () => {
@@ -169,7 +193,8 @@ test("guest channel policy fails closed for rollout, shape, archive, and hidden 
   assert.equal(canGuestReadChannel({ ...base, channelType: "private", isChannelMember: false }), false);
   assert.equal(canGuestReadChannel({ ...base, channelType: "private", isChannelMember: true }), true);
   assert.equal(canGuestReadChannel({ ...base, channelType: "dm", isChannelMember: true }), true);
-  assert.equal(canGuestPostToChannel({ ...base, channelType: "dm", isChannelMember: true }), true);
+  assert.equal(canGuestPostToChannel({ ...base, channelType: "dm", isChannelMember: true }), false);
+  assert.equal(canGuestPostToChannel({ ...base, channelType: "private", isChannelMember: true }), false);
   assert.equal(canGuestPostToChannel({ ...base, archived: true, isChannelMember: true }), false);
 });
 
@@ -203,6 +228,7 @@ test("local role never bypasses membership or unsupported channel shape", () => 
       serverRole: "member",
       channelRole: "admin",
       capability: "archiveChannels",
+      channelType: "channel",
       ...input,
     }), false);
   }

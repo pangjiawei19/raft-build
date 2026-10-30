@@ -1,9 +1,17 @@
 import { ChevronRight, Hash, LockKeyhole } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
+import {
+  PanelHeader,
+  PanelHeaderContent,
+  PanelHeaderIcon,
+  PanelTitle,
+  SidebarHeader,
+} from "@botiverse/raft-ui";
 import { RAFT_APP_SERVER_PATH_PREFIX } from "../../brand/constants";
 import AvatarSlot from "../ui/AvatarSlot";
+import SectionEyebrow from "../ui/SectionEyebrow";
 
 import type { MessageId } from "../../i18n/messages";
 
@@ -60,11 +68,11 @@ function SectionLabel({
   const { formatMessage } = useIntl();
   const labelText = formatMessage({ id: labelId });
   return (
-    <div className="mb-1 mt-3 flex h-6 items-center justify-between px-2">
-      <button
-        type="button"
+    <div className="mb-1 mt-3 flex h-7 items-center justify-between px-2">
+      <SectionEyebrow
+        as="button"
         onClick={onToggle}
-        className="flex min-w-0 items-center gap-1.5 text-[11px] font-bold uppercase tracking-[0.08em] text-black transition-transform hover:-translate-y-px focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black active:translate-x-px active:translate-y-px"
+        className="-mx-1 flex min-w-0 items-center gap-1.5 rounded-control px-1 py-0.5 outline-none hover:bg-fill-pressed focus-visible:shadow-focus active:bg-fill-pressed"
         // Was aria-label={`${label} section`}. Blank the hole and the residue is
         // " section" — a single lowercase word that no prose heuristic can tell
         // from code, which is exactly why the shared scanner grew a positional
@@ -75,16 +83,16 @@ function SectionLabel({
         data-testid={testId}
       >
         <ChevronRight
-          size={12}
-          strokeWidth={3}
+          size={14}
+          strokeWidth={2}
           className={`shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`}
           aria-hidden="true"
         />
         <span>{labelText}</span>
-        <span className="font-mono text-[11px] font-bold normal-case tracking-normal text-black/40">
+        <span className="font-mono text-mono-meta font-normal">
           {count}
         </span>
-      </button>
+      </SectionEyebrow>
     </div>
   );
 }
@@ -102,13 +110,13 @@ function SidebarRow({
 }) {
   return (
     <div
-      className={`flex min-h-8 items-center gap-1.5 border-2 px-2 py-1.5 text-xs ${
+      className={`flex min-h-8 items-center gap-1.5 rounded-control border-[1.5px] px-2 py-1 text-footnote ${
         active
-          ? "border-black bg-brutal-pink font-bold shadow-brutal-sm"
-          : "border-transparent font-medium"
+          ? "border-sticker-ink bg-brand font-bold text-sticker-ink"
+          : "border-transparent font-medium text-foreground"
       }`}
     >
-      {hash ? <span className="text-black/45">#</span> : null}
+      {hash ? <span className={active ? "text-sticker-ink" : "text-foreground-hint"}>#</span> : null}
       {avatar}
       <span className="truncate">{children}</span>
     </div>
@@ -131,13 +139,13 @@ function MessageRow({
     <div className="flex items-start gap-2.5">
       {avatar}
       <div className="min-w-0">
-        <div className="text-xs font-bold text-black">
-          {name}
-          <span className="ml-1.5 font-mono text-[9.5px] font-bold text-black/40">
+        <div className="flex min-w-0 items-baseline gap-1.5">
+          <span className="text-footnote font-bold text-foreground">{name}</span>
+          <span className="truncate text-caption text-foreground-hint">
             {label}
           </span>
         </div>
-        <div className="mt-0.5 text-xs leading-5 text-black/80">{children}</div>
+        <div className="mt-0.5 text-callout text-foreground">{children}</div>
       </div>
     </div>
   );
@@ -157,25 +165,31 @@ export default function ServerCreatePreview({
   const hasCustomSlug = previewSlug !== DEFAULT_SERVER_SLUG;
   const [channelsExpanded, setChannelsExpanded] = useState(true);
   const [agentsExpanded, setAgentsExpanded] = useState(true);
+  const handleToggleChannels = useCallback(() => {
+    setChannelsExpanded((expanded) => !expanded);
+  }, []);
+  const handleToggleAgents = useCallback(() => {
+    setAgentsExpanded((expanded) => !expanded);
+  }, []);
 
   return (
     <div
-      className="flex min-h-[520px] flex-1 rotate-[-1deg] flex-col overflow-hidden border-2 border-black bg-white shadow-brutal-lg"
+      className="flex min-h-[520px] flex-1 rotate-[-1deg] flex-col overflow-hidden rounded-container border-[1.5px] border-line-strong bg-layer-canvas shadow-sticker"
       data-testid="server-create-preview"
     >
-      <div className="flex shrink-0 flex-col gap-2 border-b-2 border-black bg-brutal-cream p-3">
+      <div className="flex shrink-0 flex-col gap-2 border-b border-line-seam bg-layer-sidebar p-3">
         <div className="flex gap-1.5 pl-px" aria-hidden="true">
-          <i className="size-3 border-2 border-black bg-brutal-pink" />
-          <i className="size-3 border-2 border-black bg-soft-signal" />
-          <i className="size-3 border-2 border-black bg-brutal-lime" />
+          <i className="size-3 rounded-[2px] border-[1.5px] border-sticker-ink bg-attention" />
+          <i className="size-3 rounded-[2px] border-[1.5px] border-sticker-ink bg-brand" />
+          <i className="size-3 rounded-[2px] border-[1.5px] border-sticker-ink bg-success" />
         </div>
-        <div className="flex items-center justify-center border-2 border-black bg-white px-3 py-2 font-mono text-xs text-black/70 shadow-brutal-sm">
+        <div className="flex h-8 items-center justify-center rounded-control border-[1.5px] border-line-strong bg-layer-card px-3 font-mono text-mono-meta text-foreground-muted">
           <span className="inline-flex min-w-0 items-center gap-1.5">
-            <LockKeyhole size={12} className="shrink-0 text-black/50" />
-            <span className="shrink-0 text-black/50">{RAFT_APP_SERVER_PATH_PREFIX}</span>
+            <LockKeyhole size={12} className="shrink-0 text-foreground-hint" />
+            <span className="shrink-0 text-foreground-hint">{RAFT_APP_SERVER_PATH_PREFIX}</span>
             <span
               key={previewSlug}
-              className={`min-w-0 truncate font-bold text-black ${hasCustomSlug ? "onboarding-preview-pop inline-block" : ""}`}
+              className={`min-w-0 truncate font-bold text-foreground ${hasCustomSlug ? "onboarding-preview-pop inline-block" : ""}`}
               data-testid="server-preview-address-slug"
             >
               {previewSlug}
@@ -184,23 +198,24 @@ export default function ServerCreatePreview({
         </div>
       </div>
       <div className="flex min-h-0 flex-1">
-        <aside className="hidden w-[200px] shrink-0 flex-col border-r-2 border-black bg-brutal-cream sm:flex">
-          <div className="flex h-panel-header items-center gap-2 border-b-2 border-black bg-soft-signal px-3">
+        <aside className="hidden w-[200px] shrink-0 flex-col border-r border-line-seam bg-layer-sidebar sm:flex">
+          {/* The preview's heads are the app's own raft-ui heads. */}
+          <SidebarHeader>
             <span
               key={previewName}
-              className="onboarding-preview-pop inline-flex max-w-full items-center gap-1.5 border-2 border-black bg-black px-2 py-1 text-xs font-bold text-soft-signal shadow-brutal-sm [--onboarding-pop-rotate:-2deg]"
+              className="onboarding-preview-pop inline-flex h-8 max-w-full items-center gap-1.5 rounded-control bg-sticker-ink px-2.5 text-footnote font-bold text-brand shadow-[0_0_0_1.5px_var(--sticker-edge)] [--onboarding-pop-rotate:-2deg]"
               data-testid="server-preview-sidebar-badge"
             >
               <span className="truncate">{previewName}</span>
             </span>
-          </div>
+          </SidebarHeader>
           <SectionLabel
             labelId="layout.sidebar.channels"
             count={2}
             testId="server-preview-section-channels"
             expanded={channelsExpanded}
             controls="server-preview-channel-rows"
-            onToggle={() => setChannelsExpanded((expanded) => !expanded)}
+            onToggle={handleToggleChannels}
           />
           {channelsExpanded ? (
             <div className="flex flex-col gap-1 px-2" id="server-preview-channel-rows">
@@ -216,7 +231,7 @@ export default function ServerCreatePreview({
             testId="server-preview-section-dms"
             expanded={agentsExpanded}
             controls="server-preview-dm-rows"
-            onToggle={() => setAgentsExpanded((expanded) => !expanded)}
+            onToggle={handleToggleAgents}
           />
           {agentsExpanded ? (
             <div className="flex flex-col gap-1 px-2" id="server-preview-dm-rows">
@@ -238,22 +253,19 @@ export default function ServerCreatePreview({
             </div>
           ) : null}
         </aside>
-        <section className="flex min-w-0 flex-1 flex-col bg-white">
-          <div className="flex h-panel-header shrink-0 items-center gap-2.5 border-b-2 border-black bg-white px-4">
-            <div className="flex size-8 shrink-0 items-center justify-center border-2 border-black bg-soft-signal">
-              <Hash size={16} />
-            </div>
-            <h2 className="truncate text-sm font-bold text-black">{PREVIEW_CHANNEL}</h2>
-          </div>
+        <section className="flex min-w-0 flex-1 flex-col bg-layer-canvas">
+          <PanelHeader>
+            <PanelHeaderIcon>
+              <Hash />
+            </PanelHeaderIcon>
+            <PanelHeaderContent>
+              <PanelTitle render={<h2>{PREVIEW_CHANNEL}</h2>} />
+            </PanelHeaderContent>
+          </PanelHeader>
           <div className="flex min-h-0 flex-1 flex-col gap-3.5 p-4">
             <MessageRow
               avatar={
-                <AvatarSlot
-                  context="surface-list"
-                  type="agent"
-                  agentAvatarUrl="pixel:mug"
-                  className="mt-px !size-7"
-                />
+                <AvatarSlot context="compact-row" type="agent" agentAvatarUrl="pixel:mug" className="mt-px" />
               }
               name="Cindy"
               label={formatMessage({ id: "onboarding.serverPreview.agentRole" })}
@@ -265,8 +277,8 @@ export default function ServerCreatePreview({
               </span>
             </MessageRow>
           </div>
-          <div className="border-t-2 border-black p-3">
-            <div className="border-2 border-black px-3 py-2 text-xs text-black/40 opacity-60 shadow-brutal-sm">
+          <div className="p-3">
+            <div className="rounded-container border-[1.5px] border-line-strong bg-layer-card px-3 py-2 text-callout text-foreground-hint">
               {formatMessage({ id: "onboarding.serverPreview.composerPlaceholder" }, { channel: PREVIEW_CHANNEL })}
             </div>
           </div>

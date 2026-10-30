@@ -1,14 +1,14 @@
 // `raft channel remove-member --target <#channel> (--user <@handle> | --agent <@handle>)`
-// -> DELETE /internal/agent/:id/channels/:channelId/members
+// -> DELETE /internal/agent-api/channels/:channelId/members
 
 import type { Command } from "commander";
 
-import { createAgentApiSurfaceClient } from "../../agentApiPath.js";
-import { defineCommand, registerCliCommand } from "../../core/command.js";
-import type { CommandRuntimeOptions } from "../../core/context.js";
-import { CliError } from "../../core/errors.js";
-import { adoptCliReplyText, writeText, NL } from "../../core/renderer.js";
-import { parseRegularChannelTarget } from "./leave.js";
+import { createAgentApiSurfaceClient } from "../../agentApiPath";
+import { defineCommand, registerCliCommand } from "../../core/command";
+import type { CommandRuntimeOptions } from "../../core/context";
+import { CliError } from "../../core/errors";
+import { adoptCliReplyText, writeText, NL } from "../../core/renderer";
+import { parseRegularChannelTarget } from "./leave";
 
 interface RemoveMemberOpts {
   target?: string;
@@ -54,11 +54,11 @@ export function formatRemoveMemberResult(target: string, memberName: string, was
 export const channelRemoveMemberCommand = defineCommand(
   {
     name: "remove-member",
-    description: "Remove a human or agent from a regular channel when this agent has server admin authority",
+    description: "Remove a human or agent of this server from a public, private, or joint channel when this agent has server admin authority",
     options: [
       {
         flags: "--target <target>",
-        description: "Regular channel to remove a member from, e.g. '#engineering'",
+        description: "Channel to remove a member from, e.g. '#engineering'",
       },
       {
         flags: "--user <handle>",
@@ -76,7 +76,7 @@ export const channelRemoveMemberCommand = defineCommand(
     if (!channelName) {
       throw new CliError({
         code: "INVALID_TARGET",
-        message: "Target must be a regular channel in the form '#channel-name'. DMs and thread targets are not supported.",
+        message: "Target must be a channel in the form '#channel-name'. DMs and thread targets are not supported.",
       });
     }
 
@@ -108,11 +108,7 @@ export const channelRemoveMemberCommand = defineCommand(
     }
 
     const body = user ? { user } : { agent };
-    const removeRes = await client.request<RemoveMemberResponse>(
-      "DELETE",
-      `/internal/agent/${encodeURIComponent(agentContext.agentId)}/channels/${encodeURIComponent(channel.id)}/members`,
-      body,
-    );
+    const removeRes = await createAgentApiSurfaceClient(client).channels.removeMember({ channelId: channel.id as never }, body);
     if (!removeRes.ok) {
       throw new CliError({
         code: removeRes.status >= 500 ? "SERVER_5XX" : "MEMBERS_FAILED",

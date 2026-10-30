@@ -1,10 +1,9 @@
 // Snapshot-style tests for agent-facing server info output format.
 // Pins the exact text shape matching MCP list_server output.
 
-import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { formatChannelMembers, formatServerInfo } from "./_format.js";
+import { formatChannelMembers, formatServerInfo } from "./_format";
 
 test("formatServerInfo: full server with channels, agents, humans", () => {
   const out = formatServerInfo({
@@ -34,6 +33,7 @@ test("formatServerInfo: full server with channels, agents, humans", () => {
       { name: "general", type: "channel", joined: true, activityMuted: true, description: "General discussion" },
       { name: "engineering", type: "private", joined: true, muted: false },
       { name: "random", type: "channel", joined: false, description: "Off-topic" },
+      { name: "partners", type: "joint", joined: true, description: "Shared with another server" },
       { name: "system.reminder", type: "dm", joined: true, description: "Reminder app" },
     ],
     agents: [
@@ -75,6 +75,7 @@ test("formatServerInfo: full server with channels, agents, humans", () => {
   assert.match(out, /#general \[public, joined, muted\] — General discussion/);
   assert.match(out, /#engineering \[private, joined, not muted\]/);
   assert.match(out, /#random \[public, not joined\] — Off-topic/);
+  assert.match(out, /#partners \[joint, joined\] — Shared with another server/);
   assert.match(out, /dm:@system\.reminder \[private, joined\] — Reminder app/);
   assert.match(out, /### Agents/);
   assert.match(out, /@akko \(online\) \(admin\) — runtime IC/);
@@ -111,6 +112,29 @@ test("formatChannelMembers: full channel member list", () => {
   assert.match(out, /Server and stored channel roles are shown separately/);
   assert.match(out, /@xxchan \(owner\) \[server role=owner, channel role=member, admin via=server_role\] — tech lead/);
   assert.match(out, /@alice/);
+});
+
+test("formatChannelMembers: joint roster lists every server a person takes part through", () => {
+  const out = formatChannelMembers({
+    channel: { ref: "#shared-room", type: "joint" },
+    agents: [],
+    humans: [
+      { name: "dual", role: "member", servers: [{ name: "Home", slug: "home", yours: true }, { name: "Peer Co", slug: "peer" }] },
+      { name: "peer-only", role: "owner", servers: [{ name: "Peer Co", slug: "peer" }] },
+      { name: "twins", servers: [{ name: "Acme", slug: "acme-1" }, { name: "Acme", slug: "acme-2" }] },
+      { name: "local" },
+    ],
+  });
+  assert.match(out, /`\[servers: \.\.\.\]` marks people in this joint channel/);
+  assert.match(out, /gives them no rights here/);
+  assert.match(out, /@dual \[servers: this server, Peer Co\]\n/);
+  assert.match(out, /@peer-only \(owner\) \[servers: Peer Co\]\n/);
+  // Two listed servers with the same display name fall back to their slugs.
+  assert.match(out, /@twins \[servers: acme-1, acme-2\]\n/);
+  assert.match(out, /@local\n/);
+
+  const plain = formatChannelMembers({ channel: { ref: "#all", type: "channel" }, agents: [], humans: [{ name: "local" }] });
+  assert.doesNotMatch(plain, /servers/);
 });
 
 test("formatChannelMembers: empty members", () => {

@@ -12,8 +12,7 @@
 // independent tiny PR after #2220 merge, owned by Huaihuai, reviewed by Hao.
 
 import assert from "node:assert/strict";
-import { test } from "vitest";
-import { ClaudeEventNormalizer } from "./claudeEventNormalizer.js";
+import { ClaudeEventNormalizer, claudeToolResultOutcome } from "./claudeEventNormalizer";
 
 const normalizer = new ClaudeEventNormalizer();
 
@@ -621,6 +620,22 @@ test("6b: system task_progress and task_notification map to bounded phases", () 
   assert.equal(normalizer.normalizeLine(progressLine)[0]?.kind, "subagent_progress");
   assert.equal((normalizer.normalizeLine(progressLine)[0] as any)?.phase, "progress");
   assert.equal((normalizer.normalizeLine(notificationLine)[0] as any)?.phase, "notification");
+  assert.equal((normalizer.normalizeLine(notificationLine)[0] as any)?.taskStatus, undefined, "no status field: nothing invented");
+});
+
+test("task #1260: task_notification carries its closed terminal status; other values and other phases carry none", () => {
+  for (const status of ["completed", "failed", "stopped"] as const) {
+    const line = JSON.stringify({ type: "system", subtype: "task_notification", task_id: "t1", tool_use_id: "toolu_1", status, summary: "secret summary text" });
+    const [event] = normalizer.normalizeLine(line) as any[];
+    assert.equal(event?.phase, "notification");
+    assert.equal(event?.taskStatus, status);
+    assert.equal(event?.taskId, "t1");
+    assert.doesNotMatch(JSON.stringify(event), /secret summary/, "summary text never leaves the envelope");
+  }
+  const odd = JSON.stringify({ type: "system", subtype: "task_notification", task_id: "t1", status: "exploded" });
+  assert.equal((normalizer.normalizeLine(odd)[0] as any)?.taskStatus, undefined);
+  const started = JSON.stringify({ type: "system", subtype: "task_started", task_id: "t1", status: "completed" });
+  assert.equal((normalizer.normalizeLine(started)[0] as any)?.taskStatus, undefined, "status is read on notifications only");
 });
 
 test("6a: plain stream_event internal_progress without lineage stays a flat liveness signal (no subagent)", () => {
@@ -665,6 +680,195 @@ test("normalizes user tool_result as a steering boundary", () => {
   }));
 
   assert.deepEqual(events, [
-    { kind: "tool_output", name: "toolu_123" },
+    { kind: "tool_output", name: "toolu_123", callId: "toolu_123", ok: true },
   ]);
+});
+
+// task #379 — Claude Code wraps API errors (usage limits, auth, overload) in an
+// assistant message carrying the SDK `error` field. Field sample (KopiC,
+// #proj-runtime:f0eadc47): `error: "rate_limit"`, model `<synthetic>`, text
+// "You've reached your Fable limit. ...", followed by a result with is_error.
+const QUOTA_TEXT = "You've reached your Fable limit. Switch to another model, or manage usage credits at claude.ai.";
+
+function syntheticApiErrorAssistant(error: string, text: string, extraContent: unknown[] = []) {
+  return JSON.stringify({
+    type: "assistant",
+    error,
+    message: { model: "<synthetic>", content: [{ type: "text", text }, ...extraContent] },
+    session_id: "session-379",
+  });
+}
+
+test("task #379: an assistant message with the SDK error field is an error, not model text", () => {
+  const fresh = new ClaudeEventNormalizer();
+  assert.deepEqual(fresh.normalizeLine(syntheticApiErrorAssistant("rate_limit", QUOTA_TEXT)), [
+    {
+      kind: "error",
+      message: QUOTA_TEXT,
+      nativeReasonPresent: true,
+      reasonProvenance: "runtime_error_event",
+      providerLimit: { kind: "quota_exhausted" },
+    },
+  ]);
+});
+
+test("task #379: the result of a turn whose API error was already reported does not report it twice", () => {
+  const fresh = new ClaudeEventNormalizer();
+  fresh.normalizeLine(syntheticApiErrorAssistant("rate_limit", QUOTA_TEXT));
+  assert.deepEqual(fresh.normalizeLine(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    result: QUOTA_TEXT,
+    session_id: "session-379",
+  })), [{ kind: "turn_end", sessionId: "session-379" }]);
+  // The suppression is per turn: the next failed result still reports.
+  assert.deepEqual(fresh.normalizeLine(JSON.stringify({
+    type: "result",
+    subtype: "success",
+    is_error: true,
+    result: "Execution failed for another reason",
+    session_id: "session-379",
+  })), [
+    { kind: "error", message: "Execution failed for another reason" },
+    { kind: "turn_end", sessionId: "session-379" },
+  ]);
+});
+
+const BEFORE_RESET_MS = 1791800000 * 1000;
+
+test("task #379: a rejected rate-limit window marks the limit as used up and carries its reported reset time", () => {
+  const fresh = new ClaudeEventNormalizer(() => BEFORE_RESET_MS);
+  fresh.normalizeLine(JSON.stringify({
+    type: "rate_limit_event",
+    rate_limit_info: { status: "rejected", resetsAt: 1791900000, rateLimitType: "seven_day" },
+    session_id: "session-379",
+  }));
+  const [event] = fresh.normalizeLine(syntheticApiErrorAssistant("rate_limit", "API Error: Rate limit reached"));
+  assert.deepEqual(event && event.kind === "error" ? event.providerLimit : null, {
+    kind: "quota_exhausted",
+    resetsAt: new Date(1791900000 * 1000).toISOString(),
+  });
+});
+
+test("task #379: a rate limit without used-up evidence stays a transient throttle", () => {
+  const fresh = new ClaudeEventNormalizer();
+  fresh.normalizeLine(JSON.stringify({
+    type: "rate_limit_event",
+    rate_limit_info: { status: "allowed_warning", resetsAt: 1791900000 },
+    session_id: "session-379",
+  }));
+  const [event] = fresh.normalizeLine(syntheticApiErrorAssistant("rate_limit", "API Error: Request rate limited, retrying shortly"));
+  assert.deepEqual(event && event.kind === "error" ? event.providerLimit : null, { kind: "transient_rate_limit" });
+});
+
+test("task #379: other SDK errors are errors without a provider-limit classification", () => {
+  const fresh = new ClaudeEventNormalizer();
+  assert.deepEqual(fresh.normalizeLine(syntheticApiErrorAssistant("overloaded", "API Error: Overloaded")), [
+    { kind: "error", message: "API Error: Overloaded", nativeReasonPresent: true, reasonProvenance: "runtime_error_event" },
+  ]);
+});
+
+test("task #379: ordinary model text and messages with tool calls are unchanged", () => {
+  const fresh = new ClaudeEventNormalizer();
+  // Model text that merely mentions a limit is still model text.
+  assert.deepEqual(fresh.normalizeLine(JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "text", text: "You've reached your Fable limit is what the user saw." }] },
+  })), [{ kind: "text", text: "You've reached your Fable limit is what the user saw." }]);
+  // A message that also calls a tool is a working turn, never an API-error wrapper.
+  const events = fresh.normalizeLine(syntheticApiErrorAssistant("rate_limit", QUOTA_TEXT, [
+    { type: "tool_use", name: "Bash", input: { command: "true" } },
+  ]));
+  assert.deepEqual(events.map((event) => event.kind), ["text", "tool_call"]);
+});
+
+test("task #379: a rejected window past its reported reset is no longer used-up evidence", () => {
+  let now = BEFORE_RESET_MS;
+  const fresh = new ClaudeEventNormalizer(() => now);
+  fresh.normalizeLine(JSON.stringify({
+    type: "rate_limit_event",
+    rate_limit_info: { status: "rejected", resetsAt: 1791900000 },
+    session_id: "session-379",
+  }));
+  now = 1791900001 * 1000;
+  const [event] = fresh.normalizeLine(syntheticApiErrorAssistant("rate_limit", "API Error: Request rate limited, retrying shortly"));
+  assert.deepEqual(event && event.kind === "error" ? event.providerLimit : null, { kind: "transient_rate_limit" });
+});
+
+test("task #379: a rejected window from another session is not used-up evidence (reviewer counterexample)", () => {
+  // Huaihuai's counterexample on 300884c4: rejected/resetsAt=1 for session
+  // old, system/init for session new, then an ordinary throttle.
+  const fresh = new ClaudeEventNormalizer(() => 0);
+  fresh.normalizeLine(JSON.stringify({
+    type: "rate_limit_event",
+    rate_limit_info: { status: "rejected", resetsAt: 1 },
+    session_id: "session-old",
+  }));
+  fresh.normalizeLine(JSON.stringify({ type: "system", subtype: "init", session_id: "session-new" }));
+  const [event] = fresh.normalizeLine(JSON.stringify({
+    type: "assistant",
+    error: "rate_limit",
+    message: { model: "<synthetic>", content: [{ type: "text", text: "Too many requests, retry shortly" }] },
+    session_id: "session-new",
+  }));
+  assert.deepEqual(event && event.kind === "error" ? event.providerLimit : null, { kind: "transient_rate_limit" });
+});
+
+test("task #379: a rejected window without a reset time does not cross into another session", () => {
+  // Expiry cannot decide this case (no resetsAt), so only the session scope can.
+  const fresh = new ClaudeEventNormalizer(() => BEFORE_RESET_MS);
+  fresh.normalizeLine(JSON.stringify({
+    type: "rate_limit_event",
+    rate_limit_info: { status: "rejected" },
+    session_id: "session-old",
+  }));
+  const [sameSession] = fresh.normalizeLine(JSON.stringify({
+    type: "assistant",
+    error: "rate_limit",
+    message: { model: "<synthetic>", content: [{ type: "text", text: "Too many requests, retry shortly" }] },
+    session_id: "session-old",
+  }));
+  assert.deepEqual(sameSession && sameSession.kind === "error" ? sameSession.providerLimit : null, { kind: "quota_exhausted" });
+  fresh.normalizeLine(JSON.stringify({ type: "result", subtype: "success", is_error: true, session_id: "session-old" }));
+  fresh.normalizeLine(JSON.stringify({ type: "system", subtype: "init", session_id: "session-new" }));
+  const [otherSession] = fresh.normalizeLine(JSON.stringify({
+    type: "assistant",
+    error: "rate_limit",
+    message: { model: "<synthetic>", content: [{ type: "text", text: "Too many requests, retry shortly" }] },
+    session_id: "session-new",
+  }));
+  assert.deepEqual(otherSession && otherSession.kind === "error" ? otherSession.providerLimit : null, { kind: "transient_rate_limit" });
+});
+
+test("task #17: tool_use carries its id and tool_result its outcome; a non-zero Bash exit is an ok call with the exit code", () => {
+  const n = new ClaudeEventNormalizer();
+  assert.deepEqual(n.normalizeLine(JSON.stringify({
+    type: "assistant",
+    message: { content: [{ type: "tool_use", id: "toolu_9", name: "Bash", input: { command: "pnpm test" } }] },
+  })), [{ kind: "tool_call", name: "Bash", input: { command: "pnpm test" }, callId: "toolu_9" }]);
+  // Shape from a real Claude Code transcript: "Exit code 1\n…" with is_error.
+  assert.deepEqual(n.normalizeLine(JSON.stringify({
+    type: "user",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_9", content: "Exit code 1\n2 tests failed", is_error: true }] },
+  })), [{ kind: "tool_output", name: "toolu_9", callId: "toolu_9", ok: true, exitCode: 1 }]);
+  assert.deepEqual(n.normalizeLine(JSON.stringify({
+    type: "user",
+    message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_10", content: [{ type: "text", text: "File does not exist." }], is_error: true }] },
+  })), [{ kind: "tool_output", name: "toolu_10", callId: "toolu_10", ok: false }]);
+});
+
+// Pins the text format claudeToolResultOutcome depends on. Claude Code reports a
+// non-zero Bash exit only as text ("Exit code N" first line, is_error true). If
+// a Claude Code upgrade changes that wording, this test must be updated together
+// with the matcher; otherwise non-zero exits silently degrade to ok: false.
+test("task #17: Exit code N format of Claude Code Bash tool_result maps to ok with the exit code", () => {
+  assert.deepEqual(claudeToolResultOutcome({ is_error: true, content: "Exit code 1\n2 tests failed" }), { ok: true, exitCode: 1 });
+  assert.deepEqual(claudeToolResultOutcome({ is_error: true, content: "Exit code 127\nbash: foo: command not found" }), { ok: true, exitCode: 127 });
+  assert.deepEqual(claudeToolResultOutcome({ is_error: true, content: [{ type: "text", text: "Exit code 2" }] }), { ok: true, exitCode: 2 });
+  // Only the leading line counts: an exit-code mention elsewhere is not the Bash format.
+  assert.deepEqual(claudeToolResultOutcome({ is_error: true, content: "Error: tool failed (Exit code 1)" }), { ok: false });
+  assert.deepEqual(claudeToolResultOutcome({ is_error: true, content: "Exit code: 1" }), { ok: false });
+  assert.deepEqual(claudeToolResultOutcome({ is_error: false, content: "Exit code 1" }), { ok: true });
+  assert.deepEqual(claudeToolResultOutcome({ content: "done" }), { ok: true });
 });

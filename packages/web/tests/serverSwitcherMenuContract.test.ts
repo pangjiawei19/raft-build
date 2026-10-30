@@ -2,9 +2,9 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test, { afterEach } from "node:test";
 import "./helpers/domSetup";
 import { createElement } from "react";
+import { Popover } from "@botiverse/raft-ui";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { TestIntlProvider } from "./helpers/intl";
@@ -81,16 +81,20 @@ function renderMenu({
       createElement(
         TestIntlProvider,
         null,
-        createElement(ServerSwitcherMenu, {
-          open: true,
-          onClose,
-          testId,
-          navigationMode,
-          serverUnreadCounts: unreadCounts,
-        }),
+        openSwitcher({ onClose, testId, navigationMode, serverUnreadCounts: unreadCounts }),
         createElement(LocationProbe),
       ),
     ),
+  );
+}
+
+// The switcher is the content of the caller's raft-ui Popover; an open one
+// closes through `onClose` as the callers wire it.
+function openSwitcher(props: Omit<Parameters<typeof ServerSwitcherMenu>[0], "onClose"> & { onClose: () => void }) {
+  return createElement(
+    Popover,
+    { open: true, onOpenChange: (open: boolean) => { if (!open) props.onClose(); } },
+    createElement(ServerSwitcherMenu, props),
   );
 }
 
@@ -118,21 +122,33 @@ afterEach(() => {
 });
 
 // `ServerSwitcherMenu` is the single primitive for the "switch server"
-// dropdown. The desktop LeftRail flyout and the mobile Sidebar pill
-// drop-down used to inline 70+ identical lines each and drifted on the
-// "current server row also shows its own unread badge" detail (LeftRail
-// did, Sidebar didn't). The primitive collapses both into one and pins
-// the canonical "current row hides unread" rule per stdrc decision C
-// 2026-05-14 `#proj-uiux:24e533e3` task #234.
+// list behind every trigger (rail, top bar, phone pill), so they cannot drift
+// on details like "the current row hides its own unread badge".
 
-test("ServerSwitcherMenu primitive exists and exports the expected shape", () => {
+test("ServerSwitcherMenu primitive exists and exports the expected shape", async () => {
   let closes = 0;
-  renderMenu({ onClose: () => { closes += 1; } });
+  const { container } = renderMenu({ onClose: () => { closes += 1; } });
 
-  assert.ok(screen.getByTestId("server-switcher-menu"));
+  const menu = screen.getByTestId("server-switcher-menu");
+  // A raft-ui Popover: the list is portaled out of the trigger's column (so
+  // opening it never moves the page), declares itself a dismiss layer, and is
+  // never taller than the space it has — the workspace list scrolls inside it
+  // while the footer actions stay outside the scroller, always reachable.
+  assert.equal(menu.getAttribute("data-slot"), "popover-content");
+  assert.equal(container.contains(menu), false, "the menu is portaled, not inline under its trigger");
+  assert.equal(menu.getAttribute("data-dismiss-layer"), "");
+  assert.match(menu.className, /max-h-\(--available-height\)/);
+  assert.doesNotMatch(menu.className, /\babsolute\b|top-full|left-full/, "no hand placement");
+  const list = within(menu).getByRole("link", { name: /Alpha/ }).closest(".overflow-y-auto");
+  assert.ok(list, "the workspace list is the scroller");
+  assert.equal(list.contains(within(menu).getByRole("button", { name: "Switch or Create Server" })), false);
+
   fireEvent.keyDown(document, { key: "Escape" });
+  await waitFor(() => assert.equal(closes, 1, "Escape closes the menu"));
+  fireEvent.pointerDown(document.body);
   fireEvent.mouseDown(document.body);
-  assert.equal(closes, 2, "the primitive owns Escape and outside-click dismissal");
+  fireEvent.click(document.body);
+  await waitFor(() => assert.ok(closes >= 2, "an outside press closes the menu"));
 });
 
 test("current server row hides its own unread badge (stdrc decision C)", () => {
@@ -155,9 +171,13 @@ test("server switcher unread count is loud unless the server is muted", () => {
       "server-beta": { unreadCount: 5, activityUnreadCount: 5 },
     },
   });
+  // Raft Design System › Badge: unread is the pink count sticker (raft-ui's
+  // accent badge owns the 20px pink + ink edge); the switcher only places it.
   const loud = within(screen.getByRole("link", { name: /Beta/ })).getByText("5");
-  assert.match(loud.className, /text-white/);
-  assert.doesNotMatch(loud.className, /text-black\/50/);
+  assert.equal(loud.getAttribute("data-slot"), "badge");
+  assert.equal(loud.getAttribute("data-variant"), "accent");
+  assert.doesNotMatch(loud.className, /text-white/);
+  assert.doesNotMatch(loud.className, /text-foreground-hint/);
   cleanup();
 
   renderMenu({
@@ -165,8 +185,11 @@ test("server switcher unread count is loud unless the server is muted", () => {
       "server-beta": { unreadCount: 5, serverPushMuted: true, activityUnreadCount: 5 },
     },
   });
+  // A muted workspace keeps its number as the gray mono count (rf-count), never
+  // the pink badge.
   const quiet = within(screen.getByRole("link", { name: /Beta/ })).getByText("5");
-  assert.match(quiet.className, /text-black\/50/);
+  assert.notEqual(quiet.getAttribute("data-slot"), "badge");
+  assert.match(quiet.className, /font-mono text-mono-meta text-foreground-hint/);
   assert.doesNotMatch(quiet.className, /text-white/);
 });
 
@@ -212,19 +235,33 @@ test("Activity counts are independent of server notification mute state", () => 
 test("muted joined channels still show quiet numeric unread counts", () => {
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 3, joined: true, showMutedIcon: false }),
-    { showLoudUnreadBadge: true, showQuietUnreadCount: false },
+    { showLoudUnreadBadge: true, showQuietUnreadCount: false, showQuietNewDot: false },
   );
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 3, joined: true, showMutedIcon: true }),
-    { showLoudUnreadBadge: false, showQuietUnreadCount: true },
+    { showLoudUnreadBadge: false, showQuietUnreadCount: true, showQuietNewDot: false },
   );
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 3, joined: false, showMutedIcon: false }),
-    { showLoudUnreadBadge: false, showQuietUnreadCount: true },
+    { showLoudUnreadBadge: false, showQuietUnreadCount: true, showQuietNewDot: false },
   );
   assert.deepEqual(
     getChannelUnreadIndicatorState({ unread: 0, joined: true, showMutedIcon: true }),
-    { showLoudUnreadBadge: false, showQuietUnreadCount: false },
+    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: false },
+  );
+  // hasNew (non-joined public channel with messages past the cursor, no count):
+  // a quiet dot on a non-joined row only; a count, when present, wins.
+  assert.deepEqual(
+    getChannelUnreadIndicatorState({ unread: 0, joined: false, showMutedIcon: false, hasNew: true }),
+    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: true },
+  );
+  assert.deepEqual(
+    getChannelUnreadIndicatorState({ unread: 0, joined: true, showMutedIcon: false, hasNew: true }),
+    { showLoudUnreadBadge: false, showQuietUnreadCount: false, showQuietNewDot: false },
+  );
+  assert.deepEqual(
+    getChannelUnreadIndicatorState({ unread: 2, joined: false, showMutedIcon: false, hasNew: true }),
+    { showLoudUnreadBadge: false, showQuietUnreadCount: true, showQuietNewDot: false },
   );
   assert.equal(shouldShowActivityMutedIcon({ activityMuted: true, joined: true }), true);
   assert.equal(shouldShowActivityMutedIcon({ activityMuted: true, joined: false }), false);
@@ -274,8 +311,7 @@ test("server switcher primitive honors desktop and mobile navigation modes", () 
       createElement(
         TestIntlProvider,
         null,
-        createElement(ServerSwitcherMenu, {
-          open: true,
+        openSwitcher({
           onClose: () => {},
           testId: "mobile-server-switcher-menu",
           navigationMode: "replace-with-home",
@@ -320,4 +356,15 @@ test("Chinese browser language does not add the QR-page action to the server swi
   });
   assert.equal(closes, 1);
   assert.equal(joinCalls[0]?.slug, "community");
+});
+
+test("a switcher row lights only on hover or keyboard focus, not on the focus a mouse open moves in", () => {
+  // The popover focuses its first row when it opens. With `focus-within`, a
+  // mouse-opened switcher showed that row yellow as if hovered, while the
+  // current workspace (checked) sat elsewhere; blurring the window cleared it.
+  const source = readFileSync(resolve(import.meta.dirname, "../src/components/ui/ServerSwitcherMenu.tsx"), "utf8");
+  const row = source.match(/className="group\/server-row [^"]*"/)?.[0] ?? "";
+  assert.ok(row, "the server row class is found");
+  assert.match(row, /has-\[:focus-visible\]:bg-brand-soft/);
+  assert.doesNotMatch(row, /focus-within:bg-/);
 });

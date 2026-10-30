@@ -1,15 +1,14 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
-import type { ApiResponse } from "../../client.js";
-import type { AgentContext } from "../../auth/env.js";
-import { createCommandContext } from "../../core/context.js";
-import { CliError } from "../../core/errors.js";
-import type { CliIo } from "../../core/io.js";
+import type { ApiResponse } from "../../client";
+import type { AgentContext } from "../../auth/env";
+import { createCommandContext } from "../../core/context";
+import { CliError } from "../../core/errors";
+import type { CliIo } from "../../core/io";
 import {
   channelRemoveMemberCommand,
   formatRemoveMemberResult,
-} from "./remove-member.js";
+} from "./remove-member";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -102,7 +101,8 @@ test("remove-member command sends DELETE body with normalized handle", async () 
           data: {
             ok: true,
             wasMember: true,
-            member: { type: "human", name: "alice" },
+            channelId: "channel-1",
+            member: { type: "human", id: "user-1", name: "alice" },
             attention: {
               stillArrives: ["If #engineering is public, followed threads still notify @alice until they unfollow them."],
               threadBoundary: "Removing a channel member does not unfollow existing thread follows.",
@@ -126,7 +126,7 @@ test("remove-member command sends DELETE body with normalized handle", async () 
     },
     {
       method: "DELETE",
-      path: "/internal/agent/agent-1/channels/channel-1/members",
+      path: "/internal/agent-api/channels/channel-1/members",
       body: { user: "alice" },
     },
   ]);

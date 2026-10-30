@@ -1,4 +1,4 @@
-# Source-available snapshot provenance
-commit=d3aae345f58f00605daf3d1afaa2599acbd23d1f
-exported_at=2026-09-24T04:40:05.890Z
-files=4383
+# 本仓库基于公开源码快照；私有 CI 和部署契约不在本仓库验收范围内。
+# 此标记供源码快照测试识别，不代表原始私有仓库的提交号。
+upstream_commit=db5e399f017d584e49597e3a28757645d6807893
+upstream_release=v1.21.23-source.1

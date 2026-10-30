@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useIntl } from "react-intl";
 import ConfirmDialog from "../ConfirmDialog";
 
@@ -29,12 +29,16 @@ export function useChannelMemberRemoval({
   const { formatMessage } = useIntl();
   const [removeTarget, setRemoveTarget] = useState<ChannelMemberRemoveTarget | null>(null);
 
-  const runRemove = () =>
-    removeTarget
-      ? removeTarget.type === "agent"
-        ? removeAgent(removeTarget.id)
-        : removeHuman(removeTarget.id)
-      : Promise.resolve();
+  const runRemove = useCallback(
+    () =>
+      removeTarget
+        ? removeTarget.type === "agent"
+          ? removeAgent(removeTarget.id)
+          : removeHuman(removeTarget.id)
+        : Promise.resolve(),
+    [removeTarget, removeAgent, removeHuman],
+  );
+  const closeConfirm = useCallback(() => setRemoveTarget(null), []);
 
   const removeTitle = formatMessage({ id: "agent.channelMembers.removeMemberTitle" });
   const removeMessage = removeTarget
@@ -51,10 +55,9 @@ export function useChannelMemberRemoval({
       confirmLabel={formatMessage({ id: "agent.channelMembers.removeAction" })}
       loadingLabel={formatMessage({ id: "agent.channelMembers.removing" })}
       layer={1}
-      actionSize="xs"
       chromeLocale="active"
       onConfirm={runRemove}
-      onClose={() => setRemoveTarget(null)}
+      onClose={closeConfirm}
     />
   );
 

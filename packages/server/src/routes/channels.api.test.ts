@@ -1,52 +1,51 @@
-import { tokenForHuman } from "../test/integration/credentials.js";
-import { fixturePasswordHash } from "../test/integration/credentials.js";
-import { createApiTest } from "../test/integration/apiTest.js";
+import { tokenForHuman } from "../test/integration/credentials";
+import { fixturePasswordHash } from "../test/integration/credentials";
+import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 
 import { and, desc, eq, inArray } from "drizzle-orm";
 import {
   BasicTracer,
-  MemoryTraceSink, TOPBAR_OVERFLOW_FEATURE_FLAG_KEY
+  MemoryTraceSink
 } from "@botiverse/raft-shared";
-import { openTestApp } from "../test/integration/app.js";
-import { getDb } from "../db/index.js";
-import { closeRisingWavePool } from "../db/risingwave.js";
+import { openTestApp } from "../test/integration/app";
+import { getDb } from "../db/index";
+import { closeRisingWavePool } from "../db/risingwave";
 import {
   users, servers as serversTable, channels, channelAgents,
   messages, messageMentions, threadFollows,
   readMutations,
   userChannelReadCursors,
   agentChannelReadCursors,
-  inboxServingRows,
   inboxTargetMuteStates,
   inboxNotificationFacts,
   inboxSuppressionStates,
   userChannelInboxStates,
   userChannelDisplayPrefs, featureFlags,
   channelHumans, serverAgentMembers
-} from "../db/schema.js";
-import { addMember, updateServerOnboardingAgent } from "../services/serverService.js";
-import { createAgent } from "../services/agentService.js";
-import { mintAgentCredential } from "../services/agentCredentialService.js";
-import { createChannel, getOrCreateThread, addHuman, addAgent, removeHuman, findOrCreateUserDM, canUserPostToChannel, archiveChannel, deleteChannel, listThreadChannelIdsForParentChannel, markRead, getInboxItems, type InboxItem } from "../services/channelService.js";
+} from "../db/schema";
+import { addMember, updateServerOnboardingAgent } from "../services/serverService";
+import { createAgent } from "../services/agentService";
+import { mintAgentCredential } from "../services/agentCredentialService";
+import { createChannel, getOrCreateThread, addHuman, addAgent, removeHuman, findOrCreateUserDM, canUserPostToChannel, archiveChannel, deleteChannel, listThreadChannelIdsForParentChannel, markRead, getInboxItems, type InboxItem } from "../services/channelService";
 import {
   createMessage
-} from "../services/messageService.js";
+} from "../services/messageService";
 import {
-  rebuildInboxServingRowsForReceiverTargets
-} from "../services/inboxNotificationService.js";
-import { ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY } from "../services/featureFlagService.js";
+} from "../services/inboxNotificationService";
+import { ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY } from "../services/featureFlagService";
 import {
   __resetOnboardingServiceDepsForTests,
   __setOnboardingServiceDepsForTests,
   triggerAllChannelUnlockOnboarding,
-} from "../services/onboardingService.js";
+} from "../services/onboardingService";
 import {
   resolveChannelSuppressionTarget,
   resolveThreadSuppressionTarget,
-} from "../services/inboxSuppressionWriters.js";
-import { createServer, installFakeIo, enableReadReceiptsForServer, recordTestInboxFact, seedThreadFixture, headers, channelDoneBody, threadDoneBody, legacyDoneFallbackCount, seedUser, type InboxMentionItem, fetchInboxAll } from "./channels.api.fixtures.js";
+} from "../services/inboxSuppressionWriters";
+import { createServer, installFakeIo, enableReadReceiptsForServer, recordTestInboxFact, seedThreadFixture, headers, channelDoneBody, threadDoneBody, legacyDoneFallbackCount, seedUser, type InboxMentionItem, fetchInboxAll } from "./channels.api.fixtures";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 
@@ -146,6 +145,100 @@ test("GET /api/channels records restore-list phases and constant query shape", a
   assert.equal(Object.values(readyEvent.attrs ?? {}).includes(joinedChannel.id), false);
 });
 
+
+test("GET /api/channels resolves channel authorization in a constant number of queries", async ({ seed, http }) => {
+  type PgliteLike = { query: (...args: unknown[]) => Promise<unknown> };
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const client = http.as(owner, server);
+  const countList = async () => {
+    const pg = (getDb() as unknown as { $client: PgliteLike }).$client;
+    const originalQuery = pg.query.bind(pg);
+    let count = 0;
+    pg.query = ((...args: unknown[]) => {
+      count += 1;
+      return originalQuery(...args);
+    }) as PgliteLike["query"];
+    try {
+      const res = await client.get("/api/channels");
+      assert.equal(res.status, 200);
+      return { count, body: await res.json() as Array<{ id: string; channelRole: string | null; channelCapabilities: Record<string, boolean>; channelAuthorityRevision: number | null }> };
+    } finally {
+      pg.query = originalQuery;
+    }
+  };
+
+  await seed.channel({ server, members: [owner] });
+  await countList();
+  const few = await countList();
+  for (let i = 0; i < 12; i += 1) await seed.channel({ server, members: [owner] });
+  await countList();
+  const many = await countList();
+
+  assert.ok(few.count > 0, "the counter must observe queries");
+  assert.ok(many.body.length >= few.body.length + 12);
+  // Per-channel authorization used to cost three queries per channel.
+  assert.equal(many.count, few.count, `${few.body.length} channels: ${few.count} queries, ${many.body.length} channels: ${many.count}`);
+  for (const channel of many.body) {
+    assert.ok(channel.channelCapabilities && typeof channel.channelCapabilities === "object", channel.id);
+  }
+});
+
+test("GET /api/channels/:id/members reads agent activity as one batch, not per agent", async ({ app, seed, http }) => {
+  type PgliteLike = { query: (...args: unknown[]) => Promise<unknown> };
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const channel = await seed.channel({ server, members: [owner] });
+  const client = http.as(owner, server);
+  const orchestrator = app.app.get("agentOrchestrator") as {
+    getActivity: (agentId: string) => Promise<{ activity: string; activityDetail: string }>;
+    getActivities: (rows: ReadonlyArray<{ id: string }>) => Promise<Array<{ activity: string; activityDetail: string }>>;
+  };
+  let singleReads = 0;
+  orchestrator.getActivity = async () => {
+    singleReads += 1;
+    return { activity: "offline", activityDetail: "" };
+  };
+  orchestrator.getActivities = async (rows) => rows.map(() => ({ activity: "online", activityDetail: "batched" }));
+  const addAgents = async (size: number) => {
+    for (let i = 0; i < size; i += 1) {
+      const agent = await createAgent(server.id, `members-${randomUUID().slice(0, 8)}`, { runtime: "claude", model: "sonnet" });
+      await addAgent(channel.id, agent.id);
+    }
+  };
+  const countMembers = async () => {
+    const pg = (getDb() as unknown as { $client: PgliteLike }).$client;
+    const originalQuery = pg.query.bind(pg);
+    let count = 0;
+    pg.query = ((...args: unknown[]) => {
+      count += 1;
+      return originalQuery(...args);
+    }) as PgliteLike["query"];
+    try {
+      const res = await client.get(`/api/channels/${channel.id}/members`);
+      assert.equal(res.status, 200);
+      return { count, body: await res.json() as { agents: Array<{ id: string; activity?: string; activityDetail?: string }> } };
+    } finally {
+      pg.query = originalQuery;
+    }
+  };
+
+  await addAgents(1);
+  await countMembers();
+  const few = await countMembers();
+  await addAgents(10);
+  await countMembers();
+  const many = await countMembers();
+
+  assert.ok(few.count > 0, "the counter must observe queries");
+  assert.equal(many.body.agents.length, few.body.agents.length + 10);
+  assert.equal(many.count, few.count, `${few.body.agents.length} agents: ${few.count} queries, ${many.body.agents.length} agents: ${many.count}`);
+  assert.equal(singleReads, 0, "activity is not read agent by agent");
+  for (const agent of many.body.agents) {
+    assert.equal(agent.activity, "online", agent.id);
+    assert.equal(agent.activityDetail, "batched", agent.id);
+  }
+});
 
 test("GET /api/channels default restore list excludes archived channels", async ({ seed, http }) => {
   const owner = await seed.human();
@@ -281,6 +374,7 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
         headers: headers(memberToken, server.id),
       });
       assert.equal(res.status, 200);
+      assert.equal(res.headers.get("cache-control"), "private, no-store");
       return await res.json() as Record<string, number>;
     };
     const lastPushTargetsEvent = () => {
@@ -314,7 +408,7 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
     sink.clear();
     // Always-on regression nail: even though openTestApp was created with
     // humanActivityMuteFlagDefaultEnabled:false, the feature is unconditionally
-    // enabled in code (isHumanActivityMuteEnabled returns true), so a no-cutoff
+    // enabled by default, so a no-cutoff
     // pglite inbox routes through the serving-rows backend, not pg_legacy.
     const alwaysOnInbox = await getInbox();
     const alwaysOnInboxSpan = [...sink.getAllSpans()].reverse().find((candidate) =>
@@ -324,7 +418,7 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
     assert.ok(alwaysOnInboxSpan, "expected GET /api/channels/inbox trace span");
     const alwaysOnBackendEvent = alwaysOnInboxSpan.events.find((event) => event.name === "inbox.backend.selected");
     assert.ok(alwaysOnBackendEvent, "expected inbox backend selection trace");
-    assert.equal(alwaysOnBackendEvent.attrs?.["inbox.backend"], "pg_serving_rows");
+    assert.equal(alwaysOnBackendEvent.attrs?.["inbox.backend"], "pg_legacy");
     assert.equal(alwaysOnBackendEvent.attrs?.["inbox.fallback_reason"], "none");
     const alwaysOnInboxItem = alwaysOnInbox.items.find((item) => item.kind === "channel" && item.channelId === channel.id);
     assert.ok(alwaysOnInboxItem, "always-on inbox should retain existing channel activity");
@@ -475,7 +569,7 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
     assert.ok(mutedInboxSpan, "expected GET /api/channels/inbox trace span");
     const backendEvent = mutedInboxSpan.events.find((event) => event.name === "inbox.backend.selected");
     assert.ok(backendEvent, "expected explicit inbox backend selection trace");
-    assert.equal(backendEvent.attrs?.["inbox.backend"], "pg_serving_rows");
+    assert.equal(backendEvent.attrs?.["inbox.backend"], "pg_legacy");
     assert.equal(backendEvent.attrs?.["inbox.fallback_reason"], "none");
 
     const mutedItem = mutedInbox.items.find((item) => item.kind === "channel" && item.channelId === channel.id);
@@ -502,16 +596,12 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
         return result;
       },
     });
-    assert.equal(
-      flagOnCutoffQueries.some((event) => event.queryName === "channels.inbox_items_by_user"),
-      false,
-      "historyCutoff traffic should not use the legacy PG cutoff query",
-    );
-    const flagOnServingRowsQuery = flagOnCutoffQueries.find((event) => event.queryName === "channels.inbox_items_serving_rows_by_user");
-    assert.ok(flagOnServingRowsQuery, "expected flag-on historyCutoff inbox to use PG serving rows");
-    assert.equal(flagOnServingRowsQuery.attrs["inbox.backend"], "pg_serving_rows");
-    assert.equal(flagOnServingRowsQuery.attrs["inbox.fallback_reason"], "history_cutoff");
-    assert.equal(flagOnServingRowsQuery.attrs.history_cutoff_present, true);
+    // 2026-09-21 teardown: the serving-rows branch is gone; historyCutoff is a
+    // predicate carried by the canonical inline SQL (and by the RW view via
+    // plan). The far-future cutoff empties everything.
+    const flagOnCanonicalQuery = flagOnCutoffQueries.find((event) => event.queryName === "channels.inbox_items_by_user");
+    assert.ok(flagOnCanonicalQuery, "expected historyCutoff inbox to run the canonical query");
+    assert.equal(flagOnCanonicalQuery.attrs["inbox.backend"], "pg_legacy");
     const mutedChannelUnread = await getChannelUnreadCounts();
     assert.equal(mutedChannelUnread[channel.id], 1, "muted ordinary traffic must remain catch-up visible through the channel read cursor");
 
@@ -559,10 +649,17 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
     assert.equal(muteRows[0].muteFromSeq, null);
     assert.equal(muteRows[0].prefsVersion, 2);
 
+    // 2026-09-21 teardown: Activity derives live from canonical tables (both
+    // the inline SQL and the RW chain — rw_subs_v1 drops the subscription
+    // while muted and revives it whole on unmute). Mute suppresses
+    // notification-time delivery (push, facts), not history: unmuting
+    // re-admits muted-window traffic to Activity. The old "no retroactive
+    // promotion" property was a recorded-verdict artifact of the retired
+    // serving-rows pipeline.
     const unmutedInbox = await getInbox();
     const unmutedItem = unmutedInbox.items.find((item) => item.kind === "channel" && item.channelId === channel.id);
-    assert.equal(unmutedItem?.lastMessageId, preMuteMessage.id, "unmuting must not retroactively promote muted-window traffic into Inbox Activity");
-    assert.equal(unmutedItem?.unreadCount, 0, "muted-window ordinary traffic remains channel catch-up, not Inbox unread");
+    assert.equal(unmutedItem?.lastMessageId, ordinaryMutedMessage.id, "unmute re-admits muted-window traffic to Activity (live derivation)");
+    assert.equal(unmutedItem?.unreadCount, 1, "muted-window ordinary traffic counts as unread once unmuted");
     assert.equal((await getChannelUnreadCounts())[channel.id], 1, "unmute must not mark muted-window traffic read in the channel");
 
     const remutedRes = await patchSettings(memberToken, { activityMuted: true });
@@ -589,25 +686,21 @@ test("GET/PATCH /api/channels/:id/notification-settings stores per-user activity
     assert.equal(mentionFactTrace.attrs?.message_id, mentionMessage.id);
     assert.equal(mentionFactTrace.attrs?.message_seq, mentionMessage.seq);
     assert.equal(mentionFactTrace.attrs?.mute_from_seq, ordinaryMutedMessage.seq + 1);
-    const servingRebuildTrace = traceEvent("inbox.serving_row.rebuild", (attrs) =>
-      attrs.source_channel_id === channel.id && attrs.receiver_id === member.id,
-    );
-    assert.equal(servingRebuildTrace.attrs?.state, "row_upserted");
-    assert.equal(servingRebuildTrace.attrs?.negative_evidence_bucket, "does_not_prove_read_state_or_ui_rendered");
-    assert.equal(servingRebuildTrace.attrs?.source_channel_id, channel.id);
-    assert.equal(servingRebuildTrace.attrs?.latest_notified_seq, mentionMessage.seq);
 
     const mentionInbox = await getInbox("mentions");
     const mentionItem = mentionInbox.items.find((item) => item.kind === "channel" && item.channelId === channel.id);
     assert.ok(mentionItem, "direct @mention should pierce channel activity mute for Mentions");
     assert.equal(mentionItem.lastMessageId, mentionMessage.id);
     assert.equal(mentionItem.hasMention, true);
+    // Re-mute anchored mute_from_seq after the formerly-muted message, so
+    // under live derivation that message is ordinary unread (it predates the
+    // current mute window) and the personal mention pierces the window.
     const mentionUnreadInbox = await getInbox("unread");
     const mentionUnreadItem = mentionUnreadInbox.items.find((item) => item.kind === "channel" && item.channelId === channel.id);
     assert.ok(mentionUnreadItem, "direct @mention should pierce channel activity mute for Inbox Unread");
-    assert.equal(mentionUnreadItem.firstUnreadMessageId, mentionMessage.id);
-    assert.equal(mentionUnreadItem.unreadCount, 1);
-    assert.equal(mentionUnreadInbox.totalUnreadCount, 1);
+    assert.equal(mentionUnreadItem.firstUnreadMessageId, ordinaryMutedMessage.id);
+    assert.equal(mentionUnreadItem.unreadCount, 2);
+    assert.equal(mentionUnreadInbox.totalUnreadCount, 2);
   } finally {
     if (previousRisingWaveDatabaseUrl === undefined) {
       delete process.env.RISINGWAVE_DATABASE_URL;
@@ -654,27 +747,9 @@ test("GET/PATCH /api/channels/:id/message-display-settings stores per-user colla
       body: JSON.stringify(body),
     });
 
-    const gatedGetRes = await getSettings(memberToken);
-    assert.equal(gatedGetRes.status, 404);
-    assert.deepEqual(await gatedGetRes.json(), {
-      error: "Channel message display settings are not enabled",
-      code: "message_display_settings_disabled",
-    });
-    const gatedPatchRes = await patchSettings(memberToken, { collapseLongMessages: false });
-    assert.equal(gatedPatchRes.status, 404);
-    const gatedRows = await db
-      .select()
-      .from(userChannelDisplayPrefs)
-      .where(and(
-        eq(userChannelDisplayPrefs.userId, member.id),
-        eq(userChannelDisplayPrefs.channelId, channel.id),
-      ));
-    assert.equal(gatedRows.length, 0, "flag-off PATCH must not persist a display-preference row");
-
-    await db
-      .update(featureFlags)
-      .set({ defaultEnabled: true })
-      .where(eq(featureFlags.key, TOPBAR_OVERFLOW_FEATURE_FLAG_KEY));
+    // Retired configuration may be absent. Display preferences remain usable;
+    // membership and input validation below still protect the endpoint.
+    await db.delete(featureFlags).where(eq(featureFlags.key, "topbar_overflow_v0"));
 
     const initialRes = await getSettings(memberToken);
     assert.equal(initialRes.status, 200);
@@ -1004,7 +1079,7 @@ test("GET /api/channels/unread records unread-count phases and query shape", asy
   const dm = await findOrCreateUserDM(server.id, owner.id, peer.id);
   assert.ok(dm);
   const channelReadMessage = await createMessage(channel.id, "user", owner.id, "already read");
-  await createMessage(channel.id, "user", peer.id, "unread channel message");
+  const unreadChannelMessage = await createMessage(channel.id, "user", peer.id, "unread channel message");
   await createMessage(dm.id, "user", peer.id, "unread dm message");
   await db.insert(userChannelReadCursors).values({
     userId: owner.id,
@@ -1024,19 +1099,17 @@ test("GET /api/channels/unread records unread-count phases and query shape", asy
   assert.equal(body[channel.id], 1);
   assert.equal(body[dm.id], 1);
 
-  await db.insert(inboxServingRows).values({
-    receiverType: "user",
-    receiverId: owner.id,
+  // 2026-09-21 teardown: the summary's mention half derives from
+  // message_mentions in the canonical seq domain (inbox_serving_rows is dead).
+  await db.insert(messageMentions).values({
+    messageId: unreadChannelMessage.id,
+    messageSeq: unreadChannelMessage.seq,
     serverId: server.id,
-    kind: "channel",
-    sourceChannelId: channel.id,
-    latestNotifiedMessageId: channelReadMessage.id,
-    latestNotifiedSeq: channelReadMessage.seq,
-    latestNotifiedAt: channelReadMessage.createdAt,
-    unreadCount: 0,
-    unreadMentionCount: 1,
-    hasAnyMention: true,
-    updatedAt: new Date(),
+    channelId: channel.id,
+    targetType: "user",
+    targetId: owner.id,
+    handleAtSendTime: "unread-trace-owner",
+    notifiableAtSend: true,
   });
 
   const summaryRes = await fetch(`${app.baseUrl}/api/channels/unread?summary=1`, {
@@ -1080,35 +1153,35 @@ test("GET /api/channels/unread records unread-count phases and query shape", asy
     .filter((name) => name !== "db.query.finished");
   assert.deepEqual(processEventNames, [
     "unread_counts.load.started",
-    "history.policy.checked",
     "inbox.backend.selected",
     "unread_counts.loaded",
     "response.ready",
     "http.response.finished",
   ]);
 
+  // Unread is ONE read of rw_conversation_unread_v3 (answered by its Postgres
+  // reference in tests); the summary adds its public hasNew arm to the same read.
   const dbEvents = span.events.filter((event) => event.name === "db.query.finished");
   assert.deepEqual(dbEvents.map((event) => event.attrs?.query_name), ["channels.unread_counts_by_user"]);
   assert.equal(dbEvents.length, 1);
   assert.equal(dbEvents[0]?.attrs?.phase, "unread_counts.loaded");
   assert.equal(dbEvents[0]?.attrs?.unread_channels_count, 2);
-  assert.equal(dbEvents[0]?.attrs?.history_cutoff_present, false);
-  assert.equal(dbEvents[0]?.attrs?.["inbox.backend"], "pg_legacy");
+  assert.equal(dbEvents[0]?.attrs?.rw_conversation_unread_view, "rw_conversation_unread_v3");
+  assert.equal(dbEvents[0]?.attrs?.["inbox.backend"], "rw_mv");
   assert.equal(dbEvents[0]?.attrs?.["inbox.route"], "channel_unread");
-  assert.equal(dbEvents[0]?.attrs?.["inbox.fallback_reason"], "pglite_dev");
-  assert.equal(dbEvents[0]?.attrs?.["inbox.contract_version"], 2);
+  assert.equal(dbEvents[0]?.attrs?.["inbox.fallback_reason"], "none");
+  assert.equal(dbEvents[0]?.attrs?.["inbox.contract_version"], 3);
 
   const backendEvent = span.events.find((event) => event.name === "inbox.backend.selected");
   assert.ok(backendEvent);
-  assert.equal(backendEvent.attrs?.["inbox.backend"], "pg_legacy");
+  assert.equal(backendEvent.attrs?.["inbox.backend"], "rw_mv");
   assert.equal(backendEvent.attrs?.["inbox.route"], "channel_unread");
-  assert.equal(backendEvent.attrs?.["inbox.fallback_reason"], "pglite_dev");
-  assert.equal(backendEvent.attrs?.["inbox.contract_version"], 2);
+  assert.equal(backendEvent.attrs?.["inbox.fallback_reason"], "none");
+  assert.equal(backendEvent.attrs?.["inbox.contract_version"], 3);
 
   const loadedEvent = span.events.find((event) => event.name === "unread_counts.loaded");
   assert.ok(loadedEvent);
   assert.equal(loadedEvent.attrs?.unread_channels_count, 2);
-  assert.equal(loadedEvent.attrs?.history_cutoff_present, false);
 
   const readyEvent = span.events.find((event) => event.name === "response.ready");
   assert.ok(readyEvent);
@@ -2069,14 +2142,6 @@ test("Activity All paginates more than 100 unfollowed rows with mixed follow sta
 });
 
 
-test("historyCutoff PG serving fallback uses last_activity_at for row eligibility", () => {
-  const source = readFileSync(new URL("../services/channelService.ts", import.meta.url), "utf8");
-
-  assert.match(source, /sql`AND last_activity_at > \$\{opts\.historyCutoff\}`/);
-  assert.doesNotMatch(source, /sql`AND latest_notified_at > \$\{opts\.historyCutoff\}`/);
-});
-
-
 test("composed Unread + Mentions is preserved by the RisingWave serving query", () => {
   const source = readFileSync(new URL("../services/channelService.ts", import.meta.url), "utf8");
 
@@ -2092,18 +2157,18 @@ test("all Activity facet backends project and order DM/channel groups by recent 
 
   assert.equal(
     source.match(/MAX\((?:"activityAt"|last_activity_at)\) AS "groupLastActivityAt"/g)?.length,
-    4,
-    "RisingWave, serving-row PG, legacy activity PG, and canonical combined PG each aggregate a facet timestamp",
+    3,
+    "RisingWave, legacy activity PG, and canonical combined PG each aggregate a facet timestamp (the serving-row PG path died in the 2026-09-21 teardown)",
   );
   assert.equal(
     source.match(/array_agg\("groupLastActivityAt"::text ORDER BY CASE WHEN "groupChannelType" = 'dm' THEN 0 ELSE 1 END, "groupLastActivityAt" DESC NULLS LAST/g)?.length,
-    4,
-    "all four paths keep DM and Channel sections and order each by the same recent-activity key",
+    3,
+    "all three paths keep DM and Channel sections and order each by the same recent-activity key",
   );
   assert.equal(
     source.match(/group_totals\."groupLastActivityAts"/g)?.length,
-    5,
-    "the four backends plus the split serving-row page projection carry the aligned facet timestamp array",
+    3,
+    "the surviving backends carry the aligned facet timestamp array (serving-row PG and its split page projection died in the 2026-09-21 teardown)",
   );
 });
 
@@ -2611,193 +2676,6 @@ test("POST /channels/:id/read-all delegates to a kinded agent receiver without t
 });
 
 
-test("deleted Activity residue self-heals without weakening active private-channel authorization", async ({ app }) => {
-  const db = getDb();
-  const owner = await seedUser("deleted-activity-owner@slock.test", "deleted-activity-owner");
-  const sender = await seedUser("deleted-activity-sender@slock.test", "deleted-activity-sender");
-  const outsider = await seedUser("deleted-activity-outsider@slock.test", "deleted-activity-outsider");
-  const server = await createServer("Deleted Activity Residue", "deleted-activity-residue", owner.id);
-  await addMember(server.id, sender.id);
-  await addMember(server.id, outsider.id);
-  const ownerToken = await tokenForHuman(owner.email);
-  const outsiderToken = await tokenForHuman(outsider.email);
-
-  const deletedChannel = await createChannel(server.id, "deleted-activity-private", undefined, "private");
-  await addHuman(deletedChannel.id, owner.id);
-  await addHuman(deletedChannel.id, sender.id);
-  const deletedMessage = await createMessage(
-    deletedChannel.id,
-    "user",
-    sender.id,
-    "stale deleted activity mention",
-  );
-  await recordTestInboxFact({
-    serverId: server.id,
-    receiverId: owner.id,
-    kind: "channel",
-    sourceChannelId: deletedChannel.id,
-    message: deletedMessage,
-    personalMention: true,
-  });
-  assert.equal(
-    (await db.select().from(inboxServingRows).where(and(
-      eq(inboxServingRows.receiverType, "user"),
-      eq(inboxServingRows.receiverId, owner.id),
-      eq(inboxServingRows.sourceChannelId, deletedChannel.id),
-    ))).length,
-    1,
-    "fixture must contain the receiver-owned stale serving row",
-  );
-
-  await removeHuman(deletedChannel.id, owner.id);
-  const postRemovalMessage = await createMessage(
-    deletedChannel.id,
-    "user",
-    sender.id,
-    "must stay beyond the removed receiver's deleted residue frontier",
-  );
-  assert.ok(postRemovalMessage.seq > deletedMessage.seq);
-
-  await deleteChannel(deletedChannel.id);
-
-  const summaryBeforeAck = await fetch(`${app.baseUrl}/api/channels/unread?summary=1`, {
-    headers: headers(ownerToken, server.id),
-  });
-  assert.equal(summaryBeforeAck.status, 200);
-  const summaryBeforeAckBody = await summaryBeforeAck.json() as {
-    channels: Record<string, unknown>;
-  };
-  assert.equal(
-    summaryBeforeAckBody.channels[deletedChannel.id],
-    undefined,
-    "a deleted source must not resurrect a sidebar/Activity badge through stale mention metadata",
-  );
-
-  const deletedReadAll = await fetch(`${app.baseUrl}/api/channels/${deletedChannel.id}/read-all`, {
-    method: "POST",
-    headers: headers(ownerToken, server.id),
-  });
-  assert.equal(deletedReadAll.status, 200, "receiver-owned deleted residue must be safely acknowledgeable");
-  assert.deepEqual(await deletedReadAll.json(), {
-    ok: true,
-    seq: deletedMessage.seq,
-    readStateVersion: 1,
-  }, "deleted residue ack must stop at receiver-owned evidence, not the source message max");
-  const [deletedCursor] = await db.select().from(userChannelReadCursors).where(and(
-    eq(userChannelReadCursors.userId, owner.id),
-    eq(userChannelReadCursors.channelId, deletedChannel.id),
-  ));
-  assert.equal(deletedCursor?.lastReadSeq, deletedMessage.seq);
-  assert.equal(
-    (await db.select().from(inboxServingRows).where(and(
-      eq(inboxServingRows.receiverType, "user"),
-      eq(inboxServingRows.receiverId, owner.id),
-      eq(inboxServingRows.sourceChannelId, deletedChannel.id),
-    ))).length,
-    0,
-    "read acknowledgement must retire the stale serving row instead of rebuilding it",
-  );
-
-  const summaryAfterAck = await fetch(`${app.baseUrl}/api/channels/unread?summary=1`, {
-    headers: headers(ownerToken, server.id),
-  });
-  assert.equal(summaryAfterAck.status, 200);
-  const summaryAfterAckBody = await summaryAfterAck.json() as {
-    channels: Record<string, unknown>;
-  };
-  assert.equal(summaryAfterAckBody.channels[deletedChannel.id], undefined, "refresh must not resurrect the badge");
-
-  const unrelatedDeletedReadAll = await fetch(`${app.baseUrl}/api/channels/${deletedChannel.id}/read-all`, {
-    method: "POST",
-    headers: headers(outsiderToken, server.id),
-  });
-  assert.equal(
-    unrelatedDeletedReadAll.status,
-    404,
-    "a deleted channel must stay opaque to a receiver with no Activity/read residue of its own",
-  );
-  assert.equal(
-    (await db.select().from(userChannelReadCursors).where(and(
-      eq(userChannelReadCursors.userId, outsider.id),
-      eq(userChannelReadCursors.channelId, deletedChannel.id),
-    ))).length,
-    0,
-    "deleted-target residue authorization is receiver-local and must not create an outsider cursor",
-  );
-
-  const activePrivate = await createChannel(server.id, "active-private-authorization", undefined, "private");
-  await addHuman(activePrivate.id, owner.id);
-  await addHuman(activePrivate.id, sender.id);
-  const activeMessage = await createMessage(activePrivate.id, "user", sender.id, "active private residue probe");
-  await recordTestInboxFact({
-    serverId: server.id,
-    receiverId: outsider.id,
-    kind: "channel",
-    sourceChannelId: activePrivate.id,
-    message: activeMessage,
-    personalMention: true,
-  });
-
-  const unauthorizedActiveReadAll = await fetch(`${app.baseUrl}/api/channels/${activePrivate.id}/read-all`, {
-    method: "POST",
-    headers: headers(outsiderToken, server.id),
-  });
-  assert.equal(
-    unauthorizedActiveReadAll.status,
-    404,
-    "receiver-targeted residue must not grant access to an active private channel",
-  );
-  assert.equal(
-    (await db.select().from(userChannelReadCursors).where(and(
-      eq(userChannelReadCursors.userId, outsider.id),
-      eq(userChannelReadCursors.channelId, activePrivate.id),
-    ))).length,
-    0,
-    "active private denial must remain a zero-write",
-  );
-
-  const archivedChannel = await createChannel(server.id, "archived-activity-private", undefined, "private");
-  await addHuman(archivedChannel.id, owner.id);
-  await addHuman(archivedChannel.id, sender.id);
-  const archivedMessage = await createMessage(archivedChannel.id, "user", sender.id, "archived activity mention");
-  await recordTestInboxFact({
-    serverId: server.id,
-    receiverId: owner.id,
-    kind: "channel",
-    sourceChannelId: archivedChannel.id,
-    message: archivedMessage,
-    personalMention: true,
-  });
-  await archiveChannel(archivedChannel.id, owner.id);
-  await rebuildInboxServingRowsForReceiverTargets([{
-    receiverType: "user",
-    receiverId: owner.id,
-    sourceChannelId: archivedChannel.id,
-  }]);
-  assert.equal(
-    (await db.select().from(inboxServingRows).where(and(
-      eq(inboxServingRows.receiverType, "user"),
-      eq(inboxServingRows.receiverId, owner.id),
-      eq(inboxServingRows.sourceChannelId, archivedChannel.id),
-    ))).length,
-    0,
-    "archived source rebuilds must retire residue instead of preserving it for unarchive",
-  );
-  const archivedSummary = await fetch(`${app.baseUrl}/api/channels/unread?summary=1`, {
-    headers: headers(ownerToken, server.id),
-  });
-  assert.equal(archivedSummary.status, 200);
-  const archivedSummaryBody = await archivedSummary.json() as {
-    channels: Record<string, unknown>;
-  };
-  assert.equal(
-    archivedSummaryBody.channels[archivedChannel.id],
-    undefined,
-    "archived sources must be excluded from serving-row mention badges",
-  );
-});
-
-
 test("read-state mutations emit versioned user-room events", async () => {
   const previousInfo = console.info;
   const infoLogs: unknown[][] = [];
@@ -2838,6 +2716,7 @@ test("read-state mutations emit versioned user-room events", async () => {
         scopeId: channel.id,
         maxReadSeq: first.seq,
         readStateVersion: 1,
+        unreadCount: 1,
       },
     });
     assert.ok(
@@ -2878,6 +2757,7 @@ test("read-state mutations emit versioned user-room events", async () => {
         scopeId: channel.id,
         maxReadSeq: second.seq,
         readStateVersion: 2,
+        unreadCount: 0,
       },
     });
     const afterReadAllEventCount = events.length;
@@ -2929,6 +2809,7 @@ test("read-state mutations emit versioned user-room events", async () => {
         scopeId: channel.id,
         maxReadSeq: second.seq - 1,
         readStateVersion: 3,
+        unreadCount: 1,
       },
     });
     const afterUnreadEventCount = events.length;
@@ -3249,4 +3130,61 @@ test("changing channel visibility requires membership, for humans and agents ali
   } finally {
     await app.close();
   }
+});
+
+test("POST /api/channels/:id/resume-all-agents reports an agent whose start was skipped instead of counting it resumed", async ({ app, seed, http }) => {
+  const owner = await seed.human();
+  const server = await seed.server({ owner });
+  const channel = await seed.channel({ server, members: [owner] });
+  const started = await createAgent(server.id, `resume-ok-${randomUUID().slice(0, 8)}`, { runtime: "claude", model: "sonnet" });
+  const starting = await createAgent(server.id, `resume-busy-${randomUUID().slice(0, 8)}`, { runtime: "claude", model: "sonnet" });
+  await addAgent(channel.id, started.id);
+  await addAgent(channel.id, starting.id);
+  const orchestrator = app.app.get("agentOrchestrator") as {
+    startAgent: (agentId: string, options: { resumePrompt?: string }) => Promise<unknown>;
+  };
+  const prompts: Array<[string, string | undefined]> = [];
+  orchestrator.startAgent = async (agentId, options) => {
+    prompts.push([agentId, options.resumePrompt]);
+    return agentId === starting.id
+      ? { outcome: "skipped", reason: "wake_lock_held" }
+      : { outcome: "dispatched" };
+  };
+
+  const res = await http.as(owner, server).request(`/api/channels/${channel.id}/resume-all-agents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "new guidance" }),
+  });
+  assert.equal(res.status, 200);
+  const body = await res.json() as { ok: boolean; started: number; total: number; results: Array<{ agentId: string; ok: boolean; reason?: string }> };
+  assert.equal(body.ok, false, "a skipped start means the prompt did not reach that agent");
+  assert.equal(body.started, 1);
+  assert.equal(body.total, 2);
+  assert.deepEqual(
+    body.results.find((result) => result.agentId === starting.id),
+    { agentId: starting.id, ok: false, reason: "start_in_flight" },
+  );
+  assert.equal(body.results.find((result) => result.agentId === started.id)?.ok, true);
+  assert.equal(prompts.length, 2);
+
+  // The retry names only the agent that missed the guidance (plus an id from
+  // outside this channel, which is ignored): the resumed one is not started again.
+  prompts.length = 0;
+  const retry = await http.as(owner, server).request(`/api/channels/${channel.id}/resume-all-agents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "new guidance", agentIds: [starting.id, randomUUID()] }),
+  });
+  assert.equal(retry.status, 200);
+  const retryBody = await retry.json() as { total: number };
+  assert.deepEqual(prompts, [[starting.id, "new guidance"]]);
+  assert.equal(retryBody.total, 1);
+
+  const invalid = await http.as(owner, server).request(`/api/channels/${channel.id}/resume-all-agents`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "new guidance", agentIds: "everyone" }),
+  });
+  assert.equal(invalid.status, 400);
 });

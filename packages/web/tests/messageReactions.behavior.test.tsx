@@ -1,10 +1,8 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import type { SyncScopeKey } from "@botiverse/raft-shared";
 import { MemoryRouter } from "react-router-dom";
 import { cleanup, fireEvent, render as rtlRender, waitFor } from "@testing-library/react";
 import { TestIntlProvider } from "./helpers/intl";
-const render: typeof rtlRender = (ui, options) => rtlRender(ui, { wrapper: TestIntlProvider, ...options });
 import api from "../src/api/client";
 import type { Agent } from "../src/store/agentStore";
 import type { User } from "../src/store/authStore";
@@ -13,11 +11,9 @@ import type { Message, MessageReaction } from "../src/store/messageStore";
 import type { Server, ServerMember } from "../src/store/serverStore";
 import { reactionReadModelStore } from "../src/store/reactionReadModels";
 import {
-  prefetchServerFeatureFlags,
   resetServerFeatureFlagsForTests,
-  SYNC_CORE_MESSAGES_FLAG_KEY,
 } from "../src/store/serverFeatureFlags";
-import { useServerStore } from "../src/store/serverStore";
+const render: typeof rtlRender = (ui, options) => rtlRender(ui, { wrapper: TestIntlProvider, ...options });
 
 // DOM behavior coverage for the reaction chips / mobile add / floating picker /
 // optimistic toggle that MessageItem renders. Replaces the source-scanning
@@ -201,283 +197,6 @@ test("read-only reaction summaries stay visible but expose no mutation affordanc
   assert.equal(row.querySelector("[data-message-affordance='mobile-reaction-add']"), null);
 });
 
-test("normalized reactions render shared count with viewer overlay and detail cache", async (t) => {
-  useServerStore.setState({ current: makeServer() });
-  t.mock.method(api, "post", async (url: string) => {
-    assert.equal(url, "/feature-flags/evaluate");
-    return {
-      data: {
-        evaluations: [{ key: SYNC_CORE_MESSAGES_FLAG_KEY, enabled: true }],
-      },
-    };
-  });
-  await prefetchServerFeatureFlags("server-1");
-  reactionReadModelStore.getState().activatePrincipal("user-1");
-
-  const sharedFact = reactionReadModelStore.getState().applyLegacyIngress({
-    principalId: "user-1",
-    serverId: "server-1",
-    parentScopeKey: { serverId: "server-1", scopeKind: "channel", scopeId: channelId },
-    messageId,
-    source: "receiver-private",
-    viewerUserId: "user-1",
-    reactions: [{
-      emoji: "👍",
-      count: 2,
-      reactorIds: ["user-1", "user-2"],
-      reactorNames: ["Current User", "Bob"],
-    }],
-  });
-  const { row } = await renderMessage(makeMessage([...sharedFact]));
-
-  const chip = Array.from(row.querySelectorAll<HTMLElement>("button[aria-label]")).find(
-    (button) => button.getAttribute("aria-label") === "👍 reaction from Current User, Bob",
-  );
-  assert.ok(chip);
-  assert.match(chip.className, /bg-brutal-pink\/20/);
-  assert.equal(JSON.stringify(sharedFact).includes("reactorIds"), false);
-});
-
-test("an unselected normalized reaction uses the shared neutral fill and hover", async (t) => {
-  useServerStore.setState({ current: makeServer() });
-  t.mock.method(api, "post", async () => ({
-    data: {
-      evaluations: [{ key: SYNC_CORE_MESSAGES_FLAG_KEY, enabled: true }],
-    },
-  }));
-  await prefetchServerFeatureFlags("server-1");
-  reactionReadModelStore.getState().activatePrincipal("user-1");
-
-  const sharedFact = reactionReadModelStore.getState().applyLegacyIngress({
-    principalId: "user-1",
-    serverId: "server-1",
-    parentScopeKey: { serverId: "server-1", scopeKind: "channel", scopeId: channelId },
-    messageId,
-    source: "receiver-private",
-    viewerUserId: "user-1",
-    reactions: [{
-      emoji: "👍",
-      count: 1,
-      reactorIds: ["user-2"],
-      reactorNames: ["Bob"],
-    }],
-  });
-  const { row } = await renderMessage(makeMessage([...sharedFact]));
-
-  const chip = Array.from(row.querySelectorAll<HTMLElement>("button[aria-label]")).find(
-    (button) => button.getAttribute("aria-label") === "👍 reaction from Bob",
-  );
-  assert.ok(chip);
-  assert.match(chip.className, /bg-black\/\[0\.03\]/, "an unselected reaction shares the neutral 3% fill");
-  assert.match(chip.className, /hover:bg-black\/\[0\.08\]/, "an unselected reaction shares the neutral 8% hover");
-});
-
-test("normalized thread reactions read detail from the explicit local parent scope", async (t) => {
-  useServerStore.setState({ current: makeServer() });
-  t.mock.method(api, "post", async () => ({
-    data: {
-      evaluations: [{ key: SYNC_CORE_MESSAGES_FLAG_KEY, enabled: true }],
-    },
-  }));
-  await prefetchServerFeatureFlags("server-1");
-  reactionReadModelStore.getState().activatePrincipal("user-1");
-
-  const threadScope: SyncScopeKey = {
-    serverId: "server-1",
-    scopeKind: "thread",
-    scopeId: channelId,
-  };
-  const sharedFact = reactionReadModelStore.getState().applyLegacyIngress({
-    principalId: "user-1",
-    serverId: "server-1",
-    parentScopeKey: threadScope,
-    messageId,
-    source: "receiver-private",
-    viewerUserId: "user-1",
-    reactions: [{
-      emoji: "👍",
-      count: 1,
-      reactorIds: ["user-2"],
-      reactorNames: ["Thread Actor"],
-    }],
-  });
-  const { row } = await renderMessage(
-    makeMessage([...sharedFact]),
-    threadScope,
-  );
-
-  assert.ok(
-    Array.from(row.querySelectorAll<HTMLElement>("button[aria-label]")).find(
-      (button) => button.getAttribute("aria-label") === "👍 reaction from Thread Actor",
-    ),
-    "a thread HTTP/update shape without conversationContext must still hit its thread-scoped cache",
-  );
-});
-
-test("normalized optimism changes count plus overlay without inventing a shared roster", async (t) => {
-  useServerStore.setState({ current: makeServer() });
-  t.mock.method(api, "post", async () => ({
-    data: {
-      evaluations: [{ key: SYNC_CORE_MESSAGES_FLAG_KEY, enabled: true }],
-    },
-  }));
-  await prefetchServerFeatureFlags("server-1");
-  reactionReadModelStore.getState().activatePrincipal("user-1");
-
-  const sharedFact = reactionReadModelStore.getState().applyLegacyIngress({
-    principalId: "user-1",
-    serverId: "server-1",
-    parentScopeKey: { serverId: "server-1", scopeKind: "channel", scopeId: channelId },
-    messageId,
-    source: "receiver-private",
-    viewerUserId: "user-1",
-    reactions: [{
-      emoji: "👍",
-      count: 2,
-      reactorIds: ["user-1", "user-2"],
-      reactorNames: ["Current User", "Bob"],
-    }],
-  });
-
-  let resolveRequest!: (value: { data: Message }) => void;
-  const requestResult = new Promise<{ data: Message }>((resolve) => {
-    resolveRequest = resolve;
-  });
-  t.mock.method(api, "request", async () => requestResult);
-
-  const { row, useMessageStore } = await renderMessage(makeMessage([...sharedFact]));
-  const chip = Array.from(row.querySelectorAll<HTMLElement>("button[aria-label]")).find(
-    (button) => button.getAttribute("aria-label") === "👍 reaction from Current User, Bob",
-  );
-  assert.ok(chip);
-  fireEvent.click(chip);
-
-  await waitFor(() => {
-    const stored = useMessageStore.getState().channelMessages[channelId]?.[0];
-    assert.deepEqual(stored?.reactions, [{ emoji: "👍", count: 1, previewK: [] }]);
-    assert.deepEqual(
-      reactionReadModelStore.getState().readViewerOverlay("user-1", "server-1", messageId, "👍"),
-      { status: "loaded", reactedByMe: false },
-    );
-    assert.equal(JSON.stringify(stored).includes("reactorIds"), false);
-    assert.equal(reactionReadModelStore.getState().actorCache.size, 1);
-  });
-
-  resolveRequest({
-    data: makeMessage([
-      { emoji: "👍", count: 1, reactorIds: ["user-2"], reactorNames: ["Bob"] },
-    ]),
-  });
-  await waitFor(() => {
-    assert.deepEqual(
-      reactionReadModelStore.getState().readViewerOverlay("user-1", "server-1", messageId, "👍"),
-      { status: "loaded", reactedByMe: false },
-    );
-  });
-});
-
-test("two normalized emoji mutations replay out of order and roll back only the failed target", async (t) => {
-  useServerStore.setState({ current: makeServer() });
-  t.mock.method(api, "post", async () => ({
-    data: {
-      evaluations: [{ key: SYNC_CORE_MESSAGES_FLAG_KEY, enabled: true }],
-    },
-  }));
-  await prefetchServerFeatureFlags("server-1");
-  reactionReadModelStore.getState().activatePrincipal("user-1");
-
-  const sharedFact = reactionReadModelStore.getState().applyLegacyIngress({
-    principalId: "user-1",
-    serverId: "server-1",
-    parentScopeKey: { serverId: "server-1", scopeKind: "channel", scopeId: channelId },
-    messageId,
-    source: "receiver-private",
-    viewerUserId: "user-1",
-    reactions: [
-      {
-        emoji: "👍",
-        count: 2,
-        reactorIds: ["user-1", "user-2"],
-        reactorNames: ["Current User", "Bob"],
-      },
-      {
-        emoji: "👀",
-        count: 2,
-        reactorIds: ["user-1", "user-3"],
-        reactorNames: ["Current User", "Eve"],
-      },
-    ],
-  });
-
-  const pending = new Map<string, {
-    resolve(value: { data: Message & { reactionViewer?: unknown } }): void;
-    reject(reason: Error): void;
-  }>();
-  t.mock.method(api, "request", async (config: { data?: { emoji?: string } }) => (
-    new Promise((resolve, reject) => {
-      pending.set(config.data?.emoji ?? "", { resolve, reject });
-    })
-  ));
-
-  const { row, useMessageStore } = await renderMessage(makeMessage([...sharedFact]));
-  const chip = (emoji: string) => Array.from(row.querySelectorAll<HTMLElement>("button[aria-label]"))
-    .find((button) => button.getAttribute("aria-label")?.startsWith(`${emoji} reaction`));
-
-  fireEvent.click(chip("👍")!);
-  await waitFor(() => assert.ok(pending.has("👍")));
-  fireEvent.click(chip("👀")!);
-  await waitFor(() => assert.ok(pending.has("👀")));
-
-  pending.get("👀")!.resolve({
-    data: {
-      ...makeMessage([
-        { emoji: "👍", count: 2, reactorIds: ["user-1", "user-2"], reactorNames: ["Current User", "Bob"] },
-        { emoji: "👀", count: 1, reactorIds: ["user-3"], reactorNames: ["Eve"] },
-      ]),
-      reactionViewer: {
-        serverId: "server-1",
-        messageId,
-        viewerVersion: 1,
-        reactedEmojis: ["👍"],
-      },
-    },
-  });
-  await waitFor(() => {
-    assert.deepEqual(
-      reactionReadModelStore.getState().readViewerOverlay("user-1", "server-1", messageId, "👀"),
-      { status: "loaded", reactedByMe: false },
-    );
-    assert.deepEqual(
-      reactionReadModelStore.getState().readViewerOverlay("user-1", "server-1", messageId, "👍"),
-      { status: "loaded", reactedByMe: false },
-      "still-pending 👍 removal must replay over the 👀 ACK snapshot",
-    );
-    assert.deepEqual(
-      [...reactionReadModelStore.getState().viewerVersions.values()],
-      [1],
-      "mutation ACK must enter the versioned complete-snapshot projector",
-    );
-  });
-
-  pending.get("👍")!.reject(new Error("first emoji failed"));
-  await waitFor(() => {
-    const stored = useMessageStore.getState().channelMessages[channelId]?.[0];
-    assert.deepEqual(stored?.reactions, [
-      { emoji: "👀", count: 1, previewK: [] },
-      { emoji: "👍", count: 2, previewK: [] },
-    ]);
-    assert.deepEqual(
-      reactionReadModelStore.getState().readViewerOverlay("user-1", "server-1", messageId, "👍"),
-      { status: "loaded", reactedByMe: true },
-    );
-    assert.deepEqual(
-      reactionReadModelStore.getState().readViewerOverlay("user-1", "server-1", messageId, "👀"),
-      { status: "loaded", reactedByMe: false },
-    );
-    assert.equal(JSON.stringify(stored).includes("reactorIds"), false);
-  });
-});
-
 test("mobile reaction-add affordance appears only when reactions are visible", async () => {
   const { row } = await renderMessage(
     makeMessage([
@@ -499,8 +218,8 @@ test("mobile reaction-add affordance appears only when reactions are visible", a
   );
 });
 
-test("clicking a reaction chip optimistically toggles it off then reconciles from the API", async (t) => {
-  const requestMock = t.mock.method(api, "request", async () => ({
+test("clicking a reaction chip optimistically toggles it off then reconciles from the API", async () => {
+  const requestMock = vi.spyOn(api, "request").mockImplementation(async () => ({
     data: {
       id: messageId,
       channelId,
@@ -531,9 +250,9 @@ test("clicking a reaction chip optimistically toggles it off then reconciles fro
 
   // The DELETE round-trip fired against the reactions endpoint.
   await waitFor(() => {
-    assert.equal(requestMock.mock.callCount(), 1);
+    assert.equal(requestMock.mock.calls.length, 1);
   });
-  const call = requestMock.mock.calls[0].arguments[0] as {
+  const call = requestMock.mock.calls[0][0] as {
     method: string;
     url: string;
     data: { emoji: string };

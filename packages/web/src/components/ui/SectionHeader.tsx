@@ -14,15 +14,14 @@
  * Slots:
  * - `label`     — the eyebrow text
  * - `icon`      — optional leading icon node (e.g. `<Bell size={16} />`),
- *                 rendered in `text-black/60` next to the eyebrow
- * - `count`     — optional integer badge rendered after the label in
- *                 `text-black/40 font-mono` (rendered only when defined and
- *                 ≥ 0; pass `undefined` / `null` to hide)
+ *                 rendered in ink-3 next to the eyebrow
+ * - `count`     — optional integer rendered after the label as the DS gray
+ *                 section count (Space Mono 12, ink-3; rendered only when
+ *                 defined and ≥ 0; pass `undefined` / `null` to hide)
  * - `action`    — optional right-aligned action node (e.g. `<button>` to add)
  * - `htmlFor`   — when set, the eyebrow becomes a `<label htmlFor>` for the
  *                 region's main control
- * - `className` — additional classes on the outer wrapper (e.g. `mb-2`,
- *                 `border-b-2 border-black pb-2`)
+ * - `className` — additional classes on the outer wrapper (e.g. `mb-2`)
  *
  * Typography is locked via `SectionEyebrow`; do NOT pass eyebrow class
  * overrides here — if a section needs a different style, it shouldn't be a
@@ -57,12 +56,12 @@ export default function SectionHeader({
     <div className={wrapperCls}>
       <div className="flex min-w-0 items-center gap-2">
         {icon ? (
-          <span className="shrink-0 text-black/60">{icon}</span>
+          <span className="shrink-0 text-foreground-hint">{icon}</span>
         ) : null}
         <SectionEyebrow as={eyebrowAs} htmlFor={htmlFor}>
           {label}
           {typeof count === "number" && count >= 0 ? (
-            <span className="ml-2 font-mono text-black/40">{count}</span>
+            <span className="ml-2 font-mono text-mono-meta font-normal text-foreground-hint">{count}</span>
           ) : null}
         </SectionEyebrow>
       </div>

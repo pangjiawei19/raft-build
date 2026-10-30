@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { clearClockTimeout, setClockTimeout } from "@botiverse/raft-shared";
 import {
@@ -21,9 +21,14 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { useIntl } from "react-intl";
 import { useNavigate } from "react-router-dom";
-import { Check, GripVertical, Plus } from "lucide-react";
-import { Badge } from "raft-ui";
+import { Check, GripVertical, Plus, UserPlus } from "lucide-react";
+import { Badge, PopoverContent } from "@botiverse/raft-ui";
+import type { PopoverContentProps } from "@botiverse/raft-ui";
+import Banner from "./Banner";
+import Tooltip from "./Tooltip";
 import { useServerStore } from "../../store/serverStore";
+import { useServerPermissions } from "../../hooks/useServerPermissions";
+import InviteHumanDialog from "../member/InviteHumanDialog";
 import type { CommunityServerSlug, Server } from "../../store/serverStore";
 import { serverPersistence } from "../../store/serverPersistenceRegistry";
 import { useJoinCommunityFlow } from "../../hooks/useJoinCommunityFlow";
@@ -40,50 +45,40 @@ import type { ServerUnreadSummary } from "../../utils/serverUnreadSummary";
 import AvatarSlot from "./AvatarSlot";
 import ContextMenuDivider from "./ContextMenuDivider";
 import { requestHostedOnboardingServerSwitch } from "../../embed/hostBridge";
+import { dismissLayerProps } from "./dismissLayer";
 
 /**
- * Shared dropdown content for the "switch server" surfaces. The same menu
- * — a list of joined servers + "Join community" + "Switch or create
- * server" — is reachable from two callsites:
+ * The workspace switcher: the joined workspaces, Join Community, Switch or
+ * Create Server and Invite People. One list for every trigger — the desktop
+ * rail's workspace block, the web top bar's workspace button and the phone
+ * Home pill.
  *
- *  - **Desktop LeftRail** — flyout anchored to the top-left server-initial
- *    button. Positioned `absolute left-full top-1 ml-2`, fixed width.
- *  - **Mobile Sidebar navbar pill** — drop-down anchored under the
- *    ServerName pill on the Chat home tab. Positioned
- *    `absolute top-full left-2 right-2 mt-1`, fluid width.
+ * It is the content of a raft-ui Popover. Render it inside the caller's
+ * `<Popover open onOpenChange>` next to its `<PopoverTrigger>`: the popover
+ * owns the trigger toggle, outside presses and Escape, and puts the list in a
+ * portal placed against the trigger (or `anchor`), kept on screen and never
+ * taller than the space it has, so the list scrolls inside and the footer
+ * stays reachable. Opening it never moves the page.
  *
- * Both used to inline 70+ lines of identical JSX (server list + the two
- * footer buttons) and identical state plumbing (outside-click + ESC). They
- * drifted (LeftRail rendered the current server's own unread badge, mobile
- * Sidebar didn't) — this primitive collapses the duplication and pins the
- * canonical behavior.
+ * Rules:
+ *  - The current workspace's row hides its own unread count: you are already
+ *    there.
+ *  - Selecting another workspace navigates to its last remembered surface,
+ *    falling back to `/s/${slug}`; ServerResolver flips `current` once the
+ *    route lands. The URL is the source of truth, the store is not updated
+ *    directly.
  *
- * Trigger button + positioning live at the callsite. The primitive owns:
- *  - The shared card container (`card-brutal z-50 flex flex-col overflow-hidden`)
- *  - The server list with current-server check + per-row unread badge
- *  - Join community actions (global plus Chinese community for Chinese-language browsers)
- *  - The "Switch or create server" button
- *  - Outside-click + ESC dismiss
- *
- * Canonical behavior:
- *  - **Current server row hides its own unread count.** A "this server has
- *    N unread" badge inside this server's own switcher menu is redundant —
- *    you're already here. stdrc decision C 2026-05-14
- *    `#proj-uiux:24e533e3` task #234.
- *  - Selecting another server navigates to that server's last remembered
- *    surface, falling back to `/s/${slug}`; ServerResolver flips `current`
- *    once the route lands. The store is not updated directly, the URL is
- *    the source of truth.
- *
- * Trigger contract: callsite's trigger button must `e.stopPropagation()` on
- * `onMouseDown` so the document mousedown listener inside this primitive
- * doesn't fire on the same tap that toggles `open` and immediately close
- * the just-opened menu.
+ * Raft Design System › Select (the workspace list): every workspace is the
+ * ink tile with yellow initials (AvatarSlot `type="server"`); the workspace
+ * you are in carries a trailing ink check and bold name; another
+ * workspace's unread is the pink count badge (a muted one the gray mono
+ * count); rows are 8px-radius menu items with the yellow-soft highlight.
  */
-export interface ServerSwitcherMenuProps {
-  open: boolean;
+export interface ServerSwitcherMenuProps
+  extends Pick<PopoverContentProps, "anchor" | "side" | "align" | "sideOffset" | "alignOffset"> {
+  /** Closes the menu (the caller's Popover state) once an action in it is done. */
   onClose: () => void;
-  /** Positioning + sizing classes added to the outer card. */
+  /** Width classes for the menu. */
   className?: string;
   /** Server unread counts keyed by server id. Fetched at the callsite. */
   serverUnreadCounts: Record<string, ServerUnreadSummary>;
@@ -129,12 +124,15 @@ function SortableServerRow({
   const unread = unreadSummary?.activityUnreadCount;
   const isMuted = unreadSummary?.serverPushMuted === true;
 
+  // The yellow-soft highlight follows the pointer or KEYBOARD focus only. The
+  // popover moves focus into its first row when it opens, so `focus-within`
+  // lit that row after every mouse open, as if it were hovered.
   return (
     <div
       ref={setNodeRef}
       style={style}
       onAuxClick={(event) => onAuxSelect(event, server, targetHref)}
-      className="relative flex h-12 w-full items-stretch text-sm font-medium text-black transition-colors hover:bg-soft-signal"
+      className="group/server-row relative flex h-12 w-full items-stretch rounded-control text-callout font-medium text-foreground transition-colors hover:bg-brand-soft has-[:focus-visible]:bg-brand-soft"
     >
       <a
         href={targetHref}
@@ -146,26 +144,27 @@ function SortableServerRow({
           event.preventDefault();
           onSelect(server, targetHref);
         }}
-        className={`flex min-w-0 flex-1 items-center gap-2 py-0 pl-3 pr-1 text-left ${
+        className={`flex min-w-0 flex-1 items-center gap-2.5 rounded-control py-0 pl-2.5 pr-1 text-left outline-none ${
           isCurrent ? "font-bold" : ""
         }`}
       >
-        <Check size={14} className={`shrink-0 ${isCurrent ? "opacity-100" : "opacity-0"}`} />
-        <AvatarSlot context="surface-list" type="server" serverAvatarUrl={server.avatarUrl} serverInitial={initial} />
+        <AvatarSlot context="list-row" type="server" serverAvatarUrl={server.avatarUrl} serverInitial={initial} />
         <div className="min-w-0 flex-1 text-left">
           <div className="truncate">{server.name}</div>
-          <div className="truncate font-mono text-xs text-black/40">/{server.slug}</div>
+          <div className="truncate font-mono text-mono-meta font-normal text-foreground-hint">/{server.slug}</div>
         </div>
+        {isCurrent ? <Check size={16} className="shrink-0 text-foreground" aria-hidden="true" /> : null}
         {!isCurrent && unread !== undefined && unread > 0 && (
           isMuted ? (
-            <span
-              className="ml-auto shrink-0 font-mono text-[10px] font-medium leading-none text-black/50"
-              title={intl.formatMessage({ id: "ui.serverSwitcher.notificationsMuted" })}
-            >
-              {unread > 99 ? "99+" : unread}
-            </span>
+            <Tooltip content={intl.formatMessage({ id: "ui.serverSwitcher.notificationsMuted" })}>
+              <span
+                className="ml-auto shrink-0 font-mono text-mono-meta text-foreground-hint"
+              >
+                {unread > 99 ? "99+" : unread}
+              </span>
+            </Tooltip>
           ) : (
-            <Badge variant="accent" uppercase={false} className="ml-auto h-auto min-w-0 shrink-0 justify-center rounded px-1.5 py-0.5 leading-none text-white">
+            <Badge variant="accent" className="ml-auto shrink-0 justify-center">
               {unread > 99 ? "99+" : unread}
             </Badge>
           )
@@ -176,7 +175,7 @@ function SortableServerRow({
         aria-label={intl.formatMessage({ id: "ui.serverSwitcher.reorderServer" }, { name: server.name })}
         {...attributes}
         {...listeners}
-        className="flex w-6 shrink-0 touch-none cursor-grab items-center justify-center text-black/45 hover:text-black active:cursor-grabbing"
+        className="flex w-6 shrink-0 touch-none cursor-grab items-center justify-center rounded-control text-foreground-hint outline-none group-hover/server-row:text-foreground-muted focus-visible:shadow-focus active:cursor-grabbing"
       >
         <GripVertical size={14} />
       </button>
@@ -184,13 +183,25 @@ function SortableServerRow({
   );
 }
 
+// The footer actions are DS menu items: 36 tall, 14/20 500 ink, a 16px ink-2
+// icon, the yellow-soft highlight on hover and keyboard focus.
+const SWITCHER_ACTION_CLASS = "flex min-h-9 w-full items-center justify-start gap-2.5 rounded-control px-2.5 py-1.5 [@media(max-height:600px)]:min-h-8 [@media(max-height:600px)]:py-1 text-left text-callout font-medium text-foreground outline-none transition-colors hover:bg-brand-soft focus-visible:bg-brand-soft [&>svg]:text-foreground-muted";
+
+function handleAuxSelectServer(event: ReactMouseEvent, selected: Server, targetHref: string) {
+  openServerSwitcherAuxClickTarget(event, selected.id, selected.slug, { targetHref });
+}
+
 export default function ServerSwitcherMenu({
-  open,
   onClose,
   className,
   serverUnreadCounts,
   testId = "server-switcher-menu",
   navigationMode = "restore-surface",
+  anchor,
+  side = "bottom",
+  align = "start",
+  sideOffset = 8,
+  alignOffset = 0,
 }: ServerSwitcherMenuProps) {
   const intl = useIntl();
   const navigate = useNavigate();
@@ -199,8 +210,9 @@ export default function ServerSwitcherMenu({
   const updateServerOrder = useServerStore((s) => s.updateServerOrder);
   const [hostedSwitchPending, setHostedSwitchPending] = useState(false);
   const [hostedSwitchError, setHostedSwitchError] = useState("");
+  const [showInviteHuman, setShowInviteHuman] = useState(false);
+  const { capabilities } = useServerPermissions();
   const hostedSwitchTimeoutRef = useRef<ReturnType<typeof setClockTimeout> | null>(null);
-  const menuRef = useRef<HTMLDivElement | null>(null);
   const dndSensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(TouchSensor, { activationConstraint: { delay: 500, tolerance: 10 } }),
@@ -218,46 +230,9 @@ export default function ServerSwitcherMenu({
     },
   });
 
-  // Callsites pass `onClose` as an inline arrow, which means a fresh
-  // function ref on every parent render. If we depended on `onClose`
-  // directly the dismiss effect would detach+reattach the document
-  // listeners on every parent render. Park the latest `onClose` in a
-  // ref and depend only on `open`. Bugen nit 2 review of PR #1786.
-  const onCloseRef = useRef(onClose);
-  useEffect(() => {
-    onCloseRef.current = onClose;
-  }, [onClose]);
-
   useEffect(() => () => {
     if (hostedSwitchTimeoutRef.current !== null) clearClockTimeout(hostedSwitchTimeoutRef.current);
   }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    const onMouseDown = (e: MouseEvent) => {
-      if (menuRef.current?.contains(e.target as Node)) return;
-      onCloseRef.current();
-    };
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCloseRef.current();
-    };
-    document.addEventListener("mousedown", onMouseDown);
-    // keydown-focus-on-open
-    document.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.removeEventListener("mousedown", onMouseDown);
-      document.removeEventListener("keydown", onKeyDown);
-    };
-  }, [open]);
-
-  // Move focus into the menu on open so a focused background element can't
-  // swallow keys meant for it, and so Escape/Tab work immediately. Guarded so
-  // we don't steal focus from a menu item that already grabbed it.
-  useLayoutEffect(() => {
-    if (!open) return;
-    const m = menuRef.current;
-    if (m && !m.contains(document.activeElement)) m.focus();
-  }, [open]);
 
   const handleSelectServer = useCallback((selected: Server, targetHref: string) => {
     const isCurrent = selected.id === server?.id;
@@ -284,10 +259,6 @@ export default function ServerSwitcherMenu({
     onClose();
   }, [intl, navigate, navigationMode, onClose, server?.id]);
 
-  const handleAuxSelectServer = (event: ReactMouseEvent, selected: Server, targetHref: string) => {
-    openServerSwitcherAuxClickTarget(event, selected.id, selected.slug, { targetHref });
-  };
-
   const handleServerDragEnd = useCallback(({ active, over }: DragEndEvent) => {
     if (!over || active.id === over.id) return;
     const activeId = String(active.id);
@@ -299,7 +270,8 @@ export default function ServerSwitcherMenu({
     void updateServerOrder(reordered);
   }, [servers, updateServerOrder]);
 
-  if (!open) return null;
+  const sortableServerIds = useMemo(() => servers.map((candidate) => candidate.id), [servers]);
+  const closeInviteDialog = useCallback(() => setShowInviteHuman(false), []);
 
   const joinOptions: Array<
     { kind: "community-server"; slug: CommunityServerSlug; label: string }
@@ -312,22 +284,29 @@ export default function ServerSwitcherMenu({
     await communityJoinFlow.joinCommunity(slug);
   };
 
+  // The dialogs sit beside the popup, not in it: they outlive the menu, which
+  // closes as soon as one of them opens.
   return (
-    <div
-      ref={menuRef}
-      tabIndex={-1}
+    <>
+    <PopoverContent
+      anchor={anchor}
+      side={side}
+      align={align}
+      sideOffset={sideOffset}
+      alignOffset={alignOffset}
+      collisionPadding={8}
       data-testid={testId}
-      className={`card-brutal z-50 flex flex-col overflow-hidden outline-none ${className ?? ""}`}
-      onMouseDown={(e) => e.stopPropagation()}
+      {...dismissLayerProps}
+      className={`flex flex-col p-1.5 ${className ?? ""}`}
     >
       {hostedSwitchError ? (
-        <div role="alert" className="m-2 border-2 border-black bg-brutal-orange/20 p-2 text-xs font-bold">
+        <Banner intent="warning" density="sm" className="m-1 mb-1.5 shrink-0">
           {hostedSwitchError}
-        </div>
+        </Banner>
       ) : null}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
         <DndContext sensors={dndSensors} collisionDetection={closestCenter} onDragEnd={handleServerDragEnd}>
-          <SortableContext items={servers.map((s) => s.id)} strategy={verticalListSortingStrategy}>
+          <SortableContext items={sortableServerIds} strategy={verticalListSortingStrategy}>
             {servers.map((s) => (
               <div key={s.id} aria-disabled={hostedSwitchPending || undefined} className={hostedSwitchPending ? "pointer-events-none opacity-60" : ""}>
                 <SortableServerRow
@@ -348,22 +327,17 @@ export default function ServerSwitcherMenu({
 
       <ContextMenuDivider />
 
-      {/* Community actions sit ABOVE "Switch or create server" — the ordering
-          mirrors mobile Sidebar in PR #1234 (task #136). */}
+      {/* Community actions sit above Switch or Create Server. */}
       {joinOptions.map((option) => (
         <button
           key={option.slug}
-          onClick={() => {
-            void handleJoinCommunity(option.slug);
-          }}
-          className="flex w-full items-center justify-start gap-2 px-3 py-2 [@media(max-height:600px)]:py-1 text-left text-sm font-bold text-black hover:bg-brutal-pink transition-colors"
+          onClick={() => void handleJoinCommunity(option.slug)}
+          className={SWITCHER_ACTION_CLASS}
         >
-          <Plus size={14} />
+          <Plus size={16} />
           <span className="min-w-0 flex-1 text-left">{option.label}</span>
         </button>
       ))}
-
-      {communityJoinFlow.agreementDialog}
 
       <button
         onClick={() => {
@@ -371,11 +345,32 @@ export default function ServerSwitcherMenu({
           serverPersistence.clearLastServerSlug();
           navigate("/");
         }}
-        className="flex w-full items-center justify-start gap-2 px-3 py-2 [@media(max-height:600px)]:py-1 text-left text-sm font-bold text-black hover:bg-brutal-pink transition-colors"
+        className={SWITCHER_ACTION_CLASS}
       >
-        <Plus size={14} />
+        <Plus size={16} />
         <span className="min-w-0 flex-1 text-left">{intl.formatMessage({ id: "ui.serverSwitcher.switchOrCreate" })}</span>
       </button>
-    </div>
+
+      {/* "Invite people" sits right under "Switch or create server" so inviting
+          teammates is one click from the workspace menu instead of buried in
+          Settings → Administration. Gated by the same capability the Settings
+          invites section uses; opens the shared InviteHumanDialog. */}
+      {capabilities.inviteMembers ? (
+        <button
+          data-testid="server-switcher-invite"
+          onClick={() => {
+            onClose();
+            setShowInviteHuman(true);
+          }}
+          className={SWITCHER_ACTION_CLASS}
+        >
+          <UserPlus size={16} />
+          <span className="min-w-0 flex-1 text-left">{intl.formatMessage({ id: "layout.sidebar.inviteHuman" })}</span>
+        </button>
+      ) : null}
+    </PopoverContent>
+    {communityJoinFlow.agreementDialog}
+    {showInviteHuman ? <InviteHumanDialog onClose={closeInviteDialog} /> : null}
+    </>
   );
 }

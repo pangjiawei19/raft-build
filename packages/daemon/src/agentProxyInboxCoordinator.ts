@@ -2,13 +2,13 @@ import {
   type AgentProxyFreshnessDecision,
   type AgentProxyInboxCoordinator,
   type AgentProxyVisibleMessage,
-} from "./agentCredentialProxy.js";
-import { inboxProjectionTraceAttrs } from "./agentRuntimeInput.js";
+} from "./agentCredentialProxy";
+import { inboxProjectionTraceAttrs } from "./agentRuntimeInput";
 import {
   buildApmFreshnessDecisionProducerFactId,
   projectApmFreshnessDecisionTrace,
-} from "./apmStateMachine.js";
-import { daemonProxyFailureTraceAttrs, daemonTransportErrorExcerpt } from "./proxyFailureTrace.js";
+} from "./apmStateMachine";
+import { daemonProxyFailureTraceAttrs, daemonTransportErrorExcerpt } from "./proxyFailureTrace";
 
 type TraceRecorder = (
   name: string,
@@ -24,15 +24,20 @@ export function buildAgentProxyInboxCoordinator(input: {
   getBoundary: AgentProxyInboxCoordinator["getBoundary"];
   getPendingMessages: AgentProxyInboxCoordinator["getPendingMessages"];
   isMessageModelSeen: NonNullable<AgentProxyInboxCoordinator["isMessageModelSeen"]>;
+  getExactSeenSeqs?: AgentProxyInboxCoordinator["getExactSeenSeqs"];
+  getContextId?: AgentProxyInboxCoordinator["getContextId"];
   getAllPendingMessages: NonNullable<AgentProxyInboxCoordinator["getAllPendingMessages"]>;
   consumeVisibleMessages: AgentProxyInboxCoordinator["consumeVisibleMessages"];
   recordTrace: TraceRecorder;
   recordFreshnessDecisionActivity: (decision: AgentProxyFreshnessDecision, producerFactId: string) => void;
+  recordSendOutcome?: AgentProxyInboxCoordinator["recordSendOutcome"];
 }): AgentProxyInboxCoordinator {
   return {
     getBoundary: input.getBoundary,
     getPendingMessages: input.getPendingMessages,
     isMessageModelSeen: input.isMessageModelSeen,
+    getExactSeenSeqs: input.getExactSeenSeqs,
+    getContextId: input.getContextId,
     getAllPendingMessages: input.getAllPendingMessages,
     consumeVisibleMessages: input.consumeVisibleMessages,
     recordInboxSnapshot: (projection) => input.recordTrace("daemon.agent.inbox_projection.snapshot", {
@@ -78,6 +83,11 @@ export function buildAgentProxyInboxCoordinator(input: {
         ...trace.attrs,
       });
       input.recordFreshnessDecisionActivity(decision, producerFactId);
+      // A send the daemon held itself never reaches the Server, so no response reports it.
+      if (decision.action === "send" && (decision.decision === "local_hold" || decision.decision === "syncing_hold")) {
+        input.recordSendOutcome?.({ state: "held" });
+      }
     },
+    ...(input.recordSendOutcome ? { recordSendOutcome: input.recordSendOutcome } : {}),
   };
 }

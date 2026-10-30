@@ -1,22 +1,22 @@
-import { revokeSocketAccess } from "../socket/accessRevocation.js";
-import { serializeErrorForLog } from "../tracing/safeErrorLog.js";
+import { revokeSocketAccess } from "../socket/accessRevocation";
+import { serializeErrorForLog } from "../tracing/safeErrorLog";
 import { eq, and, asc, gt, isNull, sql } from "drizzle-orm";
 import argon2 from "argon2";
 import { createHash, randomBytes } from "node:crypto";
-import { getDb } from "../db/index.js";
-import type { DatabaseExecutor } from "../db/index.js";
-import { users, emailVerifications, passwordResets, userAuthIdentities, sessionFamilies, sessions, userRetirementReceipts } from "../db/schema.js";
-import { sendVerificationEmail, sendPasswordResetEmail } from "./emailService.js";
-import { normalizeEmail } from "./emailNormalization.js";
-import { syncNewsletterSignup } from "./newsletterService.js";
-import { enqueueOnboardingEmailJourneyForUser } from "./onboardingEmailJourneyService.js";
-import { assertRegistrationEnabled } from "./registrationPolicy.js";
-import type { SocialAuthProfile, SocialAuthProvider } from "./socialAuthService.js";
-import * as legalAcceptanceService from "./legalAcceptanceService.js";
+import { getDb } from "../db/index";
+import type { DatabaseExecutor } from "../db/index";
+import { users, emailVerifications, passwordResets, userAuthIdentities, sessionFamilies, sessions, userRetirementReceipts } from "../db/schema";
+import { sendVerificationEmail, sendPasswordResetEmail } from "./emailService";
+import { normalizeEmail } from "./emailNormalization";
+import { syncNewsletterSignup } from "./newsletterService";
+import { enqueueOnboardingEmailJourneyForUser } from "./onboardingEmailJourneyService";
+import { assertRegistrationEnabled } from "./registrationPolicy";
+import type { SocialAuthProfile, SocialAuthProvider } from "./socialAuthService";
+import * as legalAcceptanceService from "./legalAcceptanceService";
 import { currentDate, isReservedAgentName, validateName } from "@botiverse/raft-shared";
-import { requestExternalAuthorAvatarSync } from "./externalAuthorAvatarSyncRuntime.js";
-import { createSession, revokeAllUserSessionsInTransaction } from "./sessionService.js";
-import { isStoredUserAvatarUrl, materializeUserProviderAvatar } from "./avatarService.js";
+import { createSession, revokeAllUserSessionsInTransaction } from "./sessionService";
+import { isStoredUserAvatarUrl, materializeUserProviderAvatar } from "./avatarService";
+import { forgetTraceUserId } from "../tracing/traceUserId";
 
 export const PROFILE_SETUP_PLACEHOLDER_PREFIX = "pending_";
 const PROFILE_SETUP_PLACEHOLDER_RANDOM_BYTES = 10;
@@ -45,6 +45,7 @@ function toPublicUser(user: {
   preferredTranslationDisplay?: "translated" | "original" | "bilingual" | null;
   preferredTimeFormat?: "12h" | "24h" | null;
   preferredMessageBodyFontSize?: "sm" | "md" | "lg" | null;
+  shareUsageData?: boolean | null;
   referralSource?: string | null;
   referralSourceOther?: string | null;
   referralSourceSkippedAt?: Date | null;
@@ -81,6 +82,8 @@ function toPublicUser(user: {
     preferredTranslationDisplay: user.preferredTranslationDisplay ?? "translated",
     preferredTimeFormat: user.preferredTimeFormat ?? null,
     preferredMessageBodyFontSize: user.preferredMessageBodyFontSize ?? null,
+    // RFC-067 "Share usage data"; null = not chosen yet.
+    shareUsageData: user.shareUsageData ?? null,
     referralSource: user.referralSource ?? null,
     referralSourceOther: user.referralSourceOther ?? null,
     referralSourceSkippedAt: user.referralSourceSkippedAt ?? null,
@@ -122,6 +125,19 @@ export class EmailLoginRejectedError extends Error {
   constructor(public readonly reason: EmailLoginRejectionReason) {
     super("Invalid email or password");
     this.name = "EmailLoginRejectedError";
+  }
+}
+
+/**
+ * A social login whose verified email already belongs to an account that has
+ * no identity for this provider. The message is the user-facing sentence older
+ * clients and the `email already exists` classifiers still match; `userId` is
+ * the existing account, so a client that opted in can link inline instead.
+ */
+export class SocialEmailConflictError extends Error {
+  constructor(public readonly userId: string, provider: SocialAuthProvider) {
+    super(`An account with this email already exists. Sign in with email and password first, then connect ${getProviderLabel(provider)} in Settings.`);
+    this.name = "SocialEmailConflictError";
   }
 }
 
@@ -384,7 +400,20 @@ export async function markEmailVerifiedForTest(userId: string): Promise<void> {
   await db.update(users).set({ emailVerified: true }).where(eq(users.id, userId));
 }
 
-export async function authenticateUser(email: string, password: string) {
+export async function authenticateUser(
+  email: string,
+  password: string,
+  options: {
+    /**
+     * Pending social link (task #1304). `prepare` runs after the password
+     * verifies, outside the lock; the step it returns runs inside the locked
+     * transaction, after the hash is revalidated and before the session is
+     * created. A credential rejected at any point leaves no link behind, and
+     * a failed session rolls the link back.
+     */
+    prepareLink?: (userId: string) => Promise<(tx: DatabaseExecutor) => Promise<() => Promise<void>>>;
+  } = {},
+) {
   const db = getDb();
 
   const [user] = await db.select().from(users).where(eq(users.email, normalizeEmail(email)));
@@ -405,13 +434,20 @@ export async function authenticateUser(email: string, password: string) {
   if (!valid) {
     throw new EmailLoginRejectedError("password_mismatch");
   }
+  const linkInLock = await options.prepareLink?.(user.id);
 
   // Argon2 is deliberately outside the lock. Revalidate its exact hash under
   // the same user lock held by password changes and session issuance.
-  return db.transaction(async (tx) => {
+  let afterCommit: (() => Promise<void>) | undefined;
+  const result = await db.transaction(async (tx) => {
     const [current] = await tx.select().from(users).where(eq(users.id, user.id)).for("update");
     if (!current || current.retiredAt) throw new EmailLoginRejectedError("user_retired");
     if (current.passwordHash !== user.passwordHash) throw new EmailLoginRejectedError("password_mismatch");
+    let linked: typeof current | undefined;
+    if (linkInLock) {
+      afterCommit = await linkInLock(tx);
+      [linked] = await tx.select().from(users).where(eq(users.id, user.id));
+    }
     if (!current.passwordCredentialEstablishedAt) {
       await tx.update(users).set({
         passwordCredentialEstablishedAt: currentDate(),
@@ -423,12 +459,14 @@ export async function authenticateUser(email: string, password: string) {
     const session = await createSession(user.id, tx);
     return {
       user: toPublicUser({
-        ...current,
+        ...(linked ?? current),
         profileSetupProvider: await getProfileSetupProvider(tx, user.id),
       }),
       session,
     };
   });
+  await afterCommit?.();
+  return result;
 }
 
 export async function retireStagingSelfAccount(userId: string, actorUserId: string, capability: string) {
@@ -463,8 +501,11 @@ export async function retireStagingSelfAccount(userId: string, actorUserId: stri
       return receipt ?? null;
     }
     const now = currentDate();
-    const [updated] = await tx.update(users).set({ retiredAt: now, retiredReason: "staging_self_account" })
+    // Rotating trace_user_id unlinks the account from its traces (kept indefinitely).
+    const [updated] = await tx.update(users)
+      .set({ retiredAt: now, retiredReason: "staging_self_account", traceUserId: sql`gen_random_uuid()` })
       .where(and(eq(users.id, userId), isNull(users.retiredAt))).returning({ id: users.id });
+    forgetTraceUserId(userId);
     if (!updated) {
       const [raceReceipt] = await tx.select().from(userRetirementReceipts)
         .where(eq(userRetirementReceipts.userId, userId)).limit(1);
@@ -504,6 +545,7 @@ export async function getUser(userId: string) {
     lastObservedTimezone: users.lastObservedTimezone,
     lastObservedTimezoneAt: users.lastObservedTimezoneAt,
     autoTranslationEnabled: users.autoTranslationEnabled,
+    shareUsageData: users.shareUsageData,
     preferredTranslationMode: users.preferredTranslationMode,
     preferredTranslationDisplay: users.preferredTranslationDisplay,
     preferredTimeFormat: users.preferredTimeFormat,
@@ -541,6 +583,7 @@ export async function getUserByEmail(email: string) {
     lastObservedTimezone: users.lastObservedTimezone,
     lastObservedTimezoneAt: users.lastObservedTimezoneAt,
     autoTranslationEnabled: users.autoTranslationEnabled,
+    shareUsageData: users.shareUsageData,
     preferredTranslationMode: users.preferredTranslationMode,
     preferredTranslationDisplay: users.preferredTranslationDisplay,
     preferredTimeFormat: users.preferredTimeFormat,
@@ -572,6 +615,7 @@ export async function updateUser(userId: string, fields: {
   preferredTranslationDisplay?: "translated" | "original" | "bilingual";
   preferredTimeFormat?: "12h" | "24h" | null;
   preferredMessageBodyFontSize?: "sm" | "md" | "lg" | null;
+  shareUsageData?: boolean | null;
   referralSource?: string | null;
   referralSourceOther?: string | null;
   referralSourceSkippedAt?: Date | null;
@@ -584,9 +628,6 @@ export async function updateUser(userId: string, fields: {
     updatedAt: new Date(),
   }).where(eq(users.id, userId));
   const user = await getUser(userId);
-  if (fields.avatarUrl !== undefined && user) {
-    await requestExternalAuthorAvatarSync({ authorType: "user", authorId: userId });
-  }
   return user;
 }
 
@@ -706,6 +747,7 @@ async function getPublicUserByIdTx(database: DatabaseExecutor, userId: string) {
     lastObservedTimezone: users.lastObservedTimezone,
     lastObservedTimezoneAt: users.lastObservedTimezoneAt,
     autoTranslationEnabled: users.autoTranslationEnabled,
+    shareUsageData: users.shareUsageData,
     preferredTranslationMode: users.preferredTranslationMode,
     preferredTranslationDisplay: users.preferredTranslationDisplay,
     preferredTimeFormat: users.preferredTimeFormat,
@@ -760,10 +802,13 @@ async function upsertSocialIdentityTx(
   });
 }
 
-export async function linkSocialIdentity(userId: string, profile: SocialAuthProfile) {
+/**
+ * The checks and avatar fetch for a social link that must run outside any
+ * transaction. Pass the result to linkSocialIdentityTx.
+ */
+export async function prepareSocialLink(userId: string, profile: SocialAuthProfile) {
   const db = getDb();
   assertUsableSocialProfile(profile);
-  let shouldStartOnboardingJourney = false;
   const [currentUser] = await db.select({
     avatarUrl: users.avatarUrl,
   }).from(users).where(eq(users.id, userId));
@@ -777,57 +822,76 @@ export async function linkSocialIdentity(userId: string, profile: SocialAuthProf
   if (existingEmailUser && existingEmailUser.id !== userId) {
     throw new Error(`This ${getProviderLabel(profile.provider)} account email belongs to another Raft account`);
   }
-  const materializedAvatarUrl = await materializeSocialAvatar(currentUser.avatarUrl, profile);
+  return { materializedAvatarUrl: await materializeSocialAvatar(currentUser.avatarUrl, profile) };
+}
+
+/**
+ * Link inside the caller's transaction. Returns what to run after commit.
+ */
+export async function linkSocialIdentityTx(
+  transaction: DatabaseExecutor,
+  userId: string,
+  profile: SocialAuthProfile,
+  prepared: { materializedAvatarUrl: string | null },
+) {
+  const normalizedEmail = normalizeEmail(profile.email);
+  const [user] = await transaction.select({
+    id: users.id,
+    email: users.email,
+    avatarUrl: users.avatarUrl,
+    emailVerified: users.emailVerified,
+  }).from(users).where(eq(users.id, userId)).for("update");
+
+  if (!user) {
+    throw new Error("User not found");
+  }
+
+  const [conflictingEmailUser] = await transaction.select({
+    id: users.id,
+  }).from(users).where(eq(users.email, normalizedEmail));
+
+  if (conflictingEmailUser && conflictingEmailUser.id !== userId) {
+    throw new Error(`This ${getProviderLabel(profile.provider)} account email belongs to another Raft account`);
+  }
 
   try {
-    const linkedUser = await db.transaction(async (transaction) => {
-      const [user] = await transaction.select({
-        id: users.id,
-        email: users.email,
-        avatarUrl: users.avatarUrl,
-        emailVerified: users.emailVerified,
-      }).from(users).where(eq(users.id, userId)).for("update");
-
-      if (!user) {
-        throw new Error("User not found");
-      }
-
-      const [conflictingEmailUser] = await transaction.select({
-        id: users.id,
-      }).from(users).where(eq(users.email, normalizedEmail));
-
-      if (conflictingEmailUser && conflictingEmailUser.id !== userId) {
-        throw new Error(`This ${getProviderLabel(profile.provider)} account email belongs to another Raft account`);
-      }
-
-      await upsertSocialIdentityTx(transaction, userId, profile);
-
-      const shouldVerifyEmail = normalizeEmail(user.email) === normalizedEmail;
-      shouldStartOnboardingJourney = shouldVerifyEmail && !user.emailVerified;
-      await transaction.update(users).set({
-        avatarUrl: chooseSocialAvatarUrl(user.avatarUrl, materializedAvatarUrl),
-        emailVerified: shouldVerifyEmail ? true : user.emailVerified,
-        updatedAt: new Date(),
-      }).where(eq(users.id, userId));
-
-      return getPublicUserByIdTx(transaction, userId);
-    });
-
-    if (!linkedUser) {
-      throw new Error("Failed to link social account");
-    }
-
-    if (shouldStartOnboardingJourney) {
-      await enqueueOnboardingEmailJourneyFailOpen(linkedUser);
-    }
-
-    return linkedUser;
+    await upsertSocialIdentityTx(transaction, userId, profile);
   } catch (err) {
     if (isUniqueViolation(err)) {
       throw new Error(`This ${getProviderLabel(profile.provider)} account was linked concurrently. Please try again.`);
     }
     throw err;
   }
+
+  const shouldVerifyEmail = normalizeEmail(user.email) === normalizedEmail;
+  const shouldStartOnboardingJourney = shouldVerifyEmail && !user.emailVerified;
+  await transaction.update(users).set({
+    avatarUrl: chooseSocialAvatarUrl(user.avatarUrl, prepared.materializedAvatarUrl),
+    emailVerified: shouldVerifyEmail ? true : user.emailVerified,
+    updatedAt: new Date(),
+  }).where(eq(users.id, userId));
+
+  const linkedUser = await getPublicUserByIdTx(transaction, userId);
+  if (!linkedUser) {
+    throw new Error("Failed to link social account");
+  }
+  return {
+    linkedUser,
+    afterCommit: async () => {
+      if (shouldStartOnboardingJourney) {
+        await enqueueOnboardingEmailJourneyFailOpen(linkedUser);
+      }
+    },
+  };
+}
+
+export async function linkSocialIdentity(userId: string, profile: SocialAuthProfile) {
+  const prepared = await prepareSocialLink(userId, profile);
+  const { linkedUser, afterCommit } = await getDb().transaction(
+    (transaction) => linkSocialIdentityTx(transaction, userId, profile, prepared),
+  );
+  await afterCommit();
+  return linkedUser;
 }
 
 export async function findExistingSocialLoginUser(profile: SocialAuthProfile): Promise<PublicUser | null> {
@@ -855,7 +919,6 @@ export async function findExistingSocialLoginUser(profile: SocialAuthProfile): P
         avatarUrl: nextAvatarUrl,
         updatedAt: new Date(),
       }).where(eq(users.id, existingIdentity.userId));
-      await requestExternalAuthorAvatarSync({ authorType: "user", authorId: existingIdentity.userId });
       linkedUser = await getPublicUserByIdTx(db, existingIdentity.userId);
       if (!linkedUser) {
         throw new Error("Linked user not found");
@@ -866,7 +929,7 @@ export async function findExistingSocialLoginUser(profile: SocialAuthProfile): P
 
   const [existingEmailUser] = await db.select({ id: users.id }).from(users).where(eq(users.email, normalizedEmail));
   if (existingEmailUser) {
-    throw new Error(`An account with this email already exists. Sign in with email and password first, then connect ${getProviderLabel(profile.provider)} in Settings.`);
+    throw new SocialEmailConflictError(existingEmailUser.id, profile.provider);
   }
 
   assertRegistrationEnabled();
@@ -1205,4 +1268,11 @@ export async function changePassword(userId: string, currentPassword: string, ne
     await revokeAllUserSessionsInTransaction(tx, userId);
   });
   await revokeSocketAccessAfterCredentialChange(userId);
+}
+
+/** users.trace_user_id, the only user identifier written to traces. */
+export async function getTraceUserId(userId: string): Promise<string | null> {
+  const [user] = await getDb().select({ traceUserId: users.traceUserId })
+    .from(users).where(eq(users.id, userId)).limit(1);
+  return user?.traceUserId ?? null;
 }

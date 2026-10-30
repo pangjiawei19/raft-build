@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { act, cleanup, render, screen } from "@testing-library/react";
 import { BrowserRouter, useLocation, useSearchParams } from "react-router-dom";
@@ -110,4 +109,43 @@ test("clearing a focused message preserves a same-tick thread param", async () =
   assert.equal(query.get("thread"), "channel-1:message-1");
   assert.equal(query.has("msg"), false);
   assert.equal(query.has("message"), false);
+});
+
+function StaleSurfaceWriter() {
+  const [, setLiveSearchParams] = useLiveSearchParams();
+  return (
+    <button
+      data-testid="stale-write"
+      onClick={() => {
+        setLiveSearchParams((previous) => {
+          const next = new URLSearchParams(previous);
+          next.set("q", "late query");
+          return next;
+        }, { replace: true });
+      }}
+    >
+      stale write
+    </button>
+  );
+}
+
+// slock e2e empty-escape-routing:125 (CI run 38508015465): Escape closed the
+// search overlay back to /channel/c?msg=m, then a query write from the closing
+// /search page merged the channel's params into /search and reopened the
+// overlay at /search?msg=m&q=…. A surface whose page the browser already left
+// must not write the URL.
+test("a surface whose page the browser already left does not navigate back to it", async () => {
+  window.history.replaceState({}, "", "/s/x/search?q=seed");
+  render(
+    <BrowserRouter>
+      <StaleSurfaceWriter />
+    </BrowserRouter>,
+  );
+  // The browser moves on without this surface re-rendering first (the close
+  // navigation committed; the write was already queued).
+  window.history.replaceState({}, "", "/s/x/channel/c?msg=m");
+  await act(async () => {
+    screen.getByTestId("stale-write").click();
+  });
+  assert.equal(`${window.location.pathname}${window.location.search}`, "/s/x/channel/c?msg=m");
 });

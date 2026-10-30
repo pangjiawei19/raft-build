@@ -1,42 +1,26 @@
+import { Progress, ProgressTrack, ProgressIndicator } from "@botiverse/raft-ui";
 import type { HTMLAttributes } from "react";
 import { useContext } from "react";
 import { IntlContext } from "react-intl";
 import { en } from "../../i18n/messages/en";
 
-/**
- * Neo-Brutalism progress bar — the staging primitive for "a multi-phase
- * operation is running" feedback where a `<Spinner>` (pure indeterminate) is
- * too thin to convey staged progress. First use: the managed-Computer
- * Restart / Upgrade flow, which streams `computer:upgrade:progress` phases
- * (downloading → verifying → applying → restarting) over the live WS.
+/** Product labels and value normalization over the themed RUI progress recipe.
  *
- * Two modes, mirroring the upgrade reality (most phases have no byte percent):
- *  - determinate   — pass `value` (0–100); the fill width tracks it.
- *  - indeterminate — omit `value`; an animated brutal stripe slides across to
- *                    say "working" without a fake percentage.
- *
- * Brutal DNA, consistent with `card-brutal` / `.btn-brutal` / `StatusDot`:
- *  - `border-2 border-black` track on white, `shadow-brutal-sm` (hard, no blur)
- *  - hard-edged fill (NO rounding), solid brutal color (pink CTA by default)
- *  - snap transitions (`transition-all duration-100`), never smooth-easing
- *
- * NOT for: presence/activity (use `<StatusDot>`) or pure spinner loading
- * (use `<Spinner>`). Reach for this only when there are discrete phases or a
- * real percent to show.
- */
-export type ProgressBarTone = "pink" | "cyan" | "lime" | "orange";
+ *  Raft Design System › Loading (`rf-progress`): an 8px sunken track with a
+ *  cyan fill that carries an ink edge; orange near a limit, lime when done.
+ *  Progress is a passive indicator, so it is never the action pink. */
+export type ProgressBarTone = "cyan" | "lime" | "orange";
 
-const TONE_CLASS: Record<ProgressBarTone, string> = {
-  pink: "bg-brutal-pink",
-  cyan: "bg-brutal-cyan",
-  lime: "bg-brutal-lime",
-  orange: "bg-brutal-orange",
+const TONE_CLASS: Record<ProgressBarTone, "information" | "success" | "warning"> = {
+  cyan: "information",
+  lime: "success",
+  orange: "warning",
 };
 
 export interface ProgressBarProps extends Omit<HTMLAttributes<HTMLDivElement>, "role"> {
   /** 0–100 for a determinate bar; omit (or null) for an indeterminate stripe. */
   value?: number | null;
-  /** Fill color. Defaults to pink (CTA), matching the Upgrade button. */
+  /** Fill color. Defaults to the DS cyan fill. */
   tone?: ProgressBarTone;
   /** Optional phase / status label rendered above the track (left). */
   label?: string;
@@ -46,7 +30,7 @@ export interface ProgressBarProps extends Omit<HTMLAttributes<HTMLDivElement>, "
 
 export default function ProgressBar({
   value = null,
-  tone = "pink",
+  tone = "cyan",
   label,
   showPercent = false,
   className = "",
@@ -61,28 +45,16 @@ export default function ProgressBar({
   return (
     <div className={className} {...rest}>
       {(label || (showPercent && !indeterminate)) && (
-        <div className="mb-1 flex items-center justify-between text-xs font-mono text-black/60">
-          {label ? <span className="truncate">{label}</span> : <span />}
-          {showPercent && !indeterminate && <span className="shrink-0">{Math.round(pct)}%</span>}
+        <div className="mb-1.5 flex items-center justify-between gap-2">
+          {label ? <span className="truncate text-footnote font-semibold text-foreground">{label}</span> : <span />}
+          {showPercent && !indeterminate && <span className="shrink-0 font-mono text-mono-meta text-foreground-hint">{Math.round(pct)}%</span>}
         </div>
       )}
-      <div
-        role="progressbar"
-        aria-label={label ?? defaultAriaLabel}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        {...(indeterminate ? {} : { "aria-valuenow": Math.round(pct) })}
-        className="h-4 w-full overflow-hidden border-2 border-black bg-white shadow-brutal-sm"
-      >
-        {indeterminate ? (
-          <div className={`h-full w-2/5 ${TONE_CLASS[tone]} progress-indeterminate`} />
-        ) : (
-          <div
-            className={`h-full ${TONE_CLASS[tone]} transition-all duration-100`}
-            style={{ width: `${pct}%` }}
-          />
-        )}
-      </div>
+      <Progress value={indeterminate ? null : pct} variant={TONE_CLASS[tone]} aria-label={label ?? defaultAriaLabel}>
+        <ProgressTrack>
+          <ProgressIndicator />
+        </ProgressTrack>
+      </Progress>
     </div>
   );
 }

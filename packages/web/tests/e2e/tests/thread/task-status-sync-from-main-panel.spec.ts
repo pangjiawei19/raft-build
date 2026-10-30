@@ -114,12 +114,12 @@ test.describe("P0 thread task status sync from main panel", () => {
 
     // Find the TaskCard subtree for our task (board view).
     // Locate the unique TaskCard via a locator that walks up from the title
-    // text to the card's bordered container (TaskCard.tsx wraps in a
-    // `.shadow-brutal-sm` div). `.first()` on a bare `hasText` filter would
-    // match any ancestor and trip strict mode when prior tests pollute the
-    // DB with same-channel tasks.
+    // text to the card's root element: the raft-ui TaskCard, identified by
+    // `data-slot="task-card"`. `.first()` on a bare `hasText` filter would
+    // match any ancestor and trip strict mode when prior tests pollute the DB
+    // with same-channel tasks.
     const taskTitle = page.getByTestId("channel-task-panel").getByText(tag, { exact: true });
-    const taskCard = taskTitle.locator("xpath=ancestor::div[contains(@class, 'shadow-brutal-sm')][1]");
+    const taskCard = taskTitle.locator("xpath=ancestor::*[@data-slot='task-card'][1]");
     await expect(taskCard).toBeVisible();
 
     // Open the side thread from the HOST MESSAGE, not the task title.
@@ -136,11 +136,9 @@ test.describe("P0 thread task status sync from main panel", () => {
 
     // Change status from the MAIN panel TaskCard's inline status pill.
     // STATUS_STYLES.todo.label is "Todo" (Title Case) — the InlineBadgeEditor
-    // button shows that text. Status badges sit next to case-sensitive
-    // identifiers (`@assignee`) so they opt out of the brutal uppercase
-    // transform — stdrc msg=ce25da45 + msg=65681d15 (option B). Click it to
-    // open the dropdown, then pick the "In Progress" option (matches
-    // STATUS_LABELS).
+    // button shows that text; Raft never transforms case (DS rule 7: status
+    // names are Title Case). Click it to open the dropdown, then pick the
+    // "In Progress" option (matches STATUS_LABELS).
     await taskCard.getByRole("button", { name: /Todo/ }).click();
     await page.getByTestId("task-status-option-in_progress").click();
 
@@ -183,7 +181,7 @@ test.describe("P0 thread task status sync from main panel", () => {
     await page.getByTestId("channel-task-view-list").click();
 
     const taskTitle = page.getByTestId("channel-task-panel").getByText(tag, { exact: true });
-    const taskCard = taskTitle.locator("xpath=ancestor::div[contains(@class, 'shadow-brutal-sm')][1]");
+    const taskCard = taskTitle.locator("xpath=ancestor::*[@data-slot='task-card'][1]");
     await expect(taskCard).toBeVisible();
 
     // Open the side thread from the HOST MESSAGE, not the task title.
@@ -246,7 +244,7 @@ test.describe("P0 thread task status sync from main panel", () => {
     await expect(page.getByTestId("channel-task-panel")).toBeVisible();
 
     const taskTitle = page.getByTestId("channel-task-panel").getByText(tag, { exact: true });
-    const taskCard = taskTitle.locator("xpath=ancestor::div[contains(@class, 'shadow-brutal-sm')][1]");
+    const taskCard = taskTitle.locator("xpath=ancestor::*[@data-slot='task-card'][1]");
     await expect(taskCard).toBeVisible();
     await openSideThreadFromHostMessage(page, seedState.channel.id, hostMessageId);
 
@@ -254,20 +252,22 @@ test.describe("P0 thread task status sync from main panel", () => {
     await expect(threadParent).toBeVisible();
     const threadBadge = threadParent.locator('[data-testid="message-task-badge"]');
     await expect(threadBadge).toHaveAttribute("data-task-status", "todo");
+    const todoWash = await threadBadge.evaluate((el) => getComputedStyle(el).backgroundColor);
 
     // todo → closed. After the fix, the below-content variant must include
     // a `closed` config; pre-fix the variant fell back to statusConfig.todo,
-    // so the badge stayed visually orange/Circle even though the
-    // data-task-status attribute correctly read "closed".
+    // so the badge stayed visually Todo even though the data-task-status
+    // attribute correctly read "closed".
     await taskCard.getByRole("button", { name: /Todo/ }).click();
     await page.getByTestId("task-status-option-closed").click();
 
     await expect(threadBadge).toHaveAttribute("data-task-status", "closed");
-    // Visual sanity: the badge background must change away from the "todo"
-    // orange. The exact background color is owned by Bugen (#proj-uiux task
-    // #145 — CLOSED neutral color). Here we just verify the badge is no
-    // longer using the todo orange — i.e. the variant has a real entry for
-    // "closed" rather than silently falling through to statusConfig.todo.
-    await expect(threadBadge).not.toHaveClass(/bg-brutal-orange/);
+    // Visual sanity: the badge must stop looking like Todo. Raft draws a task
+    // status as its pixel on the status's soft wash (Todo orange, Closed
+    // stone; DS rule 5), so the pixel names the closed status and the wash
+    // moves off Todo's — i.e. the variant has a real entry for "closed"
+    // rather than silently falling through to statusConfig.todo.
+    await expect(threadBadge.locator('[data-slot="task-status-icon"]')).toHaveAttribute("data-status", "closed");
+    expect(await threadBadge.evaluate((el) => getComputedStyle(el).backgroundColor)).not.toBe(todoWash);
   });
 });

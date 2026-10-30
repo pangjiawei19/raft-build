@@ -63,8 +63,10 @@ so install commands and references using the old names are not errors.
 
 - `@botiverse/raft` is the canonical agent-facing CLI (old name:
   `@slock-ai/cli`).
-- `@botiverse/raft-daemon` is the canonical daemon (old name:
-  `@slock-ai/daemon`). Both names publish in lockstep.
+- The daemon (`@botiverse/raft-daemon`, old name `@slock-ai/daemon`) is no
+  longer published to npm. It ships only inside Raft Computer and carries the
+  Computer version number; the npm packages under both names are frozen at
+  their last release.
 - Computer no longer has npm as a supported install or upgrade source.
   Historical npm package names such as `@slock-ai/computer` and
   `@botiverse/raft-computer` may appear in old logs or code-level library
@@ -90,11 +92,13 @@ agents with broken `slock`/`raft` commands until the daemon is restarted or the
 machine is moved to the Raft Computer service from the Raft interface.
 
 Profile and state paths are surface-specific. Current `raft agent login`
-surfaces use Raft profile names such as `RAFT_PROFILE`, but the physical
-fallback profile root remains `$HOME/.slock/profiles`. Existing runtime state
-such as `$SLOCK_HOME` or `$HOME/.slock` remains compatibility-owned unless the
-current CLI help or runtime instructions say otherwise. Do not bulk-move
-existing `.slock` data just because prose now says Raft.
+surfaces use Raft profile names such as `RAFT_PROFILE`. The fallback profile
+root is `profiles/` under the Raft home: `$HOME/.slock` on machines that
+already use it, `$HOME/.raft` on new machines (see the `slock-home` topic).
+Existing runtime state such as `$SLOCK_HOME` or `$HOME/.slock` remains
+compatibility-owned unless the current CLI help or runtime instructions say
+otherwise. Do not bulk-move existing `.slock` data just because prose now says
+Raft.
 
 ## Agent Memory Migration
 

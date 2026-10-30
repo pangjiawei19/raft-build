@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -111,7 +110,7 @@ function renderBulkControls() {
   return render(
     <TestIntlProvider locale="en">
       <MemoryRouter initialEntries={["/s/acme/settings/computers/computer-1"]}>
-        <MachineDetailPanel machine={onlineComputer} workspaceEmbedded />
+        <MachineDetailPanel machine={onlineComputer} hideHeader />
       </MemoryRouter>
     </TestIntlProvider>,
   );
@@ -130,6 +129,7 @@ test("catalog pins computer residue MessageIds", () => {
   assert.equal(en["machine.detail.computer"], "Computer");
   assert.equal(en["machine.detail.macLinux"], "macOS / Linux");
   assert.equal(en["machine.detail.osLabel"], "OS");
+  // zh stays 计算机: "Computer" already renders as 计算机 on every other surface (catalogConsistencyRatchet).
   assert.equal(zh["machine.detail.computer"], "计算机");
   assert.equal(zh["machine.detail.macLinux"], "macOS / Linux");
   assert.equal(zh["machine.detail.osLabel"], "OS");
@@ -143,8 +143,6 @@ test("mounted ComputerCommandGuide keeps the macOS / Linux runtime label under z
         computerInstallCommand="curl -fsSL https://downloads.raft.build/computer/install.sh | sh"
         windowsComputerCommand="raft-computer setup /launch"
         windowsComputerInstallCommand="irm https://cdn.raft.build/computer/install.ps1 | iex"
-        macLinuxDaemonCommand="npx @botiverse/raft-daemon@latest --server-url https://api.raft.build --api-key sk_machine_abc"
-        windowsDaemonCommand="npx.cmd @botiverse/raft-daemon@latest --server-url https://api.raft.build --api-key sk_machine_abc"
       />
     </TestIntlProvider>,
   );
@@ -157,7 +155,7 @@ test("mounted MachineDetailPanel surfaces Chinese Computer chrome and the OS row
   render(
     <TestIntlProvider locale="zh-cn">
       <MemoryRouter initialEntries={["/s/acme/settings/computers/computer-1"]}>
-        <MachineDetailPanel machine={onlineComputer} workspaceEmbedded />
+        <MachineDetailPanel machine={onlineComputer} hideHeader />
       </MemoryRouter>
     </TestIntlProvider>,
   );
@@ -166,7 +164,7 @@ test("mounted MachineDetailPanel surfaces Chinese Computer chrome and the OS row
   assert.ok(screen.getByText("darwin"));
   const actions = screen.getByTestId("computer-service-actions");
   assert.ok(screen.getByText(zh["machine.detail.computer"]));
-  assert.equal(actions.querySelector(".text-sm.font-bold")?.textContent, zh["machine.detail.computer"]);
+  assert.equal(actions.querySelector(".text-subhead.font-bold")?.textContent, zh["machine.detail.computer"]);
 });
 
 test("online Computer keeps restart available while its version is still syncing", () => {
@@ -176,7 +174,7 @@ test("online Computer keeps restart available while its version is still syncing
       <MemoryRouter initialEntries={["/s/acme/settings/computers/computer-1"]}>
         <MachineDetailPanel
           machine={{ ...onlineComputer, computerVersion: null, computerUpgradeAvailable: null }}
-          workspaceEmbedded
+          hideHeader
         />
       </MemoryRouter>
     </TestIntlProvider>,
@@ -185,32 +183,41 @@ test("online Computer keeps restart available while its version is still syncing
   const actions = screen.getByTestId("computer-service-actions");
   const restart = within(actions).getByRole("button", { name: en["machine.detail.restart"] });
   assert.equal(restart.hasAttribute("disabled"), false);
-  assert.equal(
-    within(actions).getByRole("button", { name: en["machine.detail.upgrade"] }).hasAttribute("disabled"),
-    true,
+  // One next step: no greyed Upgrade button while the version is unknown.
+  assert.deepEqual(
+    within(within(actions).getByTestId("computer-upgrade-actions")).getAllByRole("button").map((b) => b.textContent),
+    [en["machine.detail.restart"]],
   );
-  assert.ok(within(actions).getByText(en["machine.detail.versionStillSyncing"]));
+  assert.ok(within(actions).getByText(en["machine.detail.upgradeStatus.readingVersion"]));
 });
 
-test("mounted MachineDetail selection rows expose live yellow markers and clear/cancel controls", () => {
+test("mounted MachineDetail selection rows expose live check markers and clear/cancel controls", () => {
   const calls = { start: [] as string[], stop: [] as string[], reset: [] as Array<[string, "restart" | "session" | "full"]> };
   seedBulkControlStores(calls);
   const view = renderBulkControls();
 
   fireEvent.click(screen.getByRole("button", { name: en["machine.detail.select"] }));
   const offline = screen.getByRole("button", { name: "Select Offline Agent" });
-  const marker = offline.querySelector(".check-marker-brutal");
-  assert.ok(marker);
-  assert.match(marker.className, /bg-white text-transparent/);
+  // The decorative raft-ui CheckboxIndicator leads the row's selection button.
+  const marker = offline.firstElementChild;
+  assert.ok(marker instanceof HTMLElement);
+  assert.equal(marker.getAttribute("aria-hidden"), "true");
+  // Raft DS Checkbox: an empty ink-lined box; checked is an ink fill with a
+  // paper check (a value, not "you are here" yellow).
+  assert.match(marker.className, /bg-layer-card text-transparent/);
 
   fireEvent.click(offline);
-  assert.match(marker.className, /bg-soft-signal text-black/);
+  assert.match(marker.className, /bg-foreground text-foreground-inverse/);
   assert.equal(screen.getByText("1 selected").textContent, "1 selected");
   assert.ok(screen.getByRole("button", { name: "Deselect Offline Agent" }));
 
   fireEvent.click(screen.getByRole("button", { name: en["machine.detail.selectAll"] }));
   assert.equal(screen.getByText("2 selected").textContent, "2 selected");
-  assert.equal(view.container.querySelectorAll(".check-marker-brutal.bg-soft-signal").length, 2);
+  const deselectButtons = within(view.container).getAllByRole("button", { name: /^Deselect / });
+  assert.equal(deselectButtons.length, 2);
+  for (const button of deselectButtons) {
+    assert.match(button.firstElementChild?.className ?? "", /bg-foreground text-foreground-inverse/);
+  }
 
   fireEvent.click(screen.getByRole("button", { name: en["machine.detail.clearAll"] }));
   assert.equal(screen.queryByText("2 selected"), null);
@@ -242,7 +249,8 @@ test("mounted MachineDetail bulk actions target offline, online, and all selecte
 
   enterSelectionAndChooseBoth();
   fireEvent.click(screen.getByRole("button", { name: en["machine.detail.restartReset"] }));
-  const resetDialog = screen.getByText("Restart 2 Agents").closest(".card-brutal");
+  const resetDialog = screen.getByText("Restart or reset 2 Agents").closest('[data-slot="dialog-card"]')
+    ?? screen.getByText("Restart or reset 2 Agents").closest('[data-slot="card"]');
   assert.ok(resetDialog);
   const restartButtons = within(resetDialog as HTMLElement).getAllByRole("button", { name: en["machine.detail.bulkRestart"] });
   fireEvent.click(restartButtons.at(-1)!);

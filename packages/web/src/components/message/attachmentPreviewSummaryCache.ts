@@ -27,7 +27,12 @@ export async function fetchAttachmentPreviewSummary(attachmentId: string): Promi
   const request = api
     .get<AttachmentPreview>(`/attachments/${attachmentId}/preview`)
     .then(({ data }) => {
-      cache.set(attachmentId, data);
+      // reason "unavailable" is transient (server compute capacity, not the
+      // file): the server never caches it, and pinning it for the session here
+      // would hide the preview until reload after the pool recovers.
+      if (data.status !== "unsupported" || data.reason !== "unavailable") {
+        cache.set(attachmentId, data);
+      }
       return data;
     })
     .catch(() => null)

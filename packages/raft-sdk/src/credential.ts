@@ -1,4 +1,4 @@
-import { currentDate } from "@botiverse/raft-shared/src/clock.js";
+import { currentDate } from "@botiverse/raft-shared/src/clock";
 
 import {
   createRaftClient,
@@ -6,7 +6,8 @@ import {
   requireServerUrl,
   type CreateRaftClientOptions,
   type RaftClient,
-} from "./client.js";
+} from "./client";
+import { createRaftAgent, type CreateRaftOptions, type Raft } from "./raft";
 
 export interface RaftCredentialIdentity {
   serverUrl: string;
@@ -65,6 +66,7 @@ export interface BootstrapRaftCredentialOptions {
   fetch?: typeof fetch;
 }
 
+/** Options of `createRaftClientFromStore`. */
 export interface CreateRaftClientFromStoreOptions {
   store: RaftCredentialStore;
   fetch?: CreateRaftClientOptions["fetch"];
@@ -276,13 +278,11 @@ export async function bootstrapRaftCredential(
   return { serverUrl, ...identity };
 }
 
-/** Load the caller-selected credential store and create a normal Raft client. */
-export async function createRaftClientFromStore(
-  options: CreateRaftClientFromStoreOptions,
-): Promise<RaftClient> {
+/** Load and validate the caller-selected store's credential; throws RaftCredentialError. */
+async function loadStoredAgentCredential(store: RaftCredentialStore): Promise<StoredRaftCredential> {
   let record: StoredRaftCredential | null;
   try {
-    record = await options.store.load();
+    record = await store.load();
   } catch {
     throw new RaftCredentialError(
       "CREDENTIAL_STORE_READ_FAILED",
@@ -308,6 +308,37 @@ export async function createRaftClientFromStore(
       "The stored Raft Agent credential does not include the send capability required by this SDK",
     );
   }
+  return validated;
+}
+
+/** Options of `createRaftAgentFromStore`. */
+export type CreateRaftAgentFromStoreOptions = Omit<CreateRaftOptions, "serverUrl" | "credential"> & {
+  /** Where `bootstrapRaftCredential` saved the Agent credential. */
+  store: RaftCredentialStore;
+};
+/** @deprecated Renamed `CreateRaftAgentFromStoreOptions` (`@botiverse/raft-sdk/agent`). Removed in 1.0. */
+export type CreateRaftFromStoreOptions = CreateRaftAgentFromStoreOptions;
+
+/** Load the caller-selected credential store and create the agent-layer client (`createRaftAgent`) from it. */
+export async function createRaftAgentFromStore(options: CreateRaftAgentFromStoreOptions): Promise<Raft> {
+  const { store, ...rest } = options;
+  const validated = await loadStoredAgentCredential(store);
+  return createRaftAgent({ ...rest, serverUrl: validated.serverUrl, credential: validated.credential });
+}
+
+/**
+ * @deprecated Renamed `createRaftAgentFromStore`; import it from `@botiverse/raft-sdk/agent`.
+ * Removed in 1.0. See MIGRATING.md.
+ */
+export async function createRaftFromStore(options: CreateRaftAgentFromStoreOptions): Promise<Raft> {
+  return createRaftAgentFromStore(options);
+}
+
+/** Load the caller-selected credential store and create the program-layer client (`createRaftClient`). */
+export async function createRaftClientFromStore(
+  options: CreateRaftClientFromStoreOptions,
+): Promise<RaftClient> {
+  const validated = await loadStoredAgentCredential(options.store);
   return createRaftClient({
     serverUrl: validated.serverUrl,
     credential: validated.credential,

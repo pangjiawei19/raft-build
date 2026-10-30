@@ -1,41 +1,42 @@
+import { Card } from "@botiverse/raft-ui";
 import type { ReactNode } from "react";
 
 /**
  * Canonical "subtle preview surface" skin (route B, locked by stdrc 2026-05-16
- * #proj-theme:441c8b2b: 1px black/15 border, white bg, no shadow, hover deepens
- * border + adds a faint bg). This is the ONE place the preview-card skin lives
- * — both `<QuotedMessageCard>` and `<AttachmentChip>` route their outer wrapper
- * through `<PreviewShell>` so hover state stays aligned across surfaces
- * (stdrc 2026-05-22 #proj-theme:441c8b2b 7d19c377 / 4365db5a — direct
- * component reuse, not just a shared border fragment).
+ * #proj-theme:441c8b2b: a hairline, the card surface, no shadow, hover adds a
+ * faint wash). This is the ONE place the preview-card skin lives — surfaces
+ * that preview another message route their outer wrapper through
+ * `<PreviewShell>` so hover state stays aligned (stdrc 2026-05-22
+ * #proj-theme:441c8b2b 7d19c377 / 4365db5a — direct component reuse, not just
+ * a shared border fragment).
+ *
+ * Raft Design System: a preview is content, not a control — the card surface
+ * (`bg-layer-card`), a hairline (`line`), the container radius from raft-ui's
+ * Card, never an ink line or a lift. Hover lays the pressed wash over the
+ * surface (`press-overlay`), so the card keeps its fill.
  *
  * No `active:` token: the press state inherits the hover styling (`:hover`
  * keeps matching while `:active` is true). This matches QuotedMessageCard's
  * pre-refactor hover-only behavior (stdrc 2026-05-23 #proj-theme:441c8b2b
- * cfd10230: "复用之前的 Quoted Message Card 的 active 和 hover 的颜色") and
- * sidesteps a Chromium compositing edge case where
- * `color-mix(in oklab, X, transparent)` × element `opacity` paints cyan
- * instead of pale yellow.
+ * cfd10230).
  *
  * Layout is caller-supplied via `className`: PreviewShell only owns the
  * polymorphic root + skin tokens. QuotedMessageCard passes `group w-full
- * text-left` for the block-preview case; AttachmentChip passes its
- * fixed-size `inline-flex h-20 w-44 …` layout.
+ * text-left` for the block-preview case.
  */
 
 /** Static border recipe only — exported for any future surface that wants
  *  the border tokens without the full bg + hover-bg skin. */
-export const PREVIEW_SHELL_BORDER = "border border-black/15 hover:border-black/30";
+export const PREVIEW_SHELL_BORDER = "border border-line-hairline";
 
-/** Full default skin: border + white bg + faint hover bg. No active token —
- *  press inherits hover. */
-export const PREVIEW_SHELL_SKIN = `${PREVIEW_SHELL_BORDER} bg-white hover:bg-black/5`;
+/** Full default skin: hairline + card surface + the pressed wash on hover +
+ *  explicitly NO shadow. No `active:` token — press inherits hover. */
+export const PREVIEW_SHELL_SKIN = `${PREVIEW_SHELL_BORDER} bg-layer-card hover:press-overlay shadow-none`;
 
-/** Muted / unavailable variant — visually unchanged from the prior
- *  QuotedMessageCard `unavailable` skin (kept distinct per stdrc: error
- *  semantic is separate from the route-B default). */
+/** Muted / unavailable variant — the sunken fill with ink-3 text: the message
+ *  it pointed at is gone, so there is nothing to lift on hover. */
 export const PREVIEW_SHELL_SKIN_MUTED =
-  "border-2 border-black/30 bg-black/5 italic text-black/40 hover:shadow-brutal-sm";
+  "border border-line-hairline bg-fill-muted text-foreground-hint shadow-none";
 
 export type PreviewShellVariant = "default" | "muted";
 
@@ -44,8 +45,7 @@ export interface PreviewShellProps {
   /** Click → renders a polymorphic <button>; otherwise a <div>. */
   onClick?: () => void;
   /** Layout + any per-callsite overrides. Appended AFTER the skin so callers
-   *  can override individual tokens via Tailwind's `!` important modifier
-   *  (e.g. AttachmentChip's `!bg-soft-signal/30` loading state). */
+   *  can override individual tokens via Tailwind's `!` important modifier. */
   className?: string;
   "data-testid"?: string;
   title?: string;
@@ -66,13 +66,16 @@ export default function PreviewShell({
 }: PreviewShellProps) {
   const Root = onClick ? "button" : "div";
   const skin = variant === "muted" ? PREVIEW_SHELL_SKIN_MUTED : PREVIEW_SHELL_SKIN;
+  // A clickable preview is reachable by keyboard: the shared DS focus ring.
+  const focus = onClick ? " outline-none focus-visible:shadow-focus" : "";
   return (
-    <Root
+    <Card
+      render={<Root />}
       {...(onClick ? { type: "button" as const, onClick } : {})}
       {...rest}
-      className={`${skin}${className ? ` ${className}` : ""}`}
+      className={`${skin}${focus}${className ? ` ${className}` : ""}`}
     >
       {children}
-    </Root>
+    </Card>
   );
 }

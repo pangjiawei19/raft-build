@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const webRoot = resolve(import.meta.dirname, "..");
 
@@ -21,7 +20,7 @@ test("channel identity carries provider-neutral bridge metadata without duplicat
   assert.doesNotMatch(settings, /channel\.edit\.slackBridgeTitle|providerConversationId/);
   assert.match(create, /ChannelSlackBridgeField[\s\S]*bridgeEditor\.apply\(channel\.id\)/);
   assert.match(settings, /ChannelSlackBridgeField[\s\S]*bridgeEditor\.apply\(channelId\)/);
-  assert.match(bridgeField, /from "raft-ui"[\s\S]*<Select[\s\S]*items=\{selectOptions\}[\s\S]*<SelectTrigger className="w-full"/);
+  assert.match(bridgeField, /from "@botiverse\/raft-ui"[\s\S]*<Select[\s\S]*items=\{selectOptions\}[\s\S]*<SelectTrigger className="w-full"/);
   assert.match(bridgeField, /pairedBySlackId[\s\S]*disabled:\s*occupied[\s\S]*<SelectItem[\s\S]*disabled=\{option\.disabled\}/);
   assert.doesNotMatch(bridgeField, /<select\b|<option\b/);
 });
@@ -39,7 +38,10 @@ test("Slack Bridge master gate hides every setup entry and suppresses channel pr
 
 test("channel member hook keeps external projections separate from Raft principals", () => {
   const hook = source("hooks/useChannelMembers.ts");
-  const members = source("components/agent/ChannelMembers.tsx");
+  const members = [
+    source("components/agent/ChannelMembers.tsx"),
+    source("components/agent/MemberRoleActions.tsx"),
+  ].join("\n");
 
   assert.match(hook, /export interface ChannelExternalMember[\s\S]*provider:\s*"slack"/);
   assert.match(hook, /agents:\s*\(data\.agents \?\? \[\]\) as ChannelAgent\[\]/);

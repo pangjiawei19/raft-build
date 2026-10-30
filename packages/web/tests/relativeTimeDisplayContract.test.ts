@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 // RELATIVE-TIME DISPLAY CONTRACT — ONE visible formatter (task #61).
 //
@@ -32,8 +31,9 @@ const CONSUMERS: {
     shape: /formatRelativeTime\(item\.(?:lastActivityAt|createdAt|lastMessageAt), locale\)/g,
     min: 3,
   },
+  // The DM list's timestamp renders in its per-row AgentDMConversationCard (task #709).
   {
-    rel: "src/components/agent/AgentDMConversationList.tsx",
+    rel: "src/components/agent/AgentDMConversationCard.tsx",
     entry: "formatRelativeTimeParts",
     shape: /formatRelativeTimeParts\(parts\.value, parts\.unit, locale\)/g,
     min: 1,
@@ -44,11 +44,19 @@ const CONSUMERS: {
     shape: /formatRelativeTimeParts\(parts\.value, parts\.unit, locale\)/g,
     min: 1,
   },
+  // MessageSearchPage's two callsites: the thread-group timestamp stays in the
+  // page; the message-hit timestamp moved with MessageHitRow (task #709).
   {
     rel: "src/components/search/MessageSearchPage.tsx",
     entry: "formatRelativeTimeParts",
     shape: /formatRelativeTimeParts\(parts\.value, parts\.unit, intl\.locale\)/g,
-    min: 2,
+    min: 1,
+  },
+  {
+    rel: "src/components/search/MessageHitRow.tsx",
+    entry: "formatRelativeTimeParts",
+    shape: /formatRelativeTimeParts\(parts\.value, parts\.unit, intl\.locale\)/g,
+    min: 1,
   },
 ];
 

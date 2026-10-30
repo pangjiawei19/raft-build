@@ -2,8 +2,9 @@ import { useIntl } from "react-intl";
 
 export default function RaftBrandLockup({
   className = "h-10 w-auto",
-  // Most Raft surfaces stay light even when the OS prefers dark colors.
-  // Only pages that actually adapt their surface may opt into the dark asset.
+  // The default lockup is the sticker wordmark (ink outline, cream fill),
+  // legible on the yellow light frame and on the dark frame alike. Only pages
+  // that paint their own OS-following surface opt into the mono-light asset.
   adaptToDarkMode = false,
 }: {
   className?: string;

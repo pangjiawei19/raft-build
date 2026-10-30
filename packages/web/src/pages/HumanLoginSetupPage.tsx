@@ -1,8 +1,9 @@
+import { AppSetupRequirement } from "../components/integrations/AppSetup";
 import { appendOAuthAuthorizationParams } from "@botiverse/raft-shared";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import type { ChangeEvent } from "react";
 import { useIntl } from "react-intl";
 import {
-  Badge,
   Select,
   SelectContent,
   SelectIcon,
@@ -11,30 +12,30 @@ import {
   SelectItemText,
   SelectList,
   SelectTrigger,
-  SelectValue,
-} from "raft-ui";
+  SelectValue, Spinner, Button, Card, Badge, Input
+} from "@botiverse/raft-ui";
 import api from "../api/client";
 import { useAuthStore } from "../store/authStore";
 import { useServerStore } from "../store/serverStore";
 import type { Server } from "../store/serverStore";
 import AvatarSlot from "../components/ui/AvatarSlot";
-import AvatarListRow from "../components/ui/AvatarListRow";
-import Button from "../components/ui/Button";
-import Spinner from "../components/ui/Spinner";
 import SignedInAs from "../components/auth/SignedInAs";
 import RaftBrandLockup from "../components/brand/RaftBrandLockup";
 import RequestedScopeConsent from "../components/oauth/RequestedScopeConsent";
 import { hasAgentInboundOAuthScope } from "../lib/oauthScopePresentation";
+import { MarketplaceServerRow } from "./MarketplaceServerRow";
 
 type LoginClientSummary = {
   id?: string;
   clientId: string;
-  appType: "server_local" | "slock_builtin" | "third_party_global";
+  appType: "server_local" | "third_party_global";
   name: string;
   description: string | null;
   homepageUrl: string | null;
   returnUrl: string | null;
   logoUrl?: string | null;
+  setupUrl?: string | null;
+  setupDescription?: string | null;
   allowedScopes?: string[] | null;
   scopeValidation?: {
     allowed: boolean;
@@ -49,7 +50,7 @@ type LoginClientSummary = {
   };
 };
 
-type AvailableServerClient = {
+export type AvailableServerClient = {
   server: Server;
   client: LoginClientSummary;
 };
@@ -75,56 +76,63 @@ function renderSelectItems(options: readonly SelectOption[]) {
   ));
 }
 
-function readyChipClassName() {
-  return "border-2 border-black bg-brutal-lime/70 px-2 py-0.5 text-[10px] font-black uppercase tracking-widest";
-}
+// The app's details sit in a raft-ui Card; a card that opens the app's
+// homepage is the same Card drawn on a link.
+const APP_DETAILS_CARD_CLASS = "mt-1.5 px-3 py-2.5 text-callout";
+const APP_DETAILS_LINK_CARD_CLASS = `${APP_DETAILS_CARD_CLASS} no-underline outline-none hover:press-overlay active:press-overlay focus-visible:shadow-focus`;
 
-function appDetailsCardClassName(clickable: boolean) {
-  const base = "mt-1 border-2 border-black bg-white px-3 py-2 text-sm";
-  return clickable
-    ? `${base} block text-black no-underline shadow-brutal-sm transition-all duration-100 hover:-translate-y-[1px] hover:shadow-brutal active:translate-x-[1px] active:translate-y-[1px] active:shadow-brutal-active`
-    : base;
-}
+// A field label above a value (DS TextField label: 13/18 600, ink-2).
+const FIELD_LABEL_CLASS = "text-footnote font-semibold text-foreground-muted";
+// Help text under a field (DS: 12/16, ink-3).
+const FIELD_HELP_CLASS = "mt-1.5 text-caption text-foreground-hint";
+// A read-only stand-in where the server picker would be (loading / none).
+const FIELD_PLACEHOLDER_CLASS = "flex min-h-11 items-center rounded-control border-[1.5px] border-line-hairline bg-fill-muted px-3 text-callout text-foreground-muted";
+// DS Button drawn on a link, so these stay links for assistive tech.
+const GHOST_LINK_BUTTON_CLASS = "inline-flex h-8 items-center rounded-control px-2.5 text-footnote font-bold text-foreground no-underline outline-none hover:bg-fill-pressed active:bg-fill-pressed focus-visible:shadow-focus";
+const OUTLINE_LINK_BUTTON_CLASS = "mt-3 flex h-11 w-full items-center justify-center rounded-control border-[1.5px] border-line-strong bg-layer-card px-4 text-center text-subhead font-bold text-foreground no-underline outline-none hover:press-overlay active:press-overlay focus-visible:shadow-focus";
 
 function LoginAppDetailsCard({ client }: { client: LoginClientSummary }) {
   const { formatMessage } = useIntl();
   const content = (
     <div className="flex min-w-0 items-start gap-3">
       <AvatarSlot
-        context="surface-list"
+        context="list-row"
         type="app"
         appAvatarUrl={client.logoUrl}
         appInitials={initialsForApp(client.name)}
-        className="shadow-brutal-sm"
       />
       <div className="min-w-0 flex-1 space-y-1">
         <div className="flex flex-wrap items-center gap-2">
-          <span className="min-w-0 break-words font-black">{client.name}</span>
-          <span className={readyChipClassName()}>{formatMessage({
+          <span className="min-w-0 break-words text-subhead font-bold">{client.name}</span>
+          <Badge variant="success" appearance="soft">{formatMessage({
             id: client.marketplace || client.availability === "install_required"
               ? "pages.humanLogin.marketplace"
               : "pages.humanLogin.ready",
-          })}</span>
+          })}</Badge>
         </div>
-        {client.description && <div className="text-xs text-black/60">{client.description}</div>}
+        {client.description && <div className="text-footnote text-foreground-muted">{client.description}</div>}
       </div>
     </div>
   );
 
   if (!client.homepageUrl) {
-    return <div className={appDetailsCardClassName(false)}>{content}</div>;
+    return <Card className={APP_DETAILS_CARD_CLASS}>{content}</Card>;
   }
 
   return (
-    <a
-      href={client.homepageUrl}
-      target="_blank"
-      rel="noreferrer"
-      aria-label={`${formatMessage({ id: "pages.humanLogin.openAppAriaPrefix" })} ${client.name}`}
-      className={appDetailsCardClassName(true)}
+    <Card
+      render={(
+        <a
+          href={client.homepageUrl}
+          target="_blank"
+          rel="noreferrer"
+          aria-label={`${formatMessage({ id: "pages.humanLogin.openAppAriaPrefix" })} ${client.name}`}
+        />
+      )}
+      className={APP_DETAILS_LINK_CARD_CLASS}
     >
       {content}
-    </a>
+    </Card>
   );
 }
 
@@ -169,6 +177,9 @@ export default function HumanLoginSetupPage() {
   const [clientError, setClientError] = useState("");
   const [installingServerId, setInstallingServerId] = useState("");
   const [serverQuery, setServerQuery] = useState("");
+  const handleServerQueryChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    setServerQuery(event.target.value);
+  }, []);
 
   // Async-loader: OAuth client availability by clientId across the user's servers.
   // Unavailable servers are hidden from the selector instead of surfacing a dead option.
@@ -274,10 +285,10 @@ export default function HumanLoginSetupPage() {
   const selectedMarketplaceNeedsAdmin = selectedMarketplaceEntry?.client.availability === "install_required"
     && !selectedMarketplaceCanInstall;
   const detailsClient = marketplaceClient ?? client;
-  const availableServerOptions = availableServerClients.map(({ server }) => ({
+  const availableServerOptions = useMemo(() => availableServerClients.map(({ server }) => ({
     value: server.id,
     label: `${server.name} (${server.slug})`,
-  }));
+  })), [availableServerClients]);
 
   const serviceName = detailsClient?.name || (clientId.trim() ? formatMessage({ id: "pages.humanLogin.thisApp" }) : formatMessage({ id: "pages.humanLogin.thisService" }));
   const selectedServerName = selectedMarketplaceRow?.server.name
@@ -302,7 +313,7 @@ export default function HumanLoginSetupPage() {
   const unavailableAfterLookup = !!clientId.trim() && !serversLoading && !clientLoading
     && availableServerClients.length === 0 && installRequiredServerClients.length === 0;
 
-  async function authorizeWithClient(serverId: string, loginClient: LoginClientSummary) {
+  const authorizeWithClient = useCallback(async (serverId: string, loginClient: LoginClientSummary) => {
     setSubmitting(true);
     setStatus("");
     try {
@@ -325,9 +336,19 @@ export default function HumanLoginSetupPage() {
     } finally {
       setSubmitting(false);
     }
-  }
+  }, [
+    configuredReturnUrl,
+    formatMessage,
+    oidcCodeChallenge,
+    oidcCodeChallengeMethod,
+    oidcFlow,
+    oidcNonce,
+    requestedServerHint,
+    scopes,
+    setupState,
+  ]);
 
-  async function installMarketplaceApp(entry: AvailableServerClient) {
+  const installMarketplaceApp = useCallback(async (entry: AvailableServerClient) => {
     if (!entry.client.id || !entry.client.installation?.canInstall) return;
     setInstallingServerId(entry.server.id);
     setStatus("");
@@ -359,9 +380,9 @@ export default function HumanLoginSetupPage() {
     } finally {
       setInstallingServerId("");
     }
-  }
+  }, [authorizeWithClient, formatMessage]);
 
-  async function continueToApp() {
+  const continueToApp = useCallback(async () => {
     if (!clientId.trim()) {
       setStatus(formatMessage({ id: "pages.humanLogin.missingClientId" }));
       return;
@@ -380,23 +401,42 @@ export default function HumanLoginSetupPage() {
     }
 
     await authorizeWithClient(selectedServerId, client);
-  }
+  }, [authorizeWithClient, client, clientError, clientId, configuredReturnUrl, formatMessage, selectedServerId]);
+
+  const handleCommit = useCallback(() => {
+    if (selectedMarketplaceCanInstall && selectedMarketplaceEntry) {
+      void installMarketplaceApp(selectedMarketplaceEntry);
+      return;
+    }
+    void continueToApp();
+  }, [continueToApp, installMarketplaceApp, selectedMarketplaceCanInstall, selectedMarketplaceEntry]);
+
+  const handleLogout = useCallback(() => logout(), [logout]);
+
+  const handleSelectServerRow = useCallback((serverId: string) => {
+    if (installingServerId) return;
+    setSelectedServerId(serverId);
+  }, [installingServerId]);
+
+  const handleServerChange = useCallback((value: string | null) => {
+    if (value == null) return;
+    setSelectedServerId(value);
+  }, []);
 
   return (
-    <div className="h-full min-h-0 overflow-y-auto bg-brutal-cream font-display text-black">
-      <header className="border-b-2 border-black bg-white">
+    <div className="h-full min-h-0 overflow-y-auto bg-layer-sidebar font-display text-foreground">
+      <header className="border-b border-line-seam bg-layer-canvas">
         <div className="flex items-center justify-between gap-3 px-4 py-3 sm:px-6 sm:py-4">
-          <div className="flex min-w-0 flex-wrap items-center gap-1.5 font-black sm:gap-2">
-            <span className="shrink-0 text-xs font-bold uppercase tracking-widest text-black/55 sm:text-sm">{formatMessage({ id: "pages.humanLogin.loginWith" })}</span>
+          <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
+            <span className="shrink-0 text-footnote font-bold text-foreground-hint sm:text-subhead">{formatMessage({ id: "pages.humanLogin.loginWith" })}</span>
             <RaftBrandLockup className="h-5 w-auto shrink-0 sm:h-6" adaptToDarkMode />
           </div>
           <div className="flex shrink-0 items-center gap-2 sm:gap-4">
-            <a className="btn-flat-sm px-2.5 py-1.5 text-xs no-underline sm:text-sm" href="/">{formatMessage({ id: "pages.humanLogin.back" })}</a>
+            <a className={GHOST_LINK_BUTTON_CLASS} href="/">{formatMessage({ id: "pages.humanLogin.back" })}</a>
             <Button
-              onClick={() => logout()}
+              onClick={handleLogout}
               size="sm"
-              tone="white"
-              className="font-black sm:text-sm"
+              variant="outline"
             >
               {formatMessage({ id: "pages.humanLogin.logOut" })}
             </Button>
@@ -406,155 +446,108 @@ export default function HumanLoginSetupPage() {
 
       {unavailableAfterLookup ? (
         <main className="mx-auto max-w-2xl px-4 py-6 pb-10 sm:px-5 sm:py-8 sm:pb-12 md:py-10 md:pb-14">
-          <section className="border-2 border-black bg-white p-4 shadow-brutal sm:p-6">
-            <h1 className="text-3xl font-black leading-none sm:text-4xl">
+          <Card render={<section />} className="p-4 sm:p-6">
+            <h1 className="text-title sm:text-display">
               {formatMessage({ id: "pages.humanLogin.notAccessibleTitle" })}
             </h1>
-            <p className="mt-4 text-sm leading-6 text-black/70">
+            <p className="mt-4 text-callout text-foreground-muted">
               {formatMessage({ id: "pages.humanLogin.notAccessibleBody" })}
             </p>
-            <div className="mt-5 border-2 border-black bg-brutal-blue/20 p-4 text-sm leading-6">
-              <h2 className="font-black">{formatMessage({ id: "pages.humanLogin.howToGetAccessTitle" })}</h2>
-              <p className="mt-1 text-black/70">
+            <div className="mt-5 rounded-container border border-line-hairline bg-info-soft p-4 text-callout text-foreground">
+              <h2 className="font-bold">{formatMessage({ id: "pages.humanLogin.howToGetAccessTitle" })}</h2>
+              <p className="mt-1">
                 {formatMessage({ id: "pages.humanLogin.howToGetAccessBody" })}
               </p>
             </div>
-            <p className="mt-5 text-xs leading-5 text-black/60">
+            <p className="mt-5 text-caption text-foreground-hint">
               <SignedInAs user={user} prefix={formatMessage({ id: "pages.humanLogin.signedInAsPrefix" })} />
             </p>
-          </section>
+          </Card>
         </main>
       ) : (
         <main className="mx-auto grid max-w-5xl gap-5 px-4 py-6 pb-10 sm:gap-6 sm:px-5 sm:py-8 sm:pb-12 md:grid-cols-[1fr_360px] md:py-10 md:pb-14">
-        <section className="border-2 border-black bg-white p-4 shadow-brutal sm:p-6">
-          <h1 className="mb-3 leading-none">
-            <span className="block text-lg font-bold sm:text-2xl">{formatMessage({ id: "pages.humanLogin.connectTitle" }, { serviceName, serverName: selectedServerName })}</span>
-            <span className="mt-1 block break-words text-3xl font-black sm:text-5xl">{serviceName}</span>
+        <Card render={<section />} className="p-4 sm:p-6">
+          <h1 className="mb-3">
+            <span className="block text-headline sm:text-title">{formatMessage({ id: "pages.humanLogin.connectTitle" }, { serviceName, serverName: selectedServerName })}</span>
+            <span className="mt-1 block break-words text-display sm:text-hero">{serviceName}</span>
           </h1>
-          <p className="text-sm leading-6 text-black/70">
+          <p className="text-callout text-foreground-muted">
             {formatMessage({ id: "pages.humanLogin.useAccountWith" }, { serviceName, b: (chunks) => <strong key="service">{chunks}</strong> })}
           </p>
-          <p className="mt-2 text-xs leading-5 text-black/60">
+          <p className="mt-2 text-caption text-foreground-hint">
             <SignedInAs user={user} prefix={formatMessage({ id: "pages.humanLogin.signedInAsPrefix" })} />
           </p>
 
           <div className="mt-5">
-            <div className="text-xs font-black uppercase tracking-widest">{formatMessage({ id: "pages.humanLogin.appDetailsLabel" })}</div>
-            <div className={detailsClient ? "contents" : appDetailsCardClassName(false)}>
-              {clientLoading ? (
-                <span className="font-bold text-black/60">{formatMessage({ id: "pages.humanLogin.loadingServers" })}</span>
-              ) : detailsClient ? (
-                <LoginAppDetailsCard client={detailsClient} />
-              ) : (
-                <span className="font-bold text-black/60">
-                  {clientError || formatMessage({ id: "pages.humanLogin.selectServerFallback" })}
+            <div className={FIELD_LABEL_CLASS}>{formatMessage({ id: "pages.humanLogin.appDetailsLabel" })}</div>
+            {detailsClient && !clientLoading ? (
+              <LoginAppDetailsCard client={detailsClient} />
+            ) : detailsClient ? (
+              <span className="text-foreground-muted">{formatMessage({ id: "pages.humanLogin.loadingServers" })}</span>
+            ) : (
+              <Card className={APP_DETAILS_CARD_CLASS}>
+                <span className="text-foreground-muted">
+                  {clientLoading
+                    ? formatMessage({ id: "pages.humanLogin.loadingServers" })
+                    : clientError || formatMessage({ id: "pages.humanLogin.selectServerFallback" })}
                 </span>
-              )}
-            </div>
-            <p className="mt-1 text-xs leading-5 text-black/60">
+              </Card>
+            )}
+            <p className={FIELD_HELP_CLASS}>
               {formatMessage({ id: "pages.humanLogin.appDetailsHelp" })}
             </p>
           </div>
 
           <div className="mt-5">
-            <div className="text-xs font-black uppercase tracking-widest" id="slock-login-server-label">
+            <div className={FIELD_LABEL_CLASS} id="slock-login-server-label">
               {formatMessage({ id: "pages.humanLogin.raftServerLabel" })}
             </div>
-            <div id="slock-login-server" className="mt-1">
+            <div id="slock-login-server" className="mt-1.5">
               {clientLoading ? (
-                <div className="border-2 border-black bg-white px-3 py-2 text-sm font-bold shadow-brutal-sm">
+                <div className={FIELD_PLACEHOLDER_CLASS}>
                   {formatMessage({ id: "pages.humanLogin.loadingServers" })}
                 </div>
               ) : isMarketplaceApp ? (
                 <div role="group" aria-labelledby="slock-login-server-label">
-                  <div className="overflow-hidden border-2 border-black bg-white shadow-brutal-sm">
+                  <Card>
                     {marketplaceServerRows.length > 5 && (
-                      <div className="border-b-2 border-black bg-brutal-cream p-2">
-                        <input
+                      <div className="border-b border-line-hairline p-2">
+                        <Input
                           type="search"
                           value={serverQuery}
-                          onChange={(event) => setServerQuery(event.target.value)}
+                          onChange={handleServerQueryChange}
                           disabled={!!installingServerId}
                           placeholder={formatMessage({ id: "pages.humanLogin.searchServers" })}
                           aria-label={formatMessage({ id: "pages.humanLogin.searchServers" })}
-                          className="input-brutal w-full px-3 py-2 text-sm"
+                          className="w-full"
                         />
                       </div>
                     )}
-                    <div className="max-h-72 divide-y-2 divide-black overflow-y-auto">
-                  {filteredMarketplaceServerRows.map(({ server, entry }) => {
-                    const installed = entry?.client.availability !== "install_required" && entry != null;
-                    const selected = selectedServerId === server.id;
-                    const canInstall = entry?.client.installation?.canInstall === true;
-                    const rowTitle = formatMessage({ id: installed
-                      ? "pages.humanLogin.serverInstalledReady"
-                      : canInstall
-                        ? "pages.humanLogin.serverNotInstalledCanInstall"
-                        : entry
-                          ? "pages.humanLogin.serverNotInstalledAskAdmin"
-                          : "pages.humanLogin.serverStatusUnavailable" });
-                    return (
-                      <AvatarListRow
-                        key={server.id}
-                        avatar={(
-                          <AvatarSlot
-                            context="surface-list"
-                            type="server"
-                            serverAvatarUrl={server.avatarUrl}
-                            serverInitial={server.name.slice(0, 1)}
-                            className="mt-1"
-                          />
-                        )}
-                        name={server.name}
-                        subtitle={server.slug}
-                        rightContent={installingServerId === server.id ? (
-                          <Spinner
-                            size="sm"
-                            aria-hidden="true"
-                            data-testid="marketplace-install-pending-row-spinner"
-                          />
-                        ) : !installed ? (
-                          <Badge appearance="outline" uppercase>
-                            {formatMessage({ id: !entry
-                              ? "pages.humanLogin.serverUnavailableCompact"
-                              : canInstall
-                                ? "pages.humanLogin.notInstalledCompact"
-                                : "pages.humanLogin.adminNeededCompact" })}
-                          </Badge>
-                        ) : null}
-                        align="start"
-                        selected={selected}
-                        onClick={() => {
-                          if (installingServerId) return;
-                          setSelectedServerId(server.id);
-                        }}
-                        className={`min-h-14 ${installingServerId ? "opacity-60" : ""}`}
-                        buttonProps={{
-                          "data-testid": `login-server-status-${server.id}`,
-                          disabled: !!installingServerId,
-                          "aria-pressed": selected,
-                          "aria-disabled": !!installingServerId,
-                          "aria-label": `${formatMessage({ id: "pages.humanLogin.useThisServer" })}: ${server.name}`,
-                          title: rowTitle,
-                        }}
-                      />
-                    );
-                  })}
+                    <div className="max-h-72 overflow-y-auto">
+                  {/* raft-ui ListRows: the hairline between two rows is theirs. */}
+                  {filteredMarketplaceServerRows.map(({ server, entry }) => (
+                    <MarketplaceServerRow
+                      key={server.id}
+                      server={server}
+                      entry={entry}
+                      selected={selectedServerId === server.id}
+                      installPending={installingServerId === server.id}
+                      installInFlight={!!installingServerId}
+                      onSelect={handleSelectServerRow}
+                    />
+                  ))}
                     {filteredMarketplaceServerRows.length === 0 && (
-                      <div className="px-3 py-6 text-center text-sm font-bold text-black/55">
+                      <div className="px-3 py-6 text-center text-callout text-foreground-hint">
                         {formatMessage({ id: "pages.humanLogin.noServerSearchResults" })}
                       </div>
                     )}
                     </div>
-                  </div>
+                  </Card>
                 </div>
               ) : availableServerClients.length > 0 ? (
                 <Select
                   value={selectedServerId}
-                  onValueChange={(value) => {
-                    if (value == null) return;
-                    setSelectedServerId(value);
-                  }}
+                  onValueChange={handleServerChange}
                   items={availableServerOptions}
                 >
                   <SelectTrigger className="w-full">
@@ -566,12 +559,12 @@ export default function HumanLoginSetupPage() {
                   </SelectContent>
                 </Select>
               ) : (
-                <div className="border-2 border-black bg-white px-3 py-2 text-sm font-bold shadow-brutal-sm">
+                <div className={FIELD_PLACEHOLDER_CLASS}>
                   {formatMessage({ id: "pages.humanLogin.noAvailableServers" })}
                 </div>
               )}
             </div>
-            <p className="mt-1 text-xs leading-5 text-black/60">
+            <p className={FIELD_HELP_CLASS}>
               {formatMessage({ id: isMarketplaceApp
                 ? "pages.humanLogin.marketplaceServerHelp"
                 : "pages.humanLogin.serverHelp" })}
@@ -584,16 +577,16 @@ export default function HumanLoginSetupPage() {
             <div
               role="alert"
               data-testid="oauth-scope-configuration-error"
-              className="mt-4 border-2 border-black bg-brutal-pink/20 p-4 shadow-brutal-sm"
+              className="mt-4 rounded-container border border-line-hairline bg-warning-soft p-4 text-foreground"
             >
-              <div className="text-sm font-black">
+              <div className="text-callout font-bold">
                 {formatMessage({ id: scopeValidationReason === "unsupported"
                   ? "pages.humanLogin.unsupportedScopeTitle"
                   : scopeValidationReason === "mixed"
                     ? "pages.humanLogin.invalidScopeTitle"
                     : "pages.humanLogin.scopeConfigurationTitle" })}
               </div>
-              <p className="mt-1 text-sm leading-6 text-black/75">
+              <p className="mt-1 text-callout">
                 {formatMessage(
                   { id: scopeValidationReason === "unsupported"
                     ? "pages.humanLogin.unsupportedScopeBody"
@@ -608,12 +601,12 @@ export default function HumanLoginSetupPage() {
 
           {isMarketplaceApp ? (
             <div
-              className="mt-6 border-2 border-black bg-brutal-cream p-4"
+              className="mt-6 rounded-container border border-line-hairline bg-fill-muted p-4"
               data-testid="marketplace-login-commit-zone"
               aria-busy={!!installingServerId}
             >
               {selectedMarketplaceInstalled && selectedMarketplaceRow ? (
-                <p className="text-sm leading-6 text-black/80">
+                <p className="text-callout text-foreground">
                   {formatMessage(
                     { id: "pages.humanLogin.selectedServerCommit" },
                     { serverName: selectedMarketplaceRow.server.name, b: (chunks) => <strong key="server">{chunks}</strong> },
@@ -621,7 +614,7 @@ export default function HumanLoginSetupPage() {
                 </p>
               ) : selectedMarketplaceCanInstall && selectedMarketplaceEntry && selectedMarketplaceRow ? (
                 <>
-                  <p className="text-sm leading-6 text-black/80">
+                  <p className="text-callout text-foreground">
                     {formatMessage(
                       { id: "pages.humanLogin.installCommitBody" },
                       {
@@ -631,12 +624,12 @@ export default function HumanLoginSetupPage() {
                       },
                     )}
                   </p>
-                  <p className="mt-2 font-mono text-xs text-black/55">
+                  <p className="mt-2 font-mono text-mono-meta text-foreground-muted">
                     {formatMessage({ id: "pages.humanLogin.installCommitScopes" }, { scopes: scopeSummary })}
                   </p>
                 </>
               ) : selectedMarketplaceNeedsAdmin && selectedMarketplaceEntry && selectedMarketplaceRow ? (
-                <p className="text-sm leading-6 text-black/80">
+                <p className="text-callout text-foreground">
                   {formatMessage(
                     { id: "pages.humanLogin.adminCommitBody" },
                     {
@@ -647,24 +640,20 @@ export default function HumanLoginSetupPage() {
                   )}
                 </p>
               ) : (
-                <p className="text-sm leading-6 text-black/80">
+                <p className="text-callout text-foreground">
                   {formatMessage({ id: "pages.humanLogin.serverStatusUnavailable" })}
                 </p>
               )}
 
+              {selectedMarketplaceCanInstall && detailsClient?.setupUrl ? <AppSetupRequirement url={detailsClient.setupUrl} description={detailsClient.setupDescription} /> : null}
+
               {!selectedMarketplaceNeedsAdmin ? (
                 <Button
                   disabled={selectedMarketplaceCanInstall ? !canInstallAndContinue : !canContinue}
-                  onClick={() => {
-                    if (selectedMarketplaceCanInstall && selectedMarketplaceEntry) {
-                      void installMarketplaceApp(selectedMarketplaceEntry);
-                      return;
-                    }
-                    void continueToApp();
-                  }}
-                  size="lg"
-                  tone="pink"
-                  className="mt-4 w-full font-black disabled:cursor-not-allowed disabled:opacity-50"
+                  onClick={handleCommit}
+                  size="xl"
+                  variant="accent"
+                  className="mt-4 w-full"
                 >
                   {installingServerId ? (
                     <Spinner
@@ -687,7 +676,7 @@ export default function HumanLoginSetupPage() {
               {selectedMarketplaceNeedsAdmin && selectedMarketplaceRow ? (
                 <a
                   href={`/s/${encodeURIComponent(selectedMarketplaceRow.server.slug)}/members`}
-                  className="btn-brutal-sm mt-3 flex w-full items-center justify-center bg-white px-4 py-2 text-center no-underline shadow-brutal-sm"
+                  className={OUTLINE_LINK_BUTTON_CLASS}
                 >
                   {formatMessage({ id: "pages.humanLogin.findServerAdmin" })}
                 </a>
@@ -699,40 +688,40 @@ export default function HumanLoginSetupPage() {
                 disabled={!canContinue}
                 onClick={continueToApp}
                 size="lg"
-                tone="pink"
-                className="font-black disabled:cursor-not-allowed disabled:opacity-50"
+                variant="accent"
+                className="w-full sm:w-auto"
               >
                 {submitting ? formatMessage({ id: "pages.humanLogin.continuing" }) : formatMessage({ id: "pages.humanLogin.loginWithRaft" })}
               </Button>
             </div>
           )}
 
-          {status && <pre className="mt-4 min-h-16 overflow-auto bg-black p-3 text-xs text-white">{status}</pre>}
-        </section>
+          {status && <pre className="mt-4 min-h-16 overflow-auto rounded-container border border-line-hairline bg-layer-code p-3 font-mono text-mono-code text-foreground">{status}</pre>}
+        </Card>
 
-        <aside className="border-2 border-black bg-white p-5 shadow-brutal-sm">
-          <h2 className="mb-4 text-xl font-black">{formatMessage({ id: "pages.humanLogin.faqTitle" })}</h2>
-          <div className="space-y-5 text-sm leading-6 text-black/70">
+        <Card render={<aside />} className="p-5">
+          <h2 className="mb-4 text-headline">{formatMessage({ id: "pages.humanLogin.faqTitle" })}</h2>
+          <div className="space-y-5 text-callout text-foreground-muted">
             <section>
-              <h3 className="font-black text-black">{formatMessage({ id: "pages.humanLogin.faqWhatTitle" })}</h3>
+              <h3 className="text-subhead font-bold text-foreground">{formatMessage({ id: "pages.humanLogin.faqWhatTitle" })}</h3>
               <p>
                 {formatMessage({ id: "pages.humanLogin.faqWhatBody" })}
               </p>
             </section>
             <section>
-              <h3 className="font-black text-black">{formatMessage({ id: "pages.humanLogin.faqRegisterTitle" })}</h3>
+              <h3 className="text-subhead font-bold text-foreground">{formatMessage({ id: "pages.humanLogin.faqRegisterTitle" })}</h3>
               <p>
                 {formatMessage({ id: "pages.humanLogin.faqRegisterBody" })}
               </p>
             </section>
             <section>
-              <h3 className="font-black text-black">{formatMessage({ id: "pages.humanLogin.faqAgentTitle" })}</h3>
+              <h3 className="text-subhead font-bold text-foreground">{formatMessage({ id: "pages.humanLogin.faqAgentTitle" })}</h3>
               <p>
                 {formatMessage({ id: "pages.humanLogin.faqAgentBody" })}
               </p>
             </section>
           </div>
-        </aside>
+        </Card>
       </main>
       )}
     </div>

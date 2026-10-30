@@ -2,15 +2,14 @@ import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { test } from "vitest";
 import {
   GeminiDriver,
   buildGeminiArgs,
   buildGeminiManagedMcpSettings,
   buildGeminiSpawnEnv,
   resolveGeminiSpawn,
-} from "./gemini.js";
-import type { SpawnContext } from "./types.js";
+} from "./gemini";
+import type { SpawnContext } from "./types";
 
 // Mirrors Gemini CLI 0.40.1 atCommandProcessor parsing; revisit when upstream changes it.
 const geminiAtCommandRegex = /(?<!\\)@(?:(?:"(?:[^"]*)")|(?:\\.|[^ \t\n\r,;!?()[\]{}.]|\.(?!$|[ \t\n\r])))+/g;
@@ -405,4 +404,169 @@ test("parseLine: full turn lifecycle", () => {
   assert.equal(all[3]!.name, "send_message");
   assert.equal(all[4]!.kind, "turn_end");
   assert.equal(all[4]!.sessionId, "full-test");
+});
+
+// ── task #1277, B-group: the gemini launch resolves under the start attempt's cancel ──
+
+import { chmodSync as chmodSyncT, mkdirSync as mkdirSyncT, mkdtempSync as mkdtempSyncT, rmSync as rmSyncT, writeFileSync as writeFileSyncT, existsSync as existsSyncT } from "node:fs";
+import osT from "node:os";
+import { GEMINI_WINDOWS_DISCOVERY_TIMEOUT_MS, resolveGeminiSpawnAsync } from "./gemini";
+import { ProbeChildError, type runProbeChild } from "./probeChild";
+import { RuntimeExecutableNotFoundError } from "../spawnFailureErrors";
+
+/** Plays a sync execFileSync stand-in through the async probe-child seam, recording the budget each child got. */
+function viaProbeChild(execFileSyncFn: (command: string, args: string[]) => string, budgets?: number[]): typeof runProbeChild {
+  return async (command, args, options) => {
+    budgets?.push(options.timeoutMs);
+    return { stdout: String(execFileSyncFn(command, [...args]) ?? ""), stderr: "" };
+  };
+}
+
+test("task #1277: resolveGeminiSpawnAsync resolves the Windows npm entry, the Electron Node mode and the where.exe fallback like the synchronous resolver, with a 5 s budget per child", async () => {
+  const globalRoot = String.raw`C:\Users\bot\AppData\Roaming\npm\node_modules`;
+  const entry = String.raw`C:\Users\bot\AppData\Roaming\npm\node_modules\@google\gemini-cli\bundle\gemini.js`;
+  const shim = String.raw`C:\Users\bot\AppData\Roaming\npm\gemini.cmd`;
+  const npmOk = (command: string, args: string[]) => {
+    if (command === "npm" && args.join(" ") === "root -g") return globalRoot;
+    throw new Error("unexpected command");
+  };
+  const budgets: number[] = [];
+  const a = await resolveGeminiSpawnAsync(["--output-format", "stream-json"], { platform: "win32", env: { BASE_ENV: "present" }, execIsElectron: false, runProbeChildFn: viaProbeChild(npmOk, budgets), existsSyncFn: (c) => c === entry });
+  assert.equal(a.command, process.execPath);
+  assert.deepEqual(a.args, [entry, "--output-format", "stream-json"]);
+  assert.deepEqual(budgets, [GEMINI_WINDOWS_DISCOVERY_TIMEOUT_MS]);
+  const electron = String.raw`C:\Program Files\Raft\Raft.exe`;
+  const b = await resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", env: { BASE_ENV: "present" }, execPath: electron, execIsElectron: true, runProbeChildFn: viaProbeChild(npmOk), existsSyncFn: (c) => c === entry });
+  assert.equal(b.command, electron);
+  assert.equal(b.env.ELECTRON_RUN_AS_NODE, "1");
+  const viaWhere = (command: string, args: string[]) => {
+    if (command === "npm" && args.join(" ") === "root -g") return String.raw`C:\missing`;
+    if (command === "where.exe" && args.join(" ") === "gemini") return `${shim}\r\n`;
+    throw new Error("unexpected command");
+  };
+  const c = await resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: viaProbeChild(viaWhere), existsSyncFn: (cand) => cand === entry });
+  assert.equal(c.command, process.execPath);
+  assert.deepEqual(c.args, [entry, "--yolo"]);
+  // Equivalence with the synchronous resolver on the same stand-in.
+  const sync = resolveGeminiSpawn(["--yolo"], { platform: "win32", execFileSyncFn: viaWhere as any, existsSyncFn: (cand) => cand === entry });
+  assert.deepEqual({ command: c.command, args: c.args }, { command: sync.command, args: sync.args });
+});
+
+test("task #1277: a timed-out `npm root -g` (new 5 s budget, async path only) falls through to where.exe like any other discovery failure; an abort is rethrown", async () => {
+  const entry = String.raw`C:\Users\bot\AppData\Roaming\npm\node_modules\@google\gemini-cli\bundle\gemini.js`;
+  const shim = String.raw`C:\Users\bot\AppData\Roaming\npm\gemini.cmd`;
+  const timedOutNpm: typeof runProbeChild = async (command, args) => {
+    if (command === "npm") throw new ProbeChildError("npm root -g timed out", { code: "ETIMEDOUT", cleanup: { childExited: true, waitedMs: 5001 } });
+    if (command === "where.exe" && args[0] === "gemini") return { stdout: `${shim}\r\n`, stderr: "" };
+    throw new Error("unexpected command");
+  };
+  const resolved = await resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: timedOutNpm, existsSyncFn: (c) => c === entry });
+  assert.deepEqual(resolved.args, [entry, "--yolo"]);
+  const controller = new AbortController();
+  const aborting: typeof runProbeChild = async () => {
+    controller.abort();
+    throw new ProbeChildError("aborted", { code: "ABORT_ERR" });
+  };
+  await assert.rejects(
+    resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", signal: controller.signal, runProbeChildFn: aborting, existsSyncFn: () => true }),
+    (error: unknown) => error instanceof ProbeChildError && error.code === "ABORT_ERR",
+    "a cancel is rethrown, never turned into 'not resolved'",
+  );
+});
+
+test("task #1277 (launch): a gemini spawn with an already-cancelled launch signal creates no child; a cancel during a slow lookup does the same", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSyncT(path.join(osT.tmpdir(), "gemini-launch-cancel-"));
+  const previousPath = process.env.PATH;
+  try {
+    const binDir = path.join(root, "bin");
+    mkdirSyncT(binDir, { recursive: true });
+    const argvFile = path.join(root, "argv.txt");
+    writeFileSyncT(path.join(binDir, "gemini"), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\n`);
+    chmodSyncT(path.join(binDir, "gemini"), 0o755);
+    writeFileSyncT(path.join(binDir, "which"), `#!/bin/sh\nsleep 0.4\nexec /usr/bin/which "$@"\n`);
+    chmodSyncT(path.join(binDir, "which"), 0o755);
+    process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
+    const isAbort = (error: unknown) => error instanceof Error && (error as { code?: unknown }).code === "ABORT_ERR";
+    const pre = new AbortController();
+    pre.abort();
+    await assert.rejects(new GeminiDriver().spawn({ ...makeSpawnContext(null, root), launchSignal: pre.signal }), isAbort);
+    assert.equal(existsSyncT(argvFile), false, "no gemini child was started");
+    const mid = new AbortController();
+    setTimeout(() => mid.abort(), 100);
+    await assert.rejects(new GeminiDriver().spawn({ ...makeSpawnContext(null, root), launchSignal: mid.signal }), isAbort);
+    assert.equal(existsSyncT(argvFile), false, "no gemini child was started after the cancel");
+  } finally {
+    process.env.PATH = previousPath;
+    rmSyncT(root, { recursive: true, force: true });
+  }
+});
+
+test("task #1277 (review): when every Windows discovery child timed out, the 'not resolved' error carries probe_timeout (never a bare or not_installed verdict); a non-timeout failure carries probe_failed; two clean misses carry no reason", async () => {
+  const timedOut: typeof runProbeChild = async () => { throw new ProbeChildError("timed out", { code: "ETIMEDOUT", cleanup: { childExited: true, waitedMs: 5001 } }); };
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: timedOut, existsSyncFn: () => false }), (error: unknown) => {
+    assert.ok(error instanceof RuntimeExecutableNotFoundError);
+    assert.equal(error.reason, "probe_timeout");
+    assert.doesNotMatch(error.message, /npm i -g/, "never suggests installing on an undecided lookup");
+    return true;
+  });
+  const failedThenTimedOut: typeof runProbeChild = async (command) => {
+    if (command === "npm") throw new ProbeChildError("npm missing", { code: "ENOENT" });
+    throw new ProbeChildError("timed out", { code: "ETIMEDOUT", cleanup: { childExited: true, waitedMs: 5001 } });
+  };
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: failedThenTimedOut, existsSyncFn: () => false }), (error: unknown) =>
+    error instanceof RuntimeExecutableNotFoundError && error.reason === "probe_timeout");
+  const failedOnly: typeof runProbeChild = async () => { throw new ProbeChildError("cannot run", { code: "ENOENT" }); };
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: failedOnly, existsSyncFn: () => false }), (error: unknown) =>
+    error instanceof RuntimeExecutableNotFoundError && error.reason === "probe_failed");
+  const cleanMiss: typeof runProbeChild = async (command) => ({ stdout: command === "npm" ? "C:\\missing\n" : "C:\\also-missing\\gemini.cmd\r\n", stderr: "" });
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: cleanMiss, existsSyncFn: () => false }), (error: unknown) =>
+    error instanceof RuntimeExecutableNotFoundError && error.reason === undefined && /npm i -g/.test(error.message));
+});
+
+test("task #1277 (review 2): a discovery child that exited non-zero without a string code (runProbeChild's ordinary failure shape), was killed by a signal, or threw an unknown error is probe_failed — never a bare 'install it' verdict; where.exe's documented no-match exit (1) is a clean miss; timeout keeps priority", async () => {
+  const npmStatusOnly: typeof runProbeChild = async (command) => {
+    if (command === "npm") throw new ProbeChildError("npm root -g exited with status 1", { status: 1, signal: null, stderr: "npm ERR! code ELIFECYCLE" });
+    return { stdout: "", stderr: "" };
+  };
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: npmStatusOnly, existsSyncFn: () => false }), (error: unknown) => {
+    assert.ok(error instanceof RuntimeExecutableNotFoundError);
+    assert.equal(error.reason, "probe_failed", "a non-zero npm exit with no code is an execution failure, not a clean miss");
+    assert.doesNotMatch(error.message, /npm i -g/);
+    return true;
+  });
+  const whereStatusTwo: typeof runProbeChild = async (command) => {
+    if (command === "npm") return { stdout: "C:\\missing\n", stderr: "" };
+    throw new ProbeChildError("where.exe could not run", { status: 2, signal: null });
+  };
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: whereStatusTwo, existsSyncFn: () => false }), (error: unknown) =>
+    error instanceof RuntimeExecutableNotFoundError && error.reason === "probe_failed");
+  const signalled: typeof runProbeChild = async () => { throw new ProbeChildError("killed", { status: null, signal: "SIGKILL" }); };
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: signalled, existsSyncFn: () => false }), (error: unknown) =>
+    error instanceof RuntimeExecutableNotFoundError && error.reason === "probe_failed");
+  const unknownShape: typeof runProbeChild = async () => { throw new Error("runner blew up"); };
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: unknownShape, existsSyncFn: () => false }), (error: unknown) =>
+    error instanceof RuntimeExecutableNotFoundError && error.reason === "probe_failed");
+  // Control: npm answered cleanly (entry missing) and where.exe reported its documented no-match exit — nothing undecided.
+  const cleanNoMatch: typeof runProbeChild = async (command) => {
+    if (command === "npm") return { stdout: "C:\\missing\n", stderr: "" };
+    throw new ProbeChildError("where.exe: no match", { status: 1, signal: null, stderr: "INFO: Could not find files for the given pattern(s)." });
+  };
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: cleanNoMatch, existsSyncFn: () => false }), (error: unknown) =>
+    error instanceof RuntimeExecutableNotFoundError && error.reason === undefined && /npm i -g/.test(error.message));
+  // Priority: a status-only npm failure followed by a where.exe timeout reads probe_timeout.
+  const statusThenTimeout: typeof runProbeChild = async (command) => {
+    if (command === "npm") throw new ProbeChildError("npm exited 1", { status: 1, signal: null });
+    throw new ProbeChildError("timed out", { code: "ETIMEDOUT", cleanup: { childExited: true, waitedMs: 5001 } });
+  };
+  await assert.rejects(resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: statusThenTimeout, existsSyncFn: () => false }), (error: unknown) =>
+    error instanceof RuntimeExecutableNotFoundError && error.reason === "probe_timeout");
+  // A status-only npm failure with where.exe then succeeding still resolves (successful fallback preserved).
+  const entry = String.raw`C:\Users\bot\AppData\Roaming\npm\node_modules\@google\gemini-cli\bundle\gemini.js`;
+  const statusThenFound: typeof runProbeChild = async (command) => {
+    if (command === "npm") throw new ProbeChildError("npm exited 1", { status: 1, signal: null });
+    return { stdout: String.raw`C:\Users\bot\AppData\Roaming\npm\gemini.cmd` + "\r\n", stderr: "" };
+  };
+  const resolved = await resolveGeminiSpawnAsync(["--yolo"], { platform: "win32", runProbeChildFn: statusThenFound, existsSyncFn: (c) => c === entry });
+  assert.deepEqual(resolved.args, [entry, "--yolo"]);
 });

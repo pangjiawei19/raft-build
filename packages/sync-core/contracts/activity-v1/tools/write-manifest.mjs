@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readContractRevision } from "./contract-revision.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
@@ -26,6 +27,8 @@ async function treeSha256(directory) {
 const manifest = {
   contract: "raft.activity-sync",
   version: 1,
+  revision: (await readContractRevision()).revision,
+  revisionsSha256: await sha256(resolve(root, "revisions.json")),
   status: "experimental",
   runnerProtocol: 1,
   typespecVersion: "1.14.0",

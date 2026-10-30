@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { describe, test } from "node:test";
 
 const webRoot = resolve(import.meta.dirname, "..");
 
@@ -26,7 +25,7 @@ describe("Cloudflare Pages route intent", () => {
     // measured on a preview deploy, byte-identical to a nonexistent path. The
     // OS then reads HTML instead of JSON and association silently never
     // verifies. Kept as an exact list so a future addition is a decision.
-    assert.deepEqual(routes.include, ["/.well-known/*", "/assets/*", "/desktop-manifest.json"]);
+    assert.deepEqual(routes.include, ["/.well-known/*", "/assets/*", "/feedback/assets/*", "/desktop-manifest.json"]);
     assert.deepEqual(routes.exclude, []);
   });
 });

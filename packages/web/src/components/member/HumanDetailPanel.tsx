@@ -1,13 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { formatRuntimeLabelWithStatus } from "../../utils/runtimeAvailabilityLabel";
+import { Badge, ProfilePanelBody, Button, DirectMessageIcon, PanelAction, PanelTitle, Separator, Textarea, ListRowGroup } from "@botiverse/raft-ui";
+import type { BadgeProps } from "@botiverse/raft-ui";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
 import {
   HelpCircle,
-  MessageSquare,
   Trash2,
   X,
   Pencil,
-  Upload,
 } from "lucide-react";
 import { SERVER_GUEST_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import type {
@@ -24,9 +23,10 @@ import { useAppNavigate, useMobileBack } from "../../hooks/useAppNavigate";
 import ConfirmDialog from "../ConfirmDialog";
 import InlineBadgeEditor from "../InlineBadgeEditor";
 import AvatarSlot from "../ui/AvatarSlot";
+import AvatarEditVeil from "../ui/AvatarEditVeil";
 import { useImageLightboxStore } from "../../store/imageLightboxStore";
 import { isRaftUploadedHumanAvatarUrl } from "../../utils/humanAvatar";
-import PanelHeader from "../ui/PanelHeader";
+import PanelHeader, { PROFILE_HANDLE_FONT_CLASS } from "../ui/PanelHeader";
 import SectionEyebrow from "../ui/SectionEyebrow";
 import SectionHeader from "../ui/SectionHeader";
 import KeyValueRow from "../ui/KeyValueRow";
@@ -38,8 +38,7 @@ import {
 import type {
   AgentCreatedSummary,
 } from "../../store/agentStore";
-import AvatarListRow from "../ui/AvatarListRow";
-import StatusDot from "../ui/StatusDot";
+import Tooltip from "../ui/Tooltip";
 import RolePermissionHelpDialog from "./RolePermissionHelpDialog";
 import { getHumanDepartureLabel } from "./humanMembershipStatus";
 import {
@@ -48,17 +47,26 @@ import {
   isAvatarTooLargeError,
   PROFILE_AVATAR_ACCEPT,
 } from "../../utils/avatarUpload";
-import { formatActivityText } from "../../utils/activity";
+import { formatAgentDisplayStateText } from "../../utils/activity";
 import type { MessageId } from "../../i18n/messages";
 import { useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import { getEditableHumanServerRoles } from "./humanRoleTransitions";
+import { CreatedAgentRow } from "./CreatedAgentRow";
+import { memberServerBadgeLabels } from "../../utils/channelLocalMembership";
+import type { ChannelMemberServer } from "../../utils/channelLocalMembership";
 
-const ROLE_CONFIG: Record<ServerRole, { labelId: MessageId; color: string }> = {
-  owner: { labelId: "member.detail.roleOwner", color: "bg-brutal-orange" },
-  admin: { labelId: "member.detail.roleAdmin", color: "bg-brutal-pink" },
-  member: { labelId: "member.detail.roleMember", color: "bg-brutal-lavender" },
-  guest: { labelId: "member.detail.roleGuest", color: "bg-brutal-cyan" },
+// A role is a fact about the person, not a status or a signal (DS rule 4/5):
+// owner, admin and member are the same neutral chip; a guest comes from
+// outside the workspace and reads as the cyan-soft external chip.
+const ROLE_CONFIG: Record<ServerRole, { labelId: MessageId; variant: NonNullable<BadgeProps["variant"]> }> = {
+  owner: { labelId: "member.detail.roleOwner", variant: "default" },
+  admin: { labelId: "member.detail.roleAdmin", variant: "default" },
+  member: { labelId: "member.detail.roleMember", variant: "default" },
+  guest: { labelId: "member.detail.roleGuest", variant: "information" },
 };
+// A small icon-only action beside a label (edit, help): borderless, ink-3,
+// pressed overlay on hover, the shared focus ring.
+const INLINE_ICON_ACTION_CLASS = "flex size-6 shrink-0 items-center justify-center rounded-control text-foreground-hint outline-none transition-colors hover:bg-fill-pressed hover:text-foreground focus-visible:shadow-focus";
 const EDITABLE_ROLE_OPTIONS: { id: ServerRole; labelId: MessageId }[] = [
   { id: "owner", labelId: "member.detail.roleOwner" },
   { id: "admin", labelId: "member.detail.roleAdmin" },
@@ -72,6 +80,9 @@ export interface HumanProfile {
   serverId?: string;
   serverName?: string | null;
   serverSlug?: string | null;
+  /** Joint channel context only (RFC 075 phase 1): every server the person
+   *  participates through in that channel, viewed server first. */
+  servers?: ChannelMemberServer[];
   email: string | null;
   gravatarHash: string;
   name: string;
@@ -100,7 +111,8 @@ export default function HumanDetailPanel({
   /** Controlled page stacks use this instead of the global profile overlay. */
   onOpenProfile?: (type: "agent" | "human", id: string) => void;
 }) {
-  const { formatDate, formatMessage } = useIntl();
+  const intl = useIntl();
+  const { formatDate, formatMessage } = intl;
   const currentUser = useAuthStore((s) => s.user);
   const updateProfile = useAuthStore((s) => s.updateProfile);
   const uploadAvatar = useAuthStore((s) => s.uploadAvatar);
@@ -117,9 +129,9 @@ export default function HumanDetailPanel({
     currentServerId && human.serverId && human.serverId !== currentServerId,
   );
   const isChannelSummaryHuman = human.profileProjection === "channel_summary";
-  const sourceServerLabel = isRemoteJointHuman
-    ? human.serverName || human.serverSlug || null
-    : null;
+  // Every server the person participates through when any of them is not
+  // this one (a person on both sides of a joint channel lists both).
+  const sourceServerLabel = memberServerBadgeLabels(human, currentServerId).join(", ") || null;
   // Two render modes for HumanDetailPanel — see AgentDetailPanel for the
   // same pattern. Overlay mode (`onClose` provided) routes back through
   // the closer rather than skipping past the underlying channel/DM to
@@ -274,8 +286,125 @@ export default function HumanDetailPanel({
     }
   };
 
+  const mobileBackProps = useMemo(
+    () => ({
+      "data-testid": "human-mobile-back",
+      title: formatMessage({ id: "common.announcement.back" }),
+    }),
+    [formatMessage],
+  );
+
+  const handleMessage = useCallback(async () => {
+    useProfileStore.getState().closeProfile();
+    useThreadStore.getState().closeThread();
+    if (dmChannel) {
+      nav.toDm(dmChannel.id);
+    } else {
+      const ch = await openUserDM(human.userId);
+      if (ch) nav.toDm(ch.id);
+    }
+  }, [dmChannel, nav, openUserDM, human.userId]);
+
+  const handleSaveDescription = useCallback(async () => {
+    const nextDescription = descriptionValue.trim();
+    if (
+      nextDescription.length > MAX_HUMAN_DESCRIPTION_LENGTH
+    ) {
+      setDescriptionError(
+        formatMessage(
+          { id: "member.detail.descriptionMaxLength" },
+          { count: MAX_HUMAN_DESCRIPTION_LENGTH },
+        ),
+      );
+      return;
+    }
+    setDescriptionSaving(true);
+    setDescriptionError("");
+    try {
+      await updateProfile({
+        description: nextDescription || null,
+      });
+      await loadMembers();
+      setEditingDescription(false);
+    } catch (err: any) {
+      setDescriptionError(
+        err.response?.data?.error ||
+          formatMessage({
+            id: "member.detail.updateDescriptionFailed",
+          }),
+      );
+    } finally {
+      setDescriptionSaving(false);
+    }
+  }, [descriptionValue, formatMessage, updateProfile, loadMembers]);
+
+  const handleDescriptionChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setDescriptionError((current) => (current ? "" : current));
+    setDescriptionValue(e.target.value);
+  }, []);
+
+  const handleCancelDescription = useCallback(() => {
+    setDescriptionValue(human.description || "");
+    setDescriptionError("");
+    setEditingDescription(false);
+  }, [human.description]);
+
+  const handleSelectRole = useCallback((nextRole: string) => {
+    setRoleValue(nextRole as ServerRole);
+    setRolePickerOpen(false);
+  }, []);
+
+  const handleToggleRolePicker = useCallback(() => {
+    setRolePickerOpen((value) => !value);
+  }, []);
+
+  const handleSaveRole = useCallback(async () => {
+    try {
+      setRoleSaving(true);
+      setRoleError("");
+      await updateMemberRole(human.userId, roleValue);
+      setEditingRole(false);
+    } catch (err: unknown) {
+      const axiosErr = err as {
+        response?: { data?: { error?: string } };
+      };
+      setRoleError(
+        axiosErr.response?.data?.error ||
+          formatMessage({
+            id: "member.detail.updateRoleFailed",
+          }),
+      );
+    } finally {
+      setRoleSaving(false);
+    }
+  }, [updateMemberRole, human.userId, roleValue, formatMessage]);
+
+  const handleCancelRole = useCallback(() => {
+    setRoleValue(human.role ?? "member");
+    setRolePickerOpen(false);
+    setRoleError("");
+    setEditingRole(false);
+  }, [human.role]);
+
+  const openRemoveConfirm = useCallback(() => setShowRemoveConfirm(true), []);
+
+  const handleConfirmRemove = useCallback(async () => {
+    setRemoving(true);
+    try {
+      await removeMember(human.userId);
+    } finally {
+      setRemoving(false);
+    }
+  }, [removeMember, human.userId]);
+
+  const handleCloseRemoveConfirm = useCallback(() => {
+    if (!removing) setShowRemoveConfirm(false);
+  }, [removing]);
+
+  const closeRoleHelp = useCallback(() => setShowRoleHelp(false), []);
+
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <ProfilePanelBody className="flex min-h-0 flex-1 flex-col">
       {isSelf && human.membershipStatus === "active" && (
         <input
           ref={avatarInputRef}
@@ -292,6 +421,7 @@ export default function HumanDetailPanel({
       <PanelHeader
         title={human.displayName || human.name}
         subtitle={`@${human.name}`}
+        subtitleClassName={PROFILE_HANDLE_FONT_CLASS}
         iconSlot={
           <AvatarSlot
             context="panel-header"
@@ -301,71 +431,67 @@ export default function HumanDetailPanel({
           />
         }
         iconAlwaysVisible
+        iconKind="avatar"
         onMobileBack={headerBack}
         backButtonVisibility={onBack ? "always" : "responsive"}
-        mobileBackProps={{
-          "data-testid": "human-mobile-back",
-          title: formatMessage({ id: "common.announcement.back" }),
-        }}
+        mobileBackProps={mobileBackProps}
         actions={
           <>
+            {/* DS header icon buttons (raft-ui PanelAction), like every panel
+                header: borderless, 44 with a 22px glyph on a phone, the DS
+                small 32 (18px glyph) on desktop. */}
             {canMessageHuman && (
-              <button
-                onClick={async () => {
-                  useProfileStore.getState().closeProfile();
-                  useThreadStore.getState().closeThread();
-                  if (dmChannel) {
-                    nav.toDm(dmChannel.id);
-                  } else {
-                    const ch = await openUserDM(human.userId);
-                    if (ch) nav.toDm(ch.id);
-                  }
-                }}
-                className="btn-brutal-sm flex size-7 items-center justify-center bg-white"
-                title={formatMessage({ id: "member.detail.message" })}
+              <Tooltip content={formatMessage({ id: "member.detail.message" })}>
+              <PanelAction
+                onClick={handleMessage}
                 aria-label={formatMessage({ id: "member.detail.message" })}
               >
-                <MessageSquare size={14} />
-              </button>
+                <DirectMessageIcon width={22} height={22} aria-hidden="true" />
+              </PanelAction>
+              </Tooltip>
             )}
             {onClose && (
-              <button
+              <PanelAction
                 onClick={onClose}
-                className={`btn-brutal-sm size-7 items-center justify-center bg-white ${onBack ? "flex" : "hidden md:flex"}`}
+                className={onBack ? "flex" : "hidden md:flex"}
+                aria-label={formatMessage({ id: "common.close" })}
                 title={formatMessage({ id: "common.close" })}
               >
-                <X size={14} />
-              </button>
+                <X size={22} aria-hidden="true" />
+              </PanelAction>
             )}
           </>
         }
       />
 
-      {/* Profile content — unified cream background, light separators */}
-      <div className="flex-1 overflow-y-auto bg-white">
+      {/* Profile content — white paper, sections separated by hairlines */}
+      <div className="flex-1 overflow-y-auto bg-layer-canvas">
         {sourceServerLabel && (
-          <div className="border-b border-black/10 px-5 py-3">
+          <>
+          <div className="px-5 py-3">
             <SectionEyebrow as="div" className="mb-1">
               {formatMessage({ id: "member.detail.from" })}
             </SectionEyebrow>
-            <div className="text-sm font-bold text-black">
+            <div className="text-callout font-semibold text-foreground">
               {sourceServerLabel}
             </div>
           </div>
+          <Separator />
+          </>
         )}
         {/* Avatar + name — left-aligned like agent profile */}
         <div className="flex items-start gap-4 px-5 py-5">
           {isSelf && human.membershipStatus === "active" ? (
+            <Tooltip content={formatMessage({
+              id: avatarSaving
+                ? "member.detail.uploadingAvatar"
+                : "member.detail.uploadImage",
+            })}>
             <button
               type="button"
               onClick={() => avatarInputRef.current?.click()}
               disabled={avatarSaving}
-              className="group relative flex shrink-0 disabled:cursor-not-allowed disabled:opacity-70"
-              title={formatMessage({
-                id: avatarSaving
-                  ? "member.detail.uploadingAvatar"
-                  : "member.detail.uploadImage",
-              })}
+              className="group/avatar-edit relative flex shrink-0 rounded-sticker outline-none focus-visible:shadow-focus disabled:cursor-wait"
               aria-label={formatMessage({
                 id: avatarSaving
                   ? "member.detail.uploadingAvatar"
@@ -373,16 +499,16 @@ export default function HumanDetailPanel({
               })}
             >
               <AvatarSlot
-                context="profile-tile"
+                context="profile-hero"
                 type="human"
                 humanAvatarUrl={avatarUrl}
                 gravatarHash={human.gravatarHash}
               />
-              <span className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">
-                <Upload size={18} className="text-white" />
-              </span>
+              <AvatarEditVeil busy={avatarSaving} />
             </button>
+            </Tooltip>
           ) : isRaftUploadedHumanAvatarUrl(avatarUrl) ? (
+            <Tooltip content={formatMessage({ id: "member.detail.viewAvatar" })}>
             <button
               type="button"
               onClick={() =>
@@ -390,62 +516,60 @@ export default function HumanDetailPanel({
                   .getState()
                   .openImage(avatarUrl, human.displayName || human.name)
               }
-              className="group relative flex shrink-0"
-              title={formatMessage({ id: "member.detail.viewAvatar" })}
+              className="group relative flex shrink-0 rounded-sticker outline-none focus-visible:shadow-focus"
               aria-label={formatMessage({ id: "member.detail.viewAvatar" })}
             >
               <AvatarSlot
-                context="profile-tile"
+                context="profile-hero"
                 type="human"
                 humanAvatarUrl={avatarUrl}
                 gravatarHash={human.gravatarHash}
               />
             </button>
+            </Tooltip>
           ) : (
             <AvatarSlot
-              context="profile-tile"
+              context="profile-hero"
               type="human"
               humanAvatarUrl={avatarUrl}
               gravatarHash={human.gravatarHash}
             />
           )}
           <div className="min-w-0 flex-1">
-            <div
-              className="min-w-0 truncate text-lg font-bold leading-tight text-black"
-              title={human.displayName || human.name}
-            >
-              {human.displayName || human.name}
-            </div>
-            <div className="flex min-w-0 items-center gap-2">
+            {/* PanelTitle source (cindyz 2026-10-10): the detail-block name follows
+                the panel-title spec so the same name reads identically in the
+                header and the body. */}
+            <PanelTitle className="min-w-0">{human.displayName || human.name}</PanelTitle>
+            <div className="mt-0.5 flex min-w-0 items-center gap-2">
               <span
-                className="min-w-0 truncate text-sm font-mono text-black/50"
-                title={`@${human.name}`}
+                className={`min-w-0 truncate ${PROFILE_HANDLE_FONT_CLASS} text-mono-meta text-foreground-hint`}
               >
                 @{human.name}
               </span>
               {departureLabel && (
-                <span className="inline-flex shrink-0 items-center px-1.5 py-0.5 text-[10px] font-bold uppercase border border-black bg-gray-300 text-black/60">
+                <Badge appearance="soft" variant="muted" className="shrink-0">
                   {departureLabelText}
-                </span>
+                </Badge>
               )}
               {isSelf && (
-                <span className="shrink-0 text-sm text-black/60 font-mono">
+                <Badge appearance="outline" className="shrink-0">
                   {formatMessage({ id: "member.detail.you" })}
-                </span>
+                </Badge>
               )}
             </div>
           </div>
         </div>
         {isSelf && human.membershipStatus === "active" && avatarError && (
           <div
-            className="-mt-3 px-5 pb-4 text-xs font-bold text-brutal-red"
+            className="-mt-3 px-5 pb-4 text-caption font-semibold text-danger-strong"
             role="alert"
           >
             {avatarError}
           </div>
         )}
 
-        <div className="px-5 py-4 border-t border-black/10">
+        <Separator />
+        <div className="px-5 py-4">
           <div className="flex items-center gap-2 mb-1">
             <SectionEyebrow as="div">
               {formatMessage({ id: "member.detail.description" })}
@@ -453,6 +577,7 @@ export default function HumanDetailPanel({
             {isSelf &&
               human.membershipStatus === "active" &&
               !editingDescription && (
+                <Tooltip content={formatMessage({ id: "member.detail.editDescription" })}>
                 <button
                   type="button"
                   onClick={() => {
@@ -460,115 +585,76 @@ export default function HumanDetailPanel({
                     setDescriptionError("");
                     setEditingDescription(true);
                   }}
-                  className="text-black/40 hover:text-black transition-colors"
-                  title={formatMessage({ id: "member.detail.editDescription" })}
+                  className={INLINE_ICON_ACTION_CLASS}
                   aria-label={formatMessage({
                     id: "member.detail.editDescription",
                   })}
                 >
-                  <Pencil size={12} />
+                  <Pencil size={14} aria-hidden="true" />
                 </button>
+                </Tooltip>
               )}
           </div>
           {isSelf && human.membershipStatus === "active" ? (
             editingDescription ? (
-              <div className="space-y-[5px]">
-                <textarea
+              <div className="space-y-1.5">
+                <Textarea
                   ref={descriptionRef}
                   value={descriptionValue}
-                  onChange={(e) => {
-                    if (descriptionError) setDescriptionError("");
-                    setDescriptionValue(e.target.value);
-                  }}
+                  onChange={handleDescriptionChange}
                   rows={3}
                   maxLength={MAX_HUMAN_DESCRIPTION_LENGTH}
                   placeholder={formatMessage({
                     id: "member.detail.descriptionPlaceholder",
                   })}
-                  className="m-0 min-h-10 w-full border-2 border-black px-2 py-1 text-sm leading-4 shadow-brutal-sm focus:outline-none focus:shadow-brutal-sm resize-none overflow-hidden"
+                  className="m-0 min-h-11 w-full resize-none overflow-hidden"
                 />
-                <div className="flex items-center gap-1.5">
-                  <button
+                <div className="flex items-center gap-2">
+                  <Button size="sm" variant="accent"
                     type="button"
-                    onClick={async () => {
-                      const nextDescription = descriptionValue.trim();
-                      if (
-                        nextDescription.length > MAX_HUMAN_DESCRIPTION_LENGTH
-                      ) {
-                        setDescriptionError(
-                          formatMessage(
-                            { id: "member.detail.descriptionMaxLength" },
-                            { count: MAX_HUMAN_DESCRIPTION_LENGTH },
-                          ),
-                        );
-                        return;
-                      }
-                      setDescriptionSaving(true);
-                      setDescriptionError("");
-                      try {
-                        await updateProfile({
-                          description: nextDescription || null,
-                        });
-                        await loadMembers();
-                        setEditingDescription(false);
-                      } catch (err: any) {
-                        setDescriptionError(
-                          err.response?.data?.error ||
-                            formatMessage({
-                              id: "member.detail.updateDescriptionFailed",
-                            }),
-                        );
-                      } finally {
-                        setDescriptionSaving(false);
-                      }
-                    }}
-                    className="btn-brutal-sm bg-brutal-pink px-2 py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={handleSaveDescription}
                     disabled={descriptionSaving}
                   >
                     {descriptionSaving
                       ? formatMessage({ id: "member.detail.saving" })
                       : formatMessage({ id: "member.detail.save" })}
-                  </button>
-                  <button
+                  </Button>
+                  <Button size="sm" variant="ghost"
                     type="button"
-                    onClick={() => {
-                      setDescriptionValue(human.description || "");
-                      setDescriptionError("");
-                      setEditingDescription(false);
-                    }}
-                    className="btn-brutal-sm bg-white px-2 py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={handleCancelDescription}
                     disabled={descriptionSaving}
                   >
                     {formatMessage({ id: "member.detail.cancel" })}
-                  </button>
+                  </Button>
                 </div>
-                <div className="flex items-center justify-between gap-3 text-xs">
+                {/* DS field foot: the error (danger ink) and the mono count. */}
+                <div className="flex items-start justify-between gap-3">
                   {descriptionError ? (
-                    <span className="font-bold text-brutal-red">
+                    <span className="text-caption font-semibold text-danger-strong">
                       {descriptionError}
                     </span>
                   ) : (
                     <span />
                   )}
-                  <span className="font-mono text-black/50">
+                  <span className="shrink-0 font-mono text-mono-meta text-foreground-hint">
                     {descriptionValue.trim().length}/
                     {MAX_HUMAN_DESCRIPTION_LENGTH}
                   </span>
                 </div>
               </div>
             ) : (
-              <p className="text-sm text-black">
+              <p className="text-callout text-foreground-muted">
                 {human.description || (
-                  <span className="italic text-black/40">
+                  <span className="text-foreground-hint">
                     {formatMessage({ id: "member.detail.noDescription" })}
                   </span>
                 )}
               </p>
             )
           ) : (
-            <div className="text-sm text-black">
+            <div className="text-callout text-foreground-muted">
               {human.description || (
-                <span className="italic text-black/40">
+                <span className="text-foreground-hint">
                   {formatMessage({ id: "member.detail.noDescription" })}
                 </span>
               )}
@@ -578,7 +664,9 @@ export default function HumanDetailPanel({
 
         {/* Info */}
         {!isRemoteJointHuman && !isChannelSummaryHuman && (
-          <div className="px-5 py-4 border-t border-black/10">
+          <>
+          <Separator />
+          <div className="px-5 py-4">
             <SectionEyebrow as="div" className="mb-3">
               {formatMessage({ id: "member.detail.info" })}
             </SectionEyebrow>
@@ -586,27 +674,29 @@ export default function HumanDetailPanel({
               {/* Role */}
               <div>
                 <div className="mb-1 flex items-center gap-2">
-                  <div className="text-xs text-black/50">
+                  <div className="text-footnote font-medium text-foreground-hint">
                     {departureLabel
                       ? formatMessage({ id: "member.detail.status" })
                       : formatMessage({ id: "member.detail.role" })}
                   </div>
                   {!departureLabel && (
+                    <Tooltip content={formatMessage({
+                      id: "member.detail.rolePermissions",
+                    })}>
                     <button
                       type="button"
                       onClick={() => setShowRoleHelp(true)}
-                      className="text-black/35 transition-colors hover:text-black"
-                      title={formatMessage({
-                        id: "member.detail.rolePermissions",
-                      })}
+                      className={INLINE_ICON_ACTION_CLASS}
                       aria-label={formatMessage({
                         id: "member.detail.rolePermissions",
                       })}
                     >
-                      <HelpCircle size={12} />
+                      <HelpCircle size={14} aria-hidden="true" />
                     </button>
+                    </Tooltip>
                   )}
                   {canEditRole && roleInfo && !editingRole && (
+                    <Tooltip content={formatMessage({ id: "member.detail.editRole" })}>
                     <button
                       type="button"
                       onClick={() => {
@@ -615,20 +705,20 @@ export default function HumanDetailPanel({
                         setRoleError("");
                         setEditingRole(true);
                       }}
-                      className="text-black/40 hover:text-black transition-colors"
-                      title={formatMessage({ id: "member.detail.editRole" })}
+                      className={INLINE_ICON_ACTION_CLASS}
                       aria-label={formatMessage({
                         id: "member.detail.editRole",
                       })}
                     >
-                      <Pencil size={12} />
+                      <Pencil size={14} aria-hidden="true" />
                     </button>
+                    </Tooltip>
                   )}
                 </div>
                 {departureLabel ? (
-                  <span className="inline-block border-2 border-black px-2 py-0.5 text-xs font-bold text-black bg-gray-300">
+                  <Badge appearance="soft" variant="muted">
                     {departureLabelText}
-                  </span>
+                  </Badge>
                 ) : canEditRole && roleInfo ? (
                   <div className="space-y-1.5">
                     {editingRole ? (
@@ -641,87 +731,45 @@ export default function HumanDetailPanel({
                             })}
                             selectedId={roleValue}
                             options={localizedEditableRoleOptions}
-                            onSelect={(nextRole) => {
-                              setRoleValue(nextRole as ServerRole);
-                              setRolePickerOpen(false);
-                            }}
+                            onSelect={handleSelectRole}
                             open={rolePickerOpen}
-                            onToggle={() =>
-                              setRolePickerOpen((value) => !value)
-                            }
-                            badgeClassName={
-                              (ROLE_CONFIG[roleValue] || ROLE_CONFIG.member)
-                                .color
-                            }
-                            uppercase={false}
+                            onToggle={handleToggleRolePicker}
+                            badgeClassName=""
+                            badgeVariant={(ROLE_CONFIG[roleValue] || ROLE_CONFIG.member).variant}
                             dropdownMinWidth="min-w-[140px]"
                             dropdownAlign="left"
                           />
                         </div>
-                        <div className="flex items-center gap-1.5">
-                          <button
+                        <div className="flex items-center gap-2">
+                          <Button size="sm" variant="accent"
                             type="button"
-                            onClick={async () => {
-                              try {
-                                setRoleSaving(true);
-                                setRoleError("");
-                                await updateMemberRole(human.userId, roleValue);
-                                setEditingRole(false);
-                              } catch (err: unknown) {
-                                const axiosErr = err as {
-                                  response?: { data?: { error?: string } };
-                                };
-                                setRoleError(
-                                  axiosErr.response?.data?.error ||
-                                    formatMessage({
-                                      id: "member.detail.updateRoleFailed",
-                                    }),
-                                );
-                              } finally {
-                                setRoleSaving(false);
-                              }
-                            }}
+                            onClick={handleSaveRole}
                             disabled={roleSaving || roleValue === human.role}
-                            className="btn-brutal-sm bg-brutal-pink px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {formatMessage({ id: "member.detail.save" })}
-                          </button>
-                          <button
+                          </Button>
+                          <Button size="sm" variant="ghost"
                             type="button"
-                            onClick={() => {
-                              setRoleValue(human.role ?? "member");
-                              setRolePickerOpen(false);
-                              setRoleError("");
-                              setEditingRole(false);
-                            }}
+                            onClick={handleCancelRole}
                             disabled={roleSaving}
-                            className="btn-brutal-sm bg-white px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
                           >
                             {formatMessage({ id: "member.detail.cancel" })}
-                          </button>
+                          </Button>
                         </div>
                       </>
                     ) : (
-                      <span
-                        className={`inline-block border-2 border-black px-2 py-0.5 text-xs font-bold text-black ${roleInfo.color}`}
-                      >
-                        {formatMessage({ id: roleInfo.labelId })}
-                      </span>
+                      <Badge appearance="soft" variant={roleInfo.variant}>{formatMessage({ id: roleInfo.labelId })}</Badge>
                     )}
                   </div>
                 ) : roleInfo ? (
-                  <span
-                    className={`inline-block border-2 border-black px-2 py-0.5 text-xs font-bold text-black ${roleInfo.color}`}
-                  >
-                    {formatMessage({ id: roleInfo.labelId })}
-                  </span>
+                  <Badge appearance="soft" variant={roleInfo.variant}>{formatMessage({ id: roleInfo.labelId })}</Badge>
                 ) : (
-                  <span className="inline-block border-2 border-black px-2 py-0.5 text-xs font-bold text-black bg-gray-100">
+                  <Badge appearance="soft" variant="muted">
                     {formatMessage({ id: "member.detail.unknown" })}
-                  </span>
+                  </Badge>
                 )}
                 {roleError && (
-                  <div className="mt-1 text-xs font-bold text-brutal-orange">
+                  <div className="mt-1 text-caption font-semibold text-warning-strong">
                     {roleError}
                   </div>
                 )}
@@ -731,7 +779,6 @@ export default function HumanDetailPanel({
                 <KeyValueRow
                   label={formatMessage({ id: "member.detail.email" })}
                   value={human.email}
-                  mono
                   breakAll
                 />
               )}
@@ -745,16 +792,20 @@ export default function HumanDetailPanel({
               )}
             </div>
           </div>
+          </>
         )}
         {!isRemoteJointHuman && !isChannelSummaryHuman && (
-          <div className="px-5 py-4 border-t border-black/10">
+          <>
+          <Separator />
+          <div className="px-5 py-4">
             <SectionHeader
               className="mb-3"
               label={formatMessage({ id: "member.detail.createdAgents" })}
               count={human.createdAgents?.length ?? 0}
             />
             {human.createdAgents?.length ? (
-              <div className="space-y-2">
+              // DS ListRow › `rf-list--inset`: one card, hairlines between rows.
+              <ListRowGroup>
                 {human.createdAgents.map((createdAgent) => {
                   const displayState = computeAgentDisplayState(
                     storeAgentsForDisplay,
@@ -762,62 +813,42 @@ export default function HumanDetailPanel({
                     createdAgent.id,
                     createdAgent,
                   );
-                  const activityText = formatActivityText(
-                    formatMessage,
-                    displayState.activity,
-                    displayState.activityDetail,
-                    displayState.activityDetailKind,
-                  );
+                  const activityText = formatAgentDisplayStateText(intl, displayState);
                   return (
-                    <AvatarListRow
+                    <CreatedAgentRow
                       key={createdAgent.id}
-                      avatar={
-                        <AvatarSlot
-                          context="surface-list"
-                          type="agent"
-                          agentAvatarUrl={createdAgent.avatarUrl}
-                        />
-                      }
-                      name={createdAgent.displayName || createdAgent.name}
-                      subtitle={formatRuntimeLabelWithStatus(createdAgent.runtime, formatMessage)}
-                      rightContent={
-                        <StatusDot
-                          activity={displayState.activity}
-                          title={activityText}
-                        />
-                      }
-                      onClick={() => {
-                        if (onOpenProfile) {
-                          onOpenProfile("agent", createdAgent.id);
-                          return;
-                        }
-                        useProfileStore.getState().openProfile("agent", createdAgent.id);
-                      }}
+                      createdAgent={createdAgent}
+                      displayState={displayState}
+                      activityText={activityText}
+                      onOpenProfile={onOpenProfile}
                     />
                   );
                 })}
-              </div>
+              </ListRowGroup>
             ) : (
-              <span className="text-sm italic text-black/40">
+              <span className="text-callout text-foreground-hint">
                 {formatMessage({ id: "member.detail.noCreatedAgents" })}
               </span>
             )}
           </div>
+          </>
         )}
         {canRemove && (
-          <div className="px-5 py-4 border-t border-black/10">
+          <>
+          <Separator />
+          <div className="px-5 py-4">
             <SectionEyebrow as="div" className="mb-3">
               {formatMessage({ id: "member.detail.actions" })}
             </SectionEyebrow>
-            <button
-              onClick={() => setShowRemoveConfirm(true)}
-              className="btn-brutal flex w-full items-center justify-center gap-2 bg-brutal-red px-4 py-2 text-sm font-bold"
-              title={formatMessage({ id: "member.detail.removeMember" })}
+            <Button size="lg" variant="danger"
+              onClick={openRemoveConfirm}
+              className="w-full"
             >
-              <Trash2 size={14} />
+              <Trash2 size={18} aria-hidden="true" />
               {formatMessage({ id: "member.detail.removeMember" })}
-            </button>
+            </Button>
           </div>
+          </>
         )}
       </div>
       {showRemoveConfirm && (
@@ -830,25 +861,16 @@ export default function HumanDetailPanel({
           confirmLabel={formatMessage({ id: "member.detail.removeAction" })}
           loadingLabel={formatMessage({ id: "member.detail.removing" })}
           chromeLocale="active"
-          onConfirm={async () => {
-            setRemoving(true);
-            try {
-              await removeMember(human.userId);
-            } finally {
-              setRemoving(false);
-            }
-          }}
-          onClose={() => {
-            if (!removing) setShowRemoveConfirm(false);
-          }}
+          onConfirm={handleConfirmRemove}
+          onClose={handleCloseRemoveConfirm}
         />
       )}
       {showRoleHelp && (
         <RolePermissionHelpDialog
           subject="human"
-          onClose={() => setShowRoleHelp(false)}
+          onClose={closeRoleHelp}
         />
       )}
-    </div>
+    </ProfilePanelBody>
   );
 }

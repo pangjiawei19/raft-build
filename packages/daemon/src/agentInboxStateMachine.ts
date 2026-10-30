@@ -3,14 +3,16 @@ import {
   projectApmHeldFreshnessEnvelope,
   type ApmFreshnessHeldDecision,
   type ApmHeldFreshnessEnvelopeBody,
-} from "./apmStateMachine.js";
+} from "./apmStateMachine";
 
-export type AgentInboxStateMachineAction = "send" | "task_claim" | "task_update";
+export type AgentInboxStateMachineAction = "send" | "task_claim" | "task_update" | "task_amend";
 
 export type AgentInboxStateMachineMessage = {
   seq?: number;
   id?: string;
   message_id?: string;
+  channel_id?: string;
+  channelId?: string;
   sender_id?: string;
   senderId?: string;
   channel_type?: string;
@@ -20,9 +22,11 @@ export type AgentInboxStateMachineMessage = {
   sender_type?: string;
   sender_name?: string;
   sender_description?: string | null;
+  sender_timezone?: string | null;
   senderType?: string;
   senderName?: string;
   senderDescription?: string | null;
+  senderTimezone?: string | null;
   content?: string;
   timestamp?: string;
   createdAt?: string;
@@ -182,7 +186,7 @@ export function planAgentInboxSideEffect(input: AgentInboxSideEffectPlanInput): 
         heldMessageCount: 0,
         omittedMessageCount: 0,
       }, trace, {
-        forwardSeenUpToSeq: input.action === "send" && canAdvanceBoundary ? boundary.seenUpToSeq : undefined,
+        forwardSeenUpToSeq: canAdvanceBoundary ? boundary.seenUpToSeq : undefined,
         consumeEffect: {
           type: "consume_visible_messages",
           target: input.target,
@@ -247,7 +251,7 @@ export function planAgentInboxSideEffect(input: AgentInboxSideEffectPlanInput): 
       reason: "model_seen_boundary",
       pendingCount: 0,
       modelSeenSeq: boundary,
-    }, trace, { forwardSeenUpToSeq: input.action === "send" ? boundary : undefined });
+    }, trace, { forwardSeenUpToSeq: boundary });
   }
 
   if (input.recentMessages.length > 0) {
@@ -275,10 +279,12 @@ export function normalizeInboxVisibleMessage(
     ...targetFields,
     ...message,
     message_id: message.message_id ?? message.id,
+    ...((message.channel_id ?? message.channelId) && { channel_id: message.channel_id ?? message.channelId }),
     timestamp: message.timestamp ?? message.createdAt,
     sender_type: message.sender_type ?? message.senderType,
     sender_name: message.sender_name ?? message.senderName,
     sender_description: message.sender_description ?? message.senderDescription ?? null,
+    sender_timezone: message.sender_timezone ?? message.senderTimezone ?? null,
   };
   const senderId = messageSenderId(message);
   if (senderId) normalized.sender_id = senderId;
@@ -370,7 +376,7 @@ function planFirstTouchRecentContext(
       heldMessageCount: 0,
       omittedMessageCount: 0,
     }, trace, {
-      forwardSeenUpToSeq: input.action === "send" ? boundary.seenUpToSeq : undefined,
+      forwardSeenUpToSeq: boundary.seenUpToSeq,
       consumeEffect: {
         type: "consume_visible_messages",
         target: input.target,

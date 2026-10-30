@@ -1,0 +1,2 @@
+ALTER TABLE "joint_channel_invites" ADD COLUMN "accepted_via" text;--> statement-breakpoint
+ALTER TABLE "joint_channel_invites" ADD CONSTRAINT "joint_channel_invites_accepted_via_known" CHECK ("joint_channel_invites"."accepted_via" IS NULL OR "joint_channel_invites"."accepted_via" IN ('invitee', 'same_admin'));

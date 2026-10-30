@@ -41,7 +41,19 @@ assert the action's actual HTTP result and persisted state.
 `expectThreadFocusedWindow` proves the intended focus row is visible before
 sampling a partial timeline. A nonempty unrelated window is insufficient.
 This extracts the focus-row precondition from PR #7479; it does not claim to
-fix every original search timeout. Neither helper raises assertion deadlines.
+fix every original search timeout. Neither helper raises assertion deadlines. The lazy-search scenario also
+moves the focused timeline to its top programmatically before opening search:
+this must not load ordinary history pages. A permalink uses the same bounded
+context barrier as a search hit until a real scroll gesture; the scenario then
+checks that native wheel and focused-container Home navigation resume pagination. Search corpus hydration
+remains separate from the rendered timeline, and the final partial-window
+assertion remains unchanged. The keyboard scenario first proves centered focus
+and stable scroll geometry with bounded frame sampling, then establishes an
+exact, focused keyboard start position. Failures preserve a
+`keyboard-scroll-evidence.json` attachment with focus, key/default-cancellation,
+scroll positions, dimensions, and history requests. A prior independent
+Linux/WebKit first-attempt failure remains unexplained; the added readiness and
+evidence do not claim its root cause.
 
 ## Verify a migration
 
@@ -65,3 +77,21 @@ separate full-stack test of the readiness helper's custom rejection is not
 required. When diagnosing a helper, a temporary wrong-state/valid-state control
 can still distinguish a meaningful failure from a missing page or an
 always-failing helper; that experiment need not become a permanent E2E case.
+
+## Older-page first-failure evidence
+
+The message-list stability burst/slow history tests retain their completeness
+and cursor-uniqueness assertions. On failure, `history-request-evidence.json`
+records one channel's history requests with test-local IDs, monotonic start,
+response, completion and failure times, status, and response row count/first and
+last sequence. Requests without a cursor are retained as latest-window reloads.
+Compare the second start with the first completion to distinguish overlapping
+transport requests from later reuse; this does not prove when the client store
+accepted a response. Null timings and pending/unavailable body states remain
+explicit when capture happens before completion.
+
+The artifact excludes URLs, headers, credentials, message text and unfiltered
+query values. Response bodies are read only to extract counts and sequence
+bounds. The assertion still observes every older cursor as before; its in-memory
+values are separate from the artifact's numeric allowlist. No retries, product
+behavior or assertion thresholds are changed.

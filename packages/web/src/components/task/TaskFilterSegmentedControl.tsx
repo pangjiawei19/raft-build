@@ -1,4 +1,4 @@
-import { SegmentedControl, SegmentedControlCount, SegmentedControlItem, SegmentedControlLabel } from "raft-ui";
+import { SegmentedControl, SegmentedControlCount, SegmentedControlItem, SegmentedControlLabel } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 
 import type { MessageId } from "../../i18n/messages";

@@ -6,6 +6,11 @@
 
 
 
+/** Wire contract identity, compared with the server-reported contract (X-Raft-Contract header, follow-up to task #3). */
+export const ACTIVITY_SYNC_CONTRACT = "raft.activity-sync" as const;
+/** Contract revision from revisions.json; enable the sync engine only when the server reports exactly this revision. */
+export const ACTIVITY_SYNC_CONTRACT_REVISION = 2 as const;
+
 export type OpaqueId = string;
 
 export type SafeUnsignedCounter = number;

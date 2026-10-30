@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
-import type { ApiResponse } from "../../client.js";
-import type { AgentContext } from "../../auth/env.js";
-import { createCommandContext } from "../../core/context.js";
-import { CliError } from "../../core/errors.js";
-import type { CliIo } from "../../core/io.js";
-import { channelMembersCommand } from "./members.js";
+import type { ApiResponse } from "../../client";
+import type { AgentContext } from "../../auth/env";
+import { createCommandContext } from "../../core/context";
+import { CliError } from "../../core/errors";
+import type { CliIo } from "../../core/io";
+import { channelMembersCommand } from "./members";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -105,8 +104,38 @@ test("channel members command maps missing target into typed CliError", async ()
     (err: unknown) => {
       assert.ok(err instanceof CliError);
       assert.equal(err.code, "INVALID_ARG");
-      assert.equal(err.message, "target is required");
+      assert.equal(err.message, "A target is required: a channel, DM, or thread.");
       return true;
     },
+  );
+});
+
+test("channel members takes the target as --target too (agents reach for it by habit); both forms must agree", async () => {
+  const { io } = memoryIo();
+  const paths: string[] = [];
+  const ctx = createCommandContext({
+    io,
+    loadAgentContext: () => agentContext,
+    createApiClient: () => ({
+      request: async (_method: string, path: string): Promise<ApiResponse<unknown>> => {
+        paths.push(path);
+        return { ok: true, status: 200, error: null, data: { channel: { ref: "#ops", type: "public" }, agents: [], humans: [] } };
+      },
+    }) as any,
+  });
+
+  await channelMembersCommand.handler(ctx, undefined, { target: "#ops" });
+  await channelMembersCommand.handler(ctx, "#ops", { target: "#ops" });
+  assert.deepEqual(paths, [
+    "/internal/agent-api/channel-members?channel=%23ops",
+    "/internal/agent-api/channel-members?channel=%23ops",
+  ]);
+  await assert.rejects(
+    async () => { await channelMembersCommand.handler(ctx, "#ops", { target: "#dev" }); },
+    (error: unknown) => error instanceof CliError && error.code === "INVALID_ARG",
+  );
+  await assert.rejects(
+    async () => { await channelMembersCommand.handler(ctx, undefined, {}); },
+    (error: unknown) => error instanceof CliError && error.code === "INVALID_ARG" && /--target/.test(error.suggestedNextAction ?? ""),
   );
 });

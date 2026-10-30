@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
 import {
   countMachinesNeedingAttention,
@@ -8,7 +7,7 @@ import {
   getComputerAttentionStatus,
   getComputerRowDotStatus,
   getComputerRowDotTitleDescriptor,
-  getComputerRowDotTone,
+  getComputerRowDotLight,
   summarizeComputerAttention,
 } from "../src/utils/computerUpgradeIndicator";
 
@@ -57,7 +56,7 @@ test("Computer attention summary returns aggregate counts and dot priority", () 
   assert.equal(summary.offlineCount, 1);
   assert.deepEqual(summary.problemComputers.map((machine) => machine.id), ["upgrade", "offline"]);
   assert.equal(formatComputerAttentionCounts(summary), "1 needs upgrade · 1 offline");
-  assert.equal(getComputerAttentionDotTone(summary.status), "bg-brutal-pink");
+  assert.equal(getComputerAttentionDotTone(summary.status), "bg-attention");
 });
 
 test("rail attention counts every affected machine once", () => {
@@ -115,9 +114,11 @@ test("Computer row dot is a single full-state signal for managed Computers and l
     "offline",
   );
 
-  assert.equal(getComputerRowDotTone("online"), "bg-brutal-lime");
-  assert.equal(getComputerRowDotTone("upgrade"), "bg-brutal-pink");
-  assert.equal(getComputerRowDotTone("offline"), "bg-gray-400");
+  // Raft DS: presence lights are fixed (online lime, offline stone); an
+  // upgrade waiting for you is the pink attention pixel.
+  assert.deepEqual(getComputerRowDotLight("online"), { presence: "online" });
+  assert.deepEqual(getComputerRowDotLight("upgrade"), { tone: "bg-attention" });
+  assert.deepEqual(getComputerRowDotLight("offline"), { presence: "offline" });
 });
 
 test("offline plus upgrade keeps upgrade primary while preserving offline in the dot title", () => {

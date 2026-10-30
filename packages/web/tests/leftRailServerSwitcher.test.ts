@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 import {
   getDesktopServerBootstrapTarget,
   getServerSwitcherTarget,
@@ -104,9 +103,11 @@ test("native bootstrap query selects only the exact canonical server identity", 
 });
 
 test("desktop server switcher keeps long server lists inside the viewport", () => {
-  // Post-extraction (task #234 ServerSwitcherMenu primitive): the desktop
-  // LeftRail callsite owns the testId + max-h sizing (passed in via props);
-  // the inner scrollable container + card chrome now live in the primitive.
+  // Every trigger opens the one primitive as raft-ui Popover content: the
+  // popover places it against the trigger (or the rail head), keeps it on
+  // screen and caps it at the space it has; the primitive's list is the
+  // scroll region, so its footer stays reachable however many servers there
+  // are. No caller positions or sizes the menu's height by hand.
   const leftRail = readFileSync(
     resolve(repoRoot, "src/components/layout/LeftRail.tsx"),
     "utf8",
@@ -116,14 +117,12 @@ test("desktop server switcher keeps long server lists inside the viewport", () =
     "utf8",
   );
 
-  // Callsite owns: testId + viewport-bounded max-h (sized for the desktop rail).
   assert.match(leftRail, /testId="desktop-server-switcher-menu"/);
-  assert.match(leftRail, /max-h-\[calc\(100dvh-16px\)\]/);
-  // Primitive owns: card chrome + the inner scroll region. Order in the
-  // primitive is `card-brutal z-50 flex flex-col overflow-hidden`; assert
-  // the load-bearing tokens rather than exact ordering.
-  assert.match(primitive, /card-brutal/);
-  assert.match(primitive, /flex flex-col overflow-hidden/);
+  assert.match(leftRail, /<PopoverTrigger[\s\S]*?<AppRailItem/);
+  assert.doesNotMatch(leftRail, /left-full|max-h-\[calc\(100dvh/);
+  assert.match(primitive, /<PopoverContent[\s\S]*?collisionPadding=\{8\}[\s\S]*?className=\{`flex flex-col p-1\.5/);
+  assert.doesNotMatch(primitive, /PopoverPopup|ResizeObserver|getBoundingClientRect|addEventListener\("mousedown"/);
+  assert.doesNotMatch(primitive, /card-brutal/);
   assert.match(primitive, /min-h-0 flex-1 overflow-y-auto overscroll-contain/);
 });
 
@@ -160,7 +159,8 @@ test("rail tabs hover to opaque white, not translucent gray", () => {
     "utf8",
   );
 
-  assert.match(source, /border-transparent hover:border-black hover:bg-white"/);
+  assert.match(source, /<AppRailItem[\s\S]*className=\{`size-10 /);
+  assert.match(source, /AppRailItem/);
   assert.doesNotMatch(source, /hover:bg-white\/70/);
 });
 
@@ -178,7 +178,9 @@ test("chat rail tab shows an icon-anchored unread dot only while inactive", () =
   // instrumentation; the runtime render tooth below owns subscription behavior.
   assert.match(source, /activityUnreadCount/);
   assert.match(source, /currentServerActivityCount/);
-  assert.match(source, /currentServerActivityCount !== undefined/);
+  assert.match(source, /hasCurrentServerActivityUnread\(\{/);
+  assert.match(source, /hasAcceptedActivityWindow/);
+  assert.match(source, /summaryUnreadCount: currentServerActivityCount/);
   // Chat attention is narrowed to joined channels and DMs; public discovery
   // rows keep gray row-level unread without lighting the global pink dot.
   assert.match(source, /selectChatAttentionChannelIds\(s\.channels, s\.dmChannels\)/);
@@ -193,17 +195,12 @@ test("chat rail tab shows an icon-anchored unread dot only while inactive", () =
   assert.match(sidebar, /activityUnreadCount > 0/);
   assert.doesNotMatch(sidebar, /inboxTotalUnreadCount/);
   assert.match(source, /dotInactiveOnly/);
-  assert.match(source, /<span className="relative inline-flex items-center justify-center">/);
+  assert.match(source, /<AppRailItemIcon className="relative">/);
+  assert.match(source, /<AppRailItemAttention title=\{dotTooltip \?\? label\} \/>/);
   assert.match(source, /const dotVisible = Boolean\(showDot && \(!dotInactiveOnly \|\| !active\)\)/);
-  assert.match(source, /\{dotVisible && \(/);
-  // Rail-tab attention dot goes through the canonical <AttentionDot>
-  // helper at `size="lg"` — the default canonical 10×10 tier. See
-  // CLAUDE.md "Attention Dots": size is physical fit, not priority. The
-  // rail tab corner has room for `lg`, so it uses the canonical default.
-  // Don't drop back to an inline span; the helper centralizes the
-  // size/border/color so every dot in the app tracks the locked physical-
-  // fit axis. Don't reintroduce `size="md"` — that tier was removed in
-  // PR #1709 amend (stdrc 2026-05-14, msg=6ad15567).
-  assert.match(source, /import AttentionDot from "\.\.\/ui\/AttentionDot";/);
-  assert.match(source, /<AttentionDot[\s\S]{0,200}size="lg"[\s\S]{0,200}-right-1 -top-1/);
+  assert.match(source, /dotVisible \?/);
+  // Rail-tab attention dots go through raft-ui's AppRailItemAttention, the
+  // rail's shared composite (indicator + sr-only title), so size, place and
+  // colour track the rail recipe. Don't drop back to an inline span.
+  assert.doesNotMatch(source, /<span[^>]*rounded-full[^>]*bg-(?:palette-pink|brutal-pink|attention|accent)/);
 });

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { describe, test } from "node:test";
 
 type AssetBinding = {
   fetch(request: Request): Promise<Response>;
@@ -58,6 +57,16 @@ describe("Cloudflare Pages built-asset worker", () => {
     assert.equal(stylesheet.headers.get("content-type"), "text/css");
     assert.equal(stylesheet.headers.get("cache-control"), immutable);
     assert.equal(await stylesheet.text(), "body {}");
+  });
+
+  test("protects feedback assets from cached HTML fallbacks while caching real files", async () => {
+    const real = await runWorker("/feedback/assets/index-current.js", new Response("export const ready = true;", { headers: { "Content-Type": "application/javascript" } }));
+    assert.equal(real.status, 200);
+    assert.equal(real.headers.get("cache-control"), "public, max-age=31536000, immutable");
+    const missing = await runWorker("/feedback/assets/index-missing.js", new Response("<!doctype html>", { headers: { "Content-Type": "text/html" } }));
+    assert.equal(missing.status, 404);
+    assert.equal(missing.headers.get("cache-control"), "no-store");
+    assert.equal(await missing.text(), "");
   });
 
   test("turns Pages SPA HTML fallback into an empty non-cacheable 404", async () => {

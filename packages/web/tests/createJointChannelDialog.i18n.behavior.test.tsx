@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -87,22 +86,21 @@ test("the default dialog renders in Chinese with no untranslated English", () =>
   assertNoEnglish("the default state");
 });
 
-test("the limited-time Free allowance keeps creation enabled and renders in Chinese without a hard date", () => {
+test("the Free hint explains the two-free-server rule and keeps creation enabled", () => {
   seed({ plan: "free" });
   renderZh();
 
   const text = document.body.textContent ?? "";
-  assert.ok(text.includes("Free 套餐可限时免费创建 1 个联合频道。"), "limited-time allowance banner");
-  assert.ok(!text.includes("9 月 1 日"), "no expiry copy");
+  assert.ok(text.includes("免费服务器可以创建和加入联合频道。每个联合频道最多 30 个服务器，其中免费服务器不超过 2 个。"), "free-server hint");
   assert.equal(
     (screen.getByRole("button", { name: "创建联合频道" }) as HTMLButtonElement).disabled,
     false,
-    "the limited-time Free allowance must leave submit enabled",
+    "Free servers may create joint channels",
   );
-  assertNoEnglish("the limited-time Free allowance");
+  assertNoEnglish("the Free hint");
 });
 
-test("a Free server that already hosts one active Joint Channel sees the original disabled-form paywall", () => {
+test("contract v0.3: a Free server that already hosts a Joint Channel can still create another", () => {
   seed({ plan: "free" });
   useChannelStore.setState({
     channels: [{
@@ -117,58 +115,24 @@ test("a Free server that already hosts one active Joint Channel sees the origina
   } as never);
   renderZh();
 
-  assert.ok(screen.getByText("第二个联合频道需要 Pro 套餐。"));
-  assert.ok(screen.getByRole("button", { name: "查看账单" }));
-  assert.ok(screen.getByPlaceholderText("例如 partner-launch"), "the original create form remains visible");
-  assert.ok(document.querySelector("form"), "the upfront gate must not collapse the dialog to a warning-only card");
+  assert.ok(screen.getByPlaceholderText("例如 partner-launch"));
   assert.equal(
     (screen.getByRole("button", { name: "创建联合频道" }) as HTMLButtonElement).disabled,
-    true,
-    "the original paywall shape keeps the form visible but disables creation",
+    false,
+    "the old one-hosted-joint paywall is gone",
   );
-  assertNoEnglish("the upfront Free limit");
+  assert.doesNotMatch(document.body.textContent ?? "", /需要 Pro 套餐/);
 });
 
-test("participant and archived host projections do not consume the Free server's active hosted allowance", () => {
-  seed({ plan: "free" });
-  useChannelStore.setState({
-    channels: [
-      {
-        id: "joint-participant",
-        name: "invited-joint",
-        description: null,
-        type: "joint",
-        createdAt: "2026-08-25T00:00:00.000Z",
-        archivedAt: null,
-        jointRole: "participant",
-      },
-      {
-        id: "joint-archived-host",
-        name: "archived-hosted-joint",
-        description: null,
-        type: "joint",
-        createdAt: "2026-08-24T00:00:00.000Z",
-        archivedAt: "2026-08-25T00:00:00.000Z",
-        jointRole: "host",
-      },
-    ],
-  } as never);
-  renderZh();
-
-  assert.ok(screen.getByText("Free 套餐可限时免费创建 1 个联合频道。"));
-  assert.ok(screen.getByPlaceholderText("例如 partner-launch"));
-  assert.equal(screen.queryByText("第二个联合频道需要 Pro 套餐。"), null);
-});
-
-test("the second-channel limit response renders localized recovery", async () => {
+test("the free-server limit response renders localized recovery", async () => {
   seed({ plan: "free" });
   useChannelStore.setState({
     createChannel: async () => {
       throw {
         response: {
           data: {
-            code: "joint_channel_free_limit_reached",
-            error: "Creating a second Joint Channel requires the Pro plan.",
+            code: "joint_free_server_limit",
+            error: "This joint channel already has 2 free servers; one side needs to upgrade.",
           },
         },
       };
@@ -187,9 +151,9 @@ test("the second-channel limit response renders localized recovery", async () =>
   });
   fireEvent.click(screen.getByRole("button", { name: "创建联合频道" }));
 
-  assert.ok(await screen.findByText("第二个联合频道需要 Pro 套餐。"));
+  assert.ok(await screen.findByText("这个联合频道已满 2 个免费服务器。把任一方升级到 Pro，或有免费服务器退出后，可以继续加入（总服务器上限 30 个）"));
   assert.ok(screen.getByRole("button", { name: "查看账单" }));
-  assert.doesNotMatch(document.body.textContent ?? "", /Creating a second Joint Channel/);
+  assert.doesNotMatch(document.body.textContent ?? "", /already has 2 free servers/);
 });
 
 test("the max-servers sentence interpolates the limit rather than concatenating it", () => {
@@ -197,9 +161,13 @@ test("the max-servers sentence interpolates the limit rather than concatenating 
   renderZh();
   // The sentence was JSX prose split around {MAX_JOINT_CHANNEL_SERVERS}. Split
   // prose cannot translate as a unit — Chinese puts the number elsewhere in the
-  // clause — so the whole sentence has to be one ICU message.
+  // clause — so the whole sentence has to be one ICU message. It only shows at
+  // the cap, so fill the invite list first (29 invites + this server = 30).
+  for (let drafts = 1; drafts < 29; drafts += 1) {
+    fireEvent.click(screen.getByRole("button", { name: "添加服务器" }));
+  }
   assert.ok(
-    (document.body.textContent ?? "").includes("联合频道最多支持 3 个服务器，含本服务器。"),
+    (document.body.textContent ?? "").includes("联合频道最多支持 30 个服务器，含本服务器。"),
     "max-servers sentence must be one message with {max} filled in",
   );
   const en = enMessages as Record<string, string>;
@@ -302,11 +270,109 @@ test("the archived-name-collision response renders catalog-backed recovery", asy
   );
 });
 
+// Typed joint-invite rejections (joint-channel task #24). The server answers with a
+// typed 400 whose `error` is an English sentence naming the invitee; before this, the
+// dialog showed that sentence verbatim, so a zh user read untranslated English and was
+// never told which field to fix. Invitee-scoped codes carry `invitee` — the person the
+// server rejected; the response's `inviteeIndex` indexes the server's deduplicated
+// invitee list, so the dialog never maps it back into the list it submitted.
+function rejectWith(data: Record<string, unknown>) {
+  useChannelStore.setState({
+    createChannel: async () => {
+      throw { response: { data } };
+    },
+  } as never);
+}
+
+function submitInvite(slug: string, people: string) {
+  fireEvent.change(screen.getByPlaceholderText("例如 partner-launch"), { target: { value: "联合频道" } });
+  fireEvent.change(screen.getByPlaceholderText("partner-workspace"), { target: { value: slug } });
+  fireEvent.change(screen.getByPlaceholderText("@admin 或 admin@example.com"), { target: { value: people } });
+  fireEvent.click(screen.getByRole("button", { name: "创建联合频道" }));
+}
+
+test("a not-admin invitee renders a localized sentence naming the person and the server", async () => {
+  seed();
+  rejectWith({
+    code: "joint_invitee_not_admin",
+    error: "Invited person must be a target server admin: admin@example.com",
+    targetServerSlug: "partner",
+    invitee: "admin@example.com",
+  });
+  renderZh();
+  submitInvite("partner", "admin@example.com");
+
+  assert.ok(await screen.findByText("admin@example.com 必须是服务器「partner」的所有者或管理员，才能被邀请。"));
+  assert.doesNotMatch(document.body.textContent ?? "", /Invited person must be/);
+});
+
+test("the invitee field names the rejected person, regardless of position in the submitted list", async () => {
+  seed();
+  rejectWith({
+    code: "joint_invitee_not_found",
+    error: "Invited person not found in target server: second@example.com",
+    targetServerSlug: "partner",
+    invitee: "second@example.com",
+  });
+  renderZh();
+  submitInvite("partner", "first@example.com, second@example.com");
+
+  assert.ok(await screen.findByText("在服务器「partner」中找不到 second@example.com，请检查 handle 或邮箱。"));
+  assert.doesNotMatch(document.body.textContent ?? "", /找不到 first@example\.com/);
+});
+
+test("an unknown target server and the current server get different sentences for one code", async () => {
+  seed();
+  rejectWith({ code: "joint_target_server_invalid", error: "Target server not found", targetServerSlug: "partner" });
+  renderZh();
+  submitInvite("partner", "admin@example.com");
+  assert.ok(await screen.findByText("找不到服务器「partner」，请检查 slug。"));
+  cleanup();
+
+  seed(); // current server slug is "s1"
+  rejectWith({ code: "joint_target_server_invalid", error: "Cannot invite the current server", targetServerSlug: "s1" });
+  renderZh();
+  submitInvite("s1", "admin@example.com");
+  assert.ok(await screen.findByText("不能邀请本服务器加入它自己的联合频道。"));
+  assert.doesNotMatch(document.body.textContent ?? "", /Cannot invite the current server/);
+});
+
+test("an unrecognized code, or a typed code it cannot resolve, keeps the previous fallback", async () => {
+  seed();
+  rejectWith({ code: "some_future_code", error: "Server said something new" });
+  renderZh();
+  submitInvite("partner", "admin@example.com");
+  assert.ok(await screen.findByText("Server said something new"));
+  cleanup();
+
+  // No invitee field: the dialog cannot name the person, so it must not guess.
+  seed();
+  rejectWith({
+    code: "joint_invitee_not_admin",
+    error: "Invited person must be a target server admin: admin@example.com",
+    targetServerSlug: "partner",
+  });
+  renderZh();
+  submitInvite("partner", "admin@example.com");
+  assert.ok(await screen.findByText("Invited person must be a target server admin: admin@example.com"));
+});
+
+test("every channel.jointInvite.* id is translated", () => {
+  const en = enMessages as Record<string, string>;
+  const zh = zhMessages as Record<string, string>;
+  const ids = Object.keys(en).filter((k) => k.startsWith("channel.jointInvite."));
+  assert.equal(ids.length, 8, "4 invite errors + 4 same-admin strings (RFC 075 §4.5)");
+  for (const id of ids) {
+    assert.notEqual(zh[id], en[id], `${id} is still the English string`);
+    assert.match(zh[id], /\p{Script=Han}/u, `${id} has no Chinese characters`);
+  }
+});
+
 test("every new id is translated, and no string was duplicated to get there", () => {
   const en = enMessages as Record<string, string>;
   const zh = zhMessages as Record<string, string>;
   const ids = Object.keys(en).filter((k) => k.startsWith("channel.createJoint."));
-  assert.equal(ids.length, 13, "13 genuinely new strings; the rest are reused");
+  assert.equal(ids.length, 12, "12 genuinely new strings (contract v0.3 removed freeLimitReached); the rest are reused");
 
   for (const id of ids) {
     assert.notEqual(zh[id], en[id], `${id} is still the English string`);

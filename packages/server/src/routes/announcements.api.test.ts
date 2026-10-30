@@ -1,16 +1,17 @@
-import { tokenForHuman, fixturePasswordHash } from "../test/integration/credentials.js";
-import { createApiTest } from "../test/integration/apiTest.js";
+import { tokenForHuman, fixturePasswordHash } from "../test/integration/credentials";
+import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
+import { validateAnnouncementAudience } from "@botiverse/raft-shared";
 
 import { createHash, randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
-import { openTestApp } from "../test/integration/app.js";
-import { getDb } from "../db/index.js";
-import { oauthAccessTokens, users } from "../db/schema.js";
-import { verifyToken } from "../middleware/auth.js";
-import * as announcementService from "../services/announcementService.js";
-import { createOAuthClient } from "../services/oauthService.js";
-import { createServer } from "../services/serverService.js";
+import { openTestApp } from "../test/integration/app";
+import { getDb } from "../db/index";
+import { announcements, oauthAccessTokens, users } from "../db/schema";
+import { verifyToken } from "../middleware/auth";
+import * as announcementService from "../services/announcementService";
+import { createOAuthClient } from "../services/oauthService";
+import { createServer } from "../services/serverService";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 
@@ -299,7 +300,7 @@ test("drafts do not supersede live content; expiring the newest DOES surface an 
   );
 });
 
-test("scheduled windows resolve localized content on the next active read and reject overlap", async ({ app }) => {
+test("scheduled content is fixed, timing remains editable and overlapping windows queue", async ({ app }) => {
   const operator = await createVerifiedUser("ann-schedule@slock.test");
   await getDb()
     .update(users)
@@ -335,13 +336,13 @@ test("scheduled windows resolve localized content on the next active read and re
   const updated = await announcementService.updateDraft(operator.id, draft.id, {
     defaultLocale: "en",
     content: {
-      en: { title: "Scheduled updated", pages: [{ body: "English body updated" }] },
-      "zh-cn": { title: "定时公告更新", pages: [{ body: "中文正文更新" }] },
+      en: { title: "Scheduled", pages: [{ body: "English body" }] },
+      "zh-cn": { title: "定时公告", pages: [{ body: "中文正文" }] },
     },
     startsAt,
     endsAt,
   });
-  assert.equal(updated?.effectiveStatus, "scheduled", "scheduled content remains editable before activation");
+  assert.equal(updated?.effectiveStatus, "scheduled", "published timing remains editable with fixed content");
   const cancelled = await announcementService.cancelScheduledAnnouncement(
     operator.id,
     draft.id,
@@ -368,7 +369,7 @@ test("scheduled windows resolve localized content on the next active read and re
     "next-session-family",
     new Date("2030-01-02T12:00:00.000Z"),
   );
-  assert.equal(active[0]?.title, "定时公告更新");
+  assert.equal(active[0]?.title, "定时公告");
   assert.equal(active[0]?.locale, "zh-cn");
   assert.deepEqual(
     [...(await announcementService.listAuditEvents(draft.id)).map((event) => event.action)].reverse(),
@@ -394,18 +395,14 @@ test("scheduled windows resolve localized content on the next active read and re
 
   const overlapping = await announcementService.createDraft(operator.id, {
     defaultLocale: "en",
-    content: { en: { title: "Overlap", pages: [{ body: "Must reject" }] } },
+    content: { en: { title: "Overlap", pages: [{ body: "Queues after the older announcement" }] } },
     startsAt: new Date("2030-01-02T12:00:00.000Z"),
     endsAt: new Date("2030-01-04T00:00:00.000Z"),
   });
-  await assert.rejects(
-    announcementService.publishDraft(
-      operator.id,
-      overlapping.id,
-      new Date("2030-01-01T00:00:00.000Z"),
-    ),
-    /overlaps published announcement/,
-  );
+  assert.ok(await announcementService.publishDraft(operator.id, overlapping.id, new Date("2030-01-01T00:00:00.000Z")));
+  const queued = await announcementService.listUndismissedForUser(operator.id, undefined, new Date("2030-01-02T18:00:00.000Z"));
+  assert.equal(queued[0]?.id, draft.id, "overlap retains oldest-first selection");
+  await assert.rejects(announcementService.updateDraft(operator.id, draft.id, { defaultLocale: "en", content: { en: { title: "Changed", pages: [{ body: "Changed" }] } }, startsAt, endsAt }), /content and audience are fixed/);
 });
 
 test("authorized operator identity still gets 404 for every removed announcement admin route", async () => {
@@ -473,4 +470,24 @@ test("authorized operator identity still gets 404 for every removed announcement
     else process.env[authorityEnv] = previousAuthority;
     await app.close();
   }
+});
+
+
+test("targeted API validates context, rejects spoofed membership and keeps recipient IDs private", async ({ app }) => {
+  const member = await createVerifiedUser("ann-member@slock.test");
+  const outsider = await createVerifiedUser("ann-outsider@slock.test");
+  const server = await createServer("Announcement context", `ann-context-${randomUUID()}`, member.id);
+  const [row] = await getDb().insert(announcements).values({ title: "Members only", pages: [{ body: "Target" }], status: "published", startsAt: new Date("2026-01-01"), audience: validateAnnouncementAudience({ type: "server_members", serverIds: [server.id] }) }).returning();
+  const memberToken = await tokenForHuman(member.email);
+  const outsiderToken = await tokenForHuman(outsider.email);
+  const request = (token: string, query: string) => fetch(`${app.baseUrl}/api/announcements/active${query}`, { headers: { Authorization: `Bearer ${token}` } });
+  assert.equal((await request(memberToken, "?server_id=bad")).status, 400);
+  assert.equal((await request(memberToken, `?server_id=${server.id}&server_id=${server.id}`)).status, 400);
+  assert.deepEqual((await (await request(outsiderToken, `?server_id=${server.id}`)).json()).announcements, []);
+  assert.deepEqual((await getActive(app.baseUrl, memberToken)).announcements, []);
+  const data = await (await request(memberToken, `?server_id=${server.id}`)).json();
+  assert.equal(data.announcements[0].id, row.id);
+  assert.equal("audience" in data.announcements[0], false);
+  const denied = await fetch(`${app.baseUrl}/api/announcements/${row.id}/dismiss?server_id=${server.id}`, { method: "POST", headers: { Authorization: `Bearer ${outsiderToken}` } });
+  assert.equal(denied.status, 404);
 });

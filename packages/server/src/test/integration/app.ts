@@ -1,22 +1,25 @@
 import { createServer } from "node:http";
+import type { PublicSearchServiceBucketStore, PublicSearchServiceKeySource } from "../../lib/publicSearchServiceAccess";
 import express from "express";
 import type { RequestHandler } from "express";
 import type { AddressInfo } from "node:net";
 import { eq } from "drizzle-orm";
-import { createApp } from "../../app.js";
-import { getDb } from "../../db/index.js";
-import { closeTestDatabase, openTestDatabase } from "./database.js";
-import { measureIntegrationPhase, ownIntegrationResource, poisonIntegrationEnvironment } from "./lifecycle.js";
-import { featureFlags } from "../../db/schema.js";
-import { setupSocket } from "../../socket/index.js";
-import * as agentActivityLogService from "../../services/agentActivityLogService.js";
-import { HUMAN_ACTIVITY_MUTE_FEATURE_FLAG_KEY, ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY } from "../../services/featureFlagService.js";
-import type { AgentStartDispatchResult } from "../../services/agentOrchestrator.js";
-import type { AttachmentUploadSessionService } from "../../routes/attachmentUploadSessions.js";
-import type { SlackBridgeRouteDependencies } from "../../routes/slackBridge.js";
+import { createApp } from "../../app";
+import { getDb } from "../../db/index";
+import { closeTestDatabase, openTestDatabase } from "./database";
+import { measureIntegrationPhase, ownIntegrationResource, poisonIntegrationEnvironment } from "./lifecycle";
+import { featureFlags } from "../../db/schema";
+import { setupSocket } from "../../socket/index";
+import * as agentActivityLogService from "../../services/agentActivityLogService";
+import { CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY, ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY } from "../../services/featureFlagService";
+import type { AgentStartDispatchResult } from "../../services/agentOrchestrator";
+import type { AttachmentUploadSessionService } from "../../routes/attachmentUploadSessions";
+import type { SlackBridgeRouteDependencies } from "../../routes/slackBridge";
 
 type StubAgentOrchestrator = {
   deliverMessage: () => Promise<void>;
+  deliverMessagesOnChannel: (channelId: string, deliveries: ReadonlyArray<{ agentId: string; message: unknown; options?: unknown }>) => Array<Promise<unknown>>;
+  loadDeliveryGates: () => Promise<null>;
   receiveMessages: () => Promise<never[]>;
   peekPendingMessages: () => never[];
   acknowledgeDeliveredMessages: () => { removedCount: number };
@@ -32,14 +35,18 @@ type StubAgentOrchestrator = {
     serverId?: string,
   ) => Promise<{ acceptedCount: number; rejectedCount: number; droppedCount: number }>;
   getActivity: (agentId: string) => Promise<{ activity: string; activityDetail: string }>;
+  getActivities: (rows: ReadonlyArray<{ id: string }>) => Promise<Array<{ activity: string; activityDetail: string }>>;
   listRecentActivityLog: (agentId: string, limit?: number) => Promise<never[]>;
+  listTurnSummaries: (agentId: string, options?: { limit?: number; before?: { endedAt: number; id: string } }) => Promise<{ summaries: never[] }>;
+  getLiveActivityObservedAtMs: (agentId: string) => Promise<number | null>;
   getMachineStatus: (machineId: string) => Promise<"online" | "offline">;
   getMachineStatusVersion: (machineId: string) => Promise<number>;
   getMachineDaemonVersion: (machineId: string) => string | null;
   startAgent: (agentId: string) => Promise<AgentStartDispatchResult>;
-  stopAgent: (agentId: string, reason?: string) => Promise<void>;
+  stopAgent: (agentId: string, reason?: string) => Promise<{ delivered: boolean }>;
   resetAgent: (agentId: string, mode: "restart" | "session" | "full", options?: { restartIfStopped?: boolean }) => Promise<void>;
   evictCache: (agentId: string) => void;
+  liftWakeBlockForConfigChange: (agentId: string, options?: { runtimeValuesChanged?: boolean }) => Promise<void>;
   shutdown: () => void;
   setIO: () => void;
   hasMachineLocally: (machineId: string) => boolean;
@@ -66,10 +73,15 @@ function ensureTestEnv() {
 }
 
 function createAgentOrchestratorStub(): StubAgentOrchestrator {
-  return {
+  const stub: StubAgentOrchestrator = {
     detectMachineRuntimeModels: async () => ({ kind: "missing_config", recovery: "kimi_login" }),
     pushAppConfigUpsert: async () => false,
     deliverMessage: async () => { },
+    // Each item through the stub's deliverMessage (looked up at call time, so
+    // a test replacing it still observes channel-batch deliveries).
+    deliverMessagesOnChannel: (_channelId, deliveries) => deliveries.map(({ agentId, message, options }) =>
+      (stub.deliverMessage as (...args: unknown[]) => Promise<unknown>)(agentId, message, options)),
+    loadDeliveryGates: async () => null,
     receiveMessages: async () => [],
     peekPendingMessages: () => [],
     acknowledgeDeliveredMessages: () => ({ removedCount: 0 }),
@@ -98,14 +110,20 @@ function createAgentOrchestratorStub(): StubAgentOrchestrator {
         : 0,
     }),
     getActivity: async () => ({ activity: "offline", activityDetail: "" }),
+    // Per row through getActivity, so a test that replaces getActivity on the
+    // stub still drives list endpoints.
+    getActivities: async (rows) => Promise.all(rows.map((row) => stub.getActivity(row.id))),
     listRecentActivityLog: async () => [],
+    listTurnSummaries: async () => ({ summaries: [] }),
+    getLiveActivityObservedAtMs: async () => null,
     getMachineStatus: async () => "offline",
     getMachineStatusVersion: async () => 0,
     getMachineDaemonVersion: () => null,
     startAgent: async () => ({ outcome: "dispatched" }),
-    stopAgent: async () => { },
+    stopAgent: async () => ({ delivered: true }),
     resetAgent: async () => { },
     evictCache: () => { },
+    liftWakeBlockForConfigChange: async () => { },
     shutdown: () => { },
     setIO: () => { },
     hasMachineLocally: () => true,
@@ -113,14 +131,17 @@ function createAgentOrchestratorStub(): StubAgentOrchestrator {
     getAgentSessionTranscript: async () => ({ transcript: "stub transcript", reachable: true }),
     collectFeedbackTranscript: async () => ({ reachable: true, traceBundleId: "stub-bundle-id" }),
   };
+  return stub;
 }
 
 export type TestAppOptions = {
   /** Standalone harness routes only; never mounted by the production app. */
   beforeApp?: RequestHandler;
   observeHttpServer?: (server: ReturnType<typeof createServer>) => void;
+  channelToJointConversionFlagDefaultEnabled?: boolean;
   clock?: { now(): Date };
   humanActivityMuteFlagDefaultEnabled?: boolean;
+  sidebarMarkAllReadFlagDefaultEnabled?: boolean;
   onboardingOpenerFlagDefaultEnabled?: boolean;
   attachmentUploadSessionService?: AttachmentUploadSessionService;
   slackBridge?: SlackBridgeRouteDependencies;
@@ -128,15 +149,26 @@ export type TestAppOptions = {
   skipAuthRateLimit?: boolean;
   enforceMessageRateLimit?: boolean;
   messageRateLimitMax?: number;
+  publicSearchKeySource?: PublicSearchServiceKeySource;
+  publicSearchBucketStore?: PublicSearchServiceBucketStore;
 };
 
 export async function createTestApp(port = 0, opts: TestAppOptions = {}) {
   ensureTestEnv();
+  if (opts.sidebarMarkAllReadFlagDefaultEnabled !== undefined) {
+    await getDb().update(featureFlags).set({ defaultEnabled: opts.sidebarMarkAllReadFlagDefaultEnabled })
+      .where(eq(featureFlags.key, "sidebar_mark_all_read_v0"));
+  }
   if (opts.humanActivityMuteFlagDefaultEnabled !== undefined) {
     await getDb()
       .update(featureFlags)
       .set({ defaultEnabled: opts.humanActivityMuteFlagDefaultEnabled })
-      .where(eq(featureFlags.key, HUMAN_ACTIVITY_MUTE_FEATURE_FLAG_KEY));
+      .where(eq(featureFlags.key, "human_activity_mute_v0"));
+  }
+  if (opts.channelToJointConversionFlagDefaultEnabled !== undefined) {
+    await getDb().update(featureFlags)
+      .set({ defaultEnabled: opts.channelToJointConversionFlagDefaultEnabled })
+      .where(eq(featureFlags.key, CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY));
   }
   if (opts.onboardingOpenerFlagDefaultEnabled !== undefined) {
     await getDb().update(featureFlags)
@@ -154,6 +186,8 @@ export async function createTestApp(port = 0, opts: TestAppOptions = {}) {
       skipAuthRateLimit: opts.skipAuthRateLimit ?? false,
       enforceMessageRateLimit: opts.enforceMessageRateLimit,
       messageRateLimitMax: opts.messageRateLimitMax,
+      publicSearchKeySource: opts.publicSearchKeySource,
+      publicSearchBucketStore: opts.publicSearchBucketStore,
     },
   });
   const server = createServer(opts.beforeApp ? express().use(opts.beforeApp).use(app) : app);

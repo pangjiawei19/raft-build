@@ -1,4 +1,5 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { Input, InputGroup, InputGroupAddon, InputGroupInput, Button } from "@botiverse/raft-ui";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { validateNameReason } from "@botiverse/raft-shared";
@@ -8,15 +9,17 @@ import { useAuthStore } from "../../store/authStore";
 import type { User } from "../../store/authStore";
 import type { MessageId } from "../../i18n/messages";
 import api from "../../api/client";
-import GravatarAvatar from "../member/GravatarAvatar";
+import AvatarSlot from "../ui/AvatarSlot";
 import Banner from "../ui/Banner";
-import Button from "../ui/Button";
 import FormField from "../ui/FormField";
 import { AuthPageIntro } from "./AuthPageFrame";
 import OnboardingCreateShell from "./OnboardingCreateShell";
 import { authServerErrorMessage } from "./authErrors";
 import { avatarUploadApiErrorMessage, isAvatarFileTooLarge, isAvatarTooLargeError, PROFILE_AVATAR_ACCEPT } from "../../utils/avatarUpload";
 import { formatNameValidationError } from "../../i18n/nameValidation";
+import { useOptionalAppTheme } from "../../hooks/useAppTheme";
+import { hasDeviceThemePreference } from "../../theme/appThemeCache";
+import { markOnboardingDisplayStylePending } from "../../utils/onboardingDisplayStyle";
 
 const DISPLAY_NAME_MAX_LENGTH = 64;
 
@@ -53,7 +56,6 @@ function PreviewAvatar({
   email,
   safeOnly,
   size,
-  iconSize,
 }: {
   avatarPreviewUrl: string | null;
   persistedAvatarUrl: string | null;
@@ -61,17 +63,18 @@ function PreviewAvatar({
   email: string | null;
   safeOnly: boolean;
   size: number;
-  iconSize: number;
 }) {
   const src = !safeOnly && avatarPreviewUrl ? avatarPreviewUrl : persistedAvatarUrl;
-  if (src) return <img src={src} alt="" className="h-full w-full object-cover" />;
-  // The app's human default avatar: Gravatar when the account has one, otherwise
-  // a User icon on the lavender placeholder background (same look as AvatarSlot
-  // type="human"). Sized to its container so all avatars stay consistent.
   return (
-    <div className="flex h-full w-full items-center justify-center bg-brutal-lavender text-black">
-      <GravatarAvatar gravatarHash={gravatarHash} email={email} size={size} iconSize={iconSize} />
-    </div>
+    <AvatarSlot
+      context={size === 28 ? "compact-row" : "account-tile"}
+      type="human"
+      humanAvatarUrl={src}
+      gravatarHash={gravatarHash}
+      email={email}
+    >
+      {src ? <img src={src} alt="" className="h-full w-full object-cover" /> : undefined}
+    </AvatarSlot>
   );
 }
 
@@ -110,27 +113,27 @@ function IdentityImpactPreview({
         <div className="w-[min(100%,520px)]">
           <div className="relative pb-24" data-testid="identity-preview-cardzone">
             <section
-              className="onboarding-identity-card-enter relative z-10 w-[min(92%,480px)] rotate-[-1deg] overflow-hidden border-2 border-black bg-white shadow-brutal-lg [--identity-card-rotate:-1deg]"
+              className="onboarding-identity-card-enter relative z-10 w-[min(92%,480px)] rotate-[-1deg] overflow-hidden rounded-container border-[1.5px] border-line-strong bg-layer-canvas shadow-sticker [--identity-card-rotate:-1deg]"
               data-testid="identity-channel-preview"
             >
-              <header className="flex h-12 items-center gap-2 border-b-2 border-black bg-white px-4">
-                <span className="flex size-7 items-center justify-center border-2 border-black bg-soft-signal">
-                  <Hash size={15} />
+              <header className="flex h-12 items-center gap-2 border-b border-line-seam bg-layer-canvas px-4">
+                <span className="flex size-[27px] items-center justify-center rounded-sticker border-[1.5px] border-sticker-ink bg-brand text-sticker-ink">
+                  <Hash size={14} />
                 </span>
-                <span className="truncate text-sm font-black">
+                <span className="truncate text-headline text-foreground">
                   {formatMessage({ id: "pages.identitySetup.previewChannel" })}
                 </span>
               </header>
               <div className="space-y-4 p-4">
                 <div className="flex items-start gap-2.5">
-                  <div className="mt-px flex size-7 shrink-0 items-center justify-center border-2 border-black bg-brutal-lavender/70 text-[11px] font-black">
+                  <div className="mt-px flex size-[27px] shrink-0 items-center justify-center rounded-sticker border-[1.5px] border-sticker-ink bg-palette-lavender text-footnote font-bold text-sticker-ink shadow-[0_0_0_1.5px_var(--sticker-edge)]">
                     M
                   </div>
                   <div className="min-w-0">
-                    <div className="text-xs font-bold text-black">
+                    <div className="text-footnote font-bold text-foreground">
                       {formatMessage({ id: "pages.identitySetup.previewSenderName" })}
                     </div>
-                    <div className="mt-0.5 text-xs leading-5 text-black/80" data-testid="identity-seeded-message-copy">
+                    <div className="mt-0.5 text-callout text-foreground" data-testid="identity-seeded-message-copy">
                       {/* ONE message. The mention sits mid-sentence and zh puts it
                           elsewhere, so splitting this into "morning — can" +
                           mention + "take a look…" would bake English word order
@@ -148,7 +151,7 @@ function IdentityImpactPreview({
                             // behavior test catches it, no i18n guard would.
                             <span
                               key={previewHandle}
-                              className="onboarding-identity-pop inline-block rounded-sm bg-soft-signal px-1 font-bold text-black"
+                              className="onboarding-identity-pop inline-block rounded-sticker bg-brand px-[3px] font-semibold text-sticker-ink shadow-[inset_0_0_0_1.5px_var(--sticker-ink)]"
                               data-testid="identity-seeded-mention"
                             >
                               {chunks}
@@ -165,7 +168,7 @@ function IdentityImpactPreview({
                 >
                   <div
                     key={`${previewDisplayName}:${previewAvatarKey}:message-avatar`}
-                    className="onboarding-identity-pop mt-px size-7 shrink-0 overflow-hidden border-2 border-black"
+                    className="onboarding-identity-pop mt-px size-[27px] shrink-0"
                     data-testid="identity-user-message-avatar"
                   >
                     <PreviewAvatar
@@ -175,23 +178,23 @@ function IdentityImpactPreview({
                       email={email}
                       safeOnly={safeOnly}
                       size={28}
-                      iconSize={14}
+
                     />
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
                       <span
                         key={`${previewDisplayName}:message-name`}
-                        className="onboarding-identity-pop inline-block max-w-full truncate text-xs font-bold text-black"
+                        className="onboarding-identity-pop inline-block max-w-full truncate text-footnote font-bold text-foreground"
                         data-testid="identity-user-message-name"
                       >
                         {previewDisplayName}
                       </span>
-                      <span className="font-mono text-[9.5px] font-bold uppercase text-black/35">
+                      <span className="font-mono text-mono-meta text-foreground-hint">
                         {formatMessage({ id: "pages.identitySetup.previewTimestamp" })}
                       </span>
                     </div>
-                    <p className="mt-0.5 text-xs leading-5 text-black/80">
+                    <p className="mt-0.5 text-callout text-foreground">
                       {formatMessage({ id: "pages.identitySetup.previewReply" })}
                     </p>
                   </div>
@@ -200,13 +203,13 @@ function IdentityImpactPreview({
             </section>
 
             <section
-              className="onboarding-identity-card-enter absolute bottom-2 right-0 z-20 w-[min(78%,360px)] rotate-[2deg] border-2 border-black bg-white p-4 shadow-brutal-lg [--identity-card-delay:80ms] [--identity-card-rotate:2deg]"
+              className="onboarding-identity-card-enter absolute bottom-2 right-0 z-20 w-[min(78%,360px)] rotate-[2deg] rounded-container border-[1.5px] border-line-strong bg-layer-popover p-4 shadow-sticker [--identity-card-delay:80ms] [--identity-card-rotate:2deg]"
               data-testid="identity-profile-preview"
             >
               <div className="flex items-start gap-3">
                 <div
                   key={`${previewDisplayName}:${previewAvatarKey}:profile-avatar`}
-                  className="onboarding-identity-pop size-14 shrink-0 overflow-hidden border-2 border-black"
+                  className="onboarding-identity-pop size-[51px] shrink-0"
                   data-testid="identity-profile-avatar"
                 >
                   <PreviewAvatar
@@ -216,18 +219,18 @@ function IdentityImpactPreview({
                     email={email}
                     safeOnly={safeOnly}
                     size={56}
-                    iconSize={26}
+
                   />
                 </div>
                 <div className="min-w-0 flex-1">
                   <div
                     key={`${previewDisplayName}:profile-name`}
-                    className="onboarding-identity-pop truncate text-base font-black"
+                    className="onboarding-identity-pop truncate text-headline text-foreground"
                     data-testid="identity-profile-name"
                   >
                     {previewDisplayName}
                   </div>
-                  <div className="font-mono text-xs font-bold text-black/50" data-testid="identity-profile-handle">
+                  <div className="font-mono text-mono-meta text-foreground-hint" data-testid="identity-profile-handle">
                     <span
                       key={`${previewHandle}:profile-handle`}
                       className="onboarding-identity-pop inline-block"
@@ -262,6 +265,17 @@ export default function AccountIdentitySetupPage({
   // The dev/fixture preview has no real session, so it opts out of the shell's
   // sign-out affordance.
   const previewMode = onPreviewComplete != null;
+  // Task #247: a new account sees light until it picks a style later in
+  // onboarding. Only when this browser has no choice yet; an existing choice
+  // is the user's and is left alone, and they are not asked again.
+  const appTheme = useOptionalAppTheme();
+  const setThemeMode = appTheme?.setMode;
+  useEffect(() => {
+    if (previewMode || !setThemeMode || hasDeviceThemePreference()) return;
+    // A brand-new account starts in light; onboarding offers the choice later.
+    setThemeMode("light");
+    markOnboardingDisplayStylePending();
+  }, [previewMode, setThemeMode]);
   const avatarInputId = useId();
   const avatarInputRef = useRef<HTMLInputElement | null>(null);
   const [displayName, setDisplayName] = useState(user?.displayName ?? "");
@@ -280,8 +294,11 @@ export default function AccountIdentitySetupPage({
   const [fieldErrors, setFieldErrors] = useState<{ displayName?: string; handle?: string }>({});
   const provider = user?.profileSetupProvider ?? null;
 
-  const nameError = (reason: NameValidationReason | null, label: MessageId) =>
-    formatNameValidationError(reason, label, formatMessage);
+  const nameError = useCallback(
+    (reason: NameValidationReason | null, label: MessageId) =>
+      formatNameValidationError(reason, label, formatMessage),
+    [formatMessage],
+  );
   const avatarUploadErrorMessage = (error: unknown) => {
     // The size code must be mapped BEFORE the generic API-error path. This page
     // calls completeOnboardingProfile, which throws AVATAR_TOO_LARGE_CODE for an
@@ -330,18 +347,40 @@ export default function AccountIdentitySetupPage({
 
   // Validate the display name on blur (not just on Continue) so format errors
   // surface as soon as the user leaves the field.
-  const handleDisplayNameBlur = () => {
+  const handleDisplayNameBlur = useCallback(() => {
     setFieldErrors((current) => ({
       ...current,
       displayName: nameError(validateDisplayName(displayName), "pages.identitySetup.displayNameLabel") ?? undefined,
     }));
-  };
+  }, [displayName, nameError]);
 
   // On-blur username validation: run the hard-constraint (format) check FIRST
   // and surface it immediately; only if the format is valid do we hit the
   // uniqueness precheck. Both run on blur, not just on Continue. The uniqueness
   // call is advisory — completeProfile still enforces it authoritatively.
-  const handleUsernameBlur = async () => {
+  const handleHandleChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const nextHandle = event.target.value.replace(/^@+/, "");
+    setHandle(nextHandle);
+    // Mirror into the display name until the user takes it over.
+    if (!displayNameEdited) {
+      setDisplayName(nextHandle);
+      setFieldErrors((current) => ({ ...current, displayName: undefined }));
+    }
+    setFieldErrors((current) => ({ ...current, handle: undefined }));
+  }, [displayNameEdited]);
+
+  const handleDisplayNameChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    setDisplayName(event.target.value);
+    // Manual edit detaches the display name from the username mirror.
+    setDisplayNameEdited(true);
+    setFieldErrors((current) => ({ ...current, displayName: undefined }));
+  }, []);
+
+  const handleAvatarButtonClick = useCallback(() => {
+    avatarInputRef.current?.click();
+  }, []);
+
+  const handleUsernameBlur = useCallback(async () => {
     const candidate = handle.trim();
     const formatError = nameError(validateNameReason(candidate, 5), "pages.identitySetup.usernameLabel");
     if (formatError) {
@@ -363,7 +402,7 @@ export default function AccountIdentitySetupPage({
     } catch {
       // Best-effort precheck; a failure here must not block the user — submit validates.
     }
-  };
+  }, [handle, formatMessage, nameError]);
 
   const handleSubmit = async (event: FormEvent) => {
     event.preventDefault();
@@ -431,70 +470,57 @@ export default function AccountIdentitySetupPage({
           />
         </div>
 
-        {error ? <Banner intent="warning" className="font-bold">{error}</Banner> : null}
+        {error ? <Banner intent="warning">{error}</Banner> : null}
 
         <form onSubmit={handleSubmit} className="space-y-4" noValidate>
-              <FormField label={formatMessage({ id: "pages.identitySetup.usernameLabel" })} labelStyle="plain" error={fieldErrors.handle} htmlFor="identity-handle">
-                <div className="flex border-2 border-black bg-white shadow-brutal-sm transition-shadow duration-100 focus-within:shadow-brutal">
-                  <span className="flex items-center border-r-2 border-black bg-soft-signal px-3 font-mono text-base font-bold text-black/60">@</span>
-                  <input
+              <FormField label={formatMessage({ id: "pages.identitySetup.usernameLabel" })} error={fieldErrors.handle} htmlFor="identity-handle">
+                {/* The `@` is a fixed prefix of the same control (DS rf-inputgroup),
+                    not a coloured block of its own. */}
+                <InputGroup className="w-full">
+                  <InputGroupAddon.Text variant="container">@</InputGroupAddon.Text>
+                  <InputGroupInput
                     id="identity-handle"
                     name="username"
                     type="text"
                     value={handle}
-                    onChange={(event) => {
-                      const nextHandle = event.target.value.replace(/^@+/, "");
-                      setHandle(nextHandle);
-                      // Mirror into the display name until the user takes it over.
-                      if (!displayNameEdited) {
-                        setDisplayName(nextHandle);
-                        setFieldErrors((current) => ({ ...current, displayName: undefined }));
-                      }
-                      setFieldErrors((current) => ({ ...current, handle: undefined }));
-                    }}
-                    onBlur={() => void handleUsernameBlur()}
-                    className="min-w-0 flex-1 p-2 text-base focus:outline-none"
+                    onChange={handleHandleChange}
+                    onBlur={handleUsernameBlur}
                     placeholder={formatMessage({ id: "pages.identitySetup.previewSampleHandle" })}
                     autoComplete="username"
+                    data-invalid={fieldErrors.handle ? true : undefined}
                     required
                   />
-                </div>
-                <p className="mt-1 text-xs text-black/55">
+                </InputGroup>
+                <p className="mt-1.5 text-caption text-foreground-hint">
                   {formatMessage({ id: "pages.identitySetup.usernameHelper" })}
                 </p>
               </FormField>
 
-              <FormField label={formatMessage({ id: "pages.identitySetup.displayNameLabel" })} labelStyle="plain" error={fieldErrors.displayName} htmlFor="identity-display-name">
-                <input
+              <FormField label={formatMessage({ id: "pages.identitySetup.displayNameLabel" })} error={fieldErrors.displayName} htmlFor="identity-display-name">
+                <Input
                   id="identity-display-name"
                   name="name"
                   type="text"
                   value={displayName}
                   // Stryker disable next-line BlockStatement: validation-clear behavior is covered; the empty-handler mutant hangs the focused runner.
-                  onChange={(event) => {
-                    setDisplayName(event.target.value);
-                    // Manual edit detaches the display name from the username mirror.
-                    setDisplayNameEdited(true);
-                    setFieldErrors((current) => ({ ...current, displayName: undefined }));
-                  }}
+                  onChange={handleDisplayNameChange}
                   onBlur={handleDisplayNameBlur}
-                  className="w-full border-2 border-black p-2 text-base shadow-brutal-sm focus:shadow-brutal focus:outline-none"
                   placeholder={formatMessage({ id: "pages.identitySetup.displayNamePlaceholder" })}
                   autoComplete="name"
                   required
                 />
-                <p className="mt-1 text-xs text-black/50">
+                <p className="mt-1.5 text-caption text-foreground-hint">
                   {formatMessage({ id: "pages.identitySetup.displayNameHelper" })}
                 </p>
               </FormField>
 
               <div>
-                <div className="mb-1 text-sm font-bold text-black">
+                <div className="mb-1.5 text-footnote font-semibold text-foreground-muted">
                   {formatMessage({ id: "pages.identitySetup.avatarLabel" })}
                 </div>
                 <div>
                   <div className="flex items-center gap-3">
-                    <div className="size-14 shrink-0 overflow-hidden border-2 border-black shadow-brutal-sm">
+                    <div className="size-[51px] shrink-0">
                       <PreviewAvatar
                         avatarPreviewUrl={avatarPreviewUrl}
                         persistedAvatarUrl={user.avatarUrl}
@@ -502,16 +528,15 @@ export default function AccountIdentitySetupPage({
                         email={user.email}
                         safeOnly={avatarUploadFailed}
                         size={56}
-                        iconSize={26}
+
                       />
                     </div>
                     <div className="min-w-0 flex-1">
-                      <button
-                        type="button"
-                        className="btn-brutal-sm inline-flex items-center gap-1.5 bg-white px-3 py-1.5 text-sm disabled:opacity-50"
+                      <Button size="sm"
+                        variant="outline"
                         disabled={loading}
                         // Stryker disable next-line OptionalChaining: the visible button and hidden file input mount together; this stays defensive for ref timing.
-                        onClick={() => avatarInputRef.current?.click()}
+                        onClick={handleAvatarButtonClick}
                       >
                         <Camera size={15} />
                         {formatMessage({
@@ -519,7 +544,7 @@ export default function AccountIdentitySetupPage({
                             ? "pages.identitySetup.avatarUploading"
                             : "pages.identitySetup.avatarCta",
                         })}
-                      </button>
+                      </Button>
                       <input
                         ref={avatarInputRef}
                         id={avatarInputId}
@@ -528,7 +553,7 @@ export default function AccountIdentitySetupPage({
                         className="sr-only"
                         onChange={handleAvatarChange}
                       />
-                      <p className="mt-1 text-xs text-black/50">
+                      <p className="mt-1.5 text-caption text-foreground-hint">
                         {formatMessage({
                           id: provider
                             ? "pages.identitySetup.avatarOauthHelper"
@@ -537,15 +562,15 @@ export default function AccountIdentitySetupPage({
                       </p>
                     </div>
                   </div>
-                  {avatarError ? <p className="mt-2 text-xs font-bold text-brutal-red" role="alert">{avatarError}</p> : null}
+                  {avatarError ? <p className="mt-2 text-caption font-semibold text-danger-strong" role="alert">{avatarError}</p> : null}
                 </div>
               </div>
 
               <Button
                 type="submit"
                 disabled={loading}
-                size="lg"
-                tone="pink"
+                size="xl"
+                variant="accent"
                 className="w-full"
               >
                 {formatMessage({

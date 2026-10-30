@@ -1,12 +1,13 @@
+import { Badge, Spinner, Button, PanelAction } from "@botiverse/raft-ui";
 import { useEffect, useState, useCallback } from "react";
+import type { MouseEvent } from "react";
 import { useIntl } from "react-intl";
 import { X, ChevronLeft, ChevronRight, Download, ImageOff, MessageSquareMore } from "lucide-react";
 import { useImageLightboxStore } from "../store/imageLightboxStore";
 import { transparentImageBackgroundClass } from "../utils/imagePreviewStyles";
 import api from "../api/client";
-import Spinner from "./ui/Spinner";
 import Lightbox from "./ui/Lightbox";
-import Button from "./ui/Button";
+import Tooltip from "./ui/Tooltip";
 import { AttachmentCommentsPanel } from "./message/AttachmentCommentsPanel";
 import { useImageZoom } from "./ImageZoom";
 
@@ -15,6 +16,17 @@ const URL_CACHE_SAFETY_WINDOW_MS = 60_000;
 interface AttachmentUrlResponse {
   url: string;
   expiresAt: string | null;
+}
+
+function triggerDownload(href: string, filename: string) {
+  const a = document.createElement("a");
+  a.href = href;
+  a.download = filename;
+  a.rel = "noopener";
+  a.style.display = "none";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
 }
 
 export default function ImageLightbox() {
@@ -39,10 +51,10 @@ export default function ImageLightbox() {
   // entirely inside the hook (per-mount React state); not in
   // imageLightboxStore — transient interaction, not persistent gallery model.
   const zoom = useImageZoom({ resetKey: current?.id ?? null });
-  const toggleComments = () => {
+  const toggleComments = useCallback(() => {
     if (!commentsOpen) setPanelMounted(true);
     setCommentsOpen((open) => !open);
-  };
+  }, [commentsOpen]);
   const hasMultiple = images.length > 1;
   const isFirst = currentIndex === 0;
   const isLast = currentIndex === images.length - 1;
@@ -128,6 +140,35 @@ export default function ImageLightbox() {
     [prev, next, isFirst, isLast, zoom],
   );
 
+  const handlePrevClick = useCallback(
+    (e: MouseEvent) => {
+      e.stopPropagation();
+      if (!isFirst) prev();
+    },
+    [isFirst, prev],
+  );
+
+  const handleNextClick = useCallback(
+    (e: MouseEvent) => {
+      e.stopPropagation();
+      if (!isLast) next();
+    },
+    [isLast, next],
+  );
+
+  const handleDownload = useCallback(() => {
+    if (!current) return;
+    // directUrl images (e.g. avatars) have no attachment record — download the
+    // resolved URL directly instead of hitting the attachment presign endpoint.
+    if (current.directUrl) {
+      triggerDownload(current.directDownloadUrl ?? current.directUrl, current.filename);
+      return;
+    }
+    api.get<AttachmentUrlResponse>(`/attachments/${current.id}/url?disposition=attachment`).then(({ data }) => {
+      triggerDownload(data.url, current.filename);
+    }).catch(() => {});
+  }, [current]);
+
   useEffect(() => {
     if (!isOpen) return;
     // keydown-global-exempt: arrow nav inside <Lightbox> wrapper which moves focus into the overlay on open
@@ -160,96 +201,66 @@ export default function ImageLightbox() {
     setError(true);
   };
 
-  const triggerDownload = (href: string) => {
-    const a = document.createElement("a");
-    a.href = href;
-    a.download = current.filename;
-    a.rel = "noopener";
-    a.style.display = "none";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-  };
-
-  const handleDownload = () => {
-    // directUrl images (e.g. avatars) have no attachment record — download the
-    // resolved URL directly instead of hitting the attachment presign endpoint.
-    if (current.directUrl) {
-      triggerDownload(current.directUrl);
-      return;
-    }
-    api.get<AttachmentUrlResponse>(`/attachments/${current.id}/url?disposition=attachment`).then(({ data }) => {
-      triggerDownload(data.url);
-    }).catch(() => {});
-  };
-
-  // Arrow button: always visible for symmetry, but disabled style when at boundary
-  const arrowBtn = (disabled: boolean) =>
-    disabled
-      ? "flex items-center justify-center size-12 border-2 border-white/10 bg-white/5 text-white/20 cursor-default"
-      : `flex items-center justify-center size-12 border-2 border-black bg-white text-black transition-colors duration-100 hover:bg-soft-signal`;
-
   return (
     <Lightbox
       onClose={close}
       className="flex flex-col"
       data-testid="image-lightbox"
     >
-      {/* Title bar — in normal flow so image stage naturally starts below it */}
+      {/* Title bar — in normal flow so image stage naturally starts below it.
+          Raft Design System › Panel head: white paper, a seam under it, the
+          headline title, ghost icon buttons (the comments toggle turns into
+          the yellow sticker while its panel is open). */}
       <div
-        className="safe-top safe-left safe-right pointer-events-auto shrink-0 border-b-2 border-black bg-white"
+        className="safe-top safe-left safe-right pointer-events-auto shrink-0 border-b border-line-seam bg-layer-canvas text-foreground"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="flex h-14 items-center gap-3 px-4">
-          <div className="min-w-0 flex-1 truncate text-sm font-bold font-display text-black">
+        <div className="flex h-14 items-center gap-3 pl-4 pr-2 md:pl-5">
+          <div className="min-w-0 flex-1 truncate font-sans text-headline text-foreground">
             {current.filename}
           </div>
           {hasMultiple && (
-            <div className="shrink-0 border-2 border-black bg-soft-signal px-3 py-1 text-xs font-bold font-display text-black">
+            <Badge appearance="outline" className="shrink-0 tabular-nums">
               {currentIndex + 1} / {images.length}
-            </div>
+            </Badge>
           )}
-          <div className="flex shrink-0 items-center gap-1.5">
+          <div className="flex shrink-0 items-center gap-0.5">
             {currentCommentContext ? (
               /* Same iconText pattern as the preview-shell comments toggle. */
-              <Button
-                type="button"
-                onClick={toggleComments}
-                shape="icon"
-                tone={commentsOpen ? "yellow" : "white"}
-                title={
-                  commentsOpen
-                    ? formatMessage({ id: "common.lightbox.hideComments" })
-                    : formatMessage({ id: "common.lightbox.comments" })
-                }
-                aria-label={
-                  commentsOpen
-                    ? formatMessage({ id: "common.lightbox.hideComments" })
-                    : formatMessage({ id: "common.lightbox.comments" })
-                }
-                aria-pressed={commentsOpen}
-                data-comments-open={commentsOpen ? "true" : "false"}
-                data-message-affordance="attachment-comments-toggle"
-              >
-                <MessageSquareMore size={14} aria-hidden="true" />
-              </Button>
+              <Tooltip content={commentsOpen
+                ? formatMessage({ id: "common.lightbox.hideComments" })
+                : formatMessage({ id: "common.lightbox.comments" })}>
+                <PanelAction
+                  onClick={toggleComments}
+                  aria-label={
+                    commentsOpen
+                      ? formatMessage({ id: "common.lightbox.hideComments" })
+                      : formatMessage({ id: "common.lightbox.comments" })
+                  }
+                  aria-pressed={commentsOpen}
+                  data-comments-open={commentsOpen ? "true" : "false"}
+                  data-message-affordance="attachment-comments-toggle"
+                >
+                  <MessageSquareMore size={22} aria-hidden="true" />
+                </PanelAction>
+              </Tooltip>
             ) : null}
-            <Button
-              type="button"
-              onClick={handleDownload}
-              shape="icon"
-              title={formatMessage({ id: "common.lightbox.download" })}
-            >
-              <Download size={14} />
-            </Button>
-            <Button
-              type="button"
-              onClick={close}
-              shape="icon"
-              title={formatMessage({ id: "common.close" })}
-            >
-              <X size={14} />
-            </Button>
+            <Tooltip content={formatMessage({ id: "common.lightbox.download" })}>
+              <PanelAction
+                onClick={handleDownload}
+                aria-label={formatMessage({ id: "common.lightbox.download" })}
+              >
+                <Download size={22} aria-hidden="true" />
+              </PanelAction>
+            </Tooltip>
+            <Tooltip content={formatMessage({ id: "common.close" })}>
+              <PanelAction
+                onClick={close}
+                aria-label={formatMessage({ id: "common.close" })}
+              >
+                <X size={22} aria-hidden="true" />
+              </PanelAction>
+            </Tooltip>
           </div>
         </div>
       </div>
@@ -281,46 +292,54 @@ export default function ImageLightbox() {
       >
         {/* Left arrow */}
         {hasMultiple && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              if (!isFirst) prev();
-            }}
-            className={`${arrowBtn(isFirst)} absolute left-8 z-10`}
-            title={formatMessage({ id: "common.lightbox.previousImage" })}
-          >
-            <ChevronLeft size={24} />
-          </button>
+          <Tooltip content={formatMessage({ id: "common.lightbox.previousImage" })}>
+            <span
+              className="absolute left-8 z-10 inline-flex"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Button size="icon-lg"
+                type="button"
+                disabled={isFirst}
+                onClick={handlePrevClick}
+                aria-label={formatMessage({ id: "common.lightbox.previousImage" })}
+              >
+                <ChevronLeft size={24} />
+              </Button>
+            </span>
+          </Tooltip>
         )}
 
         {/* Right arrow */}
         {hasMultiple && (
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              if (!isLast) next();
-            }}
-            className={`${arrowBtn(isLast)} absolute right-8 z-10`}
-            title={formatMessage({ id: "common.lightbox.nextImage" })}
-          >
-            <ChevronRight size={24} />
-          </button>
+          <Tooltip content={formatMessage({ id: "common.lightbox.nextImage" })}>
+            <span
+              className="absolute right-8 z-10 inline-flex"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Button size="icon-lg"
+                type="button"
+                disabled={isLast}
+                onClick={handleNextClick}
+                aria-label={formatMessage({ id: "common.lightbox.nextImage" })}
+              >
+                <ChevronRight size={24} />
+              </Button>
+            </span>
+          </Tooltip>
         )}
 
         {loading && !displaySrc ? (
           <div className="flex size-64 items-center justify-center">
-            <Spinner size="lg" variant="inverse" />
+            <Spinner size="lg" variant="inverse"  aria-label={formatMessage({ id: "common.loadingLabel" })} />
           </div>
         ) : error && !displaySrc ? (
-          <div className="flex size-64 flex-col items-center justify-center gap-3 text-white/40">
-            <ImageOff size={48} />
+          <div className="flex size-64 flex-col items-center justify-center gap-3 text-foreground-on-hud/70">
+            <ImageOff size={36} />
             {/* break-all so unbreakable long filenames wrap inside the 256px
                 error stage instead of overflowing into the modal body.
                 #proj-uiux task #133. */}
-            <span className="px-4 text-center text-sm font-display break-all">{current.filename}</span>
-            <span className="text-xs">{formatMessage({ id: "common.lightbox.failedToLoad" })}</span>
+            <span className="px-4 text-center text-callout break-all">{current.filename}</span>
+            <span className="text-caption">{formatMessage({ id: "common.lightbox.failedToLoad" })}</span>
           </div>
         ) : (
           displaySrc && (
@@ -350,8 +369,8 @@ export default function ImageLightbox() {
         <aside
           // inert while collapsed: controls leave tab order + a11y tree.
           inert={!commentsOpen}
-          className={`pointer-events-auto hidden h-full shrink-0 overflow-hidden border-black bg-white transition-[width] duration-300 ease-in-out sm:block ${
-            commentsOpen ? "w-80 border-l-2" : "w-0 border-l-0"
+          className={`pointer-events-auto hidden h-full shrink-0 overflow-hidden border-line-seam bg-layer-canvas transition-[width] duration-300 ease-in-out sm:block ${
+            commentsOpen ? "w-80 border-l" : "w-0 border-l-0"
           }`}
         >
           {/* Click shield lives on the inner div, not the semantic <aside>
@@ -375,7 +394,7 @@ export default function ImageLightbox() {
         <div
           inert={!commentsOpen}
           onClick={(e) => e.stopPropagation()}
-          className={`pointer-events-auto fixed bottom-0 right-0 z-20 w-full border-l-2 border-t-2 border-black bg-white transition-transform duration-300 ease-in-out sm:hidden ${
+          className={`pointer-events-auto fixed bottom-0 right-0 z-20 w-full border-t border-l border-line-seam bg-layer-canvas transition-transform duration-300 ease-in-out sm:hidden ${
             commentsOpen ? "translate-x-0" : "translate-x-full"
           }`}
           style={{ top: "calc(56px + env(safe-area-inset-top, 0px))" }}
@@ -404,10 +423,12 @@ export default function ImageLightbox() {
                 key={img.id}
                 type="button"
                 onClick={() => goTo(idx)}
-                className={`pointer-events-auto size-12 border-2 transition-all duration-100 overflow-hidden ${
+                className={`pointer-events-auto size-12 overflow-hidden rounded-sticker border-[1.5px] transition-[opacity,border-color] duration-100 outline-none focus-visible:shadow-focus ${
                   isActive
-                    ? "border-soft-signal shadow-brutal-sm"
-                    : "border-white/30 opacity-60 hover:opacity-100 hover:border-white/60"
+                    // The image you are on: the yellow "you are here" edge
+                    // with its ink outline (a sticker edge, never a shadow).
+                    ? "border-brand opacity-100 ring-[1.5px] ring-sticker-ink"
+                    : "border-foreground-on-hud/30 opacity-60 hover:opacity-100 hover:border-foreground-on-hud/60"
                 }`}
               >
                 {thumbSrc ? (
@@ -418,7 +439,7 @@ export default function ImageLightbox() {
                     draggable={false}
                   />
                 ) : (
-                  <div className="h-full w-full bg-white/20 flex items-center justify-center text-white/50 text-xs font-bold">
+                  <div className="flex h-full w-full items-center justify-center bg-foreground-on-hud/20 font-mono text-mono-meta text-foreground-on-hud/70">
                     {idx + 1}
                   </div>
                 )}

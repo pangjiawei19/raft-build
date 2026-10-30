@@ -1,8 +1,8 @@
-import type { MarkdownAttachmentPreviewData } from "@botiverse/raft-shared";
-import type { AttachmentPreviewProvider } from "../types.js";
+import { MARKDOWN_PREVIEW_PAYLOAD_BYTE_LIMIT, type MarkdownAttachmentPreviewData } from "@botiverse/raft-shared";
+import type { AttachmentPreviewProvider } from "../types";
 
 export const MARKDOWN_PREVIEW_BYTE_LIMIT = 128 * 1024;
-export const MARKDOWN_PREVIEW_PAYLOAD_BYTE_LIMIT = 64 * 1024;
+export { MARKDOWN_PREVIEW_PAYLOAD_BYTE_LIMIT };
 
 const MARKDOWN_MIME_TYPES = new Set([
   "text/markdown",

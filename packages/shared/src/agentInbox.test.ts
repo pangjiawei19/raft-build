@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
 import {
   AGENT_INBOX_TARGET_ROW_KEYS,
@@ -8,7 +7,7 @@ import {
   formatAgentInboxSnapshot,
   projectAgentReplyAffordance,
   type AgentInboxTargetRow,
-} from "./agentInbox.js";
+} from "./agentInbox";
 
 test("agent reply affordance is projected only from the non-member delivery fact", () => {
   assert.equal(projectAgentReplyAffordance({}), null);
@@ -181,4 +180,34 @@ test("an unknown flag cannot forge output lines or run unbounded", () => {
   assert.ok(!out.includes("\nInbox: 0 pending"), "a newline in a flag must not create a line");
   assert.ok(out.includes("\\n"), "control characters must be escaped, not emitted raw");
   assert.ok(out.length < 400, `diagnostic must stay bounded, got ${out.length}`);
+});
+
+test("the third-party app events target is never shown as a readable target in inbox notices", () => {
+  const row: AgentInboxTargetRow = {
+    target: "dm:@third-party-agent-events:1201a0b5-0a42-4e45-8990-1e515700c169",
+    pendingCount: 2,
+    firstPendingMsgId: "26c98834-0000-4000-8000-000000000000",
+    latestMsgId: "8ab896be-0000-4000-8000-000000000000",
+    latestSenderName: "stamp",
+    latestSenderType: "third_party_app",
+    flags: ["dm"],
+  };
+  const delta = formatAgentInboxDelta([row], { totalPendingMessages: 2 });
+  const snapshot = formatAgentInboxSnapshot([row]);
+  for (const out of [delta, snapshot]) {
+    assert.doesNotMatch(out, /third-party-agent-events/);
+    assert.match(out, /Third-party app events/);
+    assert.match(out, /fetch with raft message check/);
+    assert.doesNotMatch(out, /agent-event:/);
+  }
+  assert.equal(
+    delta.split("\n")[1],
+    "Third-party app events  pending: 2 messages · first msg=26c98834 · latest sender @stamp · latest msg=8ab896be · fetch with raft message check",
+  );
+});
+
+test("control: an ordinary DM target keeps its own name and gets no third-party hints", () => {
+  const out = formatAgentInboxDelta([{ target: "dm:@richard", pendingCount: 1, latestMsgId: "11111111-0000", flags: ["dm"] }]);
+  assert.match(out, /^dm:@richard  pending: 1 message/m);
+  assert.doesNotMatch(out, /agent-event:|message check/);
 });

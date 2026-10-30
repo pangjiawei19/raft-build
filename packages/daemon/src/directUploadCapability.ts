@@ -1,5 +1,5 @@
-import { executeJsonRequest, executeResponseRequest, DEFAULT_CHAT_BRIDGE_TOOL_TIMEOUT_MS } from "./chatBridgeRequest.js";
-import { daemonFetch } from "./daemonFetch.js";
+import { executeJsonRequest, executeResponseRequest, ChatBridgeToolTimeoutError, DEFAULT_CHAT_BRIDGE_TOOL_TIMEOUT_MS, HttpStatusError } from "./chatBridgeRequest";
+import { daemonFetch } from "./daemonFetch";
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
@@ -19,6 +19,8 @@ export interface RequestDaemonScopeAttestationOptions {
   metadata?: Record<string, unknown>;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
+  /** Optional caller cancellation (merged with the per-hop timeout). Absent = today's behaviour. */
+  signal?: AbortSignal;
 }
 
 export interface DirectUploadCreateResponse {
@@ -31,6 +33,8 @@ export interface DirectUploadCreateResponse {
 }
 
 export interface CreateDirectUploadSessionOptions<TResponse extends DirectUploadCreateResponse> {
+  /** Runs after the server signed, BEFORE the worker is contacted. Throw to abort. */
+  verifyCapability?: (capability: DaemonScopeAttestation) => void;
   serverUrl: string;
   apiKey: string;
   workerUrl: string;
@@ -40,9 +44,19 @@ export interface CreateDirectUploadSessionOptions<TResponse extends DirectUpload
   attestationMetadata?: Record<string, unknown>;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
+  /** Optional caller cancellation for every hop. Absent = today's behaviour. */
+  signal?: AbortSignal;
 }
 
 export interface UploadWithSignedCapabilityOptions {
+  /**
+   * Runs after the server signed and the worker created the session, BEFORE
+   * any bytes are uploaded. Throw to abort (e.g. the server or worker did not
+   * acknowledge an attachment kind the caller depends on).
+   */
+  verifySession?: (capability: DaemonScopeAttestation, session: DirectUploadCreateResponse) => void;
+  /** Runs after the server signed, BEFORE the worker is contacted. Throw to abort. */
+  verifyCapability?: (capability: DaemonScopeAttestation) => void;
   serverUrl: string;
   apiKey: string;
   workerUrl: string;
@@ -53,6 +67,47 @@ export interface UploadWithSignedCapabilityOptions {
   uploadBody: BodyInit;
   fetchImpl?: FetchLike;
   timeoutMs?: number;
+  /** Optional caller cancellation for every hop (attestation, create, PUT). Absent = today's behaviour. */
+  signal?: AbortSignal;
+}
+
+/** Which hop of a signed direct upload failed. */
+export type DirectUploadStage = "attestation" | "create" | "put";
+const DIRECT_UPLOAD_STAGE = Symbol.for("raft.daemon.directUploadStage");
+
+/** Tag an error with its hop without changing its class or message (logs and callers keep their text). */
+function tagStage<T>(err: T, stage: DirectUploadStage): T {
+  if (err && typeof err === "object" && !(DIRECT_UPLOAD_STAGE in err)) {
+    Object.defineProperty(err, DIRECT_UPLOAD_STAGE, { value: stage, enumerable: false });
+  }
+  return err;
+}
+
+export interface DirectUploadFailureClass {
+  stage: DirectUploadStage | null;
+  httpStatus: number | null;
+  httpClass: "4xx" | "5xx" | "timeout" | "network" | "other";
+}
+
+/** Typed classification of a failure thrown by uploadWithSignedCapability. Never parses messages for status. */
+export function classifyDirectUploadFailure(err: unknown): DirectUploadFailureClass {
+  const chain: unknown[] = [];
+  for (let e: unknown = err; e && chain.length < 5; e = (e as { cause?: unknown }).cause) chain.push(e);
+  const tagged = chain.find((e) => e && typeof e === "object" && DIRECT_UPLOAD_STAGE in e) as Record<symbol, unknown> | undefined;
+  const stage = (tagged?.[DIRECT_UPLOAD_STAGE] as DirectUploadStage | undefined) ?? null;
+  const http = chain.find((e): e is HttpStatusError => e instanceof HttpStatusError);
+  if (http) return { stage, httpStatus: http.status, httpClass: http.status >= 500 ? "5xx" : http.status >= 400 ? "4xx" : "other" };
+  if (chain.some((e) => e instanceof ChatBridgeToolTimeoutError)) return { stage, httpStatus: null, httpClass: "timeout" };
+  if (chain.some((e) => e instanceof TypeError)) return { stage, httpStatus: null, httpClass: "network" };
+  return { stage, httpStatus: null, httpClass: "other" };
+}
+
+/** Keep the HTTP status in the message: callers and logs classify on it. */
+function withStatus(prefix: string, err: unknown, stage: DirectUploadStage): never {
+  if (err instanceof HttpStatusError) {
+    throw tagStage(new Error(`${prefix} (${err.status})${err.serverError ? `: ${err.serverError}` : ""}`, { cause: err }), stage);
+  }
+  throw tagStage(err, stage);
 }
 
 function joinUrl(base: string, path: string) {
@@ -73,8 +128,9 @@ export async function requestDaemonScopeAttestation({
   metadata,
   fetchImpl = daemonFetch,
   timeoutMs = DEFAULT_CHAT_BRIDGE_TOOL_TIMEOUT_MS,
+  signal,
 }: RequestDaemonScopeAttestationOptions): Promise<DaemonScopeAttestation> {
-  const { response, data } = await executeJsonRequest<DaemonScopeAttestation>(
+  const { data } = await executeJsonRequest<DaemonScopeAttestation>(
     joinUrl(serverUrl, "/internal/machine/scope-attestation"),
     {
       method: "POST",
@@ -83,6 +139,7 @@ export async function requestDaemonScopeAttestation({
         scope,
         ...(metadata ? { metadata } : {}),
       }),
+      ...(signal ? { signal } : {}),
     },
     {
       toolName: "daemon_direct_upload.scope_attestation",
@@ -90,11 +147,7 @@ export async function requestDaemonScopeAttestation({
       timeoutMs,
       fetchImpl,
     },
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to request daemon scope attestation (${response.status})`);
-  }
+  ).catch((err: unknown) => withStatus("Failed to request daemon scope attestation", err, "attestation"));
 
   return data;
 }
@@ -107,8 +160,10 @@ export async function createDirectUploadSession<TResponse extends DirectUploadCr
   createPath = "/api/uploads",
   body,
   attestationMetadata,
+  verifyCapability,
   fetchImpl = daemonFetch,
   timeoutMs = DEFAULT_CHAT_BRIDGE_TOOL_TIMEOUT_MS,
+  signal,
 }: CreateDirectUploadSessionOptions<TResponse>): Promise<{ capability: DaemonScopeAttestation; response: TResponse }> {
   const capability = await requestDaemonScopeAttestation({
     serverUrl,
@@ -117,9 +172,11 @@ export async function createDirectUploadSession<TResponse extends DirectUploadCr
     metadata: attestationMetadata,
     fetchImpl,
     timeoutMs,
+    signal,
   });
+  verifyCapability?.(capability);
 
-  const { response, data } = await executeJsonRequest<TResponse>(
+  const { data } = await executeJsonRequest<TResponse>(
     joinUrl(workerUrl, createPath),
     {
       method: "POST",
@@ -128,6 +185,7 @@ export async function createDirectUploadSession<TResponse extends DirectUploadCr
         ...body,
         attestation: capability.attestation,
       }),
+      ...(signal ? { signal } : {}),
     },
     {
       toolName: "daemon_direct_upload.create",
@@ -135,11 +193,7 @@ export async function createDirectUploadSession<TResponse extends DirectUploadCr
       timeoutMs,
       fetchImpl,
     },
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to create direct upload session (${response.status})`);
-  }
+  ).catch((err: unknown) => withStatus("Failed to create direct upload session", err, "create"));
 
   return { capability, response: data };
 }
@@ -153,8 +207,11 @@ export async function uploadWithSignedCapability({
   createBody,
   attestationMetadata,
   uploadBody,
+  verifySession,
+  verifyCapability,
   fetchImpl = daemonFetch,
   timeoutMs = DEFAULT_CHAT_BRIDGE_TOOL_TIMEOUT_MS,
+  signal,
 }: UploadWithSignedCapabilityOptions): Promise<{ capability: DaemonScopeAttestation; session: DirectUploadCreateResponse; uploadResponse: Response }> {
   const { capability, response: session } = await createDirectUploadSession({
     serverUrl,
@@ -164,9 +221,12 @@ export async function uploadWithSignedCapability({
     createPath,
     body: createBody,
     attestationMetadata,
+    verifyCapability,
     fetchImpl,
     timeoutMs,
+    signal,
   });
+  verifySession?.(capability, session);
 
   const { response: uploadResponse } = await executeResponseRequest(
     session.upload.url,
@@ -174,6 +234,7 @@ export async function uploadWithSignedCapability({
       method: session.upload.method,
       headers: session.upload.headers ?? {},
       body: uploadBody,
+      ...(signal ? { signal } : {}),
     },
     {
       toolName: "daemon_direct_upload.put",
@@ -181,10 +242,15 @@ export async function uploadWithSignedCapability({
       timeoutMs,
       fetchImpl,
     },
-  );
+  ).catch((err: unknown) => { throw tagStage(err, "put"); });
 
   if (!uploadResponse.ok) {
-    throw new Error(`Failed to upload with signed capability (${uploadResponse.status})`);
+    throw tagStage(
+      new Error(`Failed to upload with signed capability (${uploadResponse.status})`, {
+        cause: new HttpStatusError("daemon_direct_upload.put", uploadResponse.status, null),
+      }),
+      "put",
+    );
   }
 
   return { capability, session, uploadResponse };

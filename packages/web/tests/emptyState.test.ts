@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Paperclip } from "lucide-react";
@@ -46,24 +45,34 @@ test("EmptyState renders sentence-case title and frameless icon (B + C contract)
     }),
   );
 
+  const slotClass = (slot: string) =>
+    html.match(new RegExp(`data-slot="${slot}"[^>]*? class="([^"]*)"`))?.[1] ?? "";
+  const titleClass = slotClass("empty-state-title");
+  const iconClass = slotClass("empty-state-icon");
+  const descriptionClass = slotClass("empty-state-description");
+
   // Title is rendered as-passed (sentence case from the callsite). No
-  // `uppercase` / `tracking-tight` CSS override.
+  // `uppercase` / `tracking-tight` CSS override. It is dimmed body copy, not
+  // the full-strength foreground.
   assert.match(html, /No files yet/);
-  assert.match(html, /text-lg font-display font-semibold text-black\/60/);
+  assert.match(titleClass, /(?:^|\s)text-foreground-muted(?:\s|$)/);
+  assert.doesNotMatch(titleClass, /(?:^|\s)text-foreground(?:-strong)?(?:\s|$)/);
   assert.doesNotMatch(html, /text-lg font-display font-semibold text-black"/);
   assert.doesNotMatch(html, /uppercase/);
   assert.doesNotMatch(html, /tracking-tight/);
 
-  // Icon wrapper is the new frameless, muted container — no border, no
-  // bg-black/5, no 30%-opacity black border. Just `text-black/40` to
-  // propagate to currentColor-aware lucide icons.
-  assert.match(html, /mb-4 inline-flex items-center justify-center text-black\/40/);
+  // Icon wrapper is frameless and muted — no border, no tinted box. The muted
+  // colour propagates to currentColor-aware lucide icons.
+  assert.match(iconClass, /(?:^|\s)text-foreground-hint(?:\s|$)/);
+  assert.doesNotMatch(iconClass, /(?:^|\s)(?:border|bg)-/);
+  // The icon is decoration; the title carries the meaning (raft-ui 0.7.0).
+  assert.match(html, /data-slot="empty-state-icon" aria-hidden="true"/);
   assert.doesNotMatch(html, /border-black\/30/);
   assert.doesNotMatch(html, /bg-black\/5/);
   assert.doesNotMatch(html, /text-black\/45/);
 
-  // Description + action slots still work.
-  assert.match(html, /mx-auto max-w-\[32ch\] text-sm leading-relaxed text-black\/60/);
+  // Description + action slots still work; the description is muted too.
+  assert.match(descriptionClass, /(?:^|\s)text-foreground-hint(?:\s|$)/);
   assert.match(html, /Attach files in Chat\./);
   assert.match(html, /Add file/);
 });
@@ -71,7 +80,6 @@ test("EmptyState renders sentence-case title and frameless icon (B + C contract)
 test("full-panel empty states reuse the shared EmptyState primitive", () => {
   const files = [
     "src/components/message/ChannelFilesPanel.tsx",
-    "src/components/ui/NotificationCenter.tsx",
     "src/components/saved/SavedPanel.tsx",
     "src/components/thread/ThreadsInbox.tsx",
     "src/components/task/TasksPanel.tsx",

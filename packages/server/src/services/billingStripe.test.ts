@@ -1,8 +1,7 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
-import { closeTestDatabase, openTestDatabase } from "../test/integration/database.js";
+import { dbTest as test } from "../test/integration/dbTest";
+import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { afterEach } from "vitest";
 import type Stripe from "stripe";
 import { eq } from "drizzle-orm";
 import {
@@ -13,11 +12,11 @@ import {
   MemoryTraceSink,
   type TraceEvent,
 } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
-import { subscriptions, servers, users, webhookEvents } from "../db/schema.js";
-import { runWithTraceSpan } from "../tracing/semanticTrace.js";
-import { createServer } from "./serverService.js";
-import { createAgent } from "./agentService.js";
+import { getDb } from "../db/index";
+import { subscriptions, servers, users, webhookEvents } from "../db/schema";
+import { runWithTraceSpan } from "../tracing/semanticTrace";
+import { createServer } from "./serverService";
+import { createAgent } from "./agentService";
 import {
   __resetBillingPreviewClockForTests,
   __resetStripeForTests,
@@ -29,8 +28,8 @@ import {
   handleWebhookEvent,
   previewProPackQuantityUpdate,
   updateProPackQuantity,
-} from "./billingService.js";
-import { getServerBillingEntitlement, requireTeamBillingFeature } from "./planService.js";
+} from "./billingService";
+import { getServerBillingEntitlement, requireTeamBillingFeature } from "./planService";
 
 
 const ENV_KEYS = [
@@ -2290,4 +2289,167 @@ test("non-live subscription webhook records projection but does not grant Pro en
   } finally {
     restoreEnv(env);
   }
+});
+
+test("retired referral input cannot silently create a full-price checkout", async () => {
+  const env = snapshotEnv();
+  configureStripeEnv();
+  await openTestDatabase("pglite://");
+  try {
+    const owner = await seedUser("retired-code-owner");
+    const server = await createServer("Retired code", `retired-code-${randomUUID()}`, owner.id);
+    let creates = 0;
+    __setStripeForTests({ checkout: { sessions: { create: async () => {
+      creates += 1;
+      return { url: "https://checkout.stripe.test/session" };
+    } } } } as unknown as Stripe);
+    for (const referralCode of ["OLD-CODE", 12, {}, false]) {
+      const request = { targetPlan: "pro", referralCode };
+      await assert.rejects(() => createCheckoutSession(server.id, owner.id, "https://app.test/ok", "https://app.test/cancel", request),
+        /Promotion codes must be entered on Stripe Checkout/);
+    }
+    assert.equal(creates, 0);
+    for (const referralCode of [undefined, null, "", "   "]) {
+      const request = { targetPlan: "pro", referralCode };
+      assert.equal(await createCheckoutSession(server.id, owner.id, "https://app.test/ok", "https://app.test/cancel", request), "https://checkout.stripe.test/session");
+    }
+    assert.equal(creates, 4);
+  } finally {
+    restoreEnv(env);
+  }
+});
+
+// Stripe 20.4.0 / API 2026-02-25.clover wire fixtures. Never call a real Stripe account.
+test("first Checkout promotion uses only explicit discount and canonical price/quantity without persisting raw input", async () => {
+  const env = snapshotEnv(); configureStripeEnv(); await openTestDatabase("pglite://");
+  try {
+    const owner = await seedUser("native-code"); const server = await createServer("Native", `native-${randomUUID()}`, owner.id);
+    const calls: Stripe.Checkout.SessionCreateParams[] = [];
+    const lookups: Stripe.PromotionCodeListParams[] = [];
+    const promo = seatUpdatePromotionCode({ id: "promoNative", code: "SAVE10", metadata: {}, couponMetadata: {} });
+    promo.id = "promo_Native";
+    promo.restrictions.first_time_transaction = true; // Provider, not seat-update policy, decides first-purchase eligibility.
+    __setStripeForTests({
+      prices: { retrieve: async (id: string) => ({ id, active: true, livemode: false, type: "recurring", product: "prod_pro_seat", currency: "usd", recurring: { interval: "year", interval_count: 1 } }) },
+      promotionCodes: { list: async (params: Stripe.PromotionCodeListParams) => { lookups.push(params); return { data: [promo], has_more: false }; } },
+      checkout: { sessions: { create: async (params: Stripe.Checkout.SessionCreateParams) => { calls.push(params); return { url: "https://checkout.stripe.test/native" }; } } },
+    } as unknown as Stripe);
+    const { events } = await captureBillingTrace(() => createCheckoutSession(server.id, owner.id, "https://raft.test/success", "https://raft.test/cancel", {
+      targetPlan: "pro", billingInterval: "annual", seatQuantity: 3, promotionCode: " save10 ",
+    }));
+    assert.equal(calls.length, 1); assert.deepEqual(calls[0].discounts, [{ promotion_code: "promo_Native" }]);
+    assert.equal(Object.hasOwn(calls[0], "allow_promotion_codes"), false, "explicit discount and code entry must be mutually exclusive");
+    assert.deepEqual(calls[0].line_items, [{ price: "price_pro_seat_annual", quantity: 3 }]);
+    assert.equal(calls[0].metadata?.serverId, server.id); assert.equal(lookups[0].code, "save10");
+    assert.equal(JSON.stringify(calls[0]).toLowerCase().includes("save10"), false);
+    assert.equal(JSON.stringify(events).toLowerCase().includes("save10"), false);
+    assert.equal((await getDb().select().from(subscriptions).where(eq(subscriptions.serverId, server.id))).length, 0);
+  } finally { restoreEnv(env); }
+});
+
+test("blank promotion inputs preserve legacy Checkout and never query promotion or price APIs", async () => {
+  const env = snapshotEnv(); configureStripeEnv(); await openTestDatabase("pglite://");
+  try {
+    const owner = await seedUser("blank-native-code"); const server = await createServer("Blank", `blank-${randomUUID()}`, owner.id);
+    const calls: Stripe.Checkout.SessionCreateParams[] = [];
+    __setStripeForTests({ checkout: { sessions: { create: async (p: Stripe.Checkout.SessionCreateParams) => { calls.push(p); return { url: "https://checkout.stripe.test/blank" }; } } } } as unknown as Stripe);
+    for (const promotionCode of [undefined, null, "", "   "]) await createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", { targetPlan: "pro", promotionCode });
+    assert.equal(calls.length, 4); for (const p of calls) { assert.equal(p.allow_promotion_codes, true); assert.equal(Object.hasOwn(p, "discounts"), false); }
+  } finally { restoreEnv(env); }
+});
+
+test("invalid, ambiguous, restricted, expired, exhausted or provider lookup failure never creates full-price Checkout", async () => {
+  const env = snapshotEnv(); configureStripeEnv(); await openTestDatabase("pglite://");
+  try {
+    const owner = await seedUser("refused-native-code"); const server = await createServer("Refused", `refused-${randomUUID()}`, owner.id);
+    const base = seatUpdatePromotionCode({ id: "promo_Native", code: "PRIVATECODE", metadata: {}, couponMetadata: {} });
+    const mutations: Array<{ label: string; mutate: (p: Stripe.PromotionCode) => Stripe.PromotionCode[]; price?: Record<string, unknown>; throwLookup?: boolean; code?: unknown }> = [
+      { label: "missing", mutate: () => [] },
+      { label: "ambiguous", mutate: p => [p, { ...p, id: "promo_Second" }] },
+      { label: "customer restriction", mutate: p => [{ ...p, customer: "cus_Other" }] },
+      { label: "customer account", mutate: p => [{ ...p, customer_account: "acct_Other" }] },
+      { label: "expired", mutate: p => [{ ...p, expires_at: 1 }] },
+      { label: "exhausted", mutate: p => [{ ...p, max_redemptions: 1, times_redeemed: 1 }] },
+      { label: "inactive", mutate: p => [{ ...p, active: false }] },
+      { label: "wrong mode", mutate: p => [{ ...p, livemode: true }] },
+      { label: "price mode", mutate: p => [p], price: { livemode: true } },
+      { label: "wrong interval", mutate: p => [p], price: { recurring: { interval: "year", interval_count: 1 } } },
+      { label: "wrong product", mutate: p => [p], price: { product: "prod_Other" } },
+      { label: "lookup timeout", mutate: p => [p], throwLookup: true },
+      { label: "invalid input", mutate: p => [p], code: { id: "promo_Native" } },
+      { label: "oversized input", mutate: p => [p], code: "X".repeat(129) },
+      { label: "control character", mutate: p => [p], code: "PRIVATE\u0000CODE" },
+    ];
+    for (const item of mutations) {
+      let createCount = 0;
+      __setStripeForTests({
+        prices: { retrieve: async () => ({ active: true, livemode: false, type: "recurring", product: "prod_pro_seat", currency: "usd", recurring: { interval: "month", interval_count: 1 }, ...item.price }) },
+        promotionCodes: { list: async () => { if (item.throwLookup) throw new Error("PRIVATECODE provider request leaked"); return { data: item.mutate(base), has_more: false }; } },
+        checkout: { sessions: { create: async () => { createCount++; return { url: "https://checkout.stripe.test/wrong" }; } } },
+      } as unknown as Stripe);
+      const { error, events } = await captureRejectedBillingTrace(() => createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", { targetPlan: "pro", billingInterval: "monthly", promotionCode: item.code ?? "PRIVATECODE" }));
+      assert.equal((error as Error).message, "Promotion code is unavailable", item.label); assert.equal(createCount, 0, item.label);
+      assert.equal(JSON.stringify(events).includes("PRIVATECODE"), false, item.label);
+    }
+  } finally { restoreEnv(env); }
+});
+
+test("Stripe create rejection returns generic error with no fallback or raw code trace", async () => {
+  const env = snapshotEnv(); configureStripeEnv(); await openTestDatabase("pglite://");
+  try {
+    const owner = await seedUser("stripe-rejected-code"); const server = await createServer("Reject", `reject-${randomUUID()}`, owner.id);
+    let attempts = 0;
+    __setStripeForTests({
+      prices: { retrieve: async () => ({ active: true, livemode: false, type: "recurring", product: "prod_pro_seat", currency: "usd", recurring: { interval: "month", interval_count: 1 } }) },
+      promotionCodes: { list: async () => ({ data: [seatUpdatePromotionCode({ id: "promo_Native", code: "PRIVATECODE" })], has_more: false }) },
+      checkout: { sessions: { create: async () => { attempts++; throw new Error("PRIVATECODE minimum-amount restriction"); } } },
+    } as unknown as Stripe);
+    const { error, events } = await captureRejectedBillingTrace(() => createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", { targetPlan: "pro", billingInterval: "monthly", promotionCode: "PRIVATECODE" }));
+    assert.equal((error as Error).message, "Promotion code is unavailable"); assert.equal(attempts, 1, "must not retry without the discount"); assert.equal(JSON.stringify(events).includes("PRIVATECODE"), false);
+  } finally { restoreEnv(env); }
+});
+
+test("customer-scoped code on later page uses canonical persisted customer and refuses a later ambiguous match", async () => {
+  const env = snapshotEnv(); configureStripeEnv(); await openTestDatabase("pglite://");
+  try {
+    const owner = await seedUser("paged-native-code"); const server = await createServer("Paged", `paged-${randomUUID()}`, owner.id);
+    await getDb().insert(subscriptions).values({ serverId: server.id, stripeCustomerId: "cus_Canonical", stripeSubscriptionId: "sub_Old", status: "canceled" });
+    const promo = seatUpdatePromotionCode({ id: "promo_Native", code: "SAVE10", customer: "cus_Canonical" });
+    let calls = 0, pages = 0, ambiguous = false;
+    __setStripeForTests({
+      prices: { retrieve: async () => ({ active: true, livemode: false, type: "recurring", product: "prod_pro_seat", currency: "usd", recurring: { interval: "month", interval_count: 1 } }) },
+      promotionCodes: { list: async (params: Stripe.PromotionCodeListParams) => {
+        pages++;
+        if (!params.starting_after) return { data: [{ ...promo, id: "promo_OtherCustomer", customer: "cus_Other" }], has_more: true };
+        assert.equal(params.starting_after, "promo_OtherCustomer");
+        return { data: ambiguous ? [promo, { ...promo, id: "promo_Second" }] : [promo], has_more: false };
+      } },
+      checkout: { sessions: { create: async (p: Stripe.Checkout.SessionCreateParams) => { calls++; assert.equal(p.customer, "cus_Canonical"); return { url: "https://checkout.stripe.test/paged" }; } } },
+    } as unknown as Stripe);
+    const request = { targetPlan: "pro", billingInterval: "monthly", promotionCode: "SAVE10" };
+    await createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", request);
+    assert.equal(pages, 2); assert.equal(calls, 1);
+    ambiguous = true; calls = 0;
+    await assert.rejects(() => createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", request), /Promotion code is unavailable/);
+    assert.equal(calls, 0);
+  } finally { restoreEnv(env); }
+});
+
+test("Stripe owns code characters: underscores, internal spaces and Unicode are queried unchanged except trim", async () => {
+  const env = snapshotEnv(); configureStripeEnv(); await openTestDatabase("pglite://");
+  try {
+    const owner = await seedUser("provider-code-characters"); const server = await createServer("Characters", `characters-${randomUUID()}`, owner.id);
+    for (const raw of [" TEAM_2026 ", " Team Launch 2026 ", " 春季优惠_2026 "]) {
+      const code = raw.trim();
+      const lookups: string[] = []; const creates: Stripe.Checkout.SessionCreateParams[] = [];
+      __setStripeForTests({
+        prices: { retrieve: async () => ({ active: true, livemode: false, type: "recurring", product: "prod_pro_seat", currency: "usd", recurring: { interval: "month", interval_count: 1 } }) },
+        promotionCodes: { list: async (p: Stripe.PromotionCodeListParams) => { lookups.push(p.code!); return { data: [seatUpdatePromotionCode({ id: "promo_Characters", code })], has_more: false }; } },
+        checkout: { sessions: { create: async (p: Stripe.Checkout.SessionCreateParams) => { creates.push(p); return { url: "https://checkout.stripe.test/characters" }; } } },
+      } as unknown as Stripe);
+      const { events } = await captureBillingTrace(() => createCheckoutSession(server.id, owner.id, "https://raft.test/s", "https://raft.test/c", { targetPlan: "pro", billingInterval: "monthly", promotionCode: raw }));
+      assert.deepEqual(lookups, [code]); assert.equal(creates.length, 1); assert.deepEqual(creates[0].discounts, [{ promotion_code: "promo_Characters" }]);
+      assert.equal(JSON.stringify(creates).includes(code), false); assert.equal(JSON.stringify(events).includes(code), false);
+    }
+  } finally { restoreEnv(env); }
 });

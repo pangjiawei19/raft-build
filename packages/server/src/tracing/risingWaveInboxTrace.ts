@@ -2,21 +2,25 @@ import type { TraceAttributes } from "@botiverse/raft-shared";
 import {
   getRisingWaveConnectionTimeoutMillis,
   getRisingWavePoolState,
+  isRisingWaveInternalResetsError,
+  isRisingWaveUnreachableError,
+  RisingWaveOverloadedError,
+  RisingWaveReadError,
   type RisingWavePoolState,
-} from "../db/risingwave.js";
-import { addTraceEvent } from "./semanticTrace.js";
+} from "../db/risingwave";
+import { addTraceEvent, errorClassOf } from "./semanticTrace";
+import { traceErrorMessage } from "./queryTrace";
 
-export type RisingWaveInboxTraceRoute = "all" | "unread" | "mentions" | "unread_mentions" | "sidebar_summary" | "channel_unread";
+export type RisingWaveInboxTraceRoute = "all" | "unread" | "mentions" | "unread_mentions" | "sidebar_summary" | "channel_unread" | "activity_totals";
 export type RisingWaveInboxFallbackReason = "rw_error" | "breaker_open";
 export type RisingWaveFailureStage = "acquire" | "connect" | "query" | "unknown";
 export type RisingWaveErrorKind =
   | "rw_acquire_timeout"
+  | "rw_internal_resets"
   | "rw_connect_error"
   | "rw_query_error"
   | "rw_unknown_error";
 export type RisingWaveBreakerState = "not_configured" | "closed" | "open" | "half_open";
-export type RisingWaveFallbackTarget = "pg_fallback";
-export type RisingWaveFallbackOutcome = "success" | "error";
 
 type DriverCode =
   | "ECONNREFUSED"
@@ -38,14 +42,20 @@ export interface RisingWaveInboxFailureTraceInput {
   terminalStatus?: 500;
 }
 
-export interface RisingWaveInboxFallbackTraceInput extends Omit<RisingWaveInboxFailureTraceInput, "terminalStatus"> {
-  fallbackTarget?: RisingWaveFallbackTarget;
-  fallbackOutcome: RisingWaveFallbackOutcome;
-  fallbackLatencyMs: number;
+/** The overload reason anywhere in the cause chain; undefined for any other failure. */
+function overloadReasonOf(error: unknown): string | undefined {
+  for (let current = error, depth = 0; current && depth < 5; depth += 1) {
+    if (current instanceof RisingWaveOverloadedError) return current.reason;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return undefined;
 }
 
 export function risingWaveInboxFailureAttrs(input: RisingWaveInboxFailureTraceInput): TraceAttributes {
-  const classification = classifyRisingWaveError(input.error);
+  // RisingWaveReadError only types the route response; classify the driver
+  // error it wraps so error_class / error_kind / sqlstate keep their meaning.
+  const error = input.error instanceof RisingWaveReadError ? input.error.cause : input.error;
+  const classification = classifyRisingWaveError(error);
   const poolState = input.poolState ?? getRisingWavePoolState();
   return {
     event_kind: "rw_inbox_backend",
@@ -63,12 +73,20 @@ export function risingWaveInboxFailureAttrs(input: RisingWaveInboxFailureTraceIn
     inbox_fallback_reason: input.fallbackReason ?? "rw_error",
     inbox_contract_version: input.contractVersion,
     query_name: input.queryName,
-    error_class: errorClass(input.error),
+    error_class: errorClass(error),
     error_kind: classification.errorKind,
+    // Same field as the stale served/missed events: rw_connect_error also
+    // covers other connection failures, so a restart window is counted by this.
+    overload_reason: overloadReasonOf(input.error),
     error_subkind: classification.failureStage,
     rw_failure_stage: classification.failureStage,
     sqlstate: classification.sqlstate,
     driver_code: classification.driverCode,
+    // Scrubbed, not raw: credentials/URLs/query text never reach the trace
+    // store; the failure REASON always does. Without this field a breaker open
+    // records THAT it opened but not WHY — the raw message was consumed by the
+    // classifier above and then discarded.
+    error_message: traceErrorMessage(error),
     timeout_ms: getRisingWaveConnectionTimeoutMillis(),
     ...poolState,
     rw_breaker_state: input.breakerState ?? "not_configured",
@@ -77,56 +95,8 @@ export function risingWaveInboxFailureAttrs(input: RisingWaveInboxFailureTraceIn
   };
 }
 
-export function risingWaveInboxFallbackAttrs(input: RisingWaveInboxFallbackTraceInput): TraceAttributes {
-  if (input.error === undefined) {
-    const poolState = input.poolState ?? getRisingWavePoolState();
-    return {
-      event_kind: "rw_inbox_backend",
-      outcome: input.fallbackOutcome,
-      reason: input.fallbackReason ?? "rw_error",
-      source: "rw_inbox_trace",
-      "db.system": "risingwave",
-      db_system: "risingwave",
-      "inbox.backend": "rw_mv",
-      "inbox.route": input.route,
-      "inbox.fallback_reason": input.fallbackReason ?? "rw_error",
-      "inbox.contract_version": input.contractVersion,
-      inbox_backend: "rw_mv",
-      inbox_route: input.route,
-      inbox_fallback_reason: input.fallbackReason ?? "rw_error",
-      inbox_contract_version: input.contractVersion,
-      query_name: input.queryName,
-      timeout_ms: getRisingWaveConnectionTimeoutMillis(),
-      ...poolState,
-      rw_breaker_state: input.breakerState ?? "not_configured",
-      fallback_target: input.fallbackTarget ?? "pg_fallback",
-      fallback_outcome: input.fallbackOutcome,
-      fallback_latency_ms: input.fallbackLatencyMs,
-      terminal_status: undefined,
-    };
-  }
-  return {
-    ...risingWaveInboxFailureAttrs(input),
-    outcome: input.fallbackOutcome,
-    reason: input.fallbackReason ?? "rw_error",
-    fallback_target: input.fallbackTarget ?? "pg_fallback",
-    fallback_outcome: input.fallbackOutcome,
-    fallback_latency_ms: input.fallbackLatencyMs,
-    terminal_status: undefined,
-  };
-}
-
-export function isRisingWaveInboxFailSoftError(error: unknown): boolean {
-  const classification = classifyRisingWaveError(error);
-  return classification.errorKind === "rw_acquire_timeout" || classification.errorKind === "rw_connect_error";
-}
-
 export function recordRisingWaveInboxBackendFailed(input: RisingWaveInboxFailureTraceInput): void {
   addTraceEvent("inbox.backend.failed", risingWaveInboxFailureAttrs(input));
-}
-
-export function recordRisingWaveInboxFallbackCompleted(input: RisingWaveInboxFallbackTraceInput): void {
-  addTraceEvent("inbox.backend.fallback_completed", risingWaveInboxFallbackAttrs(input));
 }
 
 function classifyRisingWaveError(error: unknown): {
@@ -143,6 +113,16 @@ function classifyRisingWaveError(error: unknown): {
       failureStage: "acquire",
       driverCode: "PG_POOL_CONNECT_TIMEOUT",
     };
+  }
+  // Classified as rw_overloaded for the response, but kept apart here so the
+  // trace says which overload it was.
+  if (isRisingWaveInternalResetsError(error)) {
+    return { errorKind: "rw_internal_resets", failureStage: "query", ...(code && isSqlState(code) ? { sqlstate: code } : {}) };
+  }
+  // RisingWave not there (restart window): served as an overload, traced as
+  // the connect error it is.
+  if (isRisingWaveUnreachableError(error)) {
+    return { errorKind: "rw_connect_error", failureStage: "connect", driverCode: code === "ECONNREFUSED" ? "ECONNREFUSED" : "RW_DRIVER_UNKNOWN" };
   }
   if (code && isSqlState(code)) {
     if (isConnectionSqlState(code)) {
@@ -164,7 +144,7 @@ function classifyRisingWaveError(error: unknown): {
 }
 
 function errorClass(error: unknown): string {
-  return error instanceof Error ? error.name : typeof error;
+  return errorClassOf(error);
 }
 
 function errorCode(error: unknown): string | undefined {

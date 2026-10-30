@@ -1,7 +1,9 @@
 import type { ChildProcess } from "node:child_process";
+import type { RuntimeCompactionInterruption } from "@botiverse/raft-shared";
 import type { ActiveSpan, AgentConfig, AgentMessage, RuntimeModelSourceOutcome, SubagentLineage, Tracer, AxSurfaceText } from "@botiverse/raft-shared";
-import type { AgentProxyInboxCoordinator } from "../agentCredentialProxy.js";
-import type { AgentAppInboxStore } from "../agentAppInbox.js";
+import type { AgentProxyInboxCoordinator } from "../agentCredentialProxy";
+import type { AgentAppInboxStore } from "../agentAppInbox";
+import type { SpawnContextGeneration } from "../contextGeneration";
 
 // ── Runtime Contracts ──
 // Behavior-level contracts that describe how the daemon should interact with a
@@ -91,19 +93,27 @@ export interface RuntimeModelContract {
 // Runtime recovery notices are visible recovery facts: they explain daemon-side
 // fallback without refreshing progress or satisfying initial-turn readiness.
 
+export type RuntimeTokenUsageKind = "cumulative_session" | "per_turn" | "per_generation" | "unknown";
+
 export type ParsedEvent =
+  | { kind: "provider_request"; activity: import("@botiverse/raft-shared").ProviderRequestActivity }
   | { kind: "session_init"; sessionId: string }
   | ({ kind: "thinking"; text: string; runtimeTurn?: RuntimeTurnAttribution } & SubagentLineage)
   | ({ kind: "text"; text: string; runtimeTurn?: RuntimeTurnAttribution } & SubagentLineage)
-  | ({ kind: "tool_call"; name: string; input: any } & SubagentLineage)
-  | ({ kind: "tool_output"; name: string } & SubagentLineage)
+  // `callId` is the runtime's id for the call when it reports one; `tool_output`
+  // with the same id ends that call. `ok` is whether the tool call itself
+  // succeeded (a non-zero `exitCode` is still ok); `durationMs` is the
+  // runtime's own measurement, used instead of the daemon's when present.
+  | ({ kind: "tool_call"; name: string; input: any; callId?: string } & SubagentLineage)
+  | ({ kind: "tool_output"; name: string; callId?: string; ok?: boolean; durationMs?: number; exitCode?: number } & SubagentLineage)
   | { kind: "compaction_started" }
   | { kind: "compaction_finished" }
   | {
       kind: "compaction_interrupted";
       outcome: "compaction_failed_or_exhausted" | "aborted";
       reason: "manual" | "threshold" | "overflow" | "unknown";
-      failureReason?: "recovery_exhausted" | "compaction_failed";
+      failureReason?: "recovery_exhausted" | "input_too_large" | "compaction_failed";
+      willRetry?: boolean;
     }
   | { kind: "review_started" }
   | { kind: "review_finished" }
@@ -118,6 +128,15 @@ export type ParsedEvent =
       nativeReasonPresent?: boolean;
       reasonProvenance?: "runtime_error_event" | "codex_native_reason" | "daemon_fallback";
       terminalReason?: "compaction_failed_or_exhausted";
+      /**
+       * task #379: the runtime declared a provider limit. Either kind takes the
+       * existing `rate_limited` delivery backoff (recoverable, cleared by real
+       * progress); `quota_exhausted` means the window is used up until it
+       * resets, `transient_rate_limit` is a short throttle. `resetsAt` is only
+       * set when the runtime reported it; it is never inferred.
+       */
+      providerLimit?: { kind: "quota_exhausted" | "transient_rate_limit"; resetsAt?: string };
+      compaction?: RuntimeCompactionInterruption;
       startupRequestMethod?:
         | "initialize"
         | "thread/start"
@@ -163,6 +182,12 @@ export type ParsedEvent =
       subagentType?: string;
       /** Claude `system` task-lifecycle envelope id. */
       taskId?: string;
+      /**
+       * task #1260 — terminal status of a `task_notification` envelope, the
+       * closed vocabulary Claude documents (completed | failed | stopped).
+       * Absent on other phases and on an unknown status value.
+       */
+      taskStatus?: "completed" | "failed" | "stopped";
       /** Bounded tool name from the envelope's `last_tool_name`, if present. */
       lastToolName?: string;
       payloadBytes?: number;
@@ -183,8 +208,8 @@ export type ParsedEvent =
     }
   | {
       kind: "runtime_recovery";
-      source: "codex_resume_missing_rollout" | "codex_resume_thread_writer_busy" | "grok_resume_missing_session";
-      resumeErrorClass: "missing_rollout" | "thread_writer_busy" | "missing_session";
+      source: "codex_resume_missing_rollout" | "codex_resume_thread_writer_busy" | "codex_resume_archived" | "grok_resume_missing_session";
+      resumeErrorClass: "missing_rollout" | "thread_writer_busy" | "archived" | "missing_session";
       recoveryAction: "fallback_fresh_thread";
       message: string;
       details?: string;
@@ -206,9 +231,9 @@ export type ParsedEvent =
     }
   | {
       kind: "telemetry";
-      name: "token_usage" | "rate_limits" | "recovery";
+      name: "token_usage" | "usage_omission" | "rate_limits" | "recovery" | "request_diagnostic";
       source?: string;
-      usageKind?: "cumulative_session" | "per_turn" | "unknown";
+      usageKind?: RuntimeTokenUsageKind;
       sessionId?: string;
       turnId?: string;
       runtimeResultId?: string;
@@ -248,11 +273,32 @@ export interface SpawnContext {
   slockHome?: string;
   launchId?: string | null;
   processInstanceId?: string | null;
+  /**
+   * task #1277 — cancels this start attempt. Aborted when the agent is stopped
+   * or the attempt is replaced while the driver is still resolving or
+   * spawning; never by a connection change. Drivers pass it to their bounded
+   * probe children and must not create a child once it is aborted.
+   */
+  launchSignal?: AbortSignal;
   agentCredentialProxyInboxCoordinator?: AgentProxyInboxCoordinator;
+  /**
+   * RFC 072 context id this spawn publishes, planned by the daemon so the
+   * start input it books and the id the CLI reads are the same (glimpse G0).
+   * Absent: the transport plans its own.
+   */
+  contextGeneration?: SpawnContextGeneration;
   /** Shared per-agent Computer-local app Inbox used by the credential proxy. */
   agentAppInbox?: AgentAppInboxStore;
   cliTransportTraceDir?: string | null;
   tracer?: Tracer;
+  /**
+   * task #365: throws when the launch was claimed against a server
+   * connection that is no longer the current one. Every driver calls it after
+   * its last await and immediately before the runtime comes into existence
+   * (a child process: right before `spawn()`; a native session: before its
+   * session factory), so no process is created for a stale launch.
+   */
+  assertLaunchCurrent?: () => void;
 }
 
 // ── Spawn Result ──
@@ -262,10 +308,33 @@ export interface SpawnResult {
   process: ChildProcess;
 }
 
+/**
+ * Structured cause for an unavailable runtime probe. Log severity is chosen from
+ * this, never from the diagnostic text: only "not_installed" (the command was
+ * not found on PATH / in its known install locations) is an expected state for
+ * an optional runtime; every other reason means something is installed but
+ * broken and stays a warning.
+ */
+export type RuntimeProbeUnavailableReason =
+  | "not_installed"
+  | "probe_failed"
+  | "probe_timeout"
+  | "permission_denied"
+  | "unsupported_version";
+
 export interface RuntimeProbeResult {
   available: boolean;
   version?: string;
   diagnostic?: string;
+  /**
+   * task #1240 — bounded one-line timing of the PATH lookup behind this probe
+   * (phase, ms, budget, outcome per child; no values, output or paths). Goes
+   * to the detection trace event; it is not a diagnostic, so a healthy
+   * runtime does not warn because of it.
+   */
+  lookupTiming?: string;
+  /** Set only when `available` is false. Absent means unknown (treated as a failure). */
+  unavailableReason?: RuntimeProbeUnavailableReason;
 }
 
 export interface RuntimeLaunchVersionPolicy {
@@ -495,6 +564,16 @@ export interface RuntimeDriver {
   readonly supportsNativeStandingPrompt?: boolean;
 
   /**
+   * task #13: the runtime rebuilds the standing prompt from this launch on
+   * every start, so a resumed session already runs on the current prompt
+   * (Pi / Built-in: systemPromptOverride; OpenCode: per-process agent config;
+   * Kimi SDK: resumeSession renders the given roleAdditional).
+   * Absent/false: a resumed session keeps its original prompt, and the daemon
+   * re-delivers a changed one in the first input (standingPromptRefresh.ts).
+   */
+  readonly standingPromptRefreshesOnResume?: boolean;
+
+  /**
    * Driver-owned live busy-delivery gate. APM lifecycle state must never claim
    * a direct steer is available when the runtime driver has already closed the
    * native turn. Drivers without a narrower native gate may omit this method.
@@ -530,6 +609,13 @@ export interface RuntimeDriver {
    * session rollovers/forks are preserved as telemetry sequence boundaries.
    */
   readonly currentSessionId?: string | null;
+
+  /**
+   * Whether the runtime itself reports a turn as accepted or running. Drivers
+   * that track the native turn lifecycle (Codex app-server) expose it so the
+   * daemon's busy state can be checked against evidence; omit when unknown.
+   */
+  readonly hasLiveTurn?: boolean;
 
   /**
    * Runtime-native state root observed from launch env or initialize metadata,

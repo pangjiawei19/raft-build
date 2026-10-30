@@ -1,13 +1,16 @@
 import { asc, and, eq, inArray, isNull, sql } from "drizzle-orm";
-import type { DatabaseExecutor } from "../db/index.js";
-import { attachmentObjects, attachments } from "../db/schema.js";
+import type { DatabaseExecutor } from "../db/index";
+import { attachmentObjects, attachments } from "../db/schema";
 import {
   AttachmentLifecycleError,
   consumeAttachmentReservationsWithExecutor,
   lockAttachmentReservationsForConsumeWithExecutor,
-} from "./attachmentLifecycleService.js";
+} from "./attachmentLifecycleService";
+import { assertChannelWritableInTransaction } from "./channelConversionFenceService";
+import { UUID_RE } from "../lib/messageId";
 
 export type AttachmentLinkErrorCode =
+  | "attachment_id_invalid"
   | "attachment_duplicate"
   | "attachment_not_found"
   | "attachment_already_linked"
@@ -32,6 +35,25 @@ export type AttachmentLinkMode = "new" | "replay";
 export type AttachmentLinkHooks = Readonly<{
   afterObjectAndReservationLocks?: () => Promise<void>;
 }>;
+
+/** Names the entry by position only; the rejected value is never echoed. */
+export function attachmentIdInvalidMessage(entryNumber: number): string {
+  return `Not sent: attachmentIds entry ${entryNumber} is not a single attachment ID. `
+    + "Each entry must be one ID returned when the file was uploaded. "
+    + "CLI: pass one ID per --attachment-id and repeat the flag for more files. "
+    + "API/SDK: put one ID in each attachmentIds entry.";
+}
+
+/**
+ * Reject ids that are not UUIDs before they reach a uuid column, where
+ * Postgres answers 22P02 and the send used to fail as a 500 (task #20; agents
+ * passed `--attachment-id "id1 id2"`).
+ */
+function assertWellFormedAttachmentIds(attachmentIds: string[]): void {
+  const index = attachmentIds.findIndex((id) => typeof id !== "string" || !UUID_RE.test(id));
+  if (index < 0) return;
+  throw new AttachmentLinkError("attachment_id_invalid", attachmentIdInvalidMessage(index + 1));
+}
 
 function assertNoDuplicateAttachmentIds(attachmentIds: string[]): void {
   const seen = new Set<string>();
@@ -137,6 +159,7 @@ export async function linkAttachmentsToMessageWithExecutor(
   now?: Date,
   hooks: AttachmentLinkHooks = {},
 ): Promise<typeof attachments.$inferSelect[]> {
+  assertWellFormedAttachmentIds(attachmentIds);
   assertNoDuplicateAttachmentIds(attachmentIds);
 
   if (mode === "replay") {
@@ -177,10 +200,18 @@ export async function linkAttachmentsToMessageWithExecutor(
       id: attachments.id,
       uploaderId: attachments.uploaderId,
       messageId: attachments.messageId,
+      channelId: attachments.channelId,
     })
     .from(attachments)
     .where(inArray(attachments.id, attachmentIds))
     .for("update");
+
+  for (const channelId of new Set(rows.map((row) => row.channelId))) {
+    // DatabaseExecutor is the transaction contract. Keep the writer fence
+    // unconditional so production and test adapters cannot silently diverge
+    // based on runtime object shape.
+    await assertChannelWritableInTransaction(executor, channelId);
+  }
 
   const byId = new Map(rows.map((row) => [row.id, row]));
   const missingOrForeignId = attachmentIds.find((id) => byId.get(id)?.uploaderId !== uploaderId);

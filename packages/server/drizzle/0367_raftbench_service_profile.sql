@@ -1,0 +1,1 @@
+ALTER TABLE "agent_runtime_provisions" ADD COLUMN "provisioned_profile" text;

@@ -1,9 +1,22 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Badge, DropdownMenuPopup, TaskStatusBadge } from "@botiverse/raft-ui";
+import type { BadgeProps, TaskStatusId } from "@botiverse/raft-ui";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Pencil, Check } from "lucide-react";
+import { ChevronDown } from "lucide-react";
 
-import SelectionPopover from "./ui/SelectionPopover";
+import { InlineBadgeMenuItem } from "./InlineBadgeMenuItem";
+import { SelectionPopoverPanel, SELECTION_POPOVER_SURFACE } from "./ui/SelectionPopover";
+import Tooltip from "./ui/Tooltip";
+import { dismissLayerProps } from "./ui/dismissLayer";
+
+export type InlineBadgeOption = { id: string; label: string; avatar?: ReactNode };
+
+function noop() {}
+
+function stopPropagation(event: { stopPropagation(): void }) {
+  event.stopPropagation();
+}
 
 interface InlineBadgeEditorProps {
   /** Display label shown in the badge */
@@ -12,20 +25,21 @@ interface InlineBadgeEditorProps {
   selectedId: string;
   /** `avatar` is rendered in a reserved leading slot, so a list of people lines
    *  up whether or not every entry has a picture. Status passes none. */
-  options: { id: string; label: string; avatar?: ReactNode }[];
+  options: InlineBadgeOption[];
   onSelect: (id: string) => Promise<void> | void;
   open: boolean;
   onToggle: () => void;
   onRequestClose?: () => void;
   badgeClassName: string;
-  capitalize?: boolean;
+  badgeVariant?: BadgeProps["variant"];
   /**
-   * Apply the brutal uppercase + tracking-wide transform on the
-   * trigger badge. Defaults to true (matches Badge primitive). Status
-   * pills mixed with case-sensitive identifiers (`@assignee`) pass
-   * `false`. stdrc msg=ce25da45 + msg=65681d15 (option B).
+   * When set, the trigger renders raft-ui's `TaskStatusBadge` for this status,
+   * so the icon + colours come from the single task-status source instead of a
+   * caller-supplied `badgeClassName`. Status callsites use this; other badges
+   * (e.g. a non-status pill) keep the generic `badgeClassName` path.
    */
-  uppercase?: boolean;
+  badgeStatus?: TaskStatusId;
+  capitalize?: boolean;
   dropdownMinWidth?: string;
   dropdownAlign?: "left" | "right";
   disabled?: boolean;
@@ -65,8 +79,9 @@ export default function InlineBadgeEditor({
   onToggle,
   onRequestClose,
   badgeClassName,
+  badgeVariant = "muted",
+  badgeStatus,
   capitalize,
-  uppercase = true,
   dropdownMinWidth = "min-w-[120px]",
   dropdownAlign,
   disabled,
@@ -179,106 +194,107 @@ export default function InlineBadgeEditor({
     if (input instanceof HTMLInputElement && document.activeElement !== input) input.focus();
   }, [open, searchable, dropdownStyle]);
 
+  const selectionOptions = useMemo(() => {
+    const reserveLeadingSlot = options.some((o) => o.avatar);
+    return options.map((opt) => ({
+      key: opt.id,
+      label: opt.label,
+      checked: opt.id === selectedId,
+      avatar: opt.avatar,
+      reserveLeadingSlot,
+      onClick: () => { void onSelect(opt.id); },
+    }));
+  }, [options, selectedId, onSelect]);
+
   const dropdown = open && searchable ? (
     // Same portal and same measured position as the plain list — only the panel
-    // itself is delegated. SelectionPopover brings its own border/shadow, so the
-    // wrapper must not also be `card-brutal` or the popup gets a double frame.
+    // itself is delegated. SelectionPopover brings its own popover surface, so
+    // the wrapper must not draw a second frame.
     <div
       ref={dropdownRef}
       style={dropdownStyle}
       data-testid={dropdownTestId}
-      onMouseDown={(event) => event.stopPropagation()}
-      onClick={(event) => event.stopPropagation()}
+      onMouseDown={stopPropagation}
+      onClick={stopPropagation}
     >
-      <SelectionPopover
+      <SelectionPopoverPanel
         searchable
         title={popoverTitle ?? ""}
         showHeader={!!popoverTitle}
         search={search}
-        onSearchChange={onSearchChange ?? (() => {})}
+        onSearchChange={onSearchChange ?? noop}
         searchPlaceholder={searchPlaceholder}
         emptyLabel={emptyLabel}
-        className="w-[240px] border-2 border-black bg-white shadow-brutal"
-        options={options.map((opt) => ({
-          key: opt.id,
-          label: opt.label,
-          checked: opt.id === selectedId,
-          avatar: opt.avatar,
-          reserveLeadingSlot: options.some((o) => o.avatar),
-          onClick: () => { void onSelect(opt.id); },
-        }))}
+        className={`w-[240px] ${SELECTION_POPOVER_SURFACE}`}
+        options={selectionOptions}
       />
     </div>
   ) : open ? (
-    <div
+    <DropdownMenuPopup
       ref={dropdownRef}
       style={dropdownStyle}
-      className={`card-brutal overflow-y-auto ${dropdownMinWidth}`}
+      className={`overflow-y-auto ${dropdownMinWidth}`}
       data-testid={dropdownTestId}
-      onMouseDown={(event) => event.stopPropagation()}
-      onClick={(event) => event.stopPropagation()}
+      {...dismissLayerProps}
+      onMouseDown={stopPropagation}
+      onClick={stopPropagation}
     >
-      {/* Dropdown chrome aligned to the Select / SelectionPopover family per
-          stdrc #proj-theme:ac79cf20 msg=832c2c02 + msg=b0b92c1c
-          (2026-05-25): no yellow hover, no yellow selected; hover =
-          `bg-soft-signal/30` (shared with SegmentedControl unselected
-          and MenuItem); ✓ on the right (trailing slot is the canonical
-          selected indicator). */}
-      {options.map((opt) => {
-        const isSelected = opt.id === selectedId;
-        return (
-          <button
-            key={opt.id}
-            type="button"
-            onClick={async () => {
-              await onSelect(opt.id);
-            }}
-            data-testid={optionTestIdPrefix ? `${optionTestIdPrefix}-${opt.id}` : undefined}
-            className="flex w-full items-center justify-between gap-2 px-3 py-2 text-sm text-left transition-colors bg-white hover:bg-soft-signal/30"
-          >
-            <span className="flex min-w-0 items-center gap-2">
-              {opt.avatar}
-              <span className="truncate">{opt.label}</span>
-            </span>
-            <Check size={14} className={`shrink-0 ${isSelected ? "opacity-100" : "opacity-0"}`} />
-          </button>
-        );
-      })}
-    </div>
+      {options.map((opt) => (
+        <InlineBadgeMenuItem
+          key={opt.id}
+          option={opt}
+          selected={opt.id === selectedId}
+          onSelect={onSelect}
+          testId={optionTestIdPrefix ? `${optionTestIdPrefix}-${opt.id}` : undefined}
+        />
+      ))}
+    </DropdownMenuPopup>
   ) : null;
 
-  // Trigger badge matches the brutal Badge visual contract (stdrc
-  // #proj-theme:ac79cf20 msg=832c2c02): uppercase + tracking-wide. Source
-  // content stays Title Case ("In Progress") so future non-brutal themes
-  // can render it natural-cased.
-  // Interactive hover for solid-bg brutal badges: filter brightness shift
-  // (cross-tone — works on any `bg-brutal-{tone}` without per-tone classes).
-  // Transition target lists `filter` AND `opacity` because the disabled
-  // state below uses `disabled:opacity-60`. stdrc msg=3d60f9dd #proj-theme
-  // — the older `hover:opacity-70 transition-colors` was a mismatch
-  // (transition target didn't cover opacity, so the state snapped).
-  const defaultButtonClassName = `mt-0.5 inline-flex items-center gap-1 border-2 border-black ${badgeClassName} px-2 py-0.5 text-xs font-bold ${uppercase ? "uppercase tracking-wide " : ""}text-black transition-[filter,opacity] duration-100 hover:brightness-90 disabled:cursor-not-allowed disabled:opacity-60${capitalize ? " capitalize" : ""}`;
+  // Raft Design System › StatusChip: an editable chip is a 22px soft chip
+  // with a trailing chevron. raft-ui's Badge draws the chip, its hover/press
+  // overlay and its disabled state; this class only lays the trigger out and
+  // carries the caller's tone class. No case transform: Title Case copy
+  // ("In Progress") renders as written.
+  const defaultButtonClassName = `mt-0.5 inline-flex items-center gap-1 ${badgeClassName} disabled:cursor-not-allowed${capitalize ? " capitalize" : ""}`;
+
+  const badge = badgeStatus ? (
+    <TaskStatusBadge
+      status={badgeStatus}
+      render={<button ref={triggerRef} type="button" disabled={disabled} />}
+      onClick={onToggle}
+      data-testid={buttonTestId}
+      data-task-status={buttonDataTaskStatus}
+      aria-label={buttonAriaLabel}
+      className={`mt-0.5 ${buttonClassName ?? ""}`.trim()}
+    >
+      {displayValue}
+      <ChevronDown size={12} aria-hidden="true" />
+    </TaskStatusBadge>
+  ) : (
+    <Badge
+      render={<button ref={triggerRef} type="button" disabled={disabled} />}
+      appearance="soft"
+      variant={badgeVariant}
+      onClick={onToggle}
+      data-testid={buttonTestId}
+      data-task-status={buttonDataTaskStatus}
+      data-slot="badge"
+      aria-label={buttonAriaLabel}
+      className={buttonClassName ?? defaultButtonClassName}
+    >
+      {buttonChildren ?? (
+        <>
+          {displayValue}
+          <ChevronDown size={12} aria-hidden="true" />
+        </>
+      )}
+    </Badge>
+  );
 
   return (
     <>
-      <button
-        ref={triggerRef}
-        type="button"
-        onClick={onToggle}
-        disabled={disabled}
-        data-testid={buttonTestId}
-        data-task-status={buttonDataTaskStatus}
-        title={buttonTitle}
-        aria-label={buttonAriaLabel}
-        className={buttonClassName ?? defaultButtonClassName}
-      >
-        {buttonChildren ?? (
-          <>
-            {displayValue}
-            <Pencil size={10} className="opacity-40" />
-          </>
-        )}
-      </button>
+      {buttonTitle ? <Tooltip content={buttonTitle}>{badge}</Tooltip> : badge}
       {dropdown && createPortal(dropdown, document.body)}
     </>
   );

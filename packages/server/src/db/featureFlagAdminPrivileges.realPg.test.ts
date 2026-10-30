@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import path from "node:path";
-import { test } from "vitest";
 import { fileURLToPath } from "node:url";
 
 import pg from "pg";
@@ -10,7 +9,7 @@ import {
   reconcileAndVerifyFeatureFlagAdminPrivileges,
   verifyFeatureFlagAdminPrivileges,
   verifyFeatureFlagAdminPrivilegeReceipt,
-} from "./featureFlagAdminPrivileges.js";
+} from "./featureFlagAdminPrivileges";
 
 const ADMIN_URL = process.env.FEATURE_FLAG_ADMIN_PRIVILEGES_REAL_PG_URL;
 const REQUIRED = process.env.FEATURE_FLAG_ADMIN_PRIVILEGES_REAL_PG_REQUIRED === "1";
@@ -47,8 +46,27 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
 
   await target.query("CREATE TABLE announcements (id uuid PRIMARY KEY, status text NOT NULL)");
   await target.query("CREATE TABLE announcement_audit_events (id uuid PRIMARY KEY, announcement_id uuid NOT NULL)");
+  await target.query(`CREATE TABLE announcement_image_assets (
+    id uuid PRIMARY KEY,
+    storage_key text NOT NULL UNIQUE,
+    content_type text NOT NULL,
+    width integer NOT NULL,
+    height integer NOT NULL,
+    size_bytes integer NOT NULL,
+    created_by_user_id uuid,
+    created_by_agent_id uuid,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    unreferenced_since timestamptz,
+    deleting_at timestamptz
+  )`);
   await target.query("CREATE TABLE users (id uuid PRIMARY KEY, email text NOT NULL)");
-  await target.query("CREATE TABLE servers (id uuid PRIMARY KEY, slug text NOT NULL, deleted_at timestamptz, name text NOT NULL)");
+  await target.query("CREATE TABLE servers (id uuid PRIMARY KEY, slug text NOT NULL, deleted_at timestamptz, name text NOT NULL, plan text NOT NULL DEFAULT 'free', kind text NOT NULL DEFAULT 'normal')");
+  await target.query("CREATE TABLE server_members (server_id uuid NOT NULL, user_id uuid NOT NULL, role text NOT NULL DEFAULT 'member')");
+  await target.query("CREATE TABLE subscriptions (id uuid PRIMARY KEY, server_id uuid NOT NULL, plan text NOT NULL, status text NOT NULL, stripe_customer_id text NOT NULL)");
+  await target.query("CREATE TABLE lab_definitions (key text PRIMARY KEY, state text NOT NULL, name text NOT NULL, description text NOT NULL DEFAULT '', created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), version integer NOT NULL DEFAULT 1)");
+  await target.query("CREATE TABLE server_lab_access (server_id uuid PRIMARY KEY, enabled boolean NOT NULL, version bigint NOT NULL)");
+  await target.query("CREATE TABLE server_lab_enrollments (server_id uuid NOT NULL, lab_key text NOT NULL, enabled boolean NOT NULL, version bigint NOT NULL, PRIMARY KEY (server_id, lab_key))");
+  await target.query("CREATE TABLE agents (id uuid PRIMARY KEY, server_id uuid NOT NULL, deleted_at timestamptz, name text NOT NULL, system_prompt text)");
   await target.query("CREATE TABLE feature_flags (key text PRIMARY KEY, enabled boolean NOT NULL DEFAULT true)");
   await target.query("CREATE TABLE feature_flag_rules (id uuid PRIMARY KEY, flag_key text NOT NULL REFERENCES feature_flags(key) ON DELETE CASCADE, stage text NOT NULL)");
   await target.query("CREATE TABLE feature_flag_audiences (key text PRIMARY KEY, name text NOT NULL, description text NOT NULL DEFAULT '', enabled boolean NOT NULL DEFAULT false)");
@@ -79,6 +97,34 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
     ),
     "utf8",
   );
+  const previewPrivilegeMigration = readFileSync(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../drizzle/0267_feature_flag_admin_preview_privileges.sql",
+    ),
+    "utf8",
+  );
+  const labPrivilegeMigration = readFileSync(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../drizzle/0303_feature_flag_admin_lab_definitions_privileges.sql",
+    ),
+    "utf8",
+  );
+  const traceIdentityPrivilegeMigration = readFileSync(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../drizzle/0312_feature_flag_admin_trace_identity_privileges.sql",
+    ),
+    "utf8",
+  );
+  const announcementImagePrivilegeMigration = readFileSync(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../drizzle/0333_feature_flag_admin_announcement_image_privileges.sql",
+    ),
+    "utf8",
+  );
 
   // 0240 may be journaled where the production-only role is absent, but it
   // installs a reconciler instead of silently becoming a no-op. Required mode
@@ -86,6 +132,12 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await target.query(migration);
   await target.query(audienceMigration.slice(reconcilerStart));
   await target.query(deletePrivilegeMigration);
+  await target.query(previewPrivilegeMigration);
+  await target.query(labPrivilegeMigration);
+  await target.query(traceIdentityPrivilegeMigration);
+  await target.query(announcementImagePrivilegeMigration);
+  const targetingMigration = readFileSync(new URL("../../drizzle/0355_announcement_targeting.sql", import.meta.url), "utf8");
+  await target.query(targetingMigration.replaceAll("--> statement-breakpoint", ""));
   await assert.rejects(
     reconcileAndVerifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values)),
     (error: unknown) => (error as { code?: string }).code === "42704",
@@ -100,16 +152,26 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   );
   await admin.query(`CREATE ROLE ${WRONG_LOGIN_ROLE} NOLOGIN`);
 
+  await target.query(`GRANT SELECT (server_id, user_id, role) ON TABLE public.server_members TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+
   // A hand-built copy of the complete grants is deliberately insufficient:
   // state readback can pass, but the migration receipt remains absent.
   await target.query(`GRANT USAGE ON SCHEMA public TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT SELECT, INSERT, UPDATE ON TABLE public.announcements TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT SELECT, INSERT ON TABLE public.announcement_audit_events TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.announcement_image_assets TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.feature_flags, public.feature_flag_rules TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT SELECT, INSERT, UPDATE ON TABLE public.feature_flag_audiences TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT SELECT, INSERT, DELETE ON TABLE public.feature_flag_audience_members TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await target.query(`GRANT SELECT (id) ON TABLE public.users TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
-  await target.query(`GRANT SELECT (id, slug, deleted_at) ON TABLE public.servers TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT (id, slug, deleted_at, plan, kind) ON TABLE public.servers TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT (server_id, plan, status) ON TABLE public.subscriptions TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT (server_id, lab_key, enabled) ON TABLE public.server_lab_enrollments TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT (server_id, enabled) ON TABLE public.server_lab_access TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT (key, name, description, state, created_at, updated_at) ON TABLE public.lab_definitions TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT INSERT (key, name, description, state, created_at, updated_at) ON TABLE public.lab_definitions TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT UPDATE (name, description, state, updated_at) ON TABLE public.lab_definitions TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await target.query(`GRANT SELECT (id, server_id, deleted_at) ON TABLE public.agents TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await verifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values));
   await assert.rejects(
     verifyFeatureFlagAdminPrivilegeReceipt((text, values) => target.query(text, values)),
@@ -132,6 +194,10 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await operator.query("UPDATE announcements SET status = 'published'");
   await operator.query("INSERT INTO announcement_audit_events (id, announcement_id) VALUES ('00000000-0000-0000-0000-000000000002', '00000000-0000-0000-0000-000000000001')");
   await operator.query("SELECT id FROM announcement_audit_events");
+  await operator.query("INSERT INTO announcement_image_assets (id, storage_key, content_type, width, height, size_bytes) VALUES ('00000000-0000-4000-8000-000000000008', 'announcements/images/00000000-0000-4000-8000-000000000008', 'image/png', 3, 1, 64)");
+  await operator.query("SELECT id, storage_key FROM announcement_image_assets");
+  await operator.query("UPDATE announcement_image_assets SET unreferenced_since = NOW() WHERE id = '00000000-0000-4000-8000-000000000008'");
+  await operator.query("DELETE FROM announcement_image_assets WHERE id = '00000000-0000-4000-8000-000000000008'");
   await operator.query("INSERT INTO feature_flags (key) VALUES ('temporary')");
   await operator.query("INSERT INTO feature_flag_rules (id, flag_key, stage) VALUES ('00000000-0000-4000-8000-000000000005', 'temporary', 'server')");
   await operator.query("UPDATE feature_flag_rules SET stage = 'user' WHERE flag_key = 'temporary'");
@@ -144,13 +210,29 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await operator.query("SELECT id FROM feature_flag_audience_members");
   await operator.query("DELETE FROM feature_flag_audience_members WHERE audience_key = 'insiders'");
   await operator.query("SELECT id FROM users");
-  await operator.query("SELECT id, slug, deleted_at FROM servers");
+  await operator.query("SELECT server_id, user_id, role FROM server_members");
+  await assert.rejects(operator.query("UPDATE server_members SET role = 'member'"),
+    (error: unknown) => (error as { code?: string }).code === "42501");
+  await operator.query("SELECT id, slug, deleted_at, plan FROM servers");
+  await operator.query("SELECT server_id, plan, status FROM subscriptions");
+  await operator.query("SELECT server_id, lab_key, enabled FROM server_lab_enrollments");
+  await operator.query("SELECT server_id, enabled FROM server_lab_access");
+  await operator.query("SELECT key, name, description, state, created_at, updated_at FROM lab_definitions");
+  // Labs catalog admin (0303): the exact INSERT/UPDATE shapes the Worker issues.
+  await operator.query("INSERT INTO lab_definitions (key, name, description, state, created_at, updated_at) VALUES ('lab_tmp', 'Tmp', '', 'draft', NOW(), NOW())");
+  await operator.query("UPDATE lab_definitions SET name = 'Tmp2', description = 'd', state = 'open', updated_at = NOW() WHERE key = 'lab_tmp'");
+  // Trace identity lookup (0312): the Worker reads only these agents columns and HMACs the ids itself.
+  await operator.query("SELECT id, server_id, deleted_at FROM agents");
   await assert.rejects(
     operator.query("DELETE FROM announcements"),
     (error: unknown) => (error as { code?: string }).code === "42501",
   );
   await assert.rejects(
     operator.query("UPDATE announcement_audit_events SET announcement_id = announcement_id"),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
+  await assert.rejects(
+    operator.query("TRUNCATE announcement_image_assets"),
     (error: unknown) => (error as { code?: string }).code === "42501",
   );
   await assert.rejects(
@@ -169,6 +251,44 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
     operator.query("SELECT name FROM servers"),
     (error: unknown) => (error as { code?: string }).code === "42501",
   );
+  await assert.rejects(
+    operator.query("SELECT stripe_customer_id FROM subscriptions"),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
+  await assert.rejects(
+    operator.query("SELECT version FROM server_lab_enrollments"),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
+  await assert.rejects(
+    operator.query("SELECT version FROM server_lab_access"),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
+  await assert.rejects(
+    operator.query("SELECT version FROM lab_definitions"),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
+  await assert.rejects(
+    operator.query("UPDATE lab_definitions SET key = key"),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
+  await assert.rejects(
+    operator.query("DELETE FROM lab_definitions"),
+    (error: unknown) => (error as { code?: string }).code === "42501",
+  );
+  for (const forbiddenAgentsQuery of [
+    "SELECT name FROM agents",
+    "SELECT system_prompt FROM agents",
+    "SELECT * FROM agents",
+    "INSERT INTO agents (id, server_id, name) VALUES ('00000000-0000-4000-8000-000000000006', '00000000-0000-4000-8000-000000000007', 'a')",
+    "UPDATE agents SET deleted_at = NOW()",
+    "DELETE FROM agents",
+  ]) {
+    await assert.rejects(
+      operator.query(forbiddenAgentsQuery),
+      (error: unknown) => (error as { code?: string }).code === "42501",
+      forbiddenAgentsQuery,
+    );
+  }
 
   // SET ROLE changes current_user but not the authenticated session_user. A
   // broad Hyperdrive login with a startup role must not satisfy readiness.
@@ -239,6 +359,13 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   );
   await reconcileAndVerifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values));
 
+  await target.query(`REVOKE DELETE ON TABLE public.announcement_image_assets FROM ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await assert.rejects(
+    verifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values)),
+    /missing:public\.announcement_image_assets:DELETE/,
+  );
+  await reconcileAndVerifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values));
+
   await target.query(`REVOKE DELETE ON TABLE public.feature_flag_rules FROM ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
   await assert.rejects(
     verifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values)),
@@ -264,6 +391,13 @@ test("real PostgreSQL proves durable reconciliation, exact grants, and binding i
   await assert.rejects(
     verifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values)),
     /unexpected:public\.users:email:UPDATE/,
+  );
+  await reconcileAndVerifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values));
+
+  await target.query(`GRANT SELECT (name) ON TABLE public.agents TO ${FEATURE_FLAG_ADMIN_OPERATOR_ROLE}`);
+  await assert.rejects(
+    verifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values)),
+    /unexpected:public\.agents:name:SELECT/,
   );
   await reconcileAndVerifyFeatureFlagAdminPrivileges((text, values) => target.query(text, values));
 

@@ -15,14 +15,13 @@
 //     shows net new additions; if everyone is already a member, the
 //     submit button is disabled with a hint.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Hash, Lock } from "lucide-react";
 import DialogCard from "../ui/DialogCard";
 import { useIntl } from "react-intl";
 import Banner from "../ui/Banner";
 import {
   ChannelMemberListShell,
-  ChannelMemberRemoveButton,
   ChannelMemberRow,
   ChannelMemberSectionHeader,
 } from "./ChannelMemberList";
@@ -31,6 +30,8 @@ import { useServerStore } from "../../store/serverStore";
 import { useChannelStore } from "../../store/channelStore";
 import { useChannelMembers } from "../../hooks/useChannelMembers";
 import { isLocalProjectionMember } from "../../utils/channelLocalMembership";
+import { Button, Card, IconTile } from "@botiverse/raft-ui";
+import { CandidateRemoveButton } from "./CandidateRemoveButton";
 
 interface Props {
   channelId: string;
@@ -64,6 +65,8 @@ interface Props {
    * error.
    */
   onSubmitError?: (err: unknown) => void;
+  actionCardMessageId?: string;
+  actionCardConfirmationVersion?: number;
 }
 
 export default function AddMembersDialog({
@@ -75,6 +78,8 @@ export default function AddMembersDialog({
   onSubmitted,
   onSubmitStart,
   onSubmitError,
+  actionCardMessageId,
+  actionCardConfirmationVersion,
 }: Props) {
   const { formatMessage } = useIntl();
   const channels = useChannelStore((s) => s.channels);
@@ -161,29 +166,29 @@ export default function AddMembersDialog({
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  function toggleHuman(id: string) {
+  const toggleHuman = useCallback((id: string) => {
     setSelectedHumanIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  }
+  }, []);
 
-  function toggleAgent(id: string) {
+  const toggleAgent = useCallback((id: string) => {
     setSelectedAgentIds((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
-  }
+  }, []);
 
   const nothingToAdd = candidateHumans.length === 0 && candidateAgents.length === 0;
   const nothingSelected = selectedHumanIds.size === 0 && selectedAgentIds.size === 0;
   const canSubmit = !submitting && !nothingToAdd && !nothingSelected;
 
-  async function handleSubmit() {
+  const handleSubmit = useCallback(async () => {
     if (!canSubmit || !channel) return;
     setSubmitting(true);
     setError(null);
@@ -192,7 +197,11 @@ export default function AddMembersDialog({
     const userIds = [...selectedHumanIds];
     const agentIds = [...selectedAgentIds];
     try {
-      await addMembers({ userIds, agentIds });
+      await addMembers({
+        userIds, agentIds,
+        ...(actionCardMessageId ? { actionCardMessageId } : {}),
+        ...(actionCardConfirmationVersion !== undefined ? { actionCardConfirmationVersion } : {}),
+      });
       onSubmitted({
         channelId: channel.id,
         channelName: channel.name,
@@ -212,7 +221,20 @@ export default function AddMembersDialog({
     } finally {
       setSubmitting(false);
     }
-  }
+  }, [
+    canSubmit,
+    channel,
+    onSubmitStart,
+    selectedHumanIds,
+    selectedAgentIds,
+    addMembers,
+    actionCardMessageId,
+    actionCardConfirmationVersion,
+    onSubmitted,
+    onClose,
+    formatMessage,
+    onSubmitError,
+  ]);
 
   // Ensure the dialog reflects the latest channel membership before
   // computing candidate filters — without this, freshly-added members
@@ -223,32 +245,32 @@ export default function AddMembersDialog({
 
   return (
     <DialogCard title={formatMessage({ id: "channel.addMembers.title" })} onClose={onClose}>
-        <div className="mb-3 flex items-center gap-2 border-2 border-black/15 bg-brutal-cream p-2 text-sm">
-          {channel?.type === "private" ? (
-            <Lock size={14} className="shrink-0" />
-          ) : (
-            <Hash size={14} className="shrink-0" />
-          )}
-          <span className="font-bold">{channel?.name ?? formatMessage({ id: "channel.addMembers.unknownChannel" })}</span>
-          <span className="text-black/55">{formatMessage({ id: "channel.addMembers.targetChannelSuffix" })}</span>
+        {/* The target channel is a place: the neutral channel tile (DS
+            ChannelIcon, never coloured) and its name. */}
+        <div className="mb-3 flex min-w-0 items-center gap-2 text-callout text-foreground">
+          <IconTile size="sm">
+            {channel?.type === "private" ? <Lock /> : <Hash />}
+          </IconTile>
+          <span className="truncate font-bold">{channel?.name ?? formatMessage({ id: "channel.addMembers.unknownChannel" })}</span>
+          <span className="shrink-0 text-foreground-muted">{formatMessage({ id: "channel.addMembers.targetChannelSuffix" })}</span>
         </div>
 
         {draftHint ? (
-          <div className="mb-3 border-l-2 border-black/20 pl-2 text-xs italic text-black/55">
+          <div className="mb-3 border-l-2 border-line-seam pl-2.5 text-callout text-foreground-muted">
             {draftHint}
           </div>
         ) : null}
 
         {error ? (
-          <Banner intent="warning" className="mb-3 text-xs font-bold">
+          <Banner intent="warning" className="mb-3">
             {error}
           </Banner>
         ) : null}
 
         {nothingToAdd ? (
-          <div className="mb-4 border-2 border-black/15 bg-white p-3 text-sm text-black/55">
+          <Card className="mb-4 p-3 text-callout text-foreground-hint">
             {formatMessage({ id: "channel.addMembers.nothingToAdd" })}
-          </div>
+          </Card>
         ) : (
           <ChannelMemberListShell className="mb-4" data-testid="add-members-action-list">
             {candidateAgents.length > 0 ? (
@@ -266,9 +288,10 @@ export default function AddMembersDialog({
                           name={a.displayName ?? a.name}
                           secondary={a.description}
                           trailing={(
-                            <ChannelMemberRemoveButton
+                            <CandidateRemoveButton
+                              id={a.id}
                               label={formatMessage({ id: "channel.addMembers.removeFromList" }, { name: a.displayName ?? a.name })}
-                              onClick={() => toggleAgent(a.id)}
+                              onRemove={toggleAgent}
                             />
                           )}
                         />
@@ -294,9 +317,10 @@ export default function AddMembersDialog({
                           name={m.displayName ?? m.name}
                           secondary={m.description ?? (m.displayName && m.displayName !== m.name ? `@${m.name}` : null)}
                           trailing={(
-                            <ChannelMemberRemoveButton
+                            <CandidateRemoveButton
+                              id={m.userId}
                               label={formatMessage({ id: "channel.addMembers.removeFromList" }, { name: m.displayName ?? m.name })}
-                              onClick={() => toggleHuman(m.userId)}
+                              onRemove={toggleHuman}
                             />
                           )}
                         />
@@ -309,20 +333,20 @@ export default function AddMembersDialog({
           </ChannelMemberListShell>
         )}
 
-        <div className="flex justify-end gap-2">
-          <button
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button size="lg"
+            variant="ghost"
             type="button"
             onClick={onClose}
             disabled={submitting}
-            className="btn-brutal bg-white px-4 py-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {formatMessage({ id: "common.confirm.cancel" })}
-          </button>
-          <button
+          </Button>
+          <Button size="lg"
+            variant="accent"
             type="button"
             onClick={handleSubmit}
             disabled={!canSubmit}
-            className="btn-brutal bg-brutal-pink px-4 py-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {submitting
               ? formatMessage({ id: "channel.addMembers.adding" })
@@ -330,7 +354,7 @@ export default function AddMembersDialog({
                   { id: "channel.addMembers.submit" },
                   { count: selectedHumanIds.size + selectedAgentIds.size },
                 )}
-          </button>
+          </Button>
         </div>
     </DialogCard>
   );

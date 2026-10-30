@@ -59,8 +59,8 @@ Accounts are human-only. Agents have their own identity (see [Agent](/agent-know
 - Time format (12-hour / 24-hour)
 
 **Appearance** (in Settings → Appearance tab)
+- Theme: Light, Dark, or System (follows the device); saved on this device
 - Message font size (sm / md / lg)
-- **No dark mode toggle today** (verified missing — agents should not promise this)
 
 **Log out**
 - Settings → Account → **Log out** (confirmation dialog)
@@ -87,7 +87,6 @@ Note: agents don't have human Accounts. They have agent credentials + identities
 - **No personal API key / PAT.** Raft doesn't have user-level access tokens. Authentication is via sign-in providers (email-password, Google, GitHub) — no scriptable API key for a human user.
 - **No 2FA / TOTP enrollment.**
 - **No data export / GDPR download.**
-- **No dark mode.**
 - **No SSO / SAML config.** Only Google + GitHub OAuth as alternative sign-in providers.
 - **Agents can't impersonate or modify human accounts.** Agent CLI is scoped to its own credential; can't touch human-user settings.
 

@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { cleanup, render } from "@testing-library/react";
 import AgentActivityDot from "../src/components/agent/AgentActivityDot";
 import StatusDot from "../src/components/ui/StatusDot";
@@ -13,26 +12,37 @@ afterEach(() => {
   useAgentStore.setState({ agents: [], agentActivities: {} } as never);
 });
 
-test("StatusDot external prop forces bg-brutal-cyan regardless of activity", () => {
+// The pixel is raft-ui `Status`: its presence light is the `data-presence` it
+// publishes (the colour comes from raft-ui's one presence map).
+const presenceOf = (el: Element | null | undefined) => el?.getAttribute("data-presence") ?? null;
+
+test("StatusDot external prop forces the external presence light regardless of activity", () => {
   const external = render(<StatusDot activity="online" external />);
-  assert.match(
-    external.container.firstElementChild?.className ?? "",
-    /(^|\s)bg-brutal-cyan(\s|$)/,
-    "external=true must produce bg-brutal-cyan, ignoring activity",
-  );
-  assert.doesNotMatch(
-    external.container.firstElementChild?.className ?? "",
-    /(^|\s)bg-brutal-lime(\s|$)/,
-    "external tone must not keep the managed online lime",
+  assert.equal(
+    presenceOf(external.container.firstElementChild),
+    "external",
+    "external=true must produce the external (cyan) presence light, ignoring activity",
   );
   cleanup();
 
   const managed = render(<StatusDot activity="online" />);
-  assert.match(
-    managed.container.firstElementChild?.className ?? "",
-    /(^|\s)bg-brutal-lime(\s|$)/,
-    "managed online remains lime so the external override is not vacuous",
+  assert.equal(
+    presenceOf(managed.container.firstElementChild),
+    "online",
+    "managed online remains the online light so the external override is not vacuous",
   );
+});
+
+test("StatusDot is the DS presence pixel: square, ink-edged, static", () => {
+  const el = render(<StatusDot activity="working" />).container.firstElementChild;
+  assert.equal(el?.getAttribute("data-slot"), "status", "the pixel is raft-ui Status");
+  assert.equal(presenceOf(el), "busy", "working maps onto the busy light");
+  const dot = el?.className ?? "";
+  assert.match(dot, /rounded-\[2px\] border-\[1\.5px\] border-sticker-ink/);
+  assert.doesNotMatch(dot, /rounded-full|animate-/);
+  cleanup();
+  const offline = render(<StatusDot />).container.firstElementChild;
+  assert.equal(presenceOf(offline), "offline", "no activity and no tone falls back to the offline stone light");
 });
 
 test("AgentActivityDot passes external agent identity through to StatusDot", () => {
@@ -65,9 +75,9 @@ test("AgentActivityDot passes external agent identity through to StatusDot", () 
       <AgentActivityDot agentId="agent-external" />
     </TestIntlProvider>,
   );
-  assert.match(
-    external.container.firstElementChild?.className ?? "",
-    /(^|\s)bg-brutal-cyan(\s|$)/,
+  assert.equal(
+    presenceOf(external.container.firstElementChild),
+    "external",
     "external agents must render the neutral cyan status dot",
   );
   cleanup();
@@ -77,9 +87,9 @@ test("AgentActivityDot passes external agent identity through to StatusDot", () 
       <AgentActivityDot agentId="agent-managed" />
     </TestIntlProvider>,
   );
-  assert.match(
-    managed.container.firstElementChild?.className ?? "",
-    /(^|\s)bg-brutal-lime(\s|$)/,
+  assert.equal(
+    presenceOf(managed.container.firstElementChild),
+    "online",
     "managed online agents still use the lime liveness dot",
   );
 });

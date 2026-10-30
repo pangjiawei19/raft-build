@@ -1,6 +1,22 @@
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { Hash, MessageSquare } from "lucide-react";
+import {
+  Badge,
+  MessageQuotedPreviewAttachment,
+  MessageQuotedPreviewAttachments,
+  MessageQuotedPreviewAuthor,
+  MessageQuotedPreviewAuthorMeta,
+  MessageQuotedPreviewAuthorName,
+  MessageQuotedPreviewChannel,
+  MessageQuotedPreviewContent,
+  MessageQuotedPreviewHeader,
+  MessageQuotedPreviewText,
+  MessageQuotedPreviewThread,
+  MessageQuotedPreviewTimestamp,
+  MessageQuotedPreviewUnavailable,
+} from "@botiverse/raft-ui";
+import type { BadgeProps } from "@botiverse/raft-ui";
 import AvatarSlot from "../AvatarSlot";
 import InlineMarkdownPreview from "../../markdown/InlineMarkdownPreview";
 import PreviewShell from "../PreviewShell";
@@ -27,22 +43,26 @@ export interface QuotedMessageCardProps {
 export function Tag({
   children,
   className,
+  variant = "muted",
 }: {
   children: ReactNode;
-  className: string;
+  className?: string;
+  variant?: BadgeProps["variant"];
 }) {
   return (
-    <span className={`inline-flex items-center gap-1 border-[1.5px] border-black px-1.5 py-0.5 text-[11px] font-bold leading-none ${className}`}>
+    <Badge appearance="soft" variant={variant} className={className}>
       {children}
-    </span>
+    </Badge>
   );
 }
 
+/** "Thread" marker in a preview header. A hint, not a signal: it takes the
+ *  part's ink-3 type (raft-ui `MessageQuotedPreviewThread`), no pink. */
 export function ThreadMarker() {
   const intl = useIntl();
   return (
-    <span className="inline-flex items-center gap-1 font-bold text-brutal-pink">
-      <MessageSquare size={10} className="shrink-0" />
+    <span className="inline-flex items-center gap-1">
+      <MessageSquare size={14} className="shrink-0" aria-hidden="true" />
       {intl.formatMessage({ id: "ui.quotedMessage.thread" })}
     </span>
   );
@@ -76,61 +96,74 @@ export default function QuotedMessageCard({
   if (unavailable) {
     return (
       <PreviewShell variant="muted" onClick={onClick} data-testid="quoted-message-card" className="group block w-full text-left">
-        <div className="px-2.5 py-2 sm:px-3 sm:py-2.5">
-          <div className="text-[13px] leading-snug">{intl.formatMessage({ id: "ui.quotedMessage.unavailable" })}</div>
-        </div>
+        {/* The card is the frame here, so the part's own quote bar is dropped. */}
+        <MessageQuotedPreviewUnavailable className="border-l-0 px-3 py-2.5">
+          <div>{intl.formatMessage({ id: "ui.quotedMessage.unavailable" })}</div>
+        </MessageQuotedPreviewUnavailable>
       </PreviewShell>
     );
   }
 
   return (
     <PreviewShell onClick={onClick} data-testid="quoted-message-card" className="group block w-full text-left">
-      <div className="px-2.5 py-2 sm:px-3 sm:py-2.5">
-        <div className="mb-1 flex items-start gap-2 sm:mb-1.5">
-          <div className="min-w-0 flex flex-1 flex-wrap items-center gap-x-1.5 gap-y-1 text-xs leading-none">
-            <span className="inline-flex items-center gap-1 font-bold text-black/70">
-              {channelKind === "dm" ? null : <Hash size={11} className="shrink-0" />}
+      <div className="px-3 py-2.5">
+        <MessageQuotedPreviewHeader className="mb-1 flex items-start gap-2">
+          <div className="min-w-0 flex flex-1 flex-wrap items-center gap-x-1.5 gap-y-1">
+            <MessageQuotedPreviewChannel className="inline-flex items-center gap-1">
+              {channelKind === "dm" ? null : <Hash size={14} className="shrink-0" aria-hidden="true" />}
               {channelKind === "dm" ? `@${channelName}` : channelName}
-            </span>
-            <span className="text-black/30">·</span>
-            <span className="inline-flex min-w-0 items-center gap-1.5">
+            </MessageQuotedPreviewChannel>
+            <span className="text-foreground-hint">·</span>
+            <MessageQuotedPreviewAuthor className="inline-flex min-w-0 items-center gap-1.5">
               <CompactUserAvatar author={author} />
-              <span className="truncate font-bold text-black/70">{author.name}</span>
+              <MessageQuotedPreviewAuthorName className="min-w-0 truncate">
+                {author.name}
+              </MessageQuotedPreviewAuthorName>
               {author.subtitle ? (
-                <span className="truncate font-mono text-[10px] text-black/40">{author.subtitle}</span>
+                <MessageQuotedPreviewAuthorMeta className="min-w-0 flex-1 max-w-fit truncate">
+                  {author.subtitle}
+                </MessageQuotedPreviewAuthorMeta>
               ) : null}
-            </span>
+            </MessageQuotedPreviewAuthor>
             {isThread ? (
               <>
-                <span className="text-black/30">·</span>
-                <ThreadMarker />
+                <span className="text-foreground-hint">·</span>
+                <MessageQuotedPreviewThread>
+                  <ThreadMarker />
+                </MessageQuotedPreviewThread>
               </>
             ) : null}
             {isArchived ? (
               <>
-                <span className="text-black/30">·</span>
-                <Tag className="bg-brutal-orange/30 text-black">
+                <span className="text-foreground-hint">·</span>
+                {/* Archived is a stopped state, not a problem: stone, not orange. */}
+                <Tag variant="muted">
                   {intl.formatMessage({ id: "ui.quotedMessage.archived" })}
                 </Tag>
               </>
             ) : null}
           </div>
-          <span className="shrink-0 font-mono text-[10px] text-black/40">{timestamp}</span>
-        </div>
-        <div className="min-w-0">
-          <div className="line-clamp-2 text-xs leading-snug text-black sm:text-[13px]">
+          <MessageQuotedPreviewTimestamp className="shrink-0">
+            {timestamp}
+          </MessageQuotedPreviewTimestamp>
+        </MessageQuotedPreviewHeader>
+        <MessageQuotedPreviewContent className="min-w-0">
+          <MessageQuotedPreviewText className="line-clamp-2">
             <InlineMarkdownPreview markdown={content} />
-          </div>
+          </MessageQuotedPreviewText>
           {attachments?.length ? (
-            <div className="mt-2 flex flex-wrap gap-1.5">
+            <MessageQuotedPreviewAttachments className="flex flex-wrap gap-1.5">
+              {/* The raft-ui attachment part is itself the DS token chip
+                  (22px, sunken fill, Space Mono), so the label sits in it
+                  directly rather than in a second badge. */}
               {attachments.map((attachment) => (
-                <Tag key={attachment.label} className="bg-brutal-lavender font-mono text-[10px] font-bold text-black">
+                <MessageQuotedPreviewAttachment key={attachment.label}>
                   {attachment.label}
-                </Tag>
+                </MessageQuotedPreviewAttachment>
               ))}
-            </div>
+            </MessageQuotedPreviewAttachments>
           ) : null}
-        </div>
+        </MessageQuotedPreviewContent>
       </div>
     </PreviewShell>
   );

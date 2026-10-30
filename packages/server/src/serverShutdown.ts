@@ -1,6 +1,8 @@
 export interface ServerShutdownDeps {
   stopAcceptingHttp(): Promise<void>;
   releaseMachineOwnership(): Promise<void>;
+  /** Let background workers finish the operation in flight (bounded by each worker). */
+  settleWorkers(): Promise<void>;
   flushTraces(): Promise<void>;
   shutdownSharedState(): Promise<void>;
   warn(message: string, reason: unknown): void;
@@ -16,10 +18,11 @@ export async function shutdownServerRuntime(deps: ServerShutdownDeps): Promise<v
   const results = await Promise.allSettled([
     httpDrain,
     deps.releaseMachineOwnership(),
-    deps.flushTraces(),
+    // Traces flush after the workers settle, so their last spans are written.
+    deps.settleWorkers().then(() => deps.flushTraces()),
   ]);
 
-  const labels = ["drain HTTP server", "shutdown agent orchestrator", "flush server traces"];
+  const labels = ["drain HTTP server", "shutdown agent orchestrator", "settle workers and flush server traces"];
   for (const [index, result] of results.entries()) {
     if (result.status === "rejected") {
       deps.warn(`Failed to ${labels[index]}`, result.reason);

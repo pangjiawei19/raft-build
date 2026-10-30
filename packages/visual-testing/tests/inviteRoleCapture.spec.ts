@@ -16,11 +16,14 @@ import { fileURLToPath } from "node:url";
 // Repo-root `artifacts/visual-testing/` is the gitignored home for local
 // visual-testing playwright output; do not invent a new untracked directory.
 const OUT = resolve(dirname(fileURLToPath(import.meta.url)), "../../../artifacts/visual-testing/invite-role");
-const CASE = (id: string, theme: "brutal" | "elegant") =>
-  `/visual-testing.html?case=${id}` + (theme === "elegant" ? "&theme=elegant" : "");
+type Mode = "light" | "dark";
+// The visual host reads its mode from `?theme=dark` and renders light
+// otherwise (requestedMode in packages/web/visual-testing/VisualTestingCases.tsx).
+const CASE = (id: string, mode: Mode) =>
+  `/visual-testing.html?case=${id}` + (mode === "dark" ? "&theme=dark" : "");
 
-for (const theme of ["brutal", "elegant"] as const) {
-  test(`invite per-row role — ${theme}`, async ({ page }) => {
+for (const mode of ["light", "dark"] as const) {
+  test(`invite per-row role — ${mode}`, async ({ page }) => {
     mkdirSync(OUT, { recursive: true });
     // Desktop width too: the dialog is max-w-lg, so at the 390px mobile viewport
     // it is clamped and the widening is invisible.
@@ -33,7 +36,7 @@ for (const theme of ["brutal", "elegant"] as const) {
     await page.route("**/feature-flags/evaluate", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ values: { server_guest_v0: true }, resolved: true }) }));
 
-    await page.goto(CASE("components.members.invite-human.per-row-role", theme));
+    await page.goto(CASE("components.members.invite-human.per-row-role", mode));
 
     const emails = page.getByRole("textbox", { name: "Email address" });
     await expect(emails).toHaveCount(1);
@@ -50,20 +53,20 @@ for (const theme of ["brutal", "elegant"] as const) {
     await page.getByRole("option", { name: "Guest" }).click();
 
     await expect(page.getByRole("button", { name: /Remove invitee/ })).toHaveCount(2);
-    await page.screenshot({ path: `${OUT}/per-row-role-${theme}.png` });
+    await page.screenshot({ path: `${OUT}/per-row-role-${mode}.png` });
   });
 
-  test(`invite gate off — ${theme}`, async ({ page }) => {
+  test(`invite gate off — ${mode}`, async ({ page }) => {
     mkdirSync(OUT, { recursive: true });
     await page.route("**/join-links", (route) =>
       route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify([{ id: "link-1", token: "join-token" }]) }));
-    await page.goto(CASE("components.members.invite-human.gate-off", theme));
+    await page.goto(CASE("components.members.invite-human.gate-off", mode));
 
     const emails = page.getByRole("textbox", { name: "Email address" });
     await expect(emails).toHaveCount(1);
     await emails.first().fill("colleague@example.com");
     // No role column at all when Guest is not on offer.
     await expect(page.getByRole("combobox", { name: "Role" })).toHaveCount(0);
-    await page.screenshot({ path: `${OUT}/gate-off-${theme}.png` });
+    await page.screenshot({ path: `${OUT}/gate-off-${mode}.png` });
   });
 }

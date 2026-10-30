@@ -1,7 +1,12 @@
+import { CheckoutPromotionUnavailableError } from "../services/checkoutPromotion";
 import { Router, type Router as RouterType, type Request, type Response } from "express";
 import { canMutateBilling, canReadBillingSummary } from "@botiverse/raft-shared";
-import * as billingService from "../services/billingService.js";
-import { getActorServerRoleInServer } from "../lib/actorPermissions.js";
+import * as billingService from "../services/billingService";
+import { getActorServerRoleInServer } from "../lib/actorPermissions";
+import { sendJsonServerError } from "./errorResponse";
+import { isAgentRuntimeProviderEnabledForServer, isAgentRuntimeProviderKillSwitched, serverHasHostedProvision } from "../services/agentRuntimeProviderFeature";
+import { getHostedRuntimeSpend, parseHostedSpendQuery } from "../services/hostedRuntimeSpendService";
+import { addTraceEvent } from "../tracing/semanticTrace";
 
 export const billingRouter: RouterType = Router();
 
@@ -62,6 +67,10 @@ billingRouter.post("/checkout", async (req: Request, res: Response) => {
 
     res.json({ url });
   } catch (err: any) {
+    if (err instanceof CheckoutPromotionUnavailableError) {
+      res.status(400).json({ error: "Promotion code is unavailable", code: err.code });
+      return;
+    }
     console.error("[Billing] Checkout error:", err);
     const message = err?.message ?? "";
     if (message.includes("is not configured")) {
@@ -69,7 +78,11 @@ billingRouter.post("/checkout", async (req: Request, res: Response) => {
     } else if (message.includes("must be")) {
       res.status(400).json({ error: message });
     } else {
-      res.status(500).json({ error: "Failed to create checkout session" });
+      sendJsonServerError(req, res, {
+        error: "Failed to create checkout session",
+        logPrefix: "[Billing] Checkout error:",
+        err,
+      });
     }
   }
 });
@@ -97,7 +110,11 @@ async function handleSeatPackQuantityUpdate(req: Request, res: Response) {
     } else if (isSeatPackQuantityRequestError(message)) {
       res.status(400).json({ error: message });
     } else {
-      res.status(500).json({ error: "Failed to update pack quantity" });
+      sendJsonServerError(req, res, {
+        error: "Failed to update pack quantity",
+        logPrefix: "[Billing] Seat pack quantity update error:",
+        err,
+      });
     }
   }
 }
@@ -125,7 +142,11 @@ async function handleSeatPackQuantityPreview(req: Request, res: Response) {
     } else if (isSeatPackQuantityRequestError(message)) {
       res.status(400).json({ error: message });
     } else {
-      res.status(500).json({ error: "Failed to preview pack quantity update" });
+      sendJsonServerError(req, res, {
+        error: "Failed to preview pack quantity update",
+        logPrefix: "[Billing] Seat pack quantity preview error:",
+        err,
+      });
     }
   }
 }
@@ -161,7 +182,11 @@ billingRouter.post("/cancel", async (req: Request, res: Response) => {
     } else if (message.includes("does not have")) {
       res.status(400).json({ error: message });
     } else {
-      res.status(500).json({ error: "Failed to cancel subscription" });
+      sendJsonServerError(req, res, {
+        error: "Failed to cancel subscription",
+        logPrefix: "[Billing] Cancellation error:",
+        err,
+      });
     }
   }
 });
@@ -193,8 +218,11 @@ billingRouter.post("/portal", async (req: Request, res: Response) => {
     const url = await billingService.createPortalSession(req.serverId!, returnUrl);
     res.json({ url });
   } catch (err: any) {
-    console.error("[Billing] Portal error:", err);
-    res.status(500).json({ error: "Failed to create portal session" });
+    sendJsonServerError(req, res, {
+      error: "Failed to create portal session",
+      logPrefix: "[Billing] Portal error:",
+      err,
+    });
   }
 });
 
@@ -216,6 +244,71 @@ billingRouter.get("/subscription", async (req: Request, res: Response) => {
     });
   } catch {
     res.status(500).json({ error: "Failed to get subscription" });
+  }
+});
+
+// GET /api/billing/hosted-runtime-usage — the server's spend on its hosted
+// runtime (antiproton), as the provider reports it: today against the daily
+// limit and totals by UTC day or month. Owners and admins only. 404
+// `hosted_runtime_spend_not_enabled` when the server has no hosted runtime (the
+// Plan page hides the card); display-only, estimated, never stored.
+billingRouter.get("/hosted-runtime-usage", async (req: Request, res: Response) => {
+  try {
+    const member = await getActorServerRoleInServer(req.serverId!, "user", req.userId!);
+    if (!canReadBillingSummary(member)) {
+      res.status(403).json({ error: "Only server owners and admins can view cloud agent spend", code: "hosted_runtime_spend_forbidden" });
+      return;
+    }
+    // Spend on agents the server already has: shown while the flag is on or once it has had one
+    // (a lowered rollout rule doesn't hide existing spend); the kill switch still hides it.
+    const hostedSpendVisible = !await isAgentRuntimeProviderKillSwitched("antiproton")
+      && (await serverHasHostedProvision(req.serverId!, "antiproton") || await isAgentRuntimeProviderEnabledForServer(req.serverId!, "antiproton"));
+    if (!hostedSpendVisible) {
+      res.status(404).json({ error: "This server has no cloud agents", code: "hosted_runtime_spend_not_enabled" });
+      return;
+    }
+    const query = parseHostedSpendQuery(req.query);
+    if (!query.ok) {
+      res.status(400).json({ error: query.error, code: "hosted_runtime_spend_invalid_query" });
+      return;
+    }
+    const result = await getHostedRuntimeSpend(req.serverId!, "antiproton", { from: query.from, to: query.to, bucket: query.bucket });
+    res.setHeader("Cache-Control", "no-store");
+    if (result.kind === "ok") {
+      res.json(result.view);
+      return;
+    }
+    let status: number;
+    let code: string;
+    let reason: string;
+    if (result.kind === "unavailable") {
+      [status, code, reason] = [404, "hosted_runtime_spend_not_enabled", result.reason];
+    } else if (result.kind === "not_found") {
+      [status, code, reason] = [404, "hosted_runtime_spend_not_enabled", "provider_tenant_not_found"];
+    } else if (result.kind === "bad_request") {
+      [status, code, reason] = [400, "hosted_runtime_spend_invalid_query", result.error?.code ?? "provider_bad_request"];
+    } else {
+      [status, code, reason] = [502, "hosted_runtime_spend_unavailable", result.reason];
+    }
+    addTraceEvent("billing.hosted_runtime_spend.failed", {
+      route_action: "hosted_runtime_spend",
+      outcome: "error",
+      reason,
+      http_status: status,
+      response_code: code,
+    });
+    res.status(status).json({
+      error: status === 502 ? "The cloud agent provider did not answer; try again later" : "Cloud agent spend is not available",
+      code,
+    });
+  } catch {
+    addTraceEvent("billing.hosted_runtime_spend.failed", {
+      route_action: "hosted_runtime_spend",
+      outcome: "error",
+      reason: "exception",
+      http_status: 500,
+    });
+    res.status(500).json({ error: "Failed to get cloud agent spend" });
   }
 });
 

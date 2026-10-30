@@ -1,0 +1,1 @@
+ALTER TABLE "computers" ADD COLUMN "api_key_hmac" "bytea";

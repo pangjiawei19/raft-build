@@ -72,7 +72,9 @@ test.describe("P0 thread task status sync", () => {
     await page.getByTestId("panel-tab-tasks").click();
     await expect(page.getByTestId("channel-task-panel")).toBeVisible();
     const taskTitle = page.getByTestId("channel-task-panel").getByText(parentContent, { exact: true });
-    const taskCard = taskTitle.locator("xpath=ancestor::div[contains(@class, 'shadow-brutal-sm')][1]");
+    // The card root is the raft-ui TaskCard, identified by
+    // `data-slot="task-card"`.
+    const taskCard = taskTitle.locator("xpath=ancestor::*[@data-slot='task-card'][1]");
     await expect(taskCard).toBeVisible();
     await taskCard.getByRole("button", { name: /Todo/ }).click();
     await page.getByTestId("task-status-option-done").click();

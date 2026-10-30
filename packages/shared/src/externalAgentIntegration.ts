@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lazySchema } from "./lazySchema";
 
 export const EXTERNAL_AGENT_COMMS_PROTOCOL_VERSION = "agent-comms-core.v1" as const;
 export const EXTERNAL_AGENT_PROOF_SCHEMA_VERSION = "agent-proof.v1" as const;
@@ -72,12 +73,12 @@ export type ExternalAgentWakeEventOutcome = typeof externalAgentWakeEventOutcome
 export const externalAgentServerApiModeValues = ["interim-agent-api-events", "agent-inbox-protocol"] as const;
 export type ExternalAgentServerApiMode = typeof externalAgentServerApiModeValues[number];
 
-const nonEmptyStringSchema = z.string().min(1);
-const isoTimestampSchema = z.string().refine((value) => !Number.isNaN(Date.parse(value)), {
+const nonEmptyStringSchema = lazySchema("nonEmptyStringSchema", () => z.string().min(1));
+const isoTimestampSchema = lazySchema("isoTimestampSchema", () => z.string().refine((value) => !Number.isNaN(Date.parse(value)), {
   message: "must be a parseable timestamp",
-});
+}));
 
-export const externalRuntimeIntegrationManifestSchema = z.object({
+export const externalRuntimeIntegrationManifestSchema = lazySchema("externalRuntimeIntegrationManifestSchema", () => z.object({
   schema: z.literal(EXTERNAL_RUNTIME_INTEGRATION_MANIFEST_SCHEMA),
   runtimeId: nonEmptyStringSchema,
   integrationPattern: z.enum(externalAgentIntegrationPatternValues),
@@ -125,11 +126,11 @@ export const externalRuntimeIntegrationManifestSchema = z.object({
       message: "interim agent-api events mode must be delivery-only",
     });
   }
-});
+}));
 
 export type ExternalRuntimeIntegrationManifest = z.infer<typeof externalRuntimeIntegrationManifestSchema>;
 
-const externalAgentWakeEventBaseSchema = z.object({
+const externalAgentWakeEventBaseSchema = lazySchema("externalAgentWakeEventBaseSchema", () => z.object({
   schema: z.literal(EXTERNAL_AGENT_WAKE_EVENT_SCHEMA),
   eventId: nonEmptyStringSchema,
   attemptId: nonEmptyStringSchema,
@@ -145,17 +146,17 @@ const externalAgentWakeEventBaseSchema = z.object({
     source: z.enum(externalAgentLifecycleSourceValues),
     provenance: z.enum(externalAgentLifecycleProvenanceValues),
   }).strict(),
-}).strict();
+}).strict());
 
-export const externalAgentProofEventEnvelopeSchema = externalAgentWakeEventBaseSchema.extend({
+export const externalAgentProofEventEnvelopeSchema = lazySchema("externalAgentProofEventEnvelopeSchema", () => externalAgentWakeEventBaseSchema.extend({
   kind: z.literal("proof"),
   proofLevel: z.enum(externalAgentWakeProofLevelValues),
   outcome: z.literal("ok"),
   failureMeta: z.undefined().optional(),
   reason: z.string().optional(),
-});
+}));
 
-export const externalAgentFailedWakeEventEnvelopeSchema = externalAgentWakeEventBaseSchema.extend({
+export const externalAgentFailedWakeEventEnvelopeSchema = lazySchema("externalAgentFailedWakeEventEnvelopeSchema", () => externalAgentWakeEventBaseSchema.extend({
   kind: z.literal("wake_attempt"),
   proofLevel: z.undefined().optional(),
   outcome: z.literal("failed"),
@@ -164,12 +165,12 @@ export const externalAgentFailedWakeEventEnvelopeSchema = externalAgentWakeEvent
     retryAfterMs: z.number().int().positive().optional(),
   }).strict(),
   reason: nonEmptyStringSchema,
-});
+}));
 
-export const externalAgentWakeEventEnvelopeSchema = z.discriminatedUnion("kind", [
+export const externalAgentWakeEventEnvelopeSchema = lazySchema("externalAgentWakeEventEnvelopeSchema", () => z.discriminatedUnion("kind", [
   externalAgentProofEventEnvelopeSchema,
   externalAgentFailedWakeEventEnvelopeSchema,
-]);
+]));
 
 export type ExternalAgentProofEventEnvelope = z.infer<typeof externalAgentProofEventEnvelopeSchema>;
 export type ExternalAgentFailedWakeEventEnvelope = z.infer<typeof externalAgentFailedWakeEventEnvelopeSchema>;

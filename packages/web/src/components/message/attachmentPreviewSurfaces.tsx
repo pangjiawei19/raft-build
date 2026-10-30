@@ -1,30 +1,47 @@
+import {
+  Button,
+  Card,
+  CopyableCode,
+  CopyableCodeAction,
+  CopyableCodeRoot,
+  Spinner,
+  Tabs,
+  TabsLabel,
+  TabsList,
+  TabsTab,
+} from "@botiverse/raft-ui";
+import CloseButton from "../ui/CloseButton";
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { Download, MessageSquareMore, Music, Plus, X } from "lucide-react";
 import { useIntl } from "react-intl";
-import { Button } from "raft-ui";
 import Banner from "../ui/Banner";
-import Spinner from "../ui/Spinner";
 import Lightbox from "../ui/Lightbox";
 import SandboxedPreviewFrame from "../ui/SandboxedPreviewFrame";
+import CrossOriginPdfFrame from "../ui/CrossOriginPdfFrame";
 import MarkdownContent from "../markdown/MarkdownContent";
 import { createMarkdownOutlineHeadingComponents, extractMarkdownOutline, MarkdownOutlineNav } from "../markdown/MarkdownOutline";
 import AttachmentTooltip from "./attachmentTooltip";
 import { AttachmentCommentsPanel } from "./AttachmentCommentsPanel";
-import { captureNodeAnchor, captureSelectionAnchor, consumePendingVideoSeek } from "./attachmentCommentAnchors";
+import {
+  captureNodeAnchor,
+  captureSelectionAnchor,
+  consumePendingVideoSeek,
+  registerHtmlRegionJumpHandler,
+  registerVideoTimestampJumpHandler,
+} from "./attachmentCommentAnchors";
+import type { CommentAnchor, StoredAnchor } from "./attachmentCommentAnchors";
 import {
   ATTACHMENT_PREVIEW_EXTERNAL_LINK_COOLDOWN_MS,
   openAttachmentPreviewExternalLink,
+  validateAttachmentPreviewExternalLink,
 } from "./attachmentPreviewExternalLink";
 import type { AttachmentPreviewExternalLink } from "./attachmentPreviewExternalLink";
 import { createVideoSeekCoalescer } from "./videoTimestampSeekCoalesce";
-import { registerHtmlRegionJumpHandler, registerVideoTimestampJumpHandler } from "./attachmentCommentAnchors";
-import type { StoredAnchor } from "./attachmentCommentAnchors";
 import { useAttachmentPreviewBridge } from "./attachmentPreviewBridge";
-import { validateAttachmentPreviewExternalLink } from "./attachmentPreviewExternalLink";
-import type { CommentAnchor } from "./attachmentCommentAnchors";
 import type { DocumentAttachmentPreview } from "./attachmentPreview";
 import type { Message } from "../../store/messageStore";
+import { AttachmentTypeBadge } from "./AttachmentTypeBadge";
 
 /**
  * Attachment preview surfaces, extracted from MessageItem.
@@ -42,6 +59,10 @@ export const DOCUMENT_PREVIEW_LABEL_ID = {
   text: "message.messageItem.docPreviewText",
   pdf: "message.messageItem.docPreviewPdf",
 } as const;
+
+// Header tooltips all sit under their buttons; one shared object keeps the
+// prop referentially stable for AttachmentTooltip.
+const TOOLTIP_SIDE_BOTTOM_PROPS = { side: "bottom" } as const;
 
 export type PreviewCommentsContext = {
   attachmentId: string;
@@ -64,11 +85,17 @@ export function AttachmentPreviewShell({
   onDownload,
   layout = "fill",
   comments,
+  copyText,
+  onCopyError,
   children,
 }: {
   filename: string;
   onClose: () => void;
   onDownload: () => void;
+  /** Text the pane is showing, when it is copyable; the header then offers RUI's copy action. */
+  copyText?: string;
+  /** Called when that copy attempt fails; the host decides how to surface it. */
+  onCopyError?: (error: Error) => void;
   // Markdown previews need the portal root itself to scroll so Chrome's
   // native find-in-page can bring off-screen matches into view.
   layout?: "fill" | "browser-find";
@@ -120,12 +147,12 @@ export function AttachmentPreviewShell({
   // (>= sm) ignores this entirely — the aside/right-drawer behavior is
   // unchanged.
   const [sheetState, setSheetState] = useState<"collapsed" | "half">("collapsed");
-  const closeComments = () => {
+  const closeComments = useCallback(() => {
     setMode("preview");
     commitPendingAnchor(null);
     setCommentsOpen(false);
     setSheetState("collapsed");
-  };
+  }, [commitPendingAnchor]);
   const openComments = () => {
     captureSelectionContext();
     setPanelMounted(true);
@@ -199,11 +226,31 @@ export function AttachmentPreviewShell({
     setPanelMounted(true);
     setCommentsOpen(true);
   }, []);
+  // Stryker disable next-line ArrowFunction: anchor-clear sync is covered by attachment comment Playwright flows.
+  const clearPendingAnchor = useCallback(() => commitPendingAnchor(null), [commitPendingAnchor]);
+  const handleCopyError = useCallback((error: unknown) => {
+    onCopyError?.(error instanceof Error ? error : new Error(String(error)));
+  }, [onCopyError]);
   const previewCommentCtx = useMemo(
     // Stryker disable next-line ArrowFunction,ObjectLiteral: video timestamp pending-anchor propagation is covered by document attachment Playwright e2e.
     () => ({ commentMode, pendingAnchor, pushAnchor, getPendingAnchor, openPanel }),
     // Stryker disable next-line ArrayDeclaration: dependency freshness is exercised by the paused video timestamp Playwright flow.
     [commentMode, pendingAnchor, pushAnchor, getPendingAnchor, openPanel],
+  );
+  const sheetControls = useMemo(
+    () => ({
+      expanded: sheetState === "half",
+      onToggle: () => {
+        if (sheetState === "collapsed") {
+          setPanelMounted(true);
+          setCommentsOpen(true);
+          setSheetState("half");
+        } else {
+          closeComments();
+        }
+      },
+    }),
+    [sheetState, closeComments],
   );
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -221,7 +268,7 @@ export function AttachmentPreviewShell({
     <Lightbox
       onClose={onClose}
       data-testid={browserFindLayout ? "attachment-preview-browser-find-scroll" : undefined}
-      backdropClass={browserFindLayout ? "bg-brutal-cream" : undefined}
+      backdropClass={browserFindLayout ? "bg-layer-sidebar" : undefined}
       positionClass={browserFindLayout ? "fixed left-0 right-0 top-0 h-[100dvh] w-screen max-w-[100dvw] overflow-x-clip overflow-y-auto" : undefined}
       lockBodyScroll={!browserFindLayout}
       scrollIntoViewOnMount={browserFindLayout}
@@ -231,7 +278,7 @@ export function AttachmentPreviewShell({
             // scrolling) scroll container and silently defeats the header's
             // sticky against the window scroller (cindyz: "header should be
             // sticky", task #38). clip clips without capturing sticky.
-            "w-full max-w-[100dvw] overflow-x-clip bg-brutal-cream"
+            "w-full max-w-[100dvw] overflow-x-clip bg-layer-sidebar"
           : "flex flex-col items-center justify-center"
       }
     >
@@ -241,23 +288,30 @@ export function AttachmentPreviewShell({
           browserFindLayout
             ? // fixed, not sticky: WebKit (iPadOS Safari) ignores sticky
               // when <html> has overflow-y set by the browser-find layout.
-              "safe-top safe-left pointer-events-auto fixed left-0 right-0 top-0 z-10 max-w-[100dvw] overflow-x-clip border-b-2 border-black bg-white"
-            : "safe-top safe-left pointer-events-auto absolute left-0 right-0 top-0 z-10 border-b-2 border-black bg-white"
+              "safe-top safe-left pointer-events-auto fixed left-0 right-0 top-0 z-10 max-w-[100dvw] overflow-x-clip border-b border-line-seam bg-layer-canvas"
+            : "safe-top safe-left pointer-events-auto absolute left-0 right-0 top-0 z-10 border-b border-line-seam bg-layer-canvas"
         }
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex h-14 items-center gap-3 px-4">
-          <div className="flex min-w-0 flex-1 items-center" title={filename}>
-            <span className="min-w-0 flex-1 truncate text-sm font-display text-black">
+          <AttachmentTooltip content={filename}>
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <AttachmentTypeBadge
+              filename={filename}
+              data-testid="attachment-preview-type-badge"
+              className="h-4 w-8"
+            />
+            <span className="min-w-0 flex-1 truncate text-headline text-foreground">
               {filename}
             </span>
           </div>
+          </AttachmentTooltip>
           <div className="flex shrink-0 items-center gap-1.5">
             {comments ? (
               <Button
                 type="button"
-                size="icon-sm"
-                variant={commentsOpen ? "primary" : "default"}
+                size="icon-lg"
+                variant={commentsOpen ? "outline" : "ghost"}
                 data-message-affordance="attachment-preview-mode"
                 onClick={mode === "comment" ? exitCommentMode : enterCommentMode}
                 aria-label={formatMessage({ id: "message.messageItem.previewComment" })}
@@ -267,15 +321,30 @@ export function AttachmentPreviewShell({
                 <MessageSquareMore size={14} aria-hidden="true" />
               </Button>
             ) : null}
-            <AttachmentTooltip content={formatMessage({ id: "common.lightbox.download" })} contentProps={{ side: "bottom" }}>
-              <Button type="button" size="icon-sm" variant="default" onClick={onDownload} aria-label={formatMessage({ id: "common.lightbox.download" })}>
+            {copyText ? (
+              <CopyableCodeRoot
+                size="sm"
+                onError={handleCopyError}
+                className="w-auto shrink-0"
+                data-slot="copyable-code-root"
+              >
+                <CopyableCode className="sr-only" aria-hidden="true">{copyText}</CopyableCode>
+                <CopyableCodeAction
+                  size="icon-lg"
+                  variant="ghost"
+                  aria-label={formatMessage({ id: "common.lightbox.copy" })}
+                />
+              </CopyableCodeRoot>
+            ) : null}
+            <AttachmentTooltip content={formatMessage({ id: "common.lightbox.download" })} contentProps={TOOLTIP_SIDE_BOTTOM_PROPS}>
+              <Button type="button" size="icon-lg" variant="ghost" onClick={onDownload} aria-label={formatMessage({ id: "common.lightbox.download" })}>
                 <Download size={14} />
               </Button>
             </AttachmentTooltip>
-            <AttachmentTooltip content={formatMessage({ id: "common.lightbox.close" })} contentProps={{ side: "bottom" }}>
-              <Button type="button" size="icon-sm" variant="default" onClick={onClose} aria-label={formatMessage({ id: "common.lightbox.close" })}>
+            <AttachmentTooltip content={formatMessage({ id: "common.lightbox.close" })} contentProps={TOOLTIP_SIDE_BOTTOM_PROPS}>
+              <CloseButton type="button" size="icon-lg" onClick={onClose} aria-label={formatMessage({ id: "common.lightbox.close" })}>
                 <X size={14} />
-              </Button>
+              </CloseButton>
             </AttachmentTooltip>
           </div>
         </div>
@@ -291,10 +360,10 @@ export function AttachmentPreviewShell({
         onMouseUp={captureLiveSelection}
         className={
           browserFindLayout
-            ? `pointer-events-auto w-full max-w-[100dvw] overflow-x-clip bg-brutal-cream transition-[padding-right] duration-300 ease-in-out ${
+            ? `pointer-events-auto w-full max-w-[100dvw] overflow-x-clip bg-layer-sidebar transition-[padding-right] duration-300 ease-in-out ${
                 comments && commentsOpen ? "sm:pr-80" : ""
               }`
-            : "absolute bottom-0 left-0 right-0 overflow-hidden bg-white"
+            : "absolute bottom-0 left-0 right-0 overflow-hidden bg-layer-canvas"
         }
         style={
           browserFindLayout
@@ -318,8 +387,8 @@ export function AttachmentPreviewShell({
               // animation, but its controls (filter/resolve/composer) must
               // leave the tab order and the accessibility tree (Dozy review).
               inert={!commentsOpen}
-              className={`hidden h-full shrink-0 overflow-hidden border-black transition-[width] duration-300 ease-in-out sm:block ${
-                commentsOpen ? "w-80 border-l-2" : "w-0 border-l-0"
+              className={`hidden h-full shrink-0 overflow-hidden border-line-seam transition-[width] duration-300 ease-in-out sm:block ${
+                commentsOpen ? "w-80 border-l" : "w-0 border-l-0"
               }`}
             >
               <div className="h-full w-80">
@@ -330,8 +399,7 @@ export function AttachmentPreviewShell({
                     parentMessage={comments.parentMessage}
                     pendingAnchor={pendingAnchor}
                     getPendingAnchor={getPendingAnchor}
-                    // Stryker disable next-line ArrowFunction: anchor-clear sync is covered by attachment comment Playwright flows.
-                    onAnchorCleared={() => commitPendingAnchor(null)}
+                    onAnchorCleared={clearPendingAnchor}
                   />
                 ) : null}
               </div>
@@ -350,7 +418,7 @@ export function AttachmentPreviewShell({
            drawer move as one gesture. Narrow viewports use the bottom sheet
            below instead. */
         <div
-          className={`pointer-events-auto fixed bottom-0 right-0 z-20 hidden w-full max-w-80 border-l-2 border-t-2 border-black bg-white transition-transform duration-300 ease-in-out sm:block ${
+          className={`pointer-events-auto fixed bottom-0 right-0 z-20 hidden w-full max-w-80 border-l border-t border-line-seam bg-layer-canvas transition-transform duration-300 ease-in-out sm:block ${
             commentsOpen ? "translate-x-0" : "translate-x-full"
           }`}
           style={{ top: "calc(56px + env(safe-area-inset-top, 0px))" }}
@@ -366,8 +434,7 @@ export function AttachmentPreviewShell({
               parentMessage={comments.parentMessage}
               pendingAnchor={pendingAnchor}
               getPendingAnchor={getPendingAnchor}
-              // Stryker disable next-line ArrowFunction: anchor-clear sync is covered by attachment comment Playwright flows.
-              onAnchorCleared={() => commitPendingAnchor(null)}
+              onAnchorCleared={clearPendingAnchor}
             />
           ) : null}
         </div>
@@ -381,7 +448,7 @@ export function AttachmentPreviewShell({
            surface. */
         <div
           data-message-affordance="attachment-comments-sheet"
-          className={`pointer-events-auto fixed inset-x-0 bottom-0 z-20 flex flex-col border-t-2 border-black bg-white transition-[height] duration-300 ease-in-out sm:hidden ${
+          className={`pointer-events-auto fixed inset-x-0 bottom-0 z-20 flex flex-col border-t border-line-seam bg-layer-canvas transition-[height] duration-300 ease-in-out sm:hidden ${
             sheetState === "half" ? "h-[45dvh]" : "h-10"
           }`}
           onClick={(e) => e.stopPropagation()}
@@ -396,24 +463,12 @@ export function AttachmentPreviewShell({
             parentMessage={comments.parentMessage}
             pendingAnchor={pendingAnchor}
             getPendingAnchor={getPendingAnchor}
-            // Stryker disable next-line ArrowFunction: anchor-clear sync is covered by attachment comment Playwright flows.
-            onAnchorCleared={() => commitPendingAnchor(null)}
+            onAnchorCleared={clearPendingAnchor}
             // A chip jump on mobile means "show me the artifact": run the
             // full session boundary (Dozy review of a3a79538).
             onAnchorJump={closeComments}
             collapsedBody={sheetState === "collapsed"}
-            sheetControls={{
-              expanded: sheetState === "half",
-              onToggle: () => {
-                if (sheetState === "collapsed") {
-                  setPanelMounted(true);
-                  setCommentsOpen(true);
-                  setSheetState("half");
-                } else {
-                  closeComments();
-                }
-              },
-            }}
+            sheetControls={sheetControls}
           />
         </div>
       ) : null}
@@ -426,8 +481,8 @@ export function CsvPreviewPane({ preview, truncated }: { preview: Extract<Docume
   const { formatMessage } = useIntl();
   return (
     // No nested vertical scroller (browser-find layout) — see TextPreviewPane.
-    <div className="w-full bg-brutal-cream/45 p-4 font-mono text-[11px] text-black">
-      <div className="mb-2 flex items-center justify-between gap-3 text-xs font-bold text-black/55">
+    <div className="w-full bg-layer-sidebar p-4 font-mono text-mono-meta text-foreground">
+      <div className="mb-2 flex items-center justify-between gap-3 text-foreground-hint">
         <span>{formatMessage({ id: "message.messageItem.csvPreview" })}</span>
         <span>{truncated ? formatMessage({ id: "message.messageItem.csvRowsFirst" }, { count: preview.rows.length }) : formatMessage({ id: "message.messageItem.csvRows" }, { count: preview.rowCount })}{formatMessage({ id: "message.messageItem.csvColumns" }, { count: preview.columnCount })}</span>
       </div>
@@ -436,25 +491,25 @@ export function CsvPreviewPane({ preview, truncated }: { preview: Extract<Docume
           row. Known trade-off: the sticky thead pins to this wrapper (a
           scroll container), not the viewport — wide-table panning beats a
           pinned header here. */}
-      <div className="overflow-x-auto border-2 border-black bg-white shadow-brutal-sm">
-        <table className="min-w-full border-collapse bg-white">
-          <thead className="sticky top-0 z-10 bg-brutal-cream">
+      <Card className="overflow-x-auto">
+        <table className="min-w-full border-collapse bg-layer-card">
+          <thead className="sticky top-0 z-10 bg-fill-muted">
             <tr>
               {preview.headers.map((header, index) => (
-                <th key={`${header}-${index}`} className="max-w-[220px] border border-black px-2 py-1 text-left font-bold">
-                  <span className="block truncate" title={header}>{header || formatMessage({ id: "message.messageItem.columnFallback" }, { index: index + 1 })}</span>
+                <th key={`${header}-${index}`} className="max-w-[220px] border border-line-hairline px-2 py-1 text-left font-bold">
+                  <AttachmentTooltip content={header}><span className="block truncate">{header || formatMessage({ id: "message.messageItem.columnFallback" }, { index: index + 1 })}</span></AttachmentTooltip>
                 </th>
               ))}
             </tr>
           </thead>
           <tbody>
             {preview.rows.map((row, rowIndex) => (
-              <tr key={rowIndex} data-anchor-row={rowIndex + 1} className="odd:bg-black/[0.03]">
+              <tr key={rowIndex} data-anchor-row={rowIndex + 1} className="odd:bg-fill-muted/50">
                 {preview.headers.map((_, columnIndex) => {
                   const value = row[columnIndex] ?? "";
                   return (
-                    <td key={columnIndex} className="max-w-[220px] border border-black/40 px-2 py-1 align-top">
-                      <span className="block truncate" title={value}>{value}</span>
+                    <td key={columnIndex} className="max-w-[220px] border border-line-hairline px-2 py-1 align-top">
+                      <AttachmentTooltip content={value}><span className="block truncate">{value}</span></AttachmentTooltip>
                     </td>
                   );
                 })}
@@ -462,8 +517,8 @@ export function CsvPreviewPane({ preview, truncated }: { preview: Extract<Docume
             ))}
           </tbody>
         </table>
-      </div>
-      <div className="mt-2 text-xs font-bold text-black/50">
+      </Card>
+      <div className="mt-2 text-foreground-hint">
         {truncated
           ? formatMessage({ id: "message.messageItem.csvTruncatedPerf" }, { count: preview.rows.length })
           : formatMessage({ id: "message.messageItem.csvShowingOf" }, { shown: preview.rows.length, total: preview.rowCount })}
@@ -475,53 +530,57 @@ export function CsvPreviewPane({ preview, truncated }: { preview: Extract<Docume
 export function XlsxPreviewPane({ preview, truncated }: { preview: Extract<DocumentAttachmentPreview, { kind: "xlsx" }>; truncated: boolean }) {
   const { formatMessage } = useIntl();
   const [activeSheet, setActiveSheet] = useState(0);
+  // Declared before the !selected early return: hooks must not trail it.
+  const handleSheetChange = useCallback((next: string) => setActiveSheet(Number(next)), []);
   const selected = preview.sheets[Math.min(activeSheet, Math.max(0, preview.sheets.length - 1))];
   if (!selected) {
-    return <div className="w-full bg-brutal-cream/45 p-4 text-xs font-bold text-black/60">{formatMessage({ id: "message.messageItem.xlsxEmpty" })}</div>;
+    return <div className="w-full bg-layer-sidebar p-4 text-callout text-foreground-muted">{formatMessage({ id: "message.messageItem.xlsxEmpty" })}</div>;
   }
   const sheetTruncated = truncated || selected.truncated;
   const isEmpty = selected.headers.length === 0 && selected.rows.length === 0;
   return (
-    <div className="w-full bg-brutal-cream/45 p-4 font-mono text-[11px] text-black">
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-3 text-xs font-bold text-black/55">
+    <div className="w-full bg-layer-sidebar p-4 font-mono text-mono-meta text-foreground">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-3 text-foreground-hint">
         <span>{formatMessage({ id: "message.messageItem.xlsxPreview" })}</span>
         <span>{formatMessage({ id: "message.messageItem.xlsxSheets" }, { count: preview.sheetCount })}</span>
       </div>
       {preview.sheets.length > 1 ? (
-        <div className="mb-3 flex max-w-full gap-1 overflow-x-auto pb-1" role="tablist" aria-label={formatMessage({ id: "message.messageItem.xlsxSheetTabs" })}>
-          {preview.sheets.map((sheet, index) => (
-            <button
-              key={`${sheet.name}-${index}`}
-              type="button"
-              role="tab"
-              aria-selected={index === activeSheet}
-              onClick={() => setActiveSheet(index)}
-              className={`shrink-0 border-2 border-black px-2 py-1 text-xs font-bold shadow-brutal-sm ${index === activeSheet ? "bg-soft-signal" : "bg-white"}`}
-            >
-              {sheet.name || formatMessage({ id: "message.messageItem.xlsxUnnamedSheet" }, { index: index + 1 })}
-            </button>
-          ))}
-        </div>
+        <Tabs<string>
+          value={String(activeSheet)}
+          onValueChange={handleSheetChange}
+          className="mb-3 max-w-full overflow-x-auto pb-1"
+        >
+          <TabsList aria-label={formatMessage({ id: "message.messageItem.xlsxSheetTabs" })}>
+            {preview.sheets.map((sheet, index) => (
+              <TabsTab
+                key={`${sheet.name}-${index}`}
+                value={String(index)}
+              >
+                <TabsLabel>{sheet.name || formatMessage({ id: "message.messageItem.xlsxUnnamedSheet" }, { index: index + 1 })}</TabsLabel>
+              </TabsTab>
+            ))}
+          </TabsList>
+        </Tabs>
       ) : null}
       {isEmpty ? (
-        <div className="border-2 border-black bg-white p-4 font-sans text-sm font-bold shadow-brutal-sm" data-testid="xlsx-preview-empty">
+        <Card className="p-4 font-sans text-callout font-semibold text-foreground-muted" data-testid="xlsx-preview-empty">
           {formatMessage({ id: "message.messageItem.xlsxEmpty" })}
-        </div>
+        </Card>
       ) : (
-        <div className="overflow-x-auto border-2 border-black bg-white shadow-brutal-sm">
-          <table className="min-w-full border-collapse bg-white">
-            <thead className="sticky top-0 z-10 bg-brutal-cream"><tr>{selected.headers.map((header, index) => (
-              <th key={`${header}-${index}`} className="max-w-[220px] border border-black px-2 py-1 text-left font-bold"><span className="block truncate" title={header}>{header || formatMessage({ id: "message.messageItem.columnFallback" }, { index: index + 1 })}</span></th>
+        <Card className="overflow-x-auto">
+          <table className="min-w-full border-collapse bg-layer-card">
+            <thead className="sticky top-0 z-10 bg-fill-muted"><tr>{selected.headers.map((header, index) => (
+              <th key={`${header}-${index}`} className="max-w-[220px] border border-line-hairline px-2 py-1 text-left font-bold"><AttachmentTooltip content={header}><span className="block truncate">{header || formatMessage({ id: "message.messageItem.columnFallback" }, { index: index + 1 })}</span></AttachmentTooltip></th>
             ))}</tr></thead>
             <tbody>{selected.rows.map((row, rowIndex) => (
-              <tr key={rowIndex} data-anchor-row={rowIndex + 1} className="odd:bg-black/[0.03]">
-                {selected.headers.map((_, columnIndex) => { const value = row[columnIndex] ?? ""; return <td key={columnIndex} className="max-w-[220px] border border-black/40 px-2 py-1 align-top"><span className="block truncate" title={value}>{value}</span></td>; })}
+              <tr key={rowIndex} data-anchor-row={rowIndex + 1} className="odd:bg-fill-muted/50">
+                {selected.headers.map((_, columnIndex) => { const value = row[columnIndex] ?? ""; return <td key={columnIndex} className="max-w-[220px] border border-line-hairline px-2 py-1 align-top"><AttachmentTooltip content={value}><span className="block truncate">{value}</span></AttachmentTooltip></td>; })}
               </tr>
             ))}</tbody>
           </table>
-        </div>
+        </Card>
       )}
-      <div className="mt-2 text-xs font-bold text-black/50">
+      <div className="mt-2 text-foreground-hint">
         {sheetTruncated
           ? formatMessage({ id: "message.messageItem.xlsxTruncated" }, { count: selected.rows.length })
           : formatMessage({ id: "message.messageItem.xlsxShowingOf" }, { shown: selected.rows.length, total: selected.rowCount })}
@@ -554,7 +613,7 @@ export function MarkdownPreviewPane({ markdown, truncated }: { markdown: string;
   );
 
   return (
-    <div className="min-h-[calc(100dvh-56px)] w-full max-w-[100dvw] overflow-x-clip bg-brutal-cream px-4 py-8 md:px-8 md:py-10">
+    <div className="min-h-[calc(100dvh-56px)] w-full max-w-[100dvw] overflow-x-clip bg-layer-sidebar px-4 py-8 md:px-8 md:py-10">
       <div className="mx-auto grid w-full max-w-3xl gap-6 xl:max-w-6xl xl:grid-cols-[16rem_minmax(0,48rem)] xl:items-start">
         <div className="hidden xl:sticky xl:top-20 xl:block xl:max-h-[calc(100dvh-7rem)] xl:self-start xl:overflow-auto">
           <MarkdownOutlineNav outline={outline} />
@@ -573,9 +632,9 @@ export function MarkdownPreviewPane({ markdown, truncated }: { markdown: string;
               )}
             </Banner>
           ) : null}
-          <div
+          <Card
             data-anchor-md-root=""
-            className="card-brutal max-w-full overflow-x-clip bg-white px-6 py-8 font-display text-base text-black md:px-10 md:py-12"
+            className="max-w-full overflow-visible overflow-x-clip px-6 py-8 font-display text-body text-foreground md:px-10 md:py-12"
           >
             <MarkdownContent
               source={markdown}
@@ -583,7 +642,7 @@ export function MarkdownPreviewPane({ markdown, truncated }: { markdown: string;
               enableMermaid
               components={headingComponents}
             />
-          </div>
+          </Card>
         </div>
       </div>
     </div>
@@ -595,15 +654,15 @@ export function TextPreviewPane({ text, truncated }: { text: string; truncated: 
   return (
     // No nested vertical scroller (browser-find layout): the pane flows into
     // the document so native find can scroll the window to matches.
-    <div className="w-full bg-brutal-cream/45 p-4">
-      <div className="mb-2 flex items-center justify-between gap-3 text-xs font-bold text-black/55">
+    <div className="w-full bg-layer-sidebar p-4">
+      <div className="mb-2 flex items-center justify-between gap-3 font-mono text-mono-meta text-foreground-hint">
         <span>{formatMessage({ id: "message.messageItem.plainTextPreview" })}</span>
         {truncated ? <span>{formatMessage({ id: "message.messageItem.previewTruncated" })}</span> : null}
       </div>
       {/* Per-line elements (not one text node) so comment anchors can target
           and flash-highlight L<n> ranges (attachmentCommentAnchors). The
           preview is byte-capped server-side, so line count stays bounded. */}
-      <pre className="min-h-full whitespace-pre-wrap break-words border-2 border-black bg-white p-4 font-mono text-xs leading-5 text-black shadow-brutal-sm">
+      <pre className="min-h-full whitespace-pre-wrap break-words rounded-container border border-line-hairline bg-layer-code p-4 font-mono text-mono-code text-foreground">
         {text.split(/\r?\n/).map((line, index) => (
           <div key={index} data-anchor-line={index + 1}>
             {line.length > 0 ? line : " "}
@@ -622,6 +681,7 @@ export function DocumentAttachmentPreviewModal({
   onClose,
   onDownload,
   comments,
+  onCopyError,
 }: {
   filename: string;
   preview: DocumentAttachmentPreview;
@@ -630,6 +690,7 @@ export function DocumentAttachmentPreviewModal({
   onClose: () => void;
   onDownload: () => void;
   comments?: PreviewCommentsContext;
+  onCopyError?: (error: Error) => void;
 }) {
   const { formatMessage } = useIntl();
   return (
@@ -637,6 +698,17 @@ export function DocumentAttachmentPreviewModal({
       filename={filename}
       onClose={onClose}
       onDownload={onDownload}
+      onCopyError={onCopyError}
+      // Only the kinds we hold as plain text: a PDF or a spreadsheet has no
+      // meaningful clipboard payload, and markdown copies its source (what the
+      // pane renders), not the rendered HTML.
+      copyText={
+        preview.kind === "text"
+          ? preview.text
+          : preview.kind === "markdown"
+            ? preview.markdown
+            : undefined
+      }
       // browser-find layout for every format rendered directly into the DOM
       // (markdown #1849; text/csv extended per cindyz, task #38 thread):
       // native ⌘F cannot scroll nested overflow containers to matches, so
@@ -655,19 +727,17 @@ export function DocumentAttachmentPreviewModal({
       {preview.kind === "text" ? <TextPreviewPane text={preview.text} truncated={truncated} /> : null}
       {preview.kind === "pdf" ? (
         // Threat model: PDFs are uploaded by any human or agent, so the bytes
-        // are attacker-controlled. Native PDF viewers (Chrome plugin, Firefox
-        // pdf.js) run scripts inside the iframe — `allow-scripts` keeps the
-        // viewer working while the absent `allow-same-origin` keeps the frame
-        // in an opaque origin, so a hostile PDF cannot reach Slock cookies,
-        // storage, or the parent DOM. Shares the same primitive + isolation
-        // config as the HTML preview above (#proj-frontend:8b1098b4
-        // react-doctor `iframe-missing-sandbox`, Ark security review).
-        <SandboxedPreviewFrame
+        // are attacker-controlled. The isolation boundary is the ORIGIN: the
+        // PDF is served from the API / object-storage origin, never the app
+        // origin, and CrossOriginPdfFrame refuses to render otherwise. It
+        // carries no `sandbox` — Chromium's PDF viewer cannot run in any
+        // sandboxed frame (task #91; supersedes the sandboxed shape from
+        // #proj-frontend:8b1098b4 / the 2026-05-18 review, which rendered
+        // chrome-error:// in Chrome and the desktop shell).
+        <CrossOriginPdfFrame
           title={formatMessage({ id: "message.messageItem.pdfPreviewTitle" }, { filename })}
           src={url ?? ""}
-          sandbox="allow-scripts"
-          referrerPolicy="no-referrer"
-          className="h-full w-full border-0 bg-white"
+          className="h-full w-full border-0 bg-sticker-paper"
         />
       ) : null}
     </AttachmentPreviewShell>
@@ -728,7 +798,7 @@ export function AudioAttachmentPreviewModal({
 }) {
   return (
     <AttachmentPreviewShell filename={filename} onClose={onClose} onDownload={onDownload}>
-      <div className="flex h-full w-full items-center justify-center bg-brutal-cream p-4">
+      <div className="flex h-full w-full items-center justify-center bg-layer-sidebar p-4">
         <AudioPreviewBody filename={filename} url={url} />
       </div>
     </AttachmentPreviewShell>
@@ -751,15 +821,15 @@ export function AudioPreviewBody({
   const { formatMessage } = useIntl();
   const inline = variant === "inline";
   return (
-    <div className={inline ? INLINE_AUDIO_PREVIEW_CARD_CLASS : "w-full max-w-xl border-2 border-black bg-white p-4 shadow-brutal"}>
+    <Card className={inline ? INLINE_AUDIO_PREVIEW_CARD_CLASS : "w-full max-w-xl p-4"}>
       <div className={`${inline ? "mb-2 gap-2" : "mb-3 gap-3"} flex items-center justify-between`}>
         <div className={`flex min-w-0 items-center ${inline ? "gap-2" : "gap-3"}`}>
-          <div className={`flex shrink-0 items-center justify-center border-2 border-black bg-soft-signal ${inline ? "size-8" : "size-10"}`}>
-            <Music size={inline ? 16 : 20} className="text-black" />
+          <div className={`flex shrink-0 items-center justify-center rounded-chip bg-fill-muted text-foreground-muted ${inline ? "size-8" : "size-9"}`}>
+            <Music size={inline ? 16 : 18} />
           </div>
           <div className="min-w-0">
-            <div className="truncate text-sm font-bold text-black" title={filename}>{filename}</div>
-            <div className="text-xs font-bold text-black/50">{formatMessage({ id: "message.messageItem.audioFile" })}</div>
+            <AttachmentTooltip content={filename}><div className="truncate text-callout font-semibold text-foreground">{filename}</div></AttachmentTooltip>
+            <div className="font-mono text-mono-meta text-foreground-hint">{formatMessage({ id: "message.messageItem.audioFile" })}</div>
           </div>
         </div>
         {actions ? <div className="shrink-0">{actions}</div> : null}
@@ -772,11 +842,12 @@ export function AudioPreviewBody({
         className="block w-full"
         onError={onError}
       />
-    </div>
+    </Card>
   );
 }
 
-export const INLINE_AUDIO_PREVIEW_CARD_CLASS = "w-full max-w-[min(28rem,calc(100vw-7rem))] overflow-hidden border-2 border-black bg-white p-2 text-left";
+/** The inline audio player's raft-ui Card: its width and inset. */
+export const INLINE_AUDIO_PREVIEW_CARD_CLASS = "w-full max-w-[min(28rem,calc(100vw-7rem))] p-2.5 text-left";
 
 
 function HtmlPreviewBody({
@@ -842,6 +913,12 @@ function HtmlPreviewBody({
     if (openAttachmentPreviewExternalLink(link)) updatePendingExternalLink(null);
     else updatePendingExternalLink(link);
   }, [updatePendingExternalLink]);
+  const dismissPendingExternalLink = useCallback(() => updatePendingExternalLink(null), [updatePendingExternalLink]);
+  const openPendingExternalLink = useCallback(() => {
+    if (pendingExternalLink && openAttachmentPreviewExternalLink(pendingExternalLink)) {
+      updatePendingExternalLink(null);
+    }
+  }, [pendingExternalLink, updatePendingExternalLink]);
   // Drag rect in overlay-local px while capturing; flash region in CONTENT px
   // (it must track the document as the bridge reports scrolling).
   const [drag, setDrag] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(null);
@@ -931,7 +1008,7 @@ function HtmlPreviewBody({
         src={buildSrc(url)}
         sandbox="allow-scripts"
         referrerPolicy="no-referrer"
-        className={`h-full w-full border-0 bg-white${externalLinksReady ? "" : " pointer-events-none"}`}
+        className={`h-full w-full border-0 bg-sticker-paper${externalLinksReady ? "" : " pointer-events-none"}`}
         frameRef={iframeRef}
         onLoad={handlePreviewDocumentLoad}
       />
@@ -939,10 +1016,10 @@ function HtmlPreviewBody({
         <div
           role="status"
           data-message-affordance="attachment-preview-external-links-loading"
-          className="absolute inset-0 z-10 flex items-center justify-center bg-white/75"
+          className="absolute inset-0 z-10 flex items-center justify-center bg-layer-canvas/75"
         >
-          <div className="flex items-center gap-2 border-2 border-black bg-white px-3 py-2 text-xs font-bold shadow-brutal-sm">
-            <Spinner size="sm" /> {formatMessage({ id: "message.messageItem.preparingPreview" })}
+          <div className="flex items-center gap-2 rounded-container bg-layer-popover px-3 py-2 text-callout font-semibold text-foreground shadow-float ring-1 ring-line-seam">
+            <Spinner size="sm" aria-label={formatMessage({ id: "common.loadingLabel" })} /> {formatMessage({ id: "message.messageItem.preparingPreview" })}
           </div>
         </div>
       ) : null}
@@ -957,7 +1034,7 @@ function HtmlPreviewBody({
                 type="button"
                 data-external-href={link.href}
                 aria-label={formatMessage({ id: "message.messageItem.openExternalLink" }, { target: text || link.hostname })}
-                className="pointer-events-auto absolute bg-transparent outline-none focus-visible:border-2 focus-visible:border-black focus-visible:bg-white/20"
+                className="pointer-events-auto absolute rounded-[2px] bg-transparent outline-none focus-visible:shadow-focus"
                 style={{ left: rect.x, top: rect.y, width: rect.w, height: rect.h }}
                 onClick={() => handleExternalLinkHotspot(link)}
               />
@@ -970,43 +1047,41 @@ function HtmlPreviewBody({
           role="status"
           aria-live="polite"
           data-message-affordance="attachment-preview-external-link-fallback"
-          className="absolute inset-x-3 bottom-3 z-40 flex items-center gap-2 border-2 border-black bg-white p-2 shadow-brutal"
+          className="absolute inset-x-3 bottom-3 z-40 flex items-center gap-2 rounded-container bg-layer-popover p-2 pl-3 shadow-float ring-1 ring-line-seam"
         >
           <div className="min-w-0 flex-1">
-            <div className="text-xs font-black">{formatMessage({ id: "message.messageItem.browserBlockedTab" })}</div>
-            <div className="truncate text-xs font-bold" title={pendingExternalLink.hostname}>
+            <div className="text-footnote font-bold text-foreground">{formatMessage({ id: "message.messageItem.browserBlockedTab" })}</div>
+            <AttachmentTooltip content={pendingExternalLink.hostname}>
+            <div className="truncate font-mono text-mono-meta font-bold text-foreground">
               {pendingExternalLink.hostname}
             </div>
-            <div className="truncate text-xs text-black/65" title={pendingExternalLink.href}>
+            </AttachmentTooltip>
+            <AttachmentTooltip content={pendingExternalLink.href}>
+            <div className="truncate font-mono text-mono-meta text-foreground-hint">
               {pendingExternalLink.href}
             </div>
+            </AttachmentTooltip>
           </div>
           <Button
             type="button"
             size="sm"
-            variant="default"
-            onClick={() => {
-              if (openAttachmentPreviewExternalLink(pendingExternalLink)) {
-                updatePendingExternalLink(null);
-              }
-            }}
+            variant="outline"
+            onClick={openPendingExternalLink}
           >
             {formatMessage({ id: "message.messageItem.openLink" })}
           </Button>
-          <Button
+          <CloseButton
             type="button"
-            size="icon-sm"
-            variant="default"
-            onClick={() => updatePendingExternalLink(null)}
+            onClick={dismissPendingExternalLink}
             aria-label={formatMessage({ id: "message.messageItem.dismissExternalLink" })}
           >
-            <X size={14} />
-          </Button>
+            <X size={16} />
+          </CloseButton>
         </div>
       ) : null}
       {flashRegion && state ? (
         <div
-          className="anchor-flash pointer-events-none absolute z-10 border-2 border-black"
+          className="anchor-flash pointer-events-none absolute z-10 rounded-[2px] border border-line-seam"
           style={{
             left: flashRegion.x - state.scrollX,
             top: flashRegion.y - state.scrollY,
@@ -1072,14 +1147,14 @@ function HtmlPreviewBody({
             });
           }}
         >
-          <div className="pointer-events-none absolute left-1/2 top-3 z-30 -translate-x-1/2 border-2 border-black bg-white px-2 py-1 text-[11px] font-bold text-black shadow-brutal-sm">
+          <div className="pointer-events-none absolute left-1/2 top-3 z-30 -translate-x-1/2 rounded-chip bg-layer-hud px-2 py-1 text-caption text-foreground-on-hud shadow-float">
             {state
               ? formatMessage({ id: "message.messageItem.clickToComment" })
               : formatMessage({ id: "message.messageItem.cantLocateInPage" })}
           </div>
           {drag ? (
             <div
-              className="pointer-events-none absolute border-2 border-dashed border-black bg-soft-signal/20"
+              className="pointer-events-none absolute border border-dashed border-line-seam bg-brand-soft/50"
               style={{
                 left: Math.min(drag.x0, drag.x1),
                 top: Math.min(drag.y0, drag.y1),
@@ -1121,6 +1196,10 @@ function VideoPreviewBody({
     const time = Math.round(video.currentTime * 1000) / 1000;
     if (time > 0) ctx.pushAnchor({ type: "video-timestamp", data: { time } });
   }, [ctx]);
+  const handleAddTimestampClick = useCallback((event: React.MouseEvent) => {
+    event.stopPropagation();
+    pushCurrentTimeAnchor();
+  }, [pushCurrentTimeAnchor]);
 
   // Coalesce timestamp jumps onto the latest target (see videoTimestampSeekCoalesce).
   // Rapid currentTime writes thrash Chromium media (Aw Snap / error code 11).
@@ -1202,22 +1281,19 @@ function VideoPreviewBody({
         controls
         playsInline
         preload="metadata"
-        className="max-h-full max-w-full border-2 border-black bg-black"
+        className="max-h-full max-w-full bg-black"
       />
       {canAddPausedTimestamp ? (
         <AttachmentTooltip content={formatMessage({ id: "message.messageItem.attachTimestamp" }, { timestamp: formatVideoCommentTimestamp(videoState.time) })}>
           <Button
             type="button"
             size="sm"
-            variant="default"
+            variant="outline"
             data-message-affordance="video-comment-add-timestamp"
-            onClick={(event) => {
-              event.stopPropagation();
-              pushCurrentTimeAnchor();
-            }}
-            className="absolute bottom-5 left-1/2 -translate-x-1/2"
+            onClick={handleAddTimestampClick}
+            className="absolute inset-x-0 bottom-5 mx-auto w-fit"
           >
-            <Plus size={12} />
+            <Plus size={16} />
             <span>{formatMessage({ id: "message.messageItem.addTimestamp" }, { timestamp: formatVideoCommentTimestamp(videoState.time) })}</span>
           </Button>
         </AttachmentTooltip>

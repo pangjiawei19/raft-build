@@ -1,12 +1,25 @@
-import { useState } from "react";
+import { useCallback, useState } from "react";
 import { useIntl } from "react-intl";
 import { RotateCcw } from "lucide-react";
+import { RadioGroup, RadioGroupItem } from "@botiverse/raft-ui";
 import { useAgentStore } from "../../store/agentStore";
 import Banner from "../ui/Banner";
 import type { MessageId } from "../../i18n/messages";
 import ConfirmDialog from "../ConfirmDialog";
 
 type ResetMode = "restart" | "session" | "full";
+
+type ResetOption = { mode: ResetMode; labelId: MessageId; descId: MessageId };
+
+const MEMBER_RUNTIME_OPTIONS: ResetOption[] = [
+  { mode: "restart", labelId: "agent.reset.restartModel", descId: "agent.reset.restartModelDesc" },
+  { mode: "session", labelId: "agent.reset.model", descId: "agent.reset.modelDesc" },
+];
+const STANDARD_OPTIONS: ResetOption[] = [
+  { mode: "restart", labelId: "agent.reset.restart", descId: "agent.reset.restartDesc" },
+  { mode: "session", labelId: "agent.reset.session", descId: "agent.reset.sessionDesc" },
+];
+const FULL_RESET_OPTION: ResetOption = { mode: "full", labelId: "agent.reset.full", descId: "agent.reset.fullDesc" };
 
 export default function ResetAgentDialog({
   agentId,
@@ -25,7 +38,7 @@ export default function ResetAgentDialog({
   const [mode, setMode] = useState<ResetMode>("restart");
   const resetAgent = useAgentStore((s) => s.resetAgent);
 
-  const handleReset = async () => {
+  const handleReset = useCallback(async () => {
     try {
       await resetAgent(agentId, mode);
     } catch (err: unknown) {
@@ -35,23 +48,22 @@ export default function ResetAgentDialog({
           || (err instanceof Error ? err.message : formatMessage({ id: "agent.reset.failed" })),
       );
     }
-  };
+  }, [resetAgent, agentId, mode, formatMessage]);
 
-  const options: { mode: ResetMode; labelId: MessageId; descId: MessageId; color: string }[] = memberRuntimeOnly
-    ? [
-        { mode: "restart", labelId: "agent.reset.restartModel", descId: "agent.reset.restartModelDesc", color: "bg-brutal-cyan/20" },
-        { mode: "session", labelId: "agent.reset.model", descId: "agent.reset.modelDesc", color: "bg-brutal-orange/20" },
-      ]
-    : [
-        { mode: "restart", labelId: "agent.reset.restart", descId: "agent.reset.restartDesc", color: "bg-brutal-cyan/20" },
-        { mode: "session", labelId: "agent.reset.session", descId: "agent.reset.sessionDesc", color: "bg-brutal-orange/20" },
-        ...(canFullReset
-          ? [{ mode: "full" as const, labelId: "agent.reset.full" as const, descId: "agent.reset.fullDesc" as const, color: "bg-brutal-red/20" }]
-          : []),
-      ];
+  const handleModeChange = useCallback((value: string) => setMode(value as ResetMode), []);
+
+  const options: ResetOption[] = memberRuntimeOnly
+    ? MEMBER_RUNTIME_OPTIONS
+    : canFullReset
+      ? [...STANDARD_OPTIONS, FULL_RESET_OPTION]
+      : STANDARD_OPTIONS;
 
   const selectedOption = options.find((o) => o.mode === mode)!;
-  const confirmColor = mode === "full" ? "bg-brutal-red" : mode === "session" ? "bg-brutal-orange" : "bg-brutal-cyan";
+  // The confirm colour states the consequence (DS Dialog): restart and session
+  // reset interrupt the agent but it comes back, so they are the orange
+  // `warning`; the full reset deletes the workspace and cannot be undone, so it
+  // is the red `danger`, paired with the red-soft destructive banner below.
+  const confirmVariant = mode === "full" ? "danger" : "warning";
 
   return (
     <ConfirmDialog
@@ -60,25 +72,33 @@ export default function ResetAgentDialog({
       plainMessage
       message={(
         <div className="space-y-3">
-          <div className="space-y-3">
+          {/* Standard rui RadioGroup. These were three hand-rolled <button>s
+              carrying their own border/tint/hover rules, which is why they read
+              as heavy panels (@Artea, task #660). The group
+              is a single-select list, so the radio semantics come free: arrow
+              keys, one tab stop, and a real checked state for assistive tech. */}
+          <RadioGroup
+            value={mode}
+            onValueChange={handleModeChange}
+            aria-label={formatMessage({ id: "agent.reset.title" }, { name: agentName })}
+            className="gap-0"
+          >
             {options.map((opt) => (
-              <button
-                key={opt.mode}
-                type="button"
-                onClick={() => setMode(opt.mode)}
-                className={`w-full text-left border-2 p-4 transition-colors ${
-                  mode === opt.mode
-                    ? `border-black ${opt.color} shadow-brutal-sm`
-                    : "border-black/30 hover:border-black"
-                }`}
-              >
-                <div className="font-bold text-sm uppercase">{formatMessage({ id: opt.labelId })}</div>
-                <p className="mt-1 text-xs text-black/60">{formatMessage({ id: opt.descId })}</p>
-              </button>
+              <label key={opt.mode} className="flex min-h-11 items-start gap-3 py-3">
+                <RadioGroupItem
+                  value={opt.mode}
+                  className="shrink-0"
+                  data-testid={`agent-reset-option-${opt.mode}`}
+                />
+                <span className="flex min-w-0 flex-col gap-0.5">
+                  <span className="text-subhead font-semibold text-foreground">{formatMessage({ id: opt.labelId })}</span>
+                  <span className="text-footnote font-normal text-foreground-muted">{formatMessage({ id: opt.descId })}</span>
+                </span>
+              </label>
             ))}
-          </div>
+          </RadioGroup>
           {mode === "full" && (
-            <Banner intent="warning" density="sm" withIcon className="font-bold">
+            <Banner intent="destructive" density="sm" withIcon>
               {formatMessage({ id: "agent.reset.fullWarning" })}
             </Banner>
           )}
@@ -88,7 +108,7 @@ export default function ResetAgentDialog({
       confirmLabel={formatMessage({ id: selectedOption.labelId })}
       loadingLabel={formatMessage({ id: "agent.reset.loading" })}
       confirmIcon={<RotateCcw size={14} />}
-      confirmColor={confirmColor}
+      confirmVariant={confirmVariant}
       onConfirm={handleReset}
       onClose={onClose}
     />

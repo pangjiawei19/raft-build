@@ -1,5 +1,8 @@
 import { create } from "zustand";
-import { isElectronDesktopShell } from "../utils/desktopShell";
+import {
+  readHideEmptySidebarSections,
+  writeHideEmptySidebarSections,
+} from "../components/layout/sidebarEmptySectionVisibility";
 
 export type MessageBodyFontSize = "sm" | "md" | "lg";
 
@@ -12,15 +15,31 @@ export const MESSAGE_BODY_FONT_SIZE_OPTIONS: Array<{
   sizeLabel: string;
   className: string;
 }> = [
-  { value: "sm", sizeLabel: "12px", className: "text-xs" },
-  { value: "md", sizeLabel: "14px", className: "text-sm" },
-  { value: "lg", sizeLabel: "16px", className: "text-base" },
+  { value: "sm", sizeLabel: "14px", className: "text-sm" },
+  { value: "md", sizeLabel: "16px", className: "text-base" },
+  { value: "lg", sizeLabel: "18px", className: "text-lg" },
 ];
 
+/**
+ * Raft Design System › Message: body text is 16/24. The middle tier is that
+ * size; Small and Large sit one step either side of it.
+ */
 const MESSAGE_BODY_FONT_SIZE_CLASSES: Record<MessageBodyFontSize, string> = {
-  sm: "text-xs",
-  md: "text-sm",
-  lg: "text-base",
+  sm: "text-sm",
+  md: "text-base",
+  lg: "text-lg",
+};
+
+/**
+ * RUI's MessageItemBody recipe intentionally provides a family default size
+ * (`theme-*:text-sm`). The product preference is a user-owned override, so it
+ * needs a terminal inline value at the shared message-body seam rather than a
+ * class whose cascade position can be changed by a theme recipe.
+ */
+const MESSAGE_BODY_FONT_SIZE_VALUES: Record<MessageBodyFontSize, string> = {
+  sm: "0.875rem",
+  md: "1rem",
+  lg: "1.125rem",
 };
 
 function isMessageBodyFontSize(value: unknown): value is MessageBodyFontSize {
@@ -67,17 +86,16 @@ function persistShowLiveAgentActivityBar(show: boolean) {
   }
 }
 
-// Platform-aware default (@WAWQAQ): ON in the desktop shell, OFF on web/mobile —
-// an explicit stored choice (either way) always wins. It adds a model label next
-// to every agent name, which desktop wants by default but web keeps opt-in.
+// Default ON everywhere (@WAWQAQ 2026-09-10): the model label next to each
+// agent name now shows by default on web AND desktop — previously desktop-only.
+// An explicit stored choice (either way) always wins.
 function readStoredShowAgentModelName(): boolean {
-  const fallback = isElectronDesktopShell();
-  if (typeof localStorage === "undefined") return fallback;
+  if (typeof localStorage === "undefined") return true;
   try {
     const stored = localStorage.getItem(SHOW_AGENT_MODEL_NAME_STORAGE_KEY);
-    return stored === null ? fallback : stored === "true";
+    return stored === null ? true : stored === "true";
   } catch {
-    return fallback;
+    return true;
   }
 }
 
@@ -94,19 +112,78 @@ export function getMessageBodyFontSizeClass(size: MessageBodyFontSize): string {
   return MESSAGE_BODY_FONT_SIZE_CLASSES[size];
 }
 
+/**
+ * Font-preference companions — 2026-10-11 (cindyz: the name, the name-line
+ * notes, and the reply preview scale with the reader's message size). The
+ * middle tier is the Raft Design System's: name 15, notes 12, reply preview
+ * 13 with its time at 12.
+ * Sizes are arbitrary values so the utilities never touch line-heights (the
+ * named text-* scale utilities carry their own leading and would displace
+ * the recipes' leading-none).
+ */
+const MESSAGE_NAME_SIZE_CLASSES: Record<MessageBodyFontSize, string> = {
+  sm: "text-[13px]",
+  md: "text-[15px]",
+  lg: "text-[17px]",
+};
+
+const MESSAGE_META_SIZE_CLASSES: Record<MessageBodyFontSize, string> = {
+  sm: "text-[11px]",
+  md: "text-[12px]",
+  lg: "text-[13px]",
+};
+
+const MESSAGE_PREVIEW_SIZE_CLASSES: Record<MessageBodyFontSize, string> = {
+  sm: "text-[12px]",
+  md: "text-[13px]",
+  lg: "text-[14px]",
+};
+
+const MESSAGE_PREVIEW_TIME_SIZE_CLASSES: Record<MessageBodyFontSize, string> = {
+  sm: "text-[11px]",
+  md: "text-[12px]",
+  lg: "text-[13px]",
+};
+
+export function getMessageNameSizeClass(size: MessageBodyFontSize): string {
+  return MESSAGE_NAME_SIZE_CLASSES[size];
+}
+
+export function getMessageMetaSizeClass(size: MessageBodyFontSize): string {
+  return MESSAGE_META_SIZE_CLASSES[size];
+}
+
+export function getMessagePreviewSizeClass(size: MessageBodyFontSize): string {
+  return MESSAGE_PREVIEW_SIZE_CLASSES[size];
+}
+
+export function getMessagePreviewTimeSizeClass(size: MessageBodyFontSize): string {
+  return MESSAGE_PREVIEW_TIME_SIZE_CLASSES[size];
+}
+
+export function getMessageBodyFontSizeStyle(size: MessageBodyFontSize): { fontSize: string } {
+  return { fontSize: MESSAGE_BODY_FONT_SIZE_VALUES[size] };
+}
+
 interface AppearanceState {
   messageBodyFontSize: MessageBodyFontSize;
   showLiveAgentActivityBar: boolean;
   showAgentModelName: boolean;
+  hideEmptySidebarSections: boolean;
   setMessageBodyFontSize: (size: MessageBodyFontSize) => void;
   setShowLiveAgentActivityBar: (show: boolean) => void;
   setShowAgentModelName: (show: boolean) => void;
+  setHideEmptySidebarSections: (hide: boolean) => void;
 }
 
 export const useAppearanceStore = create<AppearanceState>((set) => ({
   messageBodyFontSize: readStoredMessageBodyFontSize(),
   showLiveAgentActivityBar: readStoredShowLiveAgentActivityBar(),
   showAgentModelName: readStoredShowAgentModelName(),
+  // Shared with the sidebar section context menu; both read/write this store so
+  // Settings ⇄ right-click stay in sync. Default + storage live in
+  // sidebarEmptySectionVisibility (desktop default-on; stored choice wins).
+  hideEmptySidebarSections: readHideEmptySidebarSections(),
   setMessageBodyFontSize: (size) => {
     const next = normalizeMessageBodyFontSize(size);
     persistMessageBodyFontSize(next);
@@ -119,6 +196,10 @@ export const useAppearanceStore = create<AppearanceState>((set) => ({
   setShowAgentModelName: (show) => {
     persistShowAgentModelName(show);
     set({ showAgentModelName: show });
+  },
+  setHideEmptySidebarSections: (hide) => {
+    writeHideEmptySidebarSections(hide);
+    set({ hideEmptySidebarSections: hide });
   },
 }));
 

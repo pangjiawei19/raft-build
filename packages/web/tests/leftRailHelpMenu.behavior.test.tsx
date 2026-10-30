@@ -1,6 +1,5 @@
 // @ts-nocheck
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -8,6 +7,7 @@ import api from "../src/api/client";
 import { LeftRail } from "../src/components/layout/LeftRail";
 import { useServerStore } from "../src/store/serverStore";
 import { TestIntlProvider } from "./helpers/intl";
+import type { Locale } from "../src/i18n/locale";
 
 const originalApiGet = api.get;
 const originalServerState = useServerStore.getState();
@@ -30,14 +30,14 @@ function setBrowserLanguages(languages: string[]) {
 }
 
 function renderRail({
-  workspaceModeAvailable = false,
   feedbackEnabled = true,
   joinCommunityServer = originalServerState.joinCommunityServer,
+  locale = "en",
   languages = ["en-US"],
 }: {
-  workspaceModeAvailable?: boolean;
   feedbackEnabled?: boolean;
   joinCommunityServer?: typeof originalServerState.joinCommunityServer;
+  locale?: Locale;
   languages?: string[];
 } = {}) {
   setBrowserLanguages(languages);
@@ -64,8 +64,8 @@ function renderRail({
   });
   return render(
     <MemoryRouter initialEntries={["/s/botiverse/channel/general"]}>
-      <TestIntlProvider>
-        <LeftRail side="left" workspaceModeAvailable={workspaceModeAvailable} />
+      <TestIntlProvider locale={locale}>
+        <LeftRail />
         <LocationProbe />
       </TestIntlProvider>
     </MemoryRouter>,
@@ -81,23 +81,25 @@ afterEach(() => {
 });
 
 test("Help sits above Settings and exposes Raft Documentation, Feedback, and Join Community", async () => {
-  renderRail({ workspaceModeAvailable: true });
+  renderRail();
 
   const help = screen.getByRole("button", { name: "Help" });
   const settings = screen.getByRole("button", { name: "Settings" });
   const notification = screen.getByTestId("notification-trigger-rail");
-  const workspace = screen.getByTestId("workspace-mode-toggle");
   const rail = screen.getByTestId("workspace-left-rail");
 
   assert.match(rail.className, /\bhidden\b/);
   assert.match(rail.className, /\bmd:flex\b/, "the rail, including Help, is desktop-only");
   assert.equal(rail.contains(help), true);
-  for (const button of [notification, help, workspace, settings]) {
+  for (const button of [notification, help, settings]) {
     assert.match(button.className, /\bsize-10\b/, `${button.getAttribute("aria-label")} keeps a 40px target`);
+    // DS rail rhythm: 40px items 6px apart, set once by the rail's footer
+    // gap. A fixed 44px wrapper per item made the footer's spacing differ
+    // from the nav's.
     assert.equal(
       button.parentElement?.classList.contains("h-11"),
-      true,
-      `${button.getAttribute("aria-label")} keeps the 44px center rhythm`,
+      false,
+      `${button.getAttribute("aria-label")} takes the rail's own 6px rhythm`,
     );
   }
   assert.ok(
@@ -165,6 +167,8 @@ test("Documentation opens the canonical docs host", async () => {
 test("Join Community runs the shared join flow and opens the joined server", async () => {
   const joinCalls: Array<{ agreementId?: string | null; slug?: string }> = [];
   renderRail({
+    locale: "en",
+    languages: ["en-US", "zh-Hant-TW"],
     joinCommunityServer: async (options = {}) => {
       joinCalls.push(options);
       return {
@@ -175,11 +179,11 @@ test("Join Community runs the shared join flow and opens the joined server", asy
       } as never;
     },
   });
-
   await act(async () => {
     fireEvent.click(screen.getByRole("button", { name: "Help" }));
     await Promise.resolve();
   });
+  assert.ok(screen.queryByRole("menuitem", { name: "Join Chinese Community" }) === null);
   fireEvent.click(screen.getByRole("menuitem", { name: "Join Community" }));
 
   await waitFor(() => {
@@ -190,10 +194,11 @@ test("Join Community runs the shared join flow and opens the joined server", asy
   assert.equal(screen.queryByRole("menu", { name: "Help & resources" }), null);
 });
 
-test("Chinese browser language sends Help community entry to the QR page without joining a server", async () => {
+test("Chinese display locale sends Help community entry to the QR page without joining a server", async () => {
   const joinCalls: Array<{ agreementId?: string | null; slug?: string }> = [];
   renderRail({
-    languages: ["zh-CN", "en-US"],
+    locale: "zh-cn",
+    languages: ["en-US"],
     joinCommunityServer: async (options = {}) => {
       joinCalls.push(options);
       return {
@@ -206,10 +211,10 @@ test("Chinese browser language sends Help community entry to the QR page without
   });
 
   await act(async () => {
-    fireEvent.click(screen.getByRole("button", { name: "Help" }));
+    fireEvent.click(screen.getByTestId("left-rail-help"));
     await Promise.resolve();
   });
-  fireEvent.click(screen.getByRole("menuitem", { name: "Join Chinese Community" }));
+  fireEvent.click(screen.getByRole("menuitem", { name: "加入中文社群" }));
 
   await waitFor(() => {
     assert.equal(screen.getByTestId("location-probe").textContent, "/community/chinese");

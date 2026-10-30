@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
 
 import { CANONICAL_MESSAGE_MANIFEST } from "@botiverse/raft-shared";
-import type { EnrichedMessageRow, FrontendConversationContext } from "./messageService.js";
+import type { EnrichedMessageRow, FrontendConversationContext } from "./messageService";
 
 /**
  * Producer gate for the canonical message manifest (contract v3.1 → RFC 043
@@ -82,6 +81,7 @@ const EXTERNAL_AUTHOR_FORWARD: { [K in ManifestNestedNames<"externalAuthor">]: K
   displayName: "displayName", externalActorId: "externalActorId",
   externalConversationId: "externalConversationId", externalMessageId: "externalMessageId",
   installId: "installId", projectionId: "projectionId", provider: "provider", workspaceId: "workspaceId",
+  workspaceName: "workspaceName",
 };
 const EXTERNAL_AUTHOR_REVERSE: { [K in keyof EnrichedExternalAuthor]: K & ManifestNestedNames<"externalAuthor"> } = {
   actorKind: "actorKind", actorProjectionRevision: "actorProjectionRevision",
@@ -89,6 +89,7 @@ const EXTERNAL_AUTHOR_REVERSE: { [K in keyof EnrichedExternalAuthor]: K & Manife
   displayName: "displayName", externalActorId: "externalActorId",
   externalConversationId: "externalConversationId", externalMessageId: "externalMessageId",
   installId: "installId", projectionId: "projectionId", provider: "provider", workspaceId: "workspaceId",
+  workspaceName: "workspaceName",
 };
 
 test("producer nested shapes == canonical manifest (compile-time maps, runtime count pin)", () => {
@@ -122,13 +123,17 @@ test("producer nested shapes == canonical manifest (compile-time maps, runtime c
 // literal `true`. Negative fixtures at the bottom prove the gates fire.
 
 import type { CANONICAL_MESSAGE_FIELD_DESCRIPTORS } from "@botiverse/raft-shared";
-import type { projectTaskMessageUpdated } from "./taskRealtimeEvents.js";
+import type { projectTaskMessageUpdated } from "./taskRealtimeEvents";
+import type { buildPersistedMessageFrontendPayload } from "./messageService";
 
 type Descriptors = typeof CANONICAL_MESSAGE_FIELD_DESCRIPTORS;
 type TaskRow = ReturnType<typeof projectTaskMessageUpdated>;
-/** `message:new` broadcast payload: enriched row + conversationContext
- *  (withFrontendConversationContext is applied on every message:new emit). */
-type MessageNewRow = EnrichedMessageRow & { conversationContext: FrontendConversationContext };
+/** `message:new` broadcast payload: the body the send pipeline ACTUALLY emits
+ *  (broadcastAndDeliver → buildPersistedMessageFrontendPayload) +
+ *  conversationContext (withFrontendConversationContext is applied on every
+ *  message:new emit). Gating the REST row type here instead let the realtime
+ *  body silently drop senderDescription/reactions while this gate stayed green. */
+type MessageNewRow = ReturnType<typeof buildPersistedMessageFrontendPayload> & { conversationContext: FrontendConversationContext };
 /** `message:updated` enriched reload payload: getMessageContext messages —
  *  enriched row WITHOUT conversationContext (creation-time identity). */
 type EnrichedUpdatedRow = EnrichedMessageRow;
@@ -236,7 +241,7 @@ export type _CanonicalManifestTypeGates = [
 import {
   MESSAGE_REALTIME_PRODUCER_REGISTRY,
   attachmentCommentPrivacyScrubPayloadKeys,
-} from "./messageRealtimeProducerRegistry.js";
+} from "./messageRealtimeProducerRegistry";
 import {
   CANONICAL_MESSAGE_EXCLUSIONS,
   CANONICAL_REQUIRED_MESSAGE_FIELDS,

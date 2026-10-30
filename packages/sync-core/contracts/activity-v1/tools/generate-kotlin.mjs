@@ -13,6 +13,7 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readContractRevision } from "./contract-revision.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
@@ -30,6 +31,7 @@ const sourceBytes = await readFile(source);
 const contractVectorBytes = await readFile(contractVectorsPath);
 const behaviorSeedBytes = await readFile(behaviorSeedPath);
 const sourceSha256 = sha256(sourceBytes);
+const { contract, revision } = await readContractRevision();
 const contractVectorsSha256 = sha256(contractVectorBytes);
 const behaviorSeedSha256 = sha256(behaviorSeedBytes);
 
@@ -325,7 +327,15 @@ const generatedPrelude = prelude
     "",
   );
 
-const metadata = `const val ACTIVITY_SYNC_TYPESPEC_SHA256: String = "${sourceSha256}"`;
+const metadata = [
+  `const val ACTIVITY_SYNC_TYPESPEC_SHA256: String = "${sourceSha256}"`,
+  "",
+  "/** Wire contract identity, compared with the server-reported contract (X-Raft-Contract header, follow-up to task #3). */",
+  `const val ACTIVITY_SYNC_CONTRACT: String = "${contract}"`,
+  "",
+  "/** Contract revision from revisions.json; enable the sync engine only when the server reports exactly this revision. */",
+  `const val ACTIVITY_SYNC_CONTRACT_REVISION: Int = ${revision}`,
+].join("\n");
 
 const blocks = [
   generatedPrelude,

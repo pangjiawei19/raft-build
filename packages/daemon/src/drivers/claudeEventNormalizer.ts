@@ -1,5 +1,5 @@
 import type { SubagentLineage } from "@botiverse/raft-shared";
-import type { ParsedEvent } from "./types.js";
+import type { ParsedEvent } from "./types";
 
 type TelemetryAttrs = Extract<ParsedEvent, { kind: "telemetry" }>["attrs"];
 
@@ -40,6 +40,11 @@ function taskLifecyclePhase(subtype: string): "started" | "progress" | "notifica
   }
 }
 
+/** The closed terminal statuses a `task_notification` may carry; anything else is dropped, not echoed. */
+function taskNotificationStatus(value: unknown): "completed" | "failed" | "stopped" | undefined {
+  return value === "completed" || value === "failed" || value === "stopped" ? value : undefined;
+}
+
 function collectResultErrorDetail(message: Record<string, any>, fallback: string): string {
   const parts: string[] = [];
   if (Array.isArray(message.errors)) {
@@ -63,6 +68,39 @@ function isProviderApiFailureText(value: string, hasToolUse: boolean): boolean {
       || /\b4\d{2}\b/.test(value)
       || /\b5\d{2}\b/.test(value)
     );
+}
+
+// task #379: wording Claude Code uses when an account or budget limit is used
+// up (as opposed to a short throttle). Matched only on assistant messages that
+// already carry the SDK `error` field, never on free model text.
+const CLAUDE_QUOTA_EXHAUSTED_TEXT = [
+  /\breached your\b[^.\n]{0,60}\blimit\b/i,
+  /\bout of usage credits\b/i,
+  /\bhit your\b[^.\n]{0,60}\b(?:budget|spend limit|limit)\b/i,
+  /\bused your included\b[^.\n]{0,60}\busage\b/i,
+];
+
+type ClaudeRateLimitObservation = { status: string; resetsAtSec?: number };
+
+function classifyClaudeProviderLimit(
+  sdkError: string,
+  text: string,
+  lastRateLimit: ClaudeRateLimitObservation | null,
+  nowMs: number,
+): { kind: "quota_exhausted" | "transient_rate_limit"; resetsAt?: string } | undefined {
+  if (sdkError === "billing_error") return { kind: "quota_exhausted" };
+  if (sdkError !== "rate_limit") return undefined;
+  // A rejected window is evidence only until its reported reset: after that
+  // the same session can hit an ordinary throttle, which must stay transient.
+  const rejectedWindowCurrent = lastRateLimit?.status === "rejected"
+    && (lastRateLimit.resetsAtSec === undefined || lastRateLimit.resetsAtSec * 1000 > nowMs);
+  if (lastRateLimit && rejectedWindowCurrent) {
+    return lastRateLimit.resetsAtSec !== undefined
+      ? { kind: "quota_exhausted", resetsAt: new Date(lastRateLimit.resetsAtSec * 1000).toISOString() }
+      : { kind: "quota_exhausted" };
+  }
+  if (CLAUDE_QUOTA_EXHAUSTED_TEXT.some((pattern) => pattern.test(text))) return { kind: "quota_exhausted" };
+  return { kind: "transient_rate_limit" };
 }
 
 function finiteNumber(value: unknown): number | undefined {
@@ -204,7 +242,13 @@ function parseClaudeResultUsageTelemetry(
 }
 
 export class ClaudeEventNormalizer {
+  constructor(private readonly nowMs: () => number = () => Date.now()) {}
+
   private currentSession: string | null = null;
+  private lastRateLimit: ClaudeRateLimitObservation | null = null;
+  // task #379: set when this turn's assistant message already reported a
+  // runtime-declared API error, so the turn's `result` does not count it twice.
+  private turnApiErrorReported = false;
 
   get currentSessionId(): string | null {
     return this.currentSession;
@@ -221,6 +265,12 @@ export class ClaudeEventNormalizer {
     const events: ParsedEvent[] = [];
     const eventSessionId = finiteString(event.session_id);
     if (eventSessionId) {
+      if (eventSessionId !== this.currentSession) {
+        // task #379: rate-limit observations and per-turn error state belong
+        // to one session; another session must not inherit them.
+        this.lastRateLimit = null;
+        this.turnApiErrorReported = false;
+      }
       this.currentSession = eventSessionId;
     }
 
@@ -233,6 +283,8 @@ export class ClaudeEventNormalizer {
         const info = event.rate_limit_info && typeof event.rate_limit_info === "object"
           ? event.rate_limit_info
           : {};
+        const status = finiteString(info.status);
+        if (status) this.lastRateLimit = { status, resetsAtSec: finiteNumber(info.resetsAt) };
         events.push({
           kind: "telemetry",
           name: "rate_limits",
@@ -293,6 +345,7 @@ export class ClaudeEventNormalizer {
                 ? { parentToolUseId: (finiteString(event.tool_use_id) ?? finiteString(event.parent_tool_use_id))! }
                 : {}),
               ...(finiteString(event.subagent_type) ? { subagentType: finiteString(event.subagent_type)! } : {}),
+              ...(phase === "notification" && taskNotificationStatus(event.status) ? { taskStatus: taskNotificationStatus(event.status)! } : {}),
               ...(finiteString(event.last_tool_name) ? { lastToolName: finiteString(event.last_tool_name)! } : {}),
               payloadBytes: Buffer.byteLength(line, "utf8"),
             });
@@ -320,17 +373,40 @@ export class ClaudeEventNormalizer {
         const withLineage = subagent ? { subagent } : {};
         if (Array.isArray(content)) {
           const hasToolUse = content.some((block) => block?.type === "tool_use");
+          // task #379: Claude Code marks an assistant message that wraps an
+          // API error (usage limit, auth, overload, ...) with a top-level SDK
+          // `error` field; its text is a CLI-generated notice, not model
+          // output, so it must not count as runtime progress.
+          const sdkError = !hasToolUse && !subagent && typeof event.error === "string" && event.error
+            ? event.error
+            : null;
           for (const block of content) {
             if (block.type === "thinking" && block.thinking) {
               events.push({ kind: "thinking", text: block.thinking, ...withLineage });
             } else if (block.type === "text" && block.text) {
-              if (isProviderApiFailureText(block.text, hasToolUse)) {
+              if (sdkError) {
+                const providerLimit = classifyClaudeProviderLimit(sdkError, block.text, this.lastRateLimit, this.nowMs());
+                this.turnApiErrorReported = true;
+                events.push({
+                  kind: "error",
+                  message: block.text,
+                  nativeReasonPresent: true,
+                  reasonProvenance: "runtime_error_event",
+                  ...(providerLimit ? { providerLimit } : {}),
+                });
+              } else if (isProviderApiFailureText(block.text, hasToolUse)) {
                 events.push({ kind: "error", message: block.text });
               } else {
                 events.push({ kind: "text", text: block.text, ...withLineage });
               }
             } else if (block.type === "tool_use") {
-              events.push({ kind: "tool_call", name: block.name || "unknown_tool", input: block.input, ...withLineage });
+              events.push({
+                kind: "tool_call",
+                name: block.name || "unknown_tool",
+                input: block.input,
+                ...(typeof block.id === "string" && block.id ? { callId: block.id } : {}),
+                ...withLineage,
+              });
             }
           }
         }
@@ -344,7 +420,13 @@ export class ClaudeEventNormalizer {
         if (Array.isArray(content)) {
           for (const block of content) {
             if (block.type === "tool_result") {
-              events.push({ kind: "tool_output", name: block.name || block.tool_use_id || "tool_result", ...withLineage });
+              events.push({
+                kind: "tool_output",
+                name: block.name || block.tool_use_id || "tool_result",
+                ...(typeof block.tool_use_id === "string" && block.tool_use_id ? { callId: block.tool_use_id } : {}),
+                ...claudeToolResultOutcome(block),
+                ...withLineage,
+              });
             }
           }
         }
@@ -358,16 +440,20 @@ export class ClaudeEventNormalizer {
         const usageTelemetry = parseClaudeResultUsageTelemetry(event, resultSessionId);
         const isMaxTokenError = stopReason === "max_tokens" &&
           (event.is_error === true || subtype !== "success");
+        // task #379: the assistant message already reported this turn's API
+        // error; the generic result failure is the same fact, not a second one.
+        const apiErrorAlreadyReported = this.turnApiErrorReported;
+        this.turnApiErrorReported = false;
 
         switch (subtype) {
           case "success":
-            if (event.is_error) {
+            if (event.is_error && !apiErrorAlreadyReported) {
               pushResultError(event, "Execution failed");
             }
             break;
 
           case "error_during_execution":
-            if (stopReason !== "max_tokens" || isMaxTokenError) {
+            if ((stopReason !== "max_tokens" || isMaxTokenError) && !apiErrorAlreadyReported) {
               pushResultError(event, "Execution failed");
             }
             break;
@@ -392,4 +478,28 @@ export class ClaudeEventNormalizer {
 
     return events;
   }
+}
+
+/**
+ * Whether a tool_result means the tool call itself failed. Claude Code reports
+ * a Bash command that exited non-zero as `is_error: true` with the content
+ * starting "Exit code N": the command ran, so that is `ok: true` with the exit
+ * code. Any other error result is a failed call.
+ *
+ * FRAGILE: Claude Code has no structured exit code on tool_result, so this
+ * matches its text. If the wording changes, every non-zero Bash exit falls back
+ * to `ok: false` (a run with failing tests would show as failed steps). The
+ * format is pinned by the "Exit code N format" test in
+ * claudeEventNormalizer.test.ts; update both together.
+ */
+export function claudeToolResultOutcome(block: { is_error?: unknown; content?: unknown }): { ok?: boolean; exitCode?: number } {
+  // `is_error` defaults to false in the Messages API.
+  if (block.is_error !== true) return { ok: true };
+  const text = typeof block.content === "string"
+    ? block.content
+    : Array.isArray(block.content)
+      ? block.content.map((part) => (part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string" ? (part as { text: string }).text : "")).join("")
+      : "";
+  const exit = /^Exit code (\d+)\b/.exec(text);
+  return exit ? { ok: true, exitCode: Number(exit[1]) } : { ok: false };
 }

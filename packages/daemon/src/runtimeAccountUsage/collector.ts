@@ -1,5 +1,6 @@
 import type { Runtime } from "@botiverse/oar";
-import { claudeRuntime, codexRuntime, kimiRuntime, grokRuntime } from "@botiverse/oar";
+
+import { loadOarRuntime } from "../oarLoader";
 
 import type { RuntimeAccountUsageProvider, RuntimeAccountUsageSnapshot } from "@botiverse/raft-shared";
 
@@ -7,23 +8,73 @@ import {
   projectOarAccountUsageFailure,
   projectOarAccountUsageSnapshot,
   type OarAccountUsageSnapshot,
-} from "./oarAdapter.js";
+} from "./oarAdapter";
+import { resolveKimiCodeAuth, type KimiCodeAuth } from "./kimiAuth";
+import { ensureFreshKimiToken, type KimiFreshness, type KimiRefreshDeps } from "./kimiTokenRefresh";
 
 const DEFAULT_TIMEOUT_MS = 20_000;
 
-/** Exhaustive mapping: every account-usage provider is read through OAR. */
-const OAR_RUNTIME_BY_PROVIDER = {
-  codex: codexRuntime,
-  claude: claudeRuntime,
-  kimi: kimiRuntime,
-  grok: grokRuntime,
-} as const satisfies Record<RuntimeAccountUsageProvider, Runtime>;
 
 /** Injectable for tests; production passes the real OAR runtime. */
 export type OarUsageReadDeps = {
   readonly runtime?: Runtime;
   readonly timeoutMs?: number;
+  /** task #1282 — seams for the kimi pre-probe refresh (production resolves the client's auth and refreshes for real). */
+  readonly kimi?: {
+    readonly resolveAuth?: (command: string) => Promise<KimiCodeAuth | null>;
+    readonly ensureFresh?: (auth: KimiCodeAuth) => Promise<KimiFreshness>;
+    readonly refresh?: KimiRefreshDeps;
+    /**
+     * Off until the shared-credential write-back is enabled (task #1282,
+     * artin's call). While off, the kimi provider is read exactly as before
+     * this change: no refresh, no file access beyond OAR's own read, and the
+     * probe's outcome is projected unchanged — "refresh not enabled" can never
+     * surface as a new login failure. When on, the refresh runs before the
+     * probe and only a rejected or revoked token short-circuits to
+     * `reauth_required`; a transient refresh failure on an expired token is
+     * `error`, every other freshness lets the probe speak.
+     */
+    readonly enabled?: boolean;
+  };
 };
+
+/**
+ * task #1282 — what the kimi pre-probe refresh decided about the probe. The
+ * freshness kinds that are not a verdict about the account let the probe run
+ * and speak for itself.
+ *
+ * Contract (narrowed on review of #9802): "only an explicit rejection means
+ * re-login" is a guarantee about THIS pre-step's own verdicts — it never
+ * writes the client's tombstone and only an exact tombstone or a rejected
+ * refresh short-circuits to `reauth_required`. Everything it hands to the
+ * probe keeps OAR's existing panel result, unchanged by the gate: an absent
+ * file (never logged in / logged out) and an unreadable or malformed one (a
+ * damaged or foreign write) are different facts that OAR reads alike as
+ * `credentials_missing`
+ * (`reauth_required` on the wire); an expired token the pre-step could not
+ * or did not refresh (win32, lock disabled, no refresh token) still reaches
+ * the usage endpoint and reads as `credentials_rejected`; non-file storage
+ * is OAR's `unsupported` before any token read — today's behavior, listed
+ * as unresolved in KIMI_REFRESH_EVIDENCE.md.
+ */
+export function kimiProbeDecision(freshness: KimiFreshness): { kind: "probe" } | { kind: "reauth_required" } | { kind: "error" } {
+  switch (freshness.kind) {
+    case "rejected":
+    case "revoked":
+      return { kind: "reauth_required" };
+    case "transient":
+      // An expired token with no refresh result cannot confirm anything; a
+      // still-valid token can be probed despite the failed refresh. A
+      // malformed success response is one such result: nothing was written.
+      return freshness.expired ? { kind: "error" } : { kind: "probe" };
+    case "missing":
+      // No usable token on disk (absent, unreadable, malformed, no refresh
+      // token): not a verdict about the account; OAR's own read decides.
+      return { kind: "probe" };
+    default:
+      return { kind: "probe" };
+  }
+}
 
 /**
  * Reads one provider's account usage through OAR and projects it onto the Raft
@@ -44,7 +95,19 @@ export async function readOarAccountUsage(input: {
   observedAtMs: number;
   deps?: OarUsageReadDeps;
 }): Promise<RuntimeAccountUsageSnapshot> {
-  const runtime = input.deps?.runtime ?? OAR_RUNTIME_BY_PROVIDER[input.provider];
+  const failure = (): RuntimeAccountUsageSnapshot =>
+    projectOarAccountUsageFailure({
+      provider: input.provider,
+      localAccountSlot: input.localAccountSlot,
+      collectorVersion: input.collectorVersion,
+      observedAtMs: input.observedAtMs,
+    });
+  let runtime: Runtime;
+  try {
+    runtime = input.deps?.runtime ?? await loadOarRuntime(input.provider);
+  } catch {
+    return failure();
+  }
   const project = (snapshot: OarAccountUsageSnapshot): RuntimeAccountUsageSnapshot =>
     projectOarAccountUsageSnapshot({
       provider: input.provider,
@@ -67,6 +130,21 @@ export async function readOarAccountUsage(input: {
       // `not_found` and `unsupported` are both "no reading is obtainable here".
       return project({ kind: "unsupported" });
     }
+    if (input.provider === "kimi" && input.deps?.kimi?.enabled === true) {
+      // task #1282: the client's 15-minute access token is refreshed the way
+      // the client refreshes it, before OAR reads the usage endpoint with it.
+      const command = "command" in installation && typeof installation.command === "string" ? installation.command : "kimi";
+      const resolveAuth = input.deps.kimi.resolveAuth ?? ((cmd: string) => resolveKimiCodeAuth({ command: cmd }));
+      const auth = await resolveAuth(command);
+      if (auth) {
+        const ensureFresh = input.deps.kimi.ensureFresh ?? ((a: KimiCodeAuth) => ensureFreshKimiToken(a, input.deps?.kimi?.refresh));
+        const decision = kimiProbeDecision(await ensureFresh(auth));
+        if (decision.kind === "reauth_required") return project({ kind: "reauth_required", reason: "credentials_rejected" });
+        if (decision.kind === "error") {
+          return failure();
+        }
+      }
+    }
     const snapshot = await readUsage(installation, {
       timeoutMs: input.deps?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     });
@@ -74,12 +152,7 @@ export async function readOarAccountUsage(input: {
   } catch {
     // A thrown read is an explicit error account with no windows. It must never
     // be rendered as zero usage.
-    return projectOarAccountUsageFailure({
-      provider: input.provider,
-      localAccountSlot: input.localAccountSlot,
-      collectorVersion: input.collectorVersion,
-      observedAtMs: input.observedAtMs,
-    });
+    return failure();
   }
 }
 

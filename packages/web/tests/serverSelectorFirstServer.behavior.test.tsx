@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import ServerSelector from "../src/components/auth/ServerSelector";
@@ -85,8 +84,8 @@ afterEach(() => {
   delete (window as unknown as { RaftHost?: unknown }).RaftHost;
 });
 
-test("hosted server selection emits the frozen switch intent, then times out to a retryable error", (t) => {
-  t.mock.timers.enable({ apis: ["setTimeout"] });
+test("hosted server selection emits the frozen switch intent, then times out to a retryable error", () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const first = server();
   const second = server({ id: "server-2", name: "Second", slug: "second" });
   resetStores({ servers: [first, second] });
@@ -117,7 +116,7 @@ test("hosted server selection emits the frozen switch intent, then times out to 
     },
   }]);
   assert.equal(screen.getByRole("button", { name: /Second/ }).hasAttribute("disabled"), true);
-  act(() => t.mock.timers.tick(5000));
+  act(() => vi.advanceTimersByTime(5000));
   assert.ok(screen.getByText("Could not switch servers. Please try again."));
   assert.equal(screen.getByRole("button", { name: /Second/ }).hasAttribute("disabled"), false);
   assert.deepEqual(selected, [], "timeout must never fall back to a local Web selection");
@@ -138,20 +137,25 @@ test("first-server flow always renders Screen A", () => {
   assert.ok(shell?.className.includes("font-display"));
   assert.ok(grid?.className.includes("lg:grid-cols-[minmax(320px,2fr)_minmax(0,3fr)]"));
   assert.ok(formPanel?.className.includes("overflow-y-auto"));
-  assert.ok(formPanel?.className.includes("bg-white"));
-  assert.ok(dotGrid?.className.includes("radial-gradient(#111_1px,transparent_1px)"));
-  assert.ok(dotGrid?.className.includes("[background-size:16px_16px]"));
+  assert.ok(formPanel?.className.includes("bg-layer-canvas"));
+  // The demo pane is the onboarding's frame with a halftone behind the tilted
+  // preview sticker (DS ScreenOnboarding).
+  assert.ok(dotPane?.className.includes("bg-layer-frame"));
+  assert.ok(dotGrid?.className.includes("radial-gradient(var(--line-seam)_1.5px,transparent_1.5px)"));
+  assert.ok(dotGrid?.className.includes("[background-size:14px_14px]"));
   assert.ok(screen.getByTestId("server-create-preview"));
   assert.ok(preview.className.includes("rotate-[-1deg]"));
-  assert.ok(preview.className.includes("border-2"));
-  assert.ok(preview.className.includes("shadow-brutal-lg"));
+  assert.ok(preview.className.includes("shadow-sticker"));
   assert.ok(screen.getByTestId("server-preview-sidebar-badge").className.includes("onboarding-preview-pop"));
   const channelsSection = screen.getByTestId("server-preview-section-channels");
   const dmsSection = screen.getByTestId("server-preview-section-dms");
   assert.equal(channelsSection.tagName, "BUTTON");
   assert.equal(dmsSection.tagName, "BUTTON");
-  assert.ok(channelsSection.className.includes("focus-visible:outline"));
-  assert.ok(dmsSection.className.includes("hover:-translate-y-px"));
+  // DS section-title buttons: a focus ring and the pressed overlay, no
+  // translate-on-hover.
+  assert.ok(channelsSection.className.includes("focus-visible:shadow-focus"));
+  assert.ok(dmsSection.className.includes("hover:bg-fill-pressed"));
+  assert.doesNotMatch(dmsSection.className, /translate/);
   assert.equal(channelsSection.getAttribute("aria-expanded"), "true");
   assert.equal(dmsSection.getAttribute("aria-expanded"), "true");
   assert.equal(channelsSection.getAttribute("aria-controls"), "server-preview-channel-rows");
@@ -169,7 +173,7 @@ test("first-server flow always renders Screen A", () => {
   assert.ok(within(dmsSection).getByText("Direct Messages"));
   assert.equal(
     screen.getByTestId("server-preview-address-slug").className,
-    "min-w-0 truncate font-bold text-black ",
+    "min-w-0 truncate font-bold text-foreground ",
   );
   assert.ok(within(preview).getAllByText("Alex Chen Studio").length >= 1);
   assert.ok(within(preview).getByText("all"));
@@ -188,10 +192,13 @@ test("first-server flow always renders Screen A", () => {
   const sessionFooter = screen.getByTestId("onboarding-session-footer");
   assert.match(sessionFooter.textContent ?? "", /Signed in as cindy@example\.com\./);
   assert.ok(within(sessionFooter).getByRole("button", { name: "Log out" }));
-  // The primary action is full-width on every onboarding page.
+  // The primary action is full-width on every onboarding page: the raft
+  // pink sticker (`accent` → bg-attention-400) at the DS 52 call-to-action size.
   const createButton = screen.getByRole("button", { name: "Create Server" });
-  assert.ok(createButton.className.includes("bg-brutal-pink"));
-  assert.ok(createButton.className.includes("w-full"));
+  const createClasses = createButton.className.split(" ");
+  assert.ok(createClasses.includes("bg-attention-400"));
+  assert.ok(createClasses.includes("h-13"));
+  assert.ok(createClasses.includes("w-full"));
 
   fireEvent.click(channelsSection);
   assert.equal(channelsSection.getAttribute("aria-expanded"), "false");
@@ -206,6 +213,37 @@ test("first-server flow always renders Screen A", () => {
   fireEvent.click(dmsSection);
   assert.equal(dmsSection.getAttribute("aria-expanded"), "true");
   assert.equal(within(preview).queryAllByText("Cindy").length, 2, "expanded DMs show the Cindy row plus the message author");
+});
+
+// Task #686 (Artea 2026-09-28): the first-server intro copy was hardcoded
+// `text-black*`, so on elegant-dark it rendered black-on-dark and nearly
+// disappeared. The fix moved it onto the surface tokens; the Raft DS keeps it
+// there (step label ink-3 in Space Mono, display title, ink-2 paragraph).
+test("first-server title block follows the theme tokens", () => {
+  resetStores();
+  renderSelector();
+
+  const eyebrow = screen.getByText("Create your first server");
+  const heading = screen.getByRole("heading", { name: "Name the server where your agents will work." });
+  const description = screen.getByText(
+    "A server is the workspace for your people, agents, channels, and computers.",
+  );
+
+  assert.match(eyebrow.className, /(?:^|\s)text-foreground-hint(?:\s|$)/);
+  assert.match(eyebrow.className, /(?:^|\s)font-mono(?:\s|$)/);
+  assert.doesNotMatch(eyebrow.className, /uppercase/, "only a \"Step 1 of 3\" count may be all caps");
+  assert.match(heading.className, /(?:^|\s)text-foreground(?:\s|$)/);
+  assert.match(description.className, /(?:^|\s)text-foreground-muted(?:\s|$)/);
+
+  // No bare black text left: a future edit must not silently regress these to
+  // light-theme-only values again.
+  for (const element of [eyebrow, heading, description]) {
+    assert.doesNotMatch(
+      element.className,
+      /text-black/,
+      `${element.tagName} keeps its copy on semantic tokens`,
+    );
+  }
 });
 
 test("Screen A preview reflects server name and slug before create", () => {

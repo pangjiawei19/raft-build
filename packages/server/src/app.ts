@@ -2,78 +2,107 @@ import express, { type Express, type Request, type RequestHandler } from "expres
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
-import { channelRouter } from "./routes/channels.js";
-import { publicServerRouter } from "./routes/publicServer.js";
-import { messageRouter, messageV2Router } from "./routes/messages.js";
-import { agentRouter, agentAvatarRouter } from "./routes/agents.js";
-import { agentCredentialsHandler, listAgentCredentialsHandler, revokeAgentCredentialHandler } from "./routes/agentCredentials.js";
-import { listManageableAgentsHandler } from "./routes/agentDiscovery.js";
-import { internalRouter } from "./routes/internal.js";
-import { authRouter } from "./routes/auth.js";
-import { agentLoginRouter } from "./routes/agentLogin.js";
-import { deviceAuthRouter } from "./routes/deviceAuth.js";
-import { computerAttachRouter } from "./routes/computerAttach.js";
-import { computerAdoptRouter } from "./routes/computerAdopt.js";
-import { computerLegacyMachinesRouter } from "./routes/computerLegacyMachines.js";
-import { isDeviceAuthSurfaceEnabled } from "./services/deviceAuthService.js";
-import { internalComputerRouter } from "./routes/internalComputer.js";
-import { internalAgentApiRouter } from "./routes/internalAgentApi.js";
-import { serverRouter } from "./routes/servers.js";
-import { billingRouter, stripeWebhookHandler } from "./routes/billing.js";
-import { resendNewsletterWebhookHandler } from "./routes/newsletterWebhooks.js";
-import { taskRouter } from "./routes/tasks.js";
-import { workflowRouter } from "./routes/workflows.js";
-import { reminderRouter } from "./routes/reminders.js";
-import { attachmentRouter, attachmentPublicRouter } from "./routes/attachments.js";
-import { externalAvatarPublicRouter } from "./routes/externalAvatars.js";
+import { channelRouter } from "./routes/channels";
+import { publicServerRouter } from "./routes/publicServer";
+import { publicFeatureFlagsRouter } from "./routes/publicFeatureFlags";
+import { publicSearchRouter } from "./routes/publicSearch";
+import { createPublicSearchAccess, type PublicSearchServiceBucketStore, type PublicSearchServiceKeySource } from "./lib/publicSearchServiceAccess";
+import {
+  PUBLIC_VISITS_PATH,
+  publicVisitsBodyErrorHandler,
+  publicVisitsBodyParser,
+  publicVisitsRouter,
+} from "./routes/publicVisits";
+import { countIngest } from "./services/productEventIngest";
+import { messageRouter, messageV2Router } from "./routes/messages";
+import { agentRouter, agentAvatarRouter } from "./routes/agents";
+import { agentCredentialsHandler, listAgentCredentialsHandler, revokeAgentCredentialHandler } from "./routes/agentCredentials";
+import { listManageableAgentsHandler } from "./routes/agentDiscovery";
+import { internalRouter } from "./routes/internal";
+import {
+  SCOPE_ATTESTATION_PATH,
+  SCOPE_ATTESTATION_REQUEST_MAX_BYTES,
+  scopeAttestationBodyErrorHandler,
+} from "./routes/scopeAttestationRequestLimits";
+import {
+  AGENT_MIGRATION_CONTROL_PATH,
+  AGENT_MIGRATION_CONTROL_REQUEST_MAX_BYTES,
+  agentMigrationControlBodyErrorHandler,
+} from "./routes/agentMigrationControlRequestLimits";
+import { authRouter } from "./routes/auth";
+import { agentLoginRouter } from "./routes/agentLogin";
+import { deviceAuthRouter } from "./routes/deviceAuth";
+import { appLoginRouter } from "./routes/appLogin";
+import { computerAttachRouter } from "./routes/computerAttach";
+import { computerAdoptRouter } from "./routes/computerAdopt";
+import { computerLegacyMachinesRouter } from "./routes/computerLegacyMachines";
+import { isDeviceAuthSurfaceEnabled } from "./services/deviceAuthService";
+import { internalComputerRouter } from "./routes/internalComputer";
+import { internalAgentApiRouter } from "./routes/internalAgentApi";
+import { agentApiErrorTrace } from "./routes/agentApiErrorTrace";
+import { serverRouter } from "./routes/servers";
+import { billingRouter, stripeWebhookHandler } from "./routes/billing";
+import { resendNewsletterWebhookHandler } from "./routes/newsletterWebhooks";
+import { raftbenchRouter } from "./routes/raftbench";
+import { taskRouter } from "./routes/tasks";
+import { reminderRouter } from "./routes/reminders";
+import { attachmentRouter, attachmentPublicRouter } from "./routes/attachments";
+import { externalAvatarPublicRouter } from "./routes/externalAvatars";
 import {
   attachmentUploadRateLimitedResponse,
   createAttachmentUploadSessionRouter,
   type AttachmentUploadSessionService,
-} from "./routes/attachmentUploadSessions.js";
-import { shareArtifactPublicRouter, shareArtifactRouter } from "./routes/shareArtifacts.js";
-import { pushRouter } from "./routes/push.js";
-import { notificationRouter } from "./routes/notifications.js";
-import { announcementRouter } from "./routes/announcements.js";
-import { integrationInviteRouter, integrationLogoPublicRouter, integrationRouter } from "./routes/integrations.js";
-import { appInstallationRouter } from "./routes/appInstallations.js";
-import { actionsRouter } from "./routes/actions.js";
-import { productEventsRouter } from "./routes/productEvents.js";
-import { managedMcpOAuthCallbackRouter, managedMcpRouter } from "./routes/managedMcp.js";
-import { providerConnectionRouter } from "./routes/providerConnections.js";
-import { productFeedbackRouter } from "./routes/productFeedback.js";
-import { mobileDownloadRouter } from "./routes/mobileDownload.js";
-import { featureFlagsRouter } from "./routes/featureFlags.js";
-import { readMutationRouter } from "./routes/readMutations.js";
-import { wikiRouter } from "./routes/wiki.js";
-import { oauthRouter, oidcDiscoveryHandler } from "./routes/oauth.js";
-import { messageTranslationBatchHandler } from "./routes/messageTranslations.js";
-import { otlpRelayHandler } from "./routes/otlpRelay.js";
+} from "./routes/attachmentUploadSessions";
+import { shareArtifactPublicRouter, shareArtifactRouter } from "./routes/shareArtifacts";
+import { pushRouter } from "./routes/push";
+import { notificationRouter } from "./routes/notifications";
+import { announcementRouter } from "./routes/announcements";
+import { integrationInviteRouter, integrationLogoPublicRouter, integrationRouter } from "./routes/integrations";
+import { appInstallationRouter } from "./routes/appInstallations";
+import { actionsRouter } from "./routes/actions";
+import { productEventsRouter } from "./routes/productEvents";
+import { managedMcpOAuthCallbackRouter, managedMcpRouter } from "./routes/managedMcp";
+import { agentConnectionCallbackRouter } from "./routes/agentConnectionCallback";
+import { providerConnectionRouter } from "./routes/providerConnections";
+import { agentRuntimeProviderRouter } from "./routes/agentRuntimeProviders";
+import { productFeedbackRouter } from "./routes/productFeedback";
+import { releaseNotesRouter } from "./routes/releaseNotes";
+import { mobileDownloadRouter } from "./routes/mobileDownload";
+import { desktopDownloadRouter } from "./routes/desktopDownload";
+import { mobileAppEmailUnsubscribeRouter } from "./routes/mobileAppEmailUnsubscribe";
+import { featureFlagsRouter } from "./routes/featureFlags";
+import { readMutationRouter } from "./routes/readMutations";
+import { oauthRouter, oidcDiscoveryHandler, oidcScopedMountGuard } from "./routes/oauth";
+import { messageTranslationBatchHandler } from "./routes/messageTranslations";
+import { otlpRelayHandler } from "./routes/otlpRelay";
 import {
   createSlackBridgeRouteHandlers,
   type SlackBridgeRouteDependencies,
-} from "./routes/slackBridge.js";
-import { requireAuth, requireVerified, requireServer, requireMachineAuth, requireFlexAuth, requireServerForFlex } from "./middleware/auth.js";
-import { authFromRegistry } from "./middleware/authFromRegistry.js";
-import { perfAttributionMiddleware } from "./middleware/perfAttribution.js";
-import { requestObservabilityMiddleware } from "./middleware/requestObservability.js";
+} from "./routes/slackBridge";
+import { requireAuth, requireVerified, requireServer, requireMachineAuth, requireFlexAuth, requireServerForFlex } from "./middleware/auth";
+import { authFromRegistry } from "./middleware/authFromRegistry";
+import { perfAttributionMiddleware } from "./middleware/perfAttribution";
+import { requestObservabilityMiddleware } from "./middleware/requestObservability";
 import {
   forwardAdmissionTraceMiddleware,
   markForwardAdmissionStage,
-} from "./tracing/messageForwardTrace.js";
-import { raftdevActivityMiddleware } from "./middleware/raftdevActivity.js";
-import { inboxRouteBackpressureMiddleware } from "./middleware/inboxRouteBackpressure.js";
-import { AGENT_BOOTSTRAP_SURFACE_ENABLED_ENV, isAgentBootstrapSurfaceEnabled } from "./services/agentCredentialService.js";
-import { getWebCorsOriginOption } from "./config/appUrl.js";
-import { globalJsonServerErrorHandler } from "./routes/errorResponse.js";
-import { readBuildIdentityStatus } from "./version.js";
+} from "./tracing/messageForwardTrace";
+import { raftdevActivityMiddleware } from "./middleware/raftdevActivity";
+import { inboxRouteBackpressureMiddleware } from "./middleware/inboxRouteBackpressure";
+import { AGENT_BOOTSTRAP_SURFACE_ENABLED_ENV, isAgentBootstrapSurfaceEnabled } from "./services/agentCredentialService";
+import { getWebCorsOriginOption } from "./config/appUrl";
+import { globalJsonServerErrorHandler } from "./routes/errorResponse";
+import { readBuildIdentityStatus } from "./version";
+import { clientIpForRateLimit } from "./lib/clientIpForRateLimit";
 
-export function rateLimitUserOrIpKey(req: Pick<Request, "ip" | "userId">): string {
-  return req.userId || ipKeyGenerator(req.ip ?? "unknown");
+
+export const CORS_PREFLIGHT_MAX_AGE_SECONDS = 7200;
+export function rateLimitUserOrIpKey(req: Pick<Request, "ip" | "userId"> & { headers?: Request["headers"] }): string {
+  return req.userId || ipKeyGenerator(clientIpForRateLimit(req));
 }
 
-export function rateLimitUserMachineOrIpKey(req: Pick<Request, "ip" | "machineId" | "userId">): string {
-  return req.userId || req.machineId || ipKeyGenerator(req.ip ?? "unknown");
+export function rateLimitUserMachineOrIpKey(req: Pick<Request, "ip" | "machineId" | "userId"> & { headers?: Request["headers"] }): string {
+  return req.userId || req.machineId || ipKeyGenerator(clientIpForRateLimit(req));
 }
 
 export function shouldSkipAttachmentRateLimit(input: {
@@ -110,6 +139,8 @@ export type CreateAppOptions = Readonly<{
     skipAuthRateLimit?: boolean;
     enforceMessageRateLimit?: boolean;
     messageRateLimitMax?: number;
+    publicSearchKeySource?: PublicSearchServiceKeySource;
+    publicSearchBucketStore?: PublicSearchServiceBucketStore;
   };
   attachmentUploadSessionService?: AttachmentUploadSessionService;
   slackBridge?: SlackBridgeRouteDependencies;
@@ -161,12 +192,14 @@ export function createApp(options: CreateAppOptions = {}): Express {
     app.set("trust proxy", 1);
   }
 
-  // Configure Helmet with CSP that allows CDN images (for thumbnails served via CDN_BASE_URL)
+  // Configure Helmet with CSP that allows public derived images: legacy keys are
+  // served via CDN_BASE_URL and content/v2 keys via PUBLIC_CONTENT_BASE_URL.
   const imgSrc = ["'self'"];
-  if (process.env.CDN_BASE_URL) {
+  for (const publicBaseUrl of [process.env.CDN_BASE_URL, process.env.PUBLIC_CONTENT_BASE_URL]) {
+    if (!publicBaseUrl) continue;
     try {
-      const cdnHost = new URL(process.env.CDN_BASE_URL).origin;
-      imgSrc.push(cdnHost);
+      const publicHost = new URL(publicBaseUrl).origin;
+      if (!imgSrc.includes(publicHost)) imgSrc.push(publicHost);
     } catch {
       // Invalid URL — skip adding to CSP
     }
@@ -181,7 +214,11 @@ export function createApp(options: CreateAppOptions = {}): Express {
   }));
 
   const corsOrigin = getWebCorsOriginOption();
-  app.use(cors({ origin: corsOrigin, credentials: true }));
+  // The web app calls the API cross-origin with an Authorization header, so
+  // every request needs a preflight. Without Access-Control-Max-Age Chrome
+  // caches each one for 5s (per URL + method + headers): on prod a channel
+  // switch sent 13 OPTIONS round trips ahead of its GETs. 7200s is Chrome's cap.
+  app.use(cors({ origin: corsOrigin, credentials: true, maxAge: CORS_PREFLIGHT_MAX_AGE_SECONDS }));
   app.use((_req, res, next) => {
     res.setHeader("X-Robots-Tag", "noindex, nofollow");
     next();
@@ -216,15 +253,44 @@ export function createApp(options: CreateAppOptions = {}): Express {
     },
   );
 
-  // Wiki publication carries changed Markdown revision bodies alongside the
-  // manifest. Authenticate this one larger JSON surface before parsing it;
-  // the default Express JSON limit remains in force for every other route.
-  app.use(
-    "/internal/agent-api/wiki/publish",
+  // Tighter body bound for the release-notes admin mutations: must run before
+  // the global JSON parser, which would otherwise parse the request first and make a
+  // router-level limit a no-op.
+  app.use("/api/release-notes", express.json({ limit: "4mb" }));
+  // Public Server visit beacons: unauthenticated, so parse at most 1 KB and
+  // answer a bad body with the route's uniform 204 (routes/publicVisits.ts).
+  app.post(PUBLIC_VISITS_PATH, publicVisitsBodyParser, publicVisitsBodyErrorHandler);
+  // Route-scoped 1 MiB JSON limit for machine scope attestation (old daemons
+  // send ~180 KB of now-stripped diagnostics). Machine auth runs BEFORE the
+  // parser; registered ahead of the global parser, which then skips the
+  // already-parsed body. The generic `/internal` auth below still runs again
+  // for the route itself. No rate limit is added: the route had none.
+  app.post(
+    SCOPE_ATTESTATION_PATH,
+    requireMachineAuth,
+    express.json({ limit: SCOPE_ATTESTATION_REQUEST_MAX_BYTES }),
+    scopeAttestationBodyErrorHandler,
+  );
+  // Same pattern for the migration control manifest (up to 512 KB): computer
+  // auth first, then a route-scoped parser the global one then skips.
+  app.post(
+    AGENT_MIGRATION_CONTROL_PATH,
     authFromRegistry(),
-    express.json({ limit: "24mb" }),
+    express.json({ limit: AGENT_MIGRATION_CONTROL_REQUEST_MAX_BYTES }),
+    agentMigrationControlBodyErrorHandler,
   );
   app.use(express.json());
+  // Default freshness policy for the whole authenticated API surface (human
+  // /api and agent /internal alike): per-user JSON with no explicit policy is
+  // storable by any HTTP cache and may be served with heuristic freshness —
+  // observed in prod (2026-09-21) as a stale /channels/inbox body replayed by
+  // an intermediate cache. Cacheable-by-design responses (immutable
+  // attachments, release notes, share artifacts) override this by setting
+  // their own Cache-Control in the route.
+  app.use(["/api", "/internal"], (_req, res, next) => {
+    res.setHeader("Cache-Control", "private, no-store");
+    next();
+  });
   app.use(raftdevActivityMiddleware);
   app.use(requestObservabilityMiddleware);
   app.use(perfAttributionMiddleware);
@@ -235,6 +301,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   // Rate limiter for auth endpoints (general)
   const authLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
     windowMs: 60 * 1000, // 1 minute
     max: 200,
     standardHeaders: true,
@@ -254,6 +321,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   // Separate (more lenient) limiter for join-link invite flow endpoints.
   const inviteFlowLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
     windowMs: 60 * 1000, // 1 minute
     max: 120,
     standardHeaders: true,
@@ -263,6 +331,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
 
   // Stricter rate limiter for forgot-password (5 requests/hour/IP)
   const forgotPasswordLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
     windowMs: 60 * 60 * 1000, // 1 hour
     max: 5,
     standardHeaders: true,
@@ -282,6 +351,10 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // (documented intentional, mirrors `/api/agent/login`). Default-on after
   // PR-G; operators set `SLOCK_DEVICE_LOGIN_ENABLED=false` as emergency
   // kill switch only.
+  // App login handoff (HarmonyOS web login): app → web login → one-time
+  // code back to the app. Same pre-credential, rate-limited shape as the
+  // device grant; mounted before the generic `/api/auth` router.
+  app.use("/api/auth/app-login", authLimiter, appLoginRouter);
   if (isDeviceAuthSurfaceEnabled()) {
     app.use("/api/auth/device", authLimiter, deviceAuthRouter);
     // task #30 PR-B 3/n: user-authed Computer attach. Same Computer-login
@@ -304,6 +377,12 @@ export function createApp(options: CreateAppOptions = {}): Express {
   app.use("/api/auth", authLimiter, authRouter);
   app.get("/.well-known/openid-configuration", authLimiter, oidcDiscoveryHandler);
   app.use("/api/oauth", authLimiter, express.urlencoded({ extended: false }), oauthRouter);
+  // Server-scoped OIDC (task #150): clients that reject query components cannot
+  // carry `?server=`, so the server rides in the path and the whole endpoint
+  // family is mounted a second time beneath it. The unscoped mounts above stay
+  // live for existing integrations; retiring them is a separate cutover.
+  app.get("/oidc/:server/.well-known/openid-configuration", authLimiter, oidcDiscoveryHandler);
+  app.use("/oidc/:server/api/oauth", authLimiter, oidcScopedMountGuard, express.urlencoded({ extended: false }), oauthRouter);
   app.post(
     "/api/slack-bridge/oauth/start",
     authLimiter,
@@ -368,14 +447,6 @@ export function createApp(options: CreateAppOptions = {}): Express {
     requireServer,
     slackBridgeHandlers.enable,
   );
-  app.put(
-    "/api/slack-bridge/author-policies",
-    authLimiter,
-    requireAuth,
-    requireVerified,
-    requireServer,
-    slackBridgeHandlers.setAuthorPolicy,
-  );
   app.get(
     "/api/slack-bridge/oauth/callback",
     authLimiter,
@@ -430,10 +501,19 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // phone scanning it has no session. Requiring auth would land every scan on a
   // login wall. Artifacts behind it are public app builds.
   app.use("/api/mobile-download", authLimiter, mobileDownloadRouter);
+  // Same reason: the /download page is anonymous. Public desktop-beta builds.
+  app.use("/api/desktop-download", authLimiter, desktopDownloadRouter);
+  app.use("/api/email/mobile-app", authLimiter, mobileAppEmailUnsubscribeRouter);
+  // Global product release notes: public read of published revisions (anonymous
+  // projection). Writes no longer go through the server API; the Release App
+  // maintains release notes via direct database access (see
+  // services/releaseNotesMutation.ts for the shared mutation primitive).
+  app.use("/api/release-notes", authLimiter, releaseNotesRouter);
   app.use("/api/product-feedback", requireAuth, requireVerified, productFeedbackLimiter, productFeedbackRouter);
 
   // Rate limiter for billing mutation endpoints (checkout/portal create Stripe sessions)
   const billingLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
     windowMs: 60 * 1000, // 1 minute
     max: 5,
     standardHeaders: true,
@@ -445,6 +525,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // Rate limiter for file uploads (10 uploads/minute/IP to prevent abuse).
   // This covers both human `/api/attachments/upload` and agent `/internal/.../upload`.
   const uploadLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
     windowMs: 60 * 1000, // 1 minute
     max: 10,
     validate: rateLimitValidate,
@@ -464,7 +545,7 @@ export function createApp(options: CreateAppOptions = {}): Express {
     standardHeaders: true,
     legacyHeaders: false,
     message: attachmentUploadRateLimitedResponse,
-    keyGenerator: (req) => req.userId || req.actingAgentId || ipKeyGenerator(req.ip ?? "unknown"),
+    keyGenerator: (req) => req.userId || req.actingAgentId || ipKeyGenerator(clientIpForRateLimit(req)),
     skip: () => isTestEnv,
   });
   app.set("attachmentUploadSessionCreateLimiter", directUploadLimiter);
@@ -532,17 +613,95 @@ export function createApp(options: CreateAppOptions = {}): Express {
     keyGenerator: rateLimitUserOrIpKey,
   });
 
+  // Public translation can invoke the provider without a principal. Keep a
+  // separate IP-only bucket so signing in cannot multiply the public allowance.
+  // Its numeric budget matches the member endpoint by product decision.
+  const publicTranslationLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    validate: rateLimitValidate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many public translation requests, please slow down" },
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+  });
+
+  // Public attachment bytes are fetched without a principal, one request per
+  // image on a public page. Keep a separate IP-only bucket sized like the
+  // member download limiter so anonymous reads cannot borrow other budgets.
+  const publicAttachmentLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    validate: rateLimitValidate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many public attachment requests, please slow down" },
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+  });
+
   // Resource routes (auth + verified + server required)
   app.post(/^\/api\/message-translations:batch$/, requireAuth, requireVerified, requireServer, translationLimiter, messageTranslationBatchHandler);
+  app.post(/^\/api\/public\/servers\/[^/]+\/message-translations:batch$/, publicTranslationLimiter);
+  app.get(/^\/api\/public\/servers\/[^/]+\/attachments\/[^/]+$/, publicAttachmentLimiter);
   // Authenticate the JWT without DB work, then admit Inbox requests before
   // verified-profile, server-membership, policy, and serving-row queries. This
   // bounds all PostgreSQL work caused by one authenticated Inbox request, not
   // only the final serving query inside the route handler.
   // Task #70: the ONLY unauthenticated read surface for server content.
-  // No requireAuth/requireVerified/requireServer on purpose — it serves logged-out
-  // visitors. It is rate-limited and read-only; see routes/publicServer.ts for the
-  // two properties it exists to guarantee.
+  // No router-wide requireAuth/requireVerified/requireServer on purpose — its GETs
+  // serve logged-out visitors. Task #74's one membership write attaches auth and
+  // verification on that route itself; see routes/publicServer.ts.
+  // Public server SEO: the read-only search API raft.build renders from. A
+  // narrower predicate than the guest view (owner search switch + indexing
+  // master switch); see routes/publicSearch.ts. Mounted before /api/public so
+  // the guest router never sees these paths.
+  // Every service-scheme request is limited per client IP before its key
+  // lookup (task #4), so forged credentials cannot drive unbounded reads of
+  // the key table. Above the shared service bucket, so it never binds first
+  // for genuine raft.build traffic spread over Cloudflare egress addresses.
+  const publicSearchVerifyLimiter = rateLimit({
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+    windowMs: 60 * 1000,
+    max: 600,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many requests, please try again later" },
+  });
+  // Anonymous callers keep the per-IP authLimiter; raft.build's service
+  // credential gets its own finite bucket instead (lib/publicSearchServiceAccess.ts).
+  app.use("/api/public/search", createPublicSearchAccess({
+    anonymousLimiter: authLimiter,
+    verifyLimiter: publicSearchVerifyLimiter,
+    // Test harnesses inject these explicitly; production never falls back to
+    // a process-local bucket or an unchecked key source.
+    ...(options.testHarness?.publicSearchKeySource ? { keySource: options.testHarness.publicSearchKeySource } : {}),
+    ...(options.testHarness?.publicSearchBucketStore ? { bucketStore: options.testHarness.publicSearchBucketStore } : {}),
+  }), publicSearchRouter);
+  // Before-login feature flags (task #205): pre_auth_evaluable flags only, no credentials read.
+  app.use("/api/public/feature-flags", authLimiter, publicFeatureFlagsRouter);
   app.use("/api/public", authLimiter, publicServerRouter);
+  // Count-only visit beacons from public server pages: unauthenticated, always
+  // 204 (routes/publicVisits.ts). Outside authLimiter so visits do not spend
+  // the public read budget. replica-local: per-task budget (20/min/IP, Tenny
+  // 2026-10-14); the per-server daily cap is shared in Redis. The key is the
+  // visitor address only once TRUST_CLOUDFRONT_VIEWER_HEADERS is on (until then
+  // the CloudFront edge); never parse forwarding headers here.
+  const publicVisitsLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    validate: rateLimitValidate,
+    standardHeaders: false,
+    legacyHeaders: false,
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+    // 204 like every other outcome there; the metric is the only trace.
+    handler: (_req, res) => {
+      countIngest("public_visit_rate_limited", 1);
+      res.set("Cache-Control", "no-store");
+      res.status(204).end();
+    },
+    skip: () => isTestEnv,
+  });
+  app.use("/api/public-visits", publicVisitsLimiter, publicVisitsRouter);
 
   app.use(
     "/api/channels",
@@ -579,10 +738,10 @@ export function createApp(options: CreateAppOptions = {}): Express {
   app.post("/api/agents/:id/credentials", requireAuth, requireVerified, agentCredentialsHandler);
   app.get("/api/agents/:id/credentials", requireAuth, requireVerified, listAgentCredentialsHandler);
   app.delete("/api/agents/:id/credentials/:credentialId", requireAuth, requireVerified, revokeAgentCredentialHandler);
+  app.use("/api/raftbench", requireAuth, requireVerified, requireServer, raftbenchRouter);
   app.use("/api/agents", requireAuth, requireVerified, requireServer, agentRouter);
   app.use("/api/billing", requireAuth, requireVerified, requireServer, billingLimiter, billingRouter);
   app.use("/api/tasks", requireAuth, requireVerified, requireServer, taskRouter);
-  app.use("/api/workflows", requireAuth, requireVerified, requireServer, workflowRouter);
   app.use("/api/reminders", requireAuth, requireVerified, requireServer, reminderRouter);
   // Attachment-comment creation is MESSAGE-shaped traffic, not an upload:
   // it must ride the message limiter (60/min/user, skipped in the pglite
@@ -599,13 +758,29 @@ export function createApp(options: CreateAppOptions = {}): Express {
   app.use("/api/integration-invites", requireAuth, requireVerified, integrationInviteRouter);
   app.use("/api/integrations", requireAuth, requireVerified, requireServer, integrationRouter);
   app.use("/api/actions", requireAuth, requireVerified, requireServer, actionsRouter);
-  app.use("/api/wiki", requireAuth, requireVerified, requireServer, wikiRouter);
-  app.use("/api/product-events", requireAuth, requireVerified, requireServer, productEventsRouter);
+  // RFC-067 client events: a tab flushes about every 10s, so this only stops
+  // runaway or abusive senders.
+  // replica-local: abuse guard only, per-replica budget is acceptable
+  const productEventsLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 60,
+    validate: rateLimitValidate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many product event batches.", code: "product_events_rate_limited" },
+    keyGenerator: rateLimitUserOrIpKey,
+    skip: () => isTestEnv,
+  });
+  app.use("/api/product-events", requireAuth, requireVerified, requireServer, productEventsLimiter, productEventsRouter);
   // The remote provider returns here without a Raft browser session. The
   // callback consumes a one-time hashed state and derives Server scope from it.
   app.use("/api/mcp/oauth", authLimiter, managedMcpOAuthCallbackRouter);
   app.use("/api/mcp", requireAuth, requireVerified, requireServer, managedMcpRouter);
   app.use("/api/provider-connections", requireAuth, requireVerified, requireServer, providerConnectionRouter);
+  app.use("/api/agent-runtime-providers", requireAuth, requireVerified, requireServer, agentRuntimeProviderRouter);
+  // A hosted runtime provider returns the browser here after an account-connection
+  // OAuth round trip; the route only forwards the outcome to the web landing page.
+  app.use("/api/connections", authLimiter, agentConnectionCallbackRouter);
 
   // Apply the same upload concurrency guard to the agent upload surface before
   // the general internal router. Uploads can now be up to 50MB and still use the
@@ -630,19 +805,49 @@ export function createApp(options: CreateAppOptions = {}): Express {
   // bound agentId is read from the credential row — there is NO `:id` path
   // param. Cross-principal rejection (sk_machine_* / sk_computer_* / JWT) is
   // handled inside `requireAgentCredentialAuth`.
-  app.use("/internal/agent-api", experimentalInternalSurfaceContract("agent-api"), authFromRegistry(), internalAgentApiRouter);
+  // agentApiErrorTrace before auth: auth refusals (401/403) are classified too.
+  app.use("/internal/agent-api", experimentalInternalSurfaceContract("agent-api"), agentApiErrorTrace, authFromRegistry(), internalAgentApiRouter);
+
+  // App-side endpoint: installed Apps exchange their OAuth access token for
+  // the managed bot's sk_agent_* key. No user session, no X-Server-Id —
+  // server is derived from the oauth_access_tokens row. Mounted before
+  // requireMachineAuth because the caller's credential is OAuth, not
+  // sk_machine_*.
+  const appBotTokenLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    keyGenerator: (req) => ipKeyGenerator(clientIpForRateLimit(req)),
+    validate: rateLimitValidate,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { error: "Too many bot token requests" },
+  });
+  app.post("/api/app-bot/token", appBotTokenLimiter, async (req, res) => {
+    const { handleAppBotTokenExchange } = await import("./routes/integrations");
+    await handleAppBotTokenExchange(req, res);
+  });
 
   // Internal routes (machine auth)
   app.use("/internal", requireMachineAuth, internalRouter);
 
-  // Health check — verifies DB connectivity so Fly.io can detect stale connections
+  // Liveness for the ALB/ECS health check: no database query on the request
+  // path, so a Neon pause cannot fail every task at once. See dbLiveness.ts.
+  app.get("/livez", async (_req, res) => {
+    const { getDbLivenessTracker, livezStatus } = await import("./dbLiveness");
+    const verdict = getDbLivenessTracker().verdict();
+    const status = livezStatus(verdict);
+    res.status(status).json({ status: status === 200 ? "ok" : "error", ...verdict });
+  });
+
+  // Health check (readiness) — verifies DB connectivity right now. Deploy
+  // smoke checks, the Web deploy gate and canary smoke depend on this meaning.
   app.get("/health", async (_req, res) => {
     try {
-      const { pingDatabase } = await import("./db/index.js");
+      const { pingDatabase } = await import("./db/index");
       await pingDatabase();
       // Piggyback the read-only int4 seq-headroom tripwire on health polling.
       // Throttled + fail-open inside; must never affect the health verdict.
-      const { probeSeqHeadroom } = await import("./services/seqHeadroomTripwire.js");
+      const { probeSeqHeadroom } = await import("./services/seqHeadroomTripwire");
       probeSeqHeadroom();
       res.json({ status: "ok" });
     } catch (err) {

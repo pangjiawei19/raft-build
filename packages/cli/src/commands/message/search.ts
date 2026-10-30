@@ -1,17 +1,23 @@
 // `raft message search [--query <q>] [--target <t>] [--sender <handle>]
 //                       [--sort relevance|recent]
-//                       [--before <ts>] [--after <ts>] [--limit N] [--offset N]`
+//                       [--before <ts>] [--after <ts>] [--limit N] [--offset N]
+//                       [--cursor <c>]`
 // → GET /internal/agent-api/search
 
 import type { Command } from "commander";
 
-import { defineCommand, registerCliCommand } from "../../core/command.js";
-import type { CommandRuntimeOptions } from "../../core/context.js";
-import { CliError, type CliErrorCode } from "../../core/errors.js";
-import { writeText, NL } from "../../core/renderer.js";
-import { createAgentApiSurfaceClient } from "../../agentApiPath.js";
-import { resolveTargetAlias, type TargetAliasOpts } from "../_target.js";
-import { formatSearchResults } from "./_format.js";
+import {
+  AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
+  AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+} from "@botiverse/raft-shared/src/agentCliSurface";
+
+import { defineCommand, registerCliCommand } from "../../core/command";
+import type { CommandRuntimeOptions } from "../../core/context";
+import { CliError, type CliErrorCode } from "../../core/errors";
+import { writeText, NL } from "../../core/renderer";
+import { createAgentApiSurfaceClient } from "../../agentApiPath";
+import { PEER_KIND_OPTION, resolveTargetAlias, type TargetAliasOpts } from "../_target";
+import { formatSearchResults, type SearchData } from "./_format";
 
 interface SearchOpts extends TargetAliasOpts {
   query?: string;
@@ -21,6 +27,7 @@ interface SearchOpts extends TargetAliasOpts {
   after?: string;
   limit?: string;
   offset?: string;
+  cursor?: string;
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -173,6 +180,19 @@ function normalizeSearchOpts(opts: Partial<SearchOpts & { sort?: string }>): Omi
   const limit = parsePositiveInt("limit", opts.limit);
   const offset = parseNonNegativeInt("offset", opts.offset);
   const sort = opts.sort ?? (query ? undefined : "recent");
+  const cursor = opts.cursor?.trim();
+  if (opts.cursor !== undefined && (!cursor || !query || sort !== "recent")) {
+    throw new CliError({
+      code: "INVALID_ARG",
+      message: "--cursor continues a recent search: pass a previous nextCursor with the same --query and --sort recent",
+    });
+  }
+  if (cursor && offset !== undefined) {
+    throw new CliError({
+      code: "INVALID_ARG",
+      message: "--cursor already marks where to continue; drop --offset",
+    });
+  }
   const before = normalizeSearchTimestampArg("before", opts.before);
   const after = normalizeSearchTimestampArg("after", opts.after);
   return {
@@ -185,7 +205,33 @@ function normalizeSearchOpts(opts: Partial<SearchOpts & { sort?: string }>): Omi
     ...(after ? { after } : {}),
     ...(limit !== undefined ? { limit } : {}),
     ...(offset !== undefined ? { offset } : {}),
+    ...(cursor ? { cursor } : {}),
   };
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * Two copy-pasteable retries of the caller's own search: recent sort (never
+ * rejected as too broad) and the same search narrowed to one channel.
+ */
+export function formatQueryTooBroadNextAction(opts: {
+  query?: string;
+  sender?: string;
+  before?: string;
+  after?: string;
+}): string {
+  const base = [
+    "raft message search",
+    ...(opts.query ? [`--query ${shellQuote(opts.query)}`] : []),
+    ...(opts.sender ? [`--sender ${shellQuote(opts.sender)}`] : []),
+    ...(opts.after ? [`--after ${shellQuote(opts.after)}`] : []),
+    ...(opts.before ? [`--before ${shellQuote(opts.before)}`] : []),
+  ].join(" ");
+  return `Newest first (never rejected as too broad): ${base} --sort recent\n`
+    + `Or narrow to one channel you are in: ${base} --target '#<channel>'`;
 }
 
 function toSearchErrorCode(errorCode: string | null | undefined, status: number): CliErrorCode {
@@ -209,12 +255,33 @@ export const messageSearchCommand = defineCommand(
       { flags: "--query <q>", description: "Search query string (optional when filters are provided)" },
       { flags: "--target <target>", description: "Restrict to a single channel/DM/thread" },
       { flags: "--channel <target>", description: "Legacy alias for --target (accepted during transition)" },
+      PEER_KIND_OPTION,
       { flags: "--sender <handle>", description: "Restrict to messages by sender handle, e.g. @alice" },
       { flags: "--sort <mode>", description: "Sort results by relevance or recent (default: relevance; filter-only searches use recent)" },
       { flags: "--before <iso>", description: "Only messages before this ISO datetime" },
       { flags: "--after <iso>", description: "Only messages after this ISO datetime" },
-      { flags: "--limit <n>", description: "Max results (server default applies if omitted)" },
-      { flags: "--offset <n>", description: "Skip this many results (server default applies if omitted)" },
+      {
+        flags: "--limit <n>",
+        description:
+          `Max results (default ${AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT}, capped at ${AGENT_API_MESSAGE_SEARCH_MAX_LIMIT}; `
+          + `a full page of ${AGENT_API_MESSAGE_SEARCH_MAX_LIMIT} does not mean there are no more)`,
+      },
+      {
+        flags: "--offset <n>",
+        description:
+          "Skip this many results (default 0). Not a stable cursor in either sort "
+          + "mode: under relevance the ordering re-ranks as the corpus changes; under "
+          + "recent (including filter-only searches) new messages shift every later "
+          + "row, so the same offset can repeat rows. For recent, page with --cursor when the "
+          + "output gives one, else --before",
+      },
+      {
+        flags: "--cursor <c>",
+        description:
+          "Continue a recent search exactly where the previous output said (its nextCursor, unchanged); "
+          + "keep the same --query and filters, no --offset. An incomplete result (the search stopped at "
+          + "its scan budget) is continued this way",
+      },
     ],
   },
   async (ctx, opts: Partial<SearchOpts>) => {
@@ -231,14 +298,22 @@ export const messageSearchCommand = defineCommand(
       ...(searchOpts.after ? { after: searchOpts.after } : {}),
       ...(searchOpts.limit !== undefined ? { limit: String(searchOpts.limit) } : {}),
       ...(searchOpts.offset !== undefined ? { offset: String(searchOpts.offset) } : {}),
+      ...(searchOpts.cursor ? { cursor: searchOpts.cursor } : {}),
     });
     if (!res.ok) {
+      const code = toSearchErrorCode(res.errorCode, res.status);
       throw new CliError({
-        code: toSearchErrorCode(res.errorCode, res.status),
+        code,
         message: res.error ?? `HTTP ${res.status}`,
+        ...(code === "QUERY_TOO_BROAD" ? { suggestedNextAction: formatQueryTooBroadNextAction(searchOpts) } : {}),
       });
     }
-    writeText(ctx.io, formatSearchResults(searchOpts.displayQuery, res.data as any), NL);
+    writeText(ctx.io, formatSearchResults(searchOpts.displayQuery, res.data as SearchData, searchOpts.offset, searchOpts.sort, searchOpts.limit, {
+      ...(searchOpts.channel ? { target: searchOpts.channel } : {}),
+      ...(searchOpts.sender ? { sender: searchOpts.sender } : {}),
+      ...(searchOpts.after ? { after: searchOpts.after } : {}),
+      ...(searchOpts.before ? { before: searchOpts.before } : {}),
+    }), NL);
   },
 );
 

@@ -1,4 +1,4 @@
-import { closeTestDatabase, openTestDatabase } from "./integration/database.js";
+import { closeTestDatabase, openTestDatabase } from "./integration/database";
 import { and, eq, isNotNull, sql } from "drizzle-orm";
 import {
   BasicTracer,
@@ -9,17 +9,17 @@ import {
   SLACK_BRIDGE_FEATURE_FLAG_KEYS,
 } from "@botiverse/raft-shared";
 
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   channelHumans,
   channels,
   externalAppCredentials,
+  externalAppInstallServerGrants,
   externalAppInstalls,
   externalAppManifestReceipts,
   externalAppRegistrations,
   externalAppRegistrationSecrets,
   externalAppServerGrants,
-  externalAuthorPolicies,
   externalChannelBindings,
   externalDeliveryAttempts,
   externalDeliveryPartitions,
@@ -33,13 +33,13 @@ import {
   serverMembers,
   servers,
   users,
-} from "../db/schema.js";
+} from "../db/schema";
 import {
   getActiveJointChannelProjectionsByLocalChannel,
   getActiveJointThreadProjectionsByCanonicalThread,
   getJointThreadProjectionForMember,
   getOrCreateThread,
-} from "../services/channelService.js";
+} from "../services/channelService";
 import {
   __resetOrdinaryMessageOutboundAuthorizationResolverForTests,
   __setOrdinaryMessageOutboundAuthorizationResolverForTests,
@@ -48,29 +48,30 @@ import {
   projectSlackBridgeOutboundPipelineFailure,
   SlackBridgeOutboundPipelineError,
   type ProviderNeutralOutboundRuntimeFact,
-} from "../services/externalDeliveryOutboxService.js";
+} from "../services/externalDeliveryOutboxService";
 import {
   processExternalDeliveryPartitionHead,
   type ActiveExternalDeliveryRuntime,
   type ExternalDeliveryWorkerDependencies,
-} from "../services/externalDeliveryWorkerService.js";
+} from "../services/externalDeliveryWorkerService";
 import {
   __resetMessageServiceDepsForTests,
   __setMessageServiceDepsForTests,
   broadcastAndDeliver,
   drainSenderReadReceiptsForTests,
-} from "../services/messageService.js";
+} from "../services/messageService";
 import {
   __resetMobilePushDeliveryRuntimeForTests,
   __setMobilePushDeliveryRuntimeForTests,
-} from "../services/pushService.js";
-import { withTraceRoot } from "../tracing/semanticTrace.js";
+} from "../services/pushService";
+import { withTraceRoot } from "../tracing/semanticTrace";
 import {
   runSlackBridgeFullFlowPreflight,
   SLACK_BRIDGE_FULL_FLOW_PREFLIGHT_SCHEMA,
   SlackBridgeFullFlowPreflightError,
   type SlackBridgeFullFlowPreflightInput,
-} from "./slackBridgeFullFlowPreflight.js";
+} from "./slackBridgeFullFlowPreflight";
+import { withChannelDelivery } from "./orchestratorStub";
 
 export type SlackBridgeBatchTopology = "ordinary_channel" | "joint_channel" | "ordinary_thread";
 export type SlackBridgeBatchSendMode = "first" | "same_random_replay";
@@ -114,9 +115,9 @@ export interface SlackBridgeExecutableBatchHooks {
 type BroadcastIo = Parameters<typeof broadcastAndDeliver>[0];
 type BroadcastOrchestrator = Parameters<typeof broadcastAndDeliver>[1];
 
-const noopOrchestrator = {
+const noopOrchestrator = withChannelDelivery({
   deliverMessage: async () => undefined,
-} as unknown as BroadcastOrchestrator;
+}) as unknown as BroadcastOrchestrator;
 
 function healthyIo() {
   return {
@@ -231,6 +232,16 @@ async function seedBaseFixture() {
     providerAuthorityId: "T_BATCH",
     lastVerifiedAt: new Date("1999-12-31T23:00:00.000Z"),
   }).returning();
+  await db.insert(externalAppInstallServerGrants).values({
+    installId: install.id,
+    serverId: server.id,
+    registrationId: registration.id,
+    serverGrantId: grant.id,
+    grantEpoch: grant.grantEpoch,
+    state: "active",
+    authorizedByType: "human",
+    authorizedById: owner.id,
+  });
   const [credential] = await db.insert(externalAppCredentials).values({
     installId: install.id,
     state: "active",
@@ -267,20 +278,6 @@ async function seedBaseFixture() {
     consentedById: owner.id,
     consentedAt: new Date("1999-12-31T23:00:00.000Z"),
   }).returning();
-  const [policy] = await db.insert(externalAuthorPolicies).values({
-    serverId: server.id,
-    provider: "slack",
-    appRegistrationId: registration.id,
-    installId: install.id,
-    bindingId: binding.id,
-    bindingEpoch: binding.bindingEpoch,
-    authorType: "user",
-    authorId: owner.id,
-    displayName: owner.displayName ?? owner.name,
-    fallbackKind: "human",
-    consentRevision: 1,
-    state: "granted",
-  }).returning();
   return {
     owner,
     peer,
@@ -294,7 +291,6 @@ async function seedBaseFixture() {
     credential,
     manifest,
     binding,
-    policy,
   };
 }
 
@@ -314,7 +310,6 @@ function activeRuntime(fixture: Awaited<ReturnType<typeof seedBaseFixture>>): Pr
       bindingEpoch: fixture.binding.bindingEpoch,
       memberRevision: 3,
       contextRevision: 4,
-      consentRevision: fixture.policy.consentRevision,
       privacyClass: "public",
       raftChannelId: fixture.channel.id,
       providerAuthorityId: fixture.install.providerAuthorityId,
@@ -440,7 +435,6 @@ function workerDependencies(
 
 async function expiredPreflightInput(
   fixture: Awaited<ReturnType<typeof seedBaseFixture>>,
-  runtimeFingerprint: string,
 ): Promise<SlackBridgeFullFlowPreflightInput> {
   const db = getDb();
   const expiredAt = fixture.manifest.expiresAt.toISOString();
@@ -500,8 +494,6 @@ async function expiredPreflightInput(
       canonicalJointRows: canonicalJointRows?.count ?? -1,
       localJointRows: localJointRows?.count ?? -1,
       externalBindingRows: externalBindingRows?.count ?? -1,
-      runtimeBuildFingerprint: runtimeFingerprint,
-      expectedRuntimeBuildFingerprint: runtimeFingerprint,
     },
     registration: {
       id: fixture.registration.id,
@@ -569,7 +561,6 @@ async function expiredPreflightInput(
       bindingEpoch: fixture.binding.bindingEpoch,
       privacyClass: fixture.binding.privacyClass,
       providerConversationId: fixture.binding.providerConversationId,
-      consentRevision: fixture.policy.consentRevision,
     },
     membership: {
       registrationId: fixture.registration.id,
@@ -594,18 +585,6 @@ async function expiredPreflightInput(
       inboundGreen: true,
       outboundGreen: true,
       expiresAt: expiredAt,
-    },
-    authorPolicy: {
-      serverId: fixture.policy.serverId,
-      provider: fixture.policy.provider,
-      registrationId: fixture.policy.appRegistrationId,
-      installId: fixture.policy.installId,
-      bindingId: fixture.policy.bindingId,
-      bindingEpoch: fixture.policy.bindingEpoch,
-      authorId: fixture.policy.authorId,
-      displayName: fixture.policy.displayName,
-      consentRevision: fixture.policy.consentRevision,
-      state: fixture.policy.state,
     },
     flags: {
       configRevision: 1,
@@ -635,7 +614,6 @@ async function readCardinality(storedChannelId: string, providerWrites: number):
 
 export async function runSlackBridgeExecutableBatchCase(
   entry: SlackBridgeExecutableBatchCase,
-  runtimeFingerprint: string,
   hooks: SlackBridgeExecutableBatchHooks = {},
 ): Promise<SlackBridgeExecutableBatchReceipt> {
   await openTestDatabase("pglite://");
@@ -661,7 +639,7 @@ export async function runSlackBridgeExecutableBatchCase(
       }
       let failure: unknown;
       try {
-        runSlackBridgeFullFlowPreflight(await expiredPreflightInput(fixture, runtimeFingerprint));
+        runSlackBridgeFullFlowPreflight(await expiredPreflightInput(fixture));
       } catch (error) {
         failure = error;
       }

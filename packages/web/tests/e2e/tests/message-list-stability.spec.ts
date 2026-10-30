@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { writeFile } from "node:fs/promises";
 import { expect, test } from "@playwright/test";
 import type { APIRequestContext, Page, TestInfo } from "@playwright/test";
+import { recordHistoryRequests } from "../fixtures/historyRequestEvidence";
 import { loginViaApi } from "../fixtures/auth";
 import { waitForSeedState } from "../fixtures/seedState";
 import type { PlaywrightSeedState } from "../fixtures/seedState";
@@ -558,25 +559,6 @@ test.describe("message list stability", () => {
 
   type ScrollPattern = "burst" | "slow";
 
-  function recordOlderRequests(page: Page, channelId: string) {
-    const requests: { url: string; before: string | null }[] = [];
-    page.on("request", (req) => {
-      if (req.method() !== "GET") return;
-      const url = req.url();
-      if (!url.includes(`/messages/channel/${channelId}`)) return;
-      try {
-        const u = new URL(url);
-        const before = u.searchParams.get("before");
-        // Initial window load has no `before=` cursor; only count older-page fetches.
-        if (before === null) return;
-        requests.push({ url, before });
-      } catch {
-        /* ignore */
-      }
-    });
-    return requests;
-  }
-
   // Scroll-to-top helpers. The native primitive restores the anchor on
   // prepend, which means after each older-page load the scroll position
   // moves AWAY from 0 (so the user's reading position stays put). To
@@ -658,7 +640,7 @@ test.describe("message list stability", () => {
     test(`lazy-load history is complete and dedup'd under ${pattern} scroll`, async ({
       page,
       request,
-    }) => {
+    }, testInfo) => {
       const seedState = await waitForSeedState();
       const login = await loginViaApi(request, seedState);
 
@@ -689,57 +671,64 @@ test.describe("message list stability", () => {
       // visible message is older than the initial-window minSeq.
       const expectedAtLeast = seedState.messages.total;
 
-      const olderRequests = recordOlderRequests(page, seedState.channel.id);
+      const evidence = recordHistoryRequests(page, seedState.channel.id);
+      const olderRequests = evidence.olderRequests;
+      try {
+        await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
+        await expect(page.getByTestId("message-scroller")).toBeVisible();
 
-      await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
-      await expect(page.getByTestId("message-scroller")).toBeVisible();
+        const initialMetrics = await readMetrics(page);
+        console.log(
+          `[lazy-load:${pattern}] initial itemCount=${initialMetrics.itemCount} ` +
+            `seedTotal=${seedState.messages.total} latestSeq=${latestSeq}`,
+        );
 
-      const initialMetrics = await readMetrics(page);
-      console.log(
-        `[lazy-load:${pattern}] initial itemCount=${initialMetrics.itemCount} ` +
-          `seedTotal=${seedState.messages.total} latestSeq=${latestSeq}`,
-      );
+        // Pull to top in a loop. Anchor restoration on prepend means a
+        // single scroll-to-top only triggers the first older page; the
+        // user (and this test) keeps pulling upward to drain the rest.
+        const finalMetrics = await pullToTopUntilComplete(page, pattern, expectedAtLeast);
 
-      // Pull to top in a loop. Anchor restoration on prepend means a
-      // single scroll-to-top only triggers the first older page; the
-      // user (and this test) keeps pulling upward to drain the rest.
-      const finalMetrics = await pullToTopUntilComplete(page, pattern, expectedAtLeast);
+        const cursors = olderRequests.map((r) => r.before);
+        const uniqueCursors = new Set(cursors);
+        console.log(
+          `[lazy-load:${pattern}] final itemCount=${finalMetrics.itemCount} ` +
+            `requests=${olderRequests.length} uniqueCursors=${uniqueCursors.size} ` +
+            `cursors=[${cursors.join(",")}]`,
+        );
 
-      const cursors = olderRequests.map((r) => r.before);
-      const uniqueCursors = new Set(cursors);
-      console.log(
-        `[lazy-load:${pattern}] final itemCount=${finalMetrics.itemCount} ` +
-          `requests=${olderRequests.length} uniqueCursors=${uniqueCursors.size} ` +
-          `cursors=[${cursors.join(",")}]`,
-      );
+        // No omission: every seeded message is in the DOM. Other tests in
+        // this suite may have appended live messages, so the floor is the
+        // seed total — itemCount can be greater than the seed if live
+        // messages arrived during the run, but never less.
+        await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+        expect(
+          finalMetrics.itemCount,
+          `complete history: expected at least ${expectedAtLeast} items in DOM`,
+        ).toBeGreaterThanOrEqual(expectedAtLeast);
 
-      // No omission: every seeded message is in the DOM. Other tests in
-      // this suite may have appended live messages, so the floor is the
-      // seed total — itemCount can be greater than the seed if live
-      // messages arrived during the run, but never less.
-      await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
-      expect(
-        finalMetrics.itemCount,
-        `complete history: expected at least ${expectedAtLeast} items in DOM`,
-      ).toBeGreaterThanOrEqual(expectedAtLeast);
+        // No duplicate: every `before=<seq>` cursor was requested at most
+        // once. messageStore.loadOlderMessages dedup's via the loadingOlder
+        // flag, but if the IO sentinel re-fires while a request is in
+        // flight, only the in-flight request guard prevents a wasted call —
+        // this assertion catches a regression in either guard.
+        expect(
+          uniqueCursors.size,
+          `duplicate older-page request: cursors=${cursors.join(",")}`,
+        ).toBe(cursors.length);
 
-      // No duplicate: every `before=<seq>` cursor was requested at most
-      // once. messageStore.loadOlderMessages dedup's via the loadingOlder
-      // flag, but if the IO sentinel re-fires while a request is in
-      // flight, only the in-flight request guard prevents a wasted call —
-      // this assertion catches a regression in either guard.
-      expect(
-        uniqueCursors.size,
-        `duplicate older-page request: cursors=${cursors.join(",")}`,
-      ).toBe(cursors.length);
-
-      // Deterministic trigger: at least one older-page request had to fire
-      // (sanity check that the IO sentinel did its job, not that the
-      // initial window happened to contain everything).
-      expect(
-        olderRequests.length,
-        "expected at least one older-page request",
-      ).toBeGreaterThan(0);
+        // Deterministic trigger: at least one older-page request had to fire
+        // (sanity check that the IO sentinel did its job, not that the
+        // initial window happened to contain everything).
+        expect(
+          olderRequests.length,
+          "expected at least one older-page request",
+        ).toBeGreaterThan(0);
+      } catch (error) {
+        await evidence.attachFailure(testInfo);
+        throw error;
+      } finally {
+        evidence.stop();
+      }
     });
   }
 });

@@ -22,6 +22,7 @@ export type TraceFamilyName =
   | "slock.state.transition"
   | "slock.state.violation"
   | "slock.client_error"
+  | "slock.media_preview.error"
   | "server.db.query";
 
 export const TRACE_JOIN_KEYS = ["clientEventId"] as const;
@@ -41,7 +42,7 @@ export const TRACE_FAMILY_REGISTRY = [
     consumers: [
       {
         what: "S1 three-signal acceptance readback and incident bisect",
-        how: "Trace query over state-transition spans grouped by key.domain/key.event/key.outcome",
+        how: "otel.logs query over state-transition events (message = 'slock.state.transition') grouped by key.domain/key.event/key.outcome, joined on join.clientEventId",
         whoRuns: "Tiegen",
         runbook: "Manjusaka daily-scan liveness ledger",
       },
@@ -55,7 +56,7 @@ export const TRACE_FAMILY_REGISTRY = [
     consumers: [
       {
         what: "SRE threshold alerts for producer-contract breaches",
-        how: "Trace query over coalesced violation spans grouped by domain/entity/kind/epoch/verdict basis",
+        how: "otel.logs query over coalesced violation events grouped by domain/entity/kind/epoch/verdict basis",
         whoRuns: "Manjusaka",
         runbook: "Manjusaka daily-scan liveness ledger",
       },
@@ -68,9 +69,22 @@ export const TRACE_FAMILY_REGISTRY = [
     consumers: [
       {
         what: "Client crash daily scan and React crash incident detection",
-        how: "Trace query over throttled client-error spans grouped by source/error/component",
+        how: "otel.logs query over throttled client-error events grouped by source/error/component",
         whoRuns: "Manjusaka",
         runbook: "Manjusaka daily-scan liveness ledger",
+      },
+    ],
+  },
+  {
+    family: "slock.media_preview.error",
+    privacyTier: "client-error",
+    entityFilterableDimensions: [],
+    consumers: [
+      {
+        what: "Daily count of inline media preview failures, checking that expired-link failures no longer show the codec warning (bug-triage task #14)",
+        how: "otel.logs query over throttled media-preview error events (message = 'slock.media_preview.error') grouped by error_class/browser_family/url_refreshed",
+        whoRuns: "AndyLok",
+        runbook: "docs/observability/reading-telemetry.md",
       },
     ],
   },

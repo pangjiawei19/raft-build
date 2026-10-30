@@ -3,12 +3,11 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
-import { test } from "vitest";
-import { buildClaudeProviderIsolationEnv, ClaudeDriver } from "./claude.js";
-import { buildClaudeManagedMcpConfig } from "./claudeLaunch.js";
-import { CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS, LEGACY_CLAUDE_PROVIDER_CONFIG_DIR } from "./claudeProviderIsolation.js";
-import { subscribeDaemonLogs, type DaemonLogEvent } from "../logger.js";
-import type { SpawnContext } from "./types.js";
+import { buildClaudeProviderIsolationEnv, ClaudeDriver } from "./claude";
+import { buildClaudeManagedMcpConfig } from "./claudeLaunch";
+import { CLAUDE_CUSTOM_PROVIDER_HOST_ENV_KEYS, LEGACY_CLAUDE_PROVIDER_CONFIG_DIR } from "./claudeProviderIsolation";
+import { subscribeDaemonLogs, type DaemonLogEvent } from "../logger";
+import type { SpawnContext } from "./types";
 
 const driver = new ClaudeDriver();
 const config = {
@@ -38,7 +37,7 @@ test("claude driver delegates parseLine to ClaudeEventNormalizer", () => {
   }));
 
   assert.deepEqual(events, [
-    { kind: "tool_output", name: "toolu_delegation_check" },
+    { kind: "tool_output", name: "toolu_delegation_check", callId: "toolu_delegation_check", ok: true },
   ]);
 });
 
@@ -490,5 +489,70 @@ test("claude default provider launch keeps host Claude account state available",
     assert.deepEqual(env, {});
   } finally {
     rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+// ── task #1277, B-group: the claude launch resolves its command under the start attempt's cancel ──
+
+import { chmodSync as chmodSyncLC, existsSync as existsSyncLC, mkdirSync as mkdirSyncLC, mkdtempSync as mkdtempSyncLC, rmSync as rmSyncLC, writeFileSync as writeFileSyncLC } from "node:fs";
+import osLC from "node:os";
+import pathLC from "node:path";
+import { resolveClaudeLaunchCommandAsync } from "./claudeLaunch";
+import { ProbeChildError, type runProbeChild } from "./probeChild";
+
+test("task #1277: resolveClaudeLaunchCommandAsync returns a configured command without any lookup, and otherwise the async PATH lookup (with the darwin desktop fallback)", async () => {
+  const calls: string[] = [];
+  const runChild: typeof runProbeChild = async (command, args) => { calls.push([command, ...args].join(" ")); return { stdout: "/opt/claude/bin/claude\n", stderr: "" }; };
+  const base = makeSpawnContext("/tmp/claude-work").config;
+  const configured = await resolveClaudeLaunchCommandAsync({
+    ...base,
+    runtimeConfig: {
+      version: 1,
+      runtime: "claude",
+      provider: { kind: "default" },
+      model: { kind: "preset", id: "sonnet" },
+      mode: { kind: "default" },
+      command: " /custom/claude ",
+    },
+  } as unknown as typeof base, { platform: "linux", runProbeChildFn: runChild });
+  assert.equal(configured, "/custom/claude");
+  assert.deepEqual(calls, [], "a configured command needs no lookup");
+  const looked = await resolveClaudeLaunchCommandAsync(base, { platform: "linux", runProbeChildFn: runChild, homeDir: "/nonexistent" });
+  assert.equal(looked, "/opt/claude/bin/claude");
+  assert.deepEqual(calls, ["which claude"]);
+  const desktop = await resolveClaudeLaunchCommandAsync(base, { platform: "darwin", homeDir: "/nonexistent", existsSyncFn: (p) => p === "/Applications/Claude Code URL Handler.app/Contents/MacOS/claude", runProbeChildFn: async () => { throw new ProbeChildError("not found", { status: 1 }); } });
+  assert.equal(desktop, "/Applications/Claude Code URL Handler.app/Contents/MacOS/claude");
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(resolveClaudeLaunchCommandAsync(base, { platform: "linux", signal: controller.signal, runProbeChildFn: async () => { throw new ProbeChildError("aborted", { code: "ABORT_ERR" }); } }), (e: unknown) => e instanceof ProbeChildError && e.code === "ABORT_ERR");
+});
+
+test("task #1277 (launch): a claude spawn with an already-cancelled launch signal creates no child; a cancel during a slow lookup does the same", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSyncLC(pathLC.join(osLC.tmpdir(), "claude-launch-cancel-"));
+  const previousPath = process.env.PATH;
+  try {
+    const binDir = pathLC.join(root, "bin");
+    mkdirSyncLC(binDir, { recursive: true });
+    const argvFile = pathLC.join(root, "argv.txt");
+    writeFileSyncLC(pathLC.join(binDir, "claude"), `#!/bin/sh\nprintf '%s\\n' "$@" > '${argvFile}'\n`);
+    chmodSyncLC(pathLC.join(binDir, "claude"), 0o755);
+    writeFileSyncLC(pathLC.join(binDir, "which"), `#!/bin/sh\nsleep 0.4\nexec /usr/bin/which "$@"\n`);
+    chmodSyncLC(pathLC.join(binDir, "which"), 0o755);
+    process.env.PATH = `${binDir}${pathLC.delimiter}${previousPath ?? ""}`;
+    const workDir = pathLC.join(root, "work");
+    mkdirSyncLC(workDir, { recursive: true });
+    const isAbort = (error: unknown) => error instanceof Error && (error as { code?: unknown }).code === "ABORT_ERR";
+    const pre = new AbortController();
+    pre.abort();
+    await assert.rejects(new ClaudeDriver().spawn({ ...makeSpawnContext(workDir), launchSignal: pre.signal }), isAbort);
+    assert.equal(existsSyncLC(argvFile), false, "no claude child was started");
+    const mid = new AbortController();
+    setTimeout(() => mid.abort(), 100);
+    await assert.rejects(new ClaudeDriver().spawn({ ...makeSpawnContext(workDir), launchSignal: mid.signal }), isAbort);
+    assert.equal(existsSyncLC(argvFile), false, "no claude child was started after the cancel");
+  } finally {
+    process.env.PATH = previousPath;
+    rmSyncLC(root, { recursive: true, force: true });
   }
 });

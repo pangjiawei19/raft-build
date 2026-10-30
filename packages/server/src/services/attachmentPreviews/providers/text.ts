@@ -1,8 +1,8 @@
 import { TextDecoder } from "node:util";
-import { isTextPreviewCandidate, type TextAttachmentPreviewData } from "@botiverse/raft-shared";
-import type { AttachmentPreviewProvider } from "../types.js";
+import { isTextPreviewCandidate, TEXT_PREVIEW_BYTE_LIMIT, type TextAttachmentPreviewData } from "@botiverse/raft-shared";
+import type { AttachmentPreviewProvider } from "../types";
 
-export const TEXT_PREVIEW_BYTE_LIMIT = 96 * 1024;
+export { TEXT_PREVIEW_BYTE_LIMIT };
 export const TEXT_PREVIEW_PAYLOAD_BYTE_LIMIT = 128 * 1024;
 
 export function isTextAttachment(filename: string, mimeType: string | null | undefined): boolean {

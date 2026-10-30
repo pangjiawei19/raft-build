@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 import {
   buildQuotedMessageAttachmentLabel,
   extractFirstQuotedMessagePermalink,
@@ -23,6 +22,18 @@ test("extracts only the first slock permalink without mutating message content",
   assert.ok(extracted);
   assert.equal(extracted.rawUrl, FIRST_PERMALINK);
   assert.equal(extracted.parsed.routeKind, "channel");
+});
+
+test("a permalink followed directly by Chinese text targets only the leading message id", () => {
+  const extracted = extractFirstQuotedMessagePermalink(
+    `${FIRST_PERMALINK}这条你是不是没收到`,
+    CURRENT_HOSTNAME,
+    CURRENT_SERVER_SLUG,
+  );
+
+  assert.ok(extracted);
+  assert.equal(extracted.parsed.messageId, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa");
+  assert.equal(matchesUnavailableQuotedPermalink(FIRST_PERMALINK, extracted.rawUrl, CURRENT_HOSTNAME), true);
 });
 
 test("ignores permalinks inside inline and fenced code blocks", () => {

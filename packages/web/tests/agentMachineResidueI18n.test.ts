@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
@@ -38,12 +37,15 @@ test("agent and machine residue slice adopts FormatJS ids without re-hardcoding 
   const agentWorkspace = readSource("src/components/agent/AgentWorkspace.tsx");
   const pixelAvatar = readSource("src/components/agent/PixelAvatar.tsx");
   const addMachineDialog = readSource("src/components/machine/AddMachineDialog.tsx");
-  const computerCommandGuide = readSource("src/components/machine/ComputerCommandGuide.tsx");
+  const computerCommandGuide = [
+    readSource("src/components/machine/ComputerCommandGuide.tsx"),
+    readSource("src/components/machine/CommandRow.tsx"),
+  ].join("\n");
 
   assertContainsIds(agentSkills, [
     "agent.skills.loadFailed",
     "agent.skills.loading",
-    "agent.skills.title",
+    "agent.skills.heading",
     "agent.skills.globalEmpty",
     "agent.skills.workspaceEmpty",
   ]);
@@ -68,8 +70,6 @@ test("agent and machine residue slice adopts FormatJS ids without re-hardcoding 
     "machine.commandGuide.choosePlatform",
     "machine.commandGuide.windowsX64",
     "machine.commandGuide.raftComputerWindowsX64",
-    "machine.commandGuide.daemonLegacy",
-    "machine.commandGuide.generateLegacyDaemonCommand",
   ]);
 
 

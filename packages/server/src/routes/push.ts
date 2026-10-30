@@ -1,22 +1,26 @@
 import { Router, type Router as RouterType } from "express";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
-import { requireAuth, requireServer, requireVerified } from "../middleware/auth.js";
-import { getDb } from "../db/index.js";
-import { webPushPromptEvents } from "../db/schema.js";
+import { requireAuth, requireServer, requireVerified } from "../middleware/auth";
+import { getDb } from "../db/index";
+import { webPushPromptEvents } from "../db/schema";
 import {
   getVapidPublicKey,
   ensureFamilyRevokeCapability,
   isPushEnabled,
+  mobilePushDeliveryStatus,
   removeSubscription,
   revokePushFamilyByCapability,
   saveSubscription,
   sendPushToUsers,
   unbindPushInstallation,
   upsertPushRegistration,
+  webPushEndpointHostname,
   type PushRegistrationEnv,
   type PushRegistrationProvider,
-} from "../services/pushService.js";
-import * as serverService from "../services/serverService.js";
+} from "../services/pushService";
+import * as serverService from "../services/serverService";
+import { sendJsonServerError } from "./errorResponse";
+import { clientIpForRateLimit } from "../lib/clientIpForRateLimit";
 
 export const pushRouter: RouterType = Router();
 const PUSH_PROMPT_EVENTS = new Set([
@@ -32,6 +36,9 @@ const MAX_TOPIC_LENGTH = 255;
 const MAX_APP_VERSION_LENGTH = 64;
 const REGISTRATION_ID_PATTERN = /^[A-Za-z0-9._:-]+$/;
 const DEVICE_TOKEN_PATTERN = /^[A-Za-z0-9_-]+$/;
+// FCM registration tokens are longer and contain ':' (e.g. "<instance>:APA91b...").
+const MAX_FCM_DEVICE_TOKEN_LENGTH = 4096;
+const FCM_DEVICE_TOKEN_PATTERN = /^[A-Za-z0-9_:-]+$/;
 const TOPIC_PATTERN = /^[A-Za-z0-9.-]+$/;
 const APP_VERSION_PATTERN = /^[A-Za-z0-9._+()-]+$/;
 
@@ -54,7 +61,7 @@ function cleanBoundedRegistrationField(value: unknown, maxLength: number, patter
 }
 
 function parseProvider(value: unknown): PushRegistrationProvider | null {
-  return value === "apns" ? "apns" : null;
+  return value === "apns" || value === "fcm" ? value : null;
 }
 
 function parseEnv(value: unknown): PushRegistrationEnv | null {
@@ -107,8 +114,11 @@ pushRouter.post("/prompt-events", requireAuth, async (req, res) => {
     });
     res.json({ ok: true });
   } catch (err) {
-    console.error("[Push] Failed to record prompt event:", err);
-    res.status(500).json({ error: "Failed to record prompt event" });
+    sendJsonServerError(req, res, {
+      error: "Failed to record prompt event",
+      logPrefix: "[Push] Failed to record prompt event:",
+      err,
+    });
   }
 });
 
@@ -129,13 +139,20 @@ pushRouter.post("/subscribe", requireAuth, requireVerified, async (req, res) => 
     res.status(400).json({ error: "Missing endpoint or subscription keys" });
     return;
   }
+  if (!webPushEndpointHostname(endpoint)) {
+    res.status(400).json({ error: "Push endpoint must be a public HTTPS URL" });
+    return;
+  }
 
   try {
     await saveSubscription(userId, endpoint, keys.p256dh, keys.auth);
     res.json({ ok: true });
   } catch (err) {
-    console.error("[Push] Failed to save subscription:", err);
-    res.status(500).json({ error: "Failed to save subscription" });
+    sendJsonServerError(req, res, {
+      error: "Failed to save subscription",
+      logPrefix: "[Push] Failed to save subscription:",
+      err,
+    });
   }
 });
 
@@ -156,8 +173,11 @@ pushRouter.delete("/subscribe", requireAuth, requireVerified, async (req, res) =
     await removeSubscription(userId, endpoint);
     res.json({ ok: true });
   } catch (err) {
-    console.error("[Push] Failed to remove subscription:", err);
-    res.status(500).json({ error: "Failed to remove subscription" });
+    sendJsonServerError(req, res, {
+      error: "Failed to remove subscription",
+      logPrefix: "[Push] Failed to remove subscription:",
+      err,
+    });
   }
 });
 
@@ -168,7 +188,7 @@ const familyRevokeLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => {
     const capability = typeof req.body?.capability === "string" ? req.body.capability : "invalid";
-    return `${ipKeyGenerator(req.ip ?? "unknown")}:${capability.slice(0, 12)}`;
+    return `${ipKeyGenerator(clientIpForRateLimit(req))}:${capability.slice(0, 12)}`;
   },
   message: { error: "Too many family revoke attempts" },
 });
@@ -187,9 +207,38 @@ pushRouter.post("/family-revoke", familyRevokeLimiter, async (req, res) => {
       return;
     }
     res.status(204).end();
-  } catch {
-    console.error("[Push] Failed to revoke push family");
-    res.status(500).json({ error: "Failed to revoke push family" });
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to revoke push family",
+      logPrefix: "[Push] Failed to revoke push family",
+      err,
+    });
+  }
+});
+
+// Whether this installation gets server pushes through FCM, for every server the
+// user belongs to. The Android app keeps its own tray notifications where it doesn't.
+pushRouter.get("/delivery-status", requireAuth, requireVerified, async (req, res) => {
+  const userId = req.userId;
+  if (!userId) {
+    res.status(401).json({ error: "Unauthorized" });
+    return;
+  }
+  const installationId = cleanBoundedRegistrationField(req.query.installationId, MAX_INSTALLATION_ID_LENGTH, REGISTRATION_ID_PATTERN);
+  if (!installationId) {
+    res.status(400).json({ error: "Invalid installation id" });
+    return;
+  }
+
+  try {
+    const servers = await mobilePushDeliveryStatus({ userId, installationId });
+    res.json({ servers });
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to read push delivery status",
+      logPrefix: "[Push] Failed to read push delivery status:",
+      err,
+    });
   }
 });
 
@@ -205,7 +254,9 @@ pushRouter.post("/registrations", requireAuth, requireVerified, requireServer, a
   const provider = parseProvider(req.body?.provider);
   const env = parseEnv(req.body?.env);
   const installationId = cleanBoundedRegistrationField(req.body?.installationId, MAX_INSTALLATION_ID_LENGTH, REGISTRATION_ID_PATTERN);
-  const deviceToken = cleanBoundedRegistrationField(req.body?.deviceToken, MAX_DEVICE_TOKEN_LENGTH, DEVICE_TOKEN_PATTERN);
+  const deviceToken = provider === "fcm"
+    ? cleanBoundedRegistrationField(req.body?.deviceToken, MAX_FCM_DEVICE_TOKEN_LENGTH, FCM_DEVICE_TOKEN_PATTERN)
+    : cleanBoundedRegistrationField(req.body?.deviceToken, MAX_DEVICE_TOKEN_LENGTH, DEVICE_TOKEN_PATTERN);
   const topic = cleanBoundedRegistrationField(req.body?.topic, MAX_TOPIC_LENGTH, TOPIC_PATTERN);
   const appVersionInput = req.body?.appVersion;
   const appVersion = appVersionInput === undefined || appVersionInput === null
@@ -218,6 +269,11 @@ pushRouter.post("/registrations", requireAuth, requireVerified, requireServer, a
   }
   if (!env) {
     res.status(400).json({ error: "Invalid or missing push environment" });
+    return;
+  }
+  // FCM has no sandbox: one endpoint serves debug and release builds alike.
+  if (provider === "fcm" && env !== "production") {
+    res.status(400).json({ error: "FCM registrations use the production environment" });
     return;
   }
   if (!installationId || !deviceToken || !topic) {
@@ -266,8 +322,11 @@ pushRouter.post("/registrations", requireAuth, requireVerified, requireServer, a
       },
     });
   } catch (err) {
-    console.error("[Push] Failed to upsert mobile push registration:", err);
-    res.status(500).json({ error: "Failed to save push registration" });
+    sendJsonServerError(req, res, {
+      error: "Failed to save push registration",
+      logPrefix: "[Push] Failed to upsert mobile push registration:",
+      err,
+    });
   }
 });
 
@@ -289,8 +348,11 @@ pushRouter.delete("/registrations/:installationId", requireAuth, requireVerified
     const unbound = await unbindPushInstallation({ installationId, userId, serverId });
     res.json({ ok: true, unbound });
   } catch (err) {
-    console.error("[Push] Failed to unbind mobile push registration:", err);
-    res.status(500).json({ error: "Failed to unbind push registration" });
+    sendJsonServerError(req, res, {
+      error: "Failed to unbind push registration",
+      logPrefix: "[Push] Failed to unbind mobile push registration:",
+      err,
+    });
   }
 });
 
@@ -334,7 +396,10 @@ pushRouter.post("/test", requireAuth, requireVerified, async (req, res) => {
 
     res.json({ ok: true, ...result });
   } catch (err) {
-    console.error("[Push] Failed to send test push:", err);
-    res.status(500).json({ error: "Failed to send test push" });
+    sendJsonServerError(req, res, {
+      error: "Failed to send test push",
+      logPrefix: "[Push] Failed to send test push:",
+      err,
+    });
   }
 });

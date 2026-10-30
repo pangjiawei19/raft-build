@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve, relative } from "node:path";
-import test from "node:test";
 import {
   formatClock,
   formatClockWithSeconds,
@@ -10,7 +9,7 @@ import {
   formatShortDateTime,
   normalizePreferredTimeFormat,
   resolveTimeFormatPreference,
-} from "../src/utils/timeFormatting.js";
+} from "../src/utils/timeFormatting";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
@@ -84,9 +83,11 @@ test("visible time display surfaces use the shared time formatter hook", () => {
     "src/components/agent/AgentDetailPanel.tsx",
     "src/components/agent/AgentRemindersSection.tsx",
     "src/components/agent/AgentWorkspace.tsx",
-    "src/components/message/ChannelFilesPanel.tsx",
+    "src/components/message/ChannelFilesPanelFileRow.tsx",
     "src/components/message/MessageItem.tsx",
-    "src/components/message/QuotedMessagePermalinkPreview.tsx",
+    // QuotedMessagePermalinkPreview's timestamp renders in QuoteCardContent
+    // (its own file since task #709).
+    "src/components/message/QuoteCardContent.tsx",
     "src/components/settings/SettingsPanel.tsx",
     "src/components/task/LegacyTaskPanel.tsx",
   ];

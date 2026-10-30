@@ -20,16 +20,19 @@
 // Once a producer emits the canonical event directly, delete the matching
 // adapter branch and its orchestrator/daemon call-site TODO instead of
 // extending this legacy mapping layer.
-import { createAgentLifecycleEvent, type AgentLifecycleEvent, type AgentLifecycleReason } from "./agentLifecycleEvents.js";
+import { createAgentLifecycleEvent, type AgentLifecycleEvent, type AgentLifecycleReason } from "./agentLifecycleEvents";
 import {
   RUNTIME_ERROR_CLASSES,
   RUNTIME_ERROR_REASONS,
   RUNTIME_ERROR_REASON_PROVENANCES,
+  RUNTIME_ERROR_REQUIRED_ACTIONS,
+  runtimeErrorReasonForClass,
   type AgentActivity,
   type MachineShutdownReason,
   type RuntimeErrorActivityDiagnostic,
+  type RuntimeErrorRequiredAction,
 } from "@botiverse/raft-shared";
-import type { ReadyReconcileLifecycleAction } from "./agentLifecycleReducer.js";
+import type { ReadyReconcileLifecycleAction } from "./agentLifecycleReducer";
 
 export interface LegacyLifecycleEventFactoryOptions {
   now: () => Date;
@@ -88,12 +91,13 @@ export interface AdaptStartInput extends LegacyLifecycleEventFactoryOptions {
   machineId: string;
   previousStatus?: string | null;
   serverId: string;
-  startCause: "manual" | "message" | "resume";
+  /** `internal`: the task #365 spawn-error retry sweep re-serving a refused wake. */
+  startCause: "manual" | "message" | "resume" | "app_inbox_wake" | "internal";
 }
 
 export function adaptStartLifecycleEvent(input: AdaptStartInput): AdaptedLifecycleEvent {
   const reason: AgentLifecycleReason =
-    input.startCause === "message" ? "lazy_wake"
+    input.startCause === "message" || input.startCause === "app_inbox_wake" || input.startCause === "internal" ? "lazy_wake"
       : input.startCause === "resume" ? "runtime_starting"
         : "manual_start";
 
@@ -199,6 +203,9 @@ export function normalizeRuntimeErrorActivityDiagnostic(
   const expectedReason = runtimeErrorReasonForClass(candidate.errorClass as RuntimeErrorActivityDiagnostic["errorClass"]);
   if (candidate.errorReason !== expectedReason) return null;
   if (candidate.reasonProvenance === "daemon_fallback" && candidate.nativeReasonPresent !== false) return null;
+  // task #1127 — a stderr signature exists precisely because the runtime emitted
+  // no native reason, so claiming one is a contradiction, not a detail.
+  if (candidate.reasonProvenance === "codex_stderr_signature" && candidate.nativeReasonPresent !== false) return null;
   if (candidate.reasonProvenance === "codex_native_reason" && candidate.nativeReasonPresent !== true) return null;
   if (candidate.reasonProvenance === "runtime_error_event" && candidate.nativeReasonPresent !== undefined) return null;
   return {
@@ -209,26 +216,26 @@ export function normalizeRuntimeErrorActivityDiagnostic(
     ...(typeof candidate.nativeReasonPresent === "boolean"
       ? { nativeReasonPresent: candidate.nativeReasonPresent }
       : {}),
+    // An unknown action from a newer daemon is dropped, not the whole carrier.
+    ...(typeof candidate.requiredAction === "string"
+      && (RUNTIME_ERROR_REQUIRED_ACTIONS as readonly string[]).includes(candidate.requiredAction)
+      ? { requiredAction: candidate.requiredAction as RuntimeErrorRequiredAction }
+      : {}),
   };
 }
 
-function runtimeErrorReasonForClass(
-  errorClass: RuntimeErrorActivityDiagnostic["errorClass"],
-): RuntimeErrorActivityDiagnostic["errorReason"] {
-  switch (errorClass) {
-    case "InputTooLargeError": return "input_too_large";
-    case "RateLimitError": return "rate_limited";
-    case "AuthError": return "auth_failed";
-    case "LauncherError": return "launcher_error";
-    case "NotFoundError": return "not_found";
-    case "ModelConfigError": return "model_config_error";
-    case "TimeoutError": return "provider_timeout";
-    case "ProviderConnectionError": return "provider_connection_error";
-    case "ProviderStreamError": return "provider_stream_error";
-    case "ProviderServerError": return "provider_server_error";
-    case "ProviderApiError": return "provider_api_error";
-    case "RuntimeError": return "unclassified_runtime_error";
-  }
+
+/**
+ * What the owner must do before this runtime error can clear, or null when
+ * retrying may fix it. A daemon that predates `requiredAction` still classifies
+ * a rejected credential as AuthError, which always needs the owner.
+ */
+export function runtimeErrorRequiredAction(
+  diagnostic: RuntimeErrorActivityDiagnostic | null,
+): RuntimeErrorRequiredAction | null {
+  if (!diagnostic) return null;
+  if (diagnostic.requiredAction) return diagnostic.requiredAction;
+  return diagnostic.errorClass === "AuthError" ? "user_reauth" : null;
 }
 
 function daemonActivityReason(activity: AgentActivity): AgentLifecycleReason {

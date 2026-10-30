@@ -1,6 +1,9 @@
 import { create } from "zustand";
 import type { Announcement } from "@botiverse/raft-shared";
+import { resetAnnouncementShown } from "../analytics/announcements";
 import api from "../api/client";
+import { useServerStore } from "./serverStore";
+import { registerServerReset } from "./serverResetRegistry";
 
 interface AnnouncementState {
   pending: Announcement[];
@@ -13,8 +16,8 @@ interface AnnouncementState {
   markedReadIds: string[];
   /**
    * Ids whose read-complete write FAILED this session. Two jobs, deliberately
-   * one list:
-   *   1. `load()` filters them out, so one failing write cannot wedge the queue.
+   * separate scopes:
+   *   1. Per-context failure frontiers let `load()` advance that queue.
    *   2. The modal raises a toast when a new id lands here.
    *
    * Memory only — never persisted. The server holds no dismissal for these, so
@@ -35,6 +38,21 @@ interface AnnouncementState {
 // can never write into the new one.
 let announcementLoadInFlight: Promise<void> | null = null;
 let announcementLoadGeneration = 0;
+let announcementAccountGeneration = 0;
+let contextKey: string | undefined;
+const failedByContext = new Map<string, string[]>();
+function currentContext() { return useServerStore.getState().current?.id ?? "account"; }
+function syncContext() {
+  const next = currentContext();
+  if (contextKey === next) return;
+  contextKey = next;
+  announcementLoadGeneration += 1;
+  announcementLoadInFlight = null;
+  useAnnouncementStore.setState((state) => ({
+    pending: state.pending.filter((item) => item.deliveryScope?.type !== "server" || item.deliveryScope.serverId === next),
+    loaded: false,
+  }));
+}
 
 export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
   pending: [],
@@ -43,6 +61,7 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
   writeFailedIds: [],
 
   load: () => {
+    syncContext();
     // Once this tab presents a row, it owns that presentation until the user
     // closes it. Account-level dismissal from another tab must not make a
     // focused/refocused modal disappear underneath this reader.
@@ -50,12 +69,13 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
     if (announcementLoadInFlight) return announcementLoadInFlight;
 
     const generation = announcementLoadGeneration;
+    const requestContext = currentContext();
     const request = (async () => {
       try {
-        const skipped = get().writeFailedIds;
+        const skipped = failedByContext.get(requestContext) ?? [];
         const after = skipped.at(-1);
         const { data } = await api.get("/announcements/active", {
-          params: after ? { after } : undefined,
+          params: { ...(after ? { after } : {}), ...(requestContext !== "account" ? { server_id: requestContext } : {}) },
         });
         if (generation !== announcementLoadGeneration) return;
         const announcements = (data.announcements as Announcement[]) ?? [];
@@ -71,7 +91,7 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
           // presentation ownership wins over any late (especially empty)
           // response from focus recovery.
           if (state.pending.length > 0) return { loaded: true };
-          const hiddenIds = new Set([...state.writeFailedIds, ...state.markedReadIds]);
+          const hiddenIds = new Set([...(failedByContext.get(requestContext) ?? []), ...state.markedReadIds]);
           return {
             pending: announcements.filter((announcement) => !hiddenIds.has(announcement.id)),
             loaded: true,
@@ -89,15 +109,19 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
     return request;
   },
 
-  // Records an explicit confirmation. Navigation and rendering never call this:
-  // otherwise one tab could persist account-level dismissal while another tab
-  // is still presenting the same row.
+  // Records explicit confirmation, closing, or CTA activation. Rendering
+  // alone never records dismissal; already-open copies keep their local state.
   markRead: async (id) => {
     if (get().markedReadIds.includes(id)) return;
+    const writeContext = currentContext();
+    const accountGeneration = announcementAccountGeneration;
     set((state) => ({ markedReadIds: [...state.markedReadIds, id] }));
     try {
-      await api.post(`/announcements/${id}/dismiss`);
+      await api.post(`/announcements/${id}/dismiss`, undefined, { params: writeContext !== "account" ? { server_id: writeContext } : undefined });
     } catch (err) {
+      if (accountGeneration !== announcementAccountGeneration) return;
+      const failed = failedByContext.get(writeContext) ?? [];
+      if (!failed.includes(id)) failedByContext.set(writeContext, [...failed, id]);
       console.error("Failed to record announcement as read:", err);
       set((state) => ({
         // Allow a later trigger to retry the write for this row.
@@ -113,16 +137,22 @@ export const useAnnouncementStore = create<AnnouncementState>((set, get) => ({
     set((state) => ({ pending: state.pending.filter((a) => a.id !== id) }));
   },
 
-  // Explicit confirmation + hide, i.e. clicking OK on the last page. Kept as
-  // one call for the user action and the slockdev auto-dismiss.
+  // Account dismissal + local hide, shared by every explicit dismissal action
+  // and the slockdev auto-dismiss.
   dismiss: async (id) => {
     get().close(id);
     await get().markRead(id);
   },
 
   reset: () => {
+    resetAnnouncementShown();
+    announcementAccountGeneration += 1;
     announcementLoadGeneration += 1;
     announcementLoadInFlight = null;
+    failedByContext.clear();
+    contextKey = undefined;
     set({ pending: [], loaded: false, markedReadIds: [], writeFailedIds: [] });
   },
 }));
+
+registerServerReset(() => { syncContext(); void useAnnouncementStore.getState().load(); });

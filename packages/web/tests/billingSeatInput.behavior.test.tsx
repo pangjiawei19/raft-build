@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { test } from "node:test";
 import {
   applyBillingSeatInputChange,
   applyBillingSeatInputCommit,
@@ -191,7 +190,8 @@ test("billing manage-seat draft state can reduce to actual usage floor", () => {
 });
 
 test("settings billing copy sells seat quantity directly and keeps numeric text inputs", () => {
-  const settings = read("src/components/settings/SettingsPanel.tsx");
+  // The plan section moved into its own file (task #709, one component per file).
+  const settings = `${read("src/components/settings/SettingsPanel.tsx")}\n${read("src/components/settings/PlanSectionContent.tsx")}`;
 
   assert.match(settings, /formatMessage\(\{ id: "billing\.enterTheNumberOfSeatsToBuy" \}\)/);
   assert.match(settings, /formatMessage\(\{ id: "billing\.enterTheTotalSeatsAfterThisUpdate" \}\)/);
@@ -216,7 +216,7 @@ test("settings billing copy sells seat quantity directly and keeps numeric text 
   assert.match(settings, /formatMessage\(\{ id: "billing\.confirmSeatUpdate" \}\)/);
   assert.match(settings, /formatMessage\(\{ id: "billing\.reviewSeatUpdate" \}\)/);
   assert.match(settings, /formatMessage\(\{ id: "billing\.confirmAndUpdateSeats" \}\)/);
-  assert.match(settings, /const openSeatUpdateConfirm = async \(\) => \{[\s\S]*\/billing\/seat-pack-quantity\/preview[\s\S]*setConfirmBillingAction\("update"\);[\s\S]*\};/);
+  assert.match(settings, /const openSeatUpdateConfirm = useCallback\(async \(\) => \{[\s\S]*\/billing\/seat-pack-quantity\/preview[\s\S]*setConfirmBillingAction\("update"\);[\s\S]*\}, \[/);
   assert.match(settings, /onClick=\{openSeatUpdateConfirm\}/);
   assert.doesNotMatch(settings, /onClick=\{handlePackQuantityUpdate\}/);
   assert.match(settings, /onConfirm=\{confirmBillingAction === "checkout" \? handleCheckout : handlePackQuantityUpdate\}/);

@@ -1,5 +1,5 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
-import { closeTestDatabase } from "../test/integration/database.js";
+import { dbTest as test } from "../test/integration/dbTest";
+import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -7,15 +7,16 @@ import { readFile } from "node:fs/promises";
 
 import { and, eq, inArray } from "drizzle-orm";
 
-import { closeDatabase, getDb } from "../db/index.js";
+import { closeDatabase, getDb } from "../db/index";
 import {
   readMutationWorkerDrainDuration,
   readMutationWorkerDrainsTotal,
-} from "../metrics.js";
+} from "../metrics";
 import {
   agentChannelReadCursors,
   channelAgents,
   channelHumans,
+  featureFlags,
   channels,
   jointChannels,
   jointChannelServers,
@@ -24,19 +25,20 @@ import {
   readMutations,
   readMutationTombstones,
   serverMembers,
+  threadFollows,
   servers,
   userChannelInboxStates,
   userChannelReadCursors,
   users,
-} from "../db/schema.js";
-import { createAgent } from "./agentService.js";
-import { markChannelInboxDone } from "./channelService.js";
+} from "../db/schema";
+import { createAgent } from "./agentService";
+import { markChannelInboxDone } from "./channelService";
 import {
   awaitPostPersistReadMutation,
   drainSenderReadReceiptsForTests,
   getSenderReadReceiptInFlightCountForTests,
   registerSenderReadReceiptForTests,
-} from "./messageService.js";
+} from "./messageService";
 import {
   admitReadMutation,
   claimNextFairReadMutation,
@@ -47,12 +49,13 @@ import {
   executeCompatibilityReadMutation,
   executeReadMutationClaim,
   getReadMutationFrontier,
+  isReadMutationFenceRefusal,
   ReadMutationError,
   ReadMutationFailpointError,
   resolveReadMutationUnreadBoundary,
   startReadMutationWorker,
   type ReadMutationAdmissionInput,
-} from "./readMutationSequencer.js";
+} from "./readMutationSequencer";
 
 
 async function seedAuthority() {
@@ -911,13 +914,20 @@ test("server membership revoke after admission retires without effects and does 
   const ack = await executeReadMutationClaim({ claim: await claim({ serverId: server.id, principalId: owner.id }) });
   assert.equal(ack.terminalReason, "authorization_revoked");
   assert.deepEqual(ack.scopes, []);
-  const replay = await admitReadMutation({
-    serverId: server.id,
-    principalId: owner.id,
-    mutationId,
-    mutation: { kind: "global_read_all" },
-  });
-  assert.equal(replay.outcome, "ALREADY_TERMINAL");
+  // Task #93 line B, declared behaviour delta: admission fences on the Server membership row before it looks up an
+  // existing receipt. Before line B this replay of the same mutation id answered ALREADY_TERMINAL — the terminal result
+  // of work that had already completed; a member removed after admission is now refused instead. The fresh admission
+  // below was refused too, but with SCOPE_NOT_FOUND from the scope read; the fence reason is the stricter one. Neither
+  // path writes or undoes anything, and the mutation stays terminal (asserted above).
+  await assert.rejects(
+    admitReadMutation({
+      serverId: server.id,
+      principalId: owner.id,
+      mutationId,
+      mutation: { kind: "global_read_all" },
+    }),
+    (error: unknown) => isReadMutationFenceRefusal(error),
+  );
   await assert.rejects(
     admitReadMutation({
       serverId: server.id,
@@ -925,7 +935,7 @@ test("server membership revoke after admission retires without effects and does 
       mutationId: randomUUID(),
       mutation: { kind: "global_read_all" },
     }),
-    (error: unknown) => error instanceof ReadMutationError && error.code === "SCOPE_NOT_FOUND",
+    (error: unknown) => isReadMutationFenceRefusal(error),
   );
 });
 
@@ -1262,16 +1272,16 @@ test("production worker owns independent stoppable drain and compaction timers",
 // carry; skipped when an exported snapshot's RELEASE_SOURCE marker is present.
 const inSourceSnapshot = existsSync(new URL("../../../../RELEASE_SOURCE", import.meta.url));
 
-test.skipIf(inSourceSnapshot)("required typecheck CI pins the real-PostgreSQL sequencer contract and cannot silently skip it", async () => {
+test.skipIf(inSourceSnapshot)("staging integration CI pins the real-PostgreSQL sequencer contract and cannot silently skip it", async () => {
   const workflow = await readFile(new URL("../../../../.github/workflows/test.yml", import.meta.url), "utf8");
-  const typecheckJob = workflow.match(/\n  typecheck:\n(?<body>[\s\S]*?)(?=\n  [a-z][a-z0-9-]+:\n)/)?.groups?.body;
-  assert.ok(typecheckJob, "typecheck job must remain present");
-  assert.match(typecheckJob, /services:\s*\n\s+postgres:\s*\n\s+image: postgres:16-alpine/);
-  assert.match(typecheckJob, /--health-cmd "pg_isready -U read_mutation_ci -d postgres"/);
-  const focusedStep = typecheckJob.match(
+  const integrationJob = workflow.match(/\n  integration-contracts:\n(?<body>[\s\S]*?)(?=\n  [a-z][a-z0-9-]+:\n)/)?.groups?.body;
+  assert.ok(integrationJob, "integration job must remain present");
+  assert.match(integrationJob, /services:\s*\n\s+postgres:\s*\n\s+image: postgres:16-alpine/);
+  assert.match(integrationJob, /--health-cmd "pg_isready -U read_mutation_ci -d postgres"/);
+  const focusedStep = integrationJob.match(
     /- name: Read mutation sequencer real PostgreSQL contract(?<body>[\s\S]*?)(?=\n\s+- name:)/,
   )?.groups?.body;
-  assert.ok(focusedStep, "required typecheck job must execute the focused real-PG contract");
+  assert.ok(focusedStep, "required integration job must execute the focused real-PG contract");
   assert.match(focusedStep, /timeout-minutes: 3/);
   assert.match(focusedStep, /READ_MUTATION_REAL_PG_REQUIRED: "1"/);
   assert.match(focusedStep, /READ_MUTATION_REAL_PG_URL: postgresql:\/\/read_mutation_ci:/);
@@ -1326,4 +1336,159 @@ test("a contended claim at batchSize=1 does not consume the only work slot", asy
     claimNext: alwaysContended,
   });
   assert.deepEqual(bounded, { processed: 0, failed: 0 });
+});
+
+
+test("conversation read-all covers its active follows only and replay keeps the captured frontier", async ({ db }) => {
+  const { owner, sender, server, scopeA, scopeB } = await seedScopes();
+  await db.insert(messages).values([3, 4, 5].map((seq) => ({
+    channelId: scopeA.id, senderType: "user" as const, senderId: sender.id, content: `parent ${seq}`, seq,
+  })));
+  const parentsA = await db.select().from(messages).where(eq(messages.channelId, scopeA.id)).orderBy(messages.seq);
+  const [parentB] = await db.select().from(messages).where(eq(messages.channelId, scopeB.id)).limit(1);
+  const threads = await db.insert(channels).values([
+    { serverId: server.id, name: "active-a", type: "thread", parentMessageId: parentsA[0].id },
+    { serverId: server.id, name: "active-b", type: "thread", parentMessageId: parentsA[1].id },
+    { serverId: server.id, name: "unfollowed", type: "thread", parentMessageId: parentsA[2].id },
+    { serverId: server.id, name: "done", type: "thread", parentMessageId: parentsA[3].id },
+    { serverId: server.id, name: "not-followed", type: "thread", parentMessageId: parentsA[4].id },
+    { serverId: server.id, name: "other-parent", type: "thread", parentMessageId: parentB.id },
+  ]).returning();
+  for (const [index, thread] of threads.entries()) {
+    await db.insert(messages).values({ channelId: thread.id, senderType: "user", senderId: sender.id, content: "reply", seq: 3 });
+    if (index === 4) continue;
+    await db.insert(threadFollows).values({
+      followerType: "user", followerId: owner.id, threadChannelId: thread.id,
+      parentMessageId: index === 5 ? parentB.id : parentsA[index].id, reason: "manual",
+      ...(index === 2 ? { unfollowedAt: new Date() } : {}),
+      ...(index === 3 ? { doneAt: new Date() } : {}),
+    });
+  }
+  const mutationId = randomUUID();
+  const input = { serverId: server.id, principalId: owner.id, mutationId, mutation: { kind: "conversation_read_all" as const, scopeId: scopeA.id } };
+  await admitReadMutation(input);
+  const ack = await executeReadMutationClaim({
+    claim: await claim(input),
+    afterBoundaryCaptured: async ({ tx }) => {
+      await tx.insert(messages).values([
+        { channelId: scopeA.id, senderType: "user", senderId: sender.id, content: "new parent arrival", seq: 6 },
+        { channelId: threads[0].id, senderType: "user", senderId: sender.id, content: "new reply arrival", seq: 4 },
+      ]);
+    },
+  });
+  assert.deepEqual(ack.scopes.map((scope) => scope.scopeId).sort(), [scopeA.id, threads[0].id, threads[1].id].sort());
+  const cursors = await db.select().from(userChannelReadCursors).where(eq(userChannelReadCursors.userId, owner.id));
+  assert.deepEqual(new Map(cursors.map((row) => [row.channelId, row.lastReadSeq])),
+    new Map([[scopeA.id, 5], [threads[0].id, 3], [threads[1].id, 3]]));
+  const replay = await admitReadMutation(input);
+  assert.deepEqual(replay.ack, ack, "same mutation UUID never sweeps arrivals beyond its captured boundary");
+  const follows = await db.select().from(threadFollows).where(eq(threadFollows.followerId, owner.id));
+  assert.equal(follows.filter((row) => row.doneAt != null).length, 1);
+  assert.equal(follows.filter((row) => row.unfollowedAt != null).length, 1);
+});
+
+test("conversation read-all rejects thread roots and retires without writes after parent access is revoked", async ({ db }) => {
+  const { owner, sender, server, scopeA } = await seedScopes();
+  await db.update(channels).set({ type: "private" }).where(eq(channels.id, scopeA.id));
+  const [parent] = await db.select().from(messages).where(eq(messages.channelId, scopeA.id)).limit(1);
+  const [thread] = await db.insert(channels).values({ serverId: server.id, name: "private-follow", type: "thread", parentMessageId: parent.id }).returning();
+  await db.insert(messages).values({ channelId: thread.id, senderType: "user", senderId: sender.id, content: "private reply", seq: 3 });
+  await db.insert(threadFollows).values({ followerType: "user", followerId: owner.id, threadChannelId: thread.id, parentMessageId: parent.id, reason: "manual" });
+  await assert.rejects(admitReadMutation({
+    serverId: server.id, principalId: owner.id, mutationId: randomUUID(),
+    mutation: { kind: "conversation_read_all", scopeId: thread.id },
+  }), /conversation read scope/);
+  const input = { serverId: server.id, principalId: owner.id, mutationId: randomUUID(), mutation: { kind: "conversation_read_all" as const, scopeId: scopeA.id } };
+  await admitReadMutation(input);
+  await db.delete(channelHumans).where(and(eq(channelHumans.channelId, scopeA.id), eq(channelHumans.userId, owner.id)));
+  const ack = await executeReadMutationClaim({ claim: await claim(input) });
+  assert.deepEqual(ack.scopes, []);
+  assert.equal((await db.select().from(userChannelReadCursors).where(eq(userChannelReadCursors.userId, owner.id))).length, 0);
+});
+
+test("conversation read-all uses local joint cursors with canonical message frontiers", async ({ db }) => {
+  const { owner, server } = await seedAuthority();
+  const [storageParent, localParent] = await db.insert(channels).values([
+    { serverId: server.id, name: "conversation-storage", type: "joint" },
+    { serverId: server.id, name: "conversation-local", type: "joint" },
+  ]).returning();
+  await db.insert(channelHumans).values({ channelId: localParent.id, userId: owner.id });
+  const [jointParent] = await db.insert(jointChannels).values({
+    canonicalChannelId: storageParent.id, createdByServerId: server.id, createdByUserId: owner.id, status: "active",
+  }).returning();
+  await db.insert(jointChannelServers).values({
+    jointChannelId: jointParent.id, serverId: server.id, localChannelId: localParent.id, role: "host", status: "active",
+  });
+  const [parent] = await db.insert(messages).values({
+    channelId: storageParent.id, senderType: "user", senderId: owner.id, content: "canonical parent", seq: 10,
+  }).returning();
+  const [storageThread, localThread] = await db.insert(channels).values([
+    { serverId: server.id, name: "conversation-thread-storage", type: "thread", parentMessageId: parent.id },
+    { serverId: server.id, name: "conversation-thread-local", type: "thread" },
+  ]).returning();
+  const [jointThread] = await db.insert(jointChannels).values({
+    canonicalChannelId: storageThread.id, createdByServerId: server.id, createdByUserId: owner.id, status: "active",
+  }).returning();
+  await db.insert(jointChannelServers).values({
+    jointChannelId: jointThread.id, serverId: server.id, localChannelId: localThread.id, role: "host", status: "active",
+  });
+  await db.insert(threadFollows).values({
+    followerType: "user", followerId: owner.id, threadChannelId: localThread.id, parentMessageId: parent.id, reason: "manual",
+  });
+  await db.insert(messages).values({
+    channelId: storageThread.id, senderType: "user", senderId: owner.id, content: "canonical reply", seq: 11,
+  });
+  const ack = await executeCompatibilityReadMutation({
+    serverId: server.id, principalId: owner.id,
+    mutation: { kind: "conversation_read_all", scopeId: localParent.id },
+  });
+  assert.deepEqual(new Map(ack.scopes.map((scope) => [scope.scopeId, scope.maxReadSeq])),
+    new Map([[localParent.id, 10], [localThread.id, 11]]));
+  const cursors = await db.select().from(userChannelReadCursors).where(eq(userChannelReadCursors.userId, owner.id));
+  assert.deepEqual(cursors.map((row) => row.channelId).sort(), [localParent.id, localThread.id].sort(),
+    "canonical storage IDs must never become this user's cursor keys");
+});
+
+
+test("conversation read-all rechecks Guest gate and hidden all policy at execution", async ({ db }) => {
+  const { owner, sender, server, scopeA } = await seedScopes();
+  await db.update(serverMembers).set({ role: "guest" }).where(and(eq(serverMembers.serverId, server.id), eq(serverMembers.userId, owner.id)));
+  await db.update(featureFlags).set({ defaultEnabled: false }).where(eq(featureFlags.key, "server_guest_v0"));
+  const execute = () => executeCompatibilityReadMutation({
+    serverId: server.id, principalId: owner.id,
+    mutation: { kind: "conversation_read_all", scopeId: scopeA.id },
+  });
+  assert.deepEqual((await execute()).scopes, [], "disabled Guest access cannot advance cursors");
+  await db.update(featureFlags).set({ defaultEnabled: true }).where(eq(featureFlags.key, "server_guest_v0"));
+  assert.equal((await execute()).scopes.find((scope) => scope.scopeId === scopeA.id)?.maxReadSeq, 2,
+    "joined regular Guest channel remains readable");
+  await db.update(channels).set({ name: "all", type: "private" }).where(eq(channels.id, scopeA.id));
+  await db.insert(messages).values({ channelId: scopeA.id, senderType: "user", senderId: sender.id, content: "hidden activity", seq: 3 });
+  assert.deepEqual((await execute()).scopes, [], "stale membership never exposes hidden #all activity");
+  const [cursor] = await db.select().from(userChannelReadCursors).where(and(eq(userChannelReadCursors.userId, owner.id), eq(userChannelReadCursors.channelId, scopeA.id)));
+  assert.equal(cursor.lastReadSeq, 2);
+});
+
+
+test("manual unread skips own messages, self-caused system events and noise", async ({ db }) => {
+  const { owner, sender, server, scopeA, scopeB } = await seedScopes();
+  await db.insert(messages).values([
+    { channelId: scopeA.id, senderType: "user", senderId: owner.id, content: "own chat", seq: 3 },
+    { channelId: scopeA.id, senderType: "user", senderId: "system", content: "own action", seq: 4,
+      messageType: "system", causalActorType: "user", causalActorId: owner.id, systemSubtype: "channel.member_joined" },
+    { channelId: scopeA.id, senderType: "user", senderId: sender.id, content: "noise", seq: 5,
+      messageType: "system", systemSubtype: "channel.self_unfollow_thread" },
+    { channelId: scopeA.id, senderType: "user", senderId: sender.id, content: "deleted task", seq: 6,
+      messageType: "system", systemSubtype: "task.deleted_summary" },
+  ]);
+  assert.deepEqual(await resolveReadMutationUnreadBoundary({ serverId: server.id, principalId: owner.id, scopeId: scopeA.id }),
+    { latestUnreadEligibleSeq: 2, throughSeq: 1 });
+  await db.delete(messages).where(eq(messages.channelId, scopeB.id));
+  await db.insert(messages).values([
+    { channelId: scopeB.id, senderType: "user", senderId: owner.id, content: "only own", seq: 10 },
+    { channelId: scopeB.id, senderType: "user", senderId: "system", content: "own action", seq: 11,
+      messageType: "system", causalActorType: "user", causalActorId: owner.id, systemSubtype: "channel.member_joined" },
+  ]);
+  assert.deepEqual(await resolveReadMutationUnreadBoundary({ serverId: server.id, principalId: owner.id, scopeId: scopeB.id }),
+    { latestUnreadEligibleSeq: 0, throughSeq: 0 });
 });

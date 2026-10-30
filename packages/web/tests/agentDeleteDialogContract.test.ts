@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { act, createElement } from "react";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { MemoryRouter, useLocation } from "react-router-dom";
@@ -127,6 +126,7 @@ function seedStores() {
     }
     if (url === "/servers/unread-summary") return { data: [] };
     if (url === "/provider-connections") return { data: { connections: [], providerOptions: [] } };
+    if (url.includes("/runtime-account-usage/")) return { data: { state: "missing", snapshot: null } };
     return { data: [] };
   }) as typeof api.get;
   api.post = (async (url: string) => {
@@ -165,7 +165,7 @@ test("mounted agent detail closes an open delete confirmation when deletion is o
   seedStores();
   const view = render(wrap(createElement(AgentDetailPanel, { agent })));
 
-  fireEvent.click(await screen.findByRole("button", { name: "Delete Agent" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Archive Agent" }));
   assert.ok(await screen.findByRole("dialog"));
 
   view.rerender(wrap(createElement(AgentDetailPanel, {
@@ -182,9 +182,9 @@ test("mounted agent delete success closes locally without navigating", async () 
     deleteAgent: async (id: string) => { deletedAgents.push(id); },
   } as never);
   const agentView = render(wrap(createElement(AgentDetailPanel, { agent })));
-  fireEvent.click(screen.getByRole("button", { name: "Delete Agent" }));
+  fireEvent.click(screen.getByRole("button", { name: "Archive Agent" }));
   await act(async () => {
-    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete Agent" }));
+    fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Archive Agent" }));
   });
   assert.equal(screen.queryByRole("dialog"), null);
   assert.deepEqual(deletedAgents, [agent.id]);
@@ -201,7 +201,7 @@ test("mounted computer delete success closes locally without navigating", async 
     deleteMachine: async (id: string) => { deletedMachines.push(id); },
   } as never);
   render(wrap(
-    createElement(MachineDetailPanel, { machine, workspaceEmbedded: true }),
+    createElement(MachineDetailPanel, { machine, hideHeader: true }),
     "/s/server/settings/computers/machine-1",
   ));
   fireEvent.click(screen.getByRole("button", { name: "Delete Computer" }));
@@ -221,6 +221,6 @@ test("the mounted Sidebar agent menu does not fabricate an unreachable delete co
   fireEvent.contextMenu(row, { clientX: 120, clientY: 160 });
   assert.ok(await screen.findByRole("menuitem", { name: "Message" }));
   assert.ok(screen.getByRole("menuitem", { name: "Restart / Reset" }));
-  assert.equal(screen.queryByRole("menuitem", { name: "Delete Agent" }), null);
+  assert.equal(screen.queryByRole("menuitem", { name: "Archive Agent" }), null);
   assert.equal(screen.queryByRole("dialog"), null);
 });

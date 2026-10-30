@@ -1,7 +1,7 @@
 import "./helpers/domSetup";
+import { comboboxText, openCombobox } from "./helpers/combobox";
 
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import type { ReactElement } from "react";
 import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import type { RenderOptions } from "@testing-library/react";
@@ -139,7 +139,7 @@ function seedStores() {
 
 function hasSelectedValue(value: string): boolean {
   return screen.getAllByRole("combobox")
-    .some((select) => select.textContent?.trim() === value);
+    .some((select) => comboboxText(select).trim() === value);
 }
 
 afterEach(() => {
@@ -209,15 +209,15 @@ test("regular Create Agent reopens with the last successful runtime and model", 
 
   const modelSelect = await waitFor(() => {
     const select = screen.getAllByRole("combobox")
-      .find((candidate) => candidate.textContent?.includes("Claude Opus"));
+      .find((candidate) => comboboxText(candidate).includes("Claude Opus"));
     assert.ok(select);
     return select;
   });
-  fireEvent.click(modelSelect);
+  openCombobox(modelSelect);
   const sonnetOption = await screen.findByRole("option", { name: "Claude Sonnet" });
   fireEvent.pointerDown(sonnetOption);
   fireEvent.click(sonnetOption);
-  await waitFor(() => assert.match(modelSelect.textContent ?? "", /Claude Sonnet/));
+  await waitFor(() => assert.match(comboboxText(modelSelect), /Claude Sonnet/));
   fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "Alice" } });
   fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
 
@@ -300,21 +300,21 @@ test("Claude's static model choice stays labeled while runtime admission is pend
 
   const modelSelect = await waitFor(() => {
     const select = screen.getAllByRole("combobox")
-      .find((candidate) => candidate.textContent?.includes("Claude Opus"));
+      .find((candidate) => comboboxText(candidate).includes("Claude Opus"));
     assert.ok(select, "the pending admission draft must render the static Claude label, not raw 'opus'");
     return select;
   });
-  fireEvent.click(modelSelect);
+  openCombobox(modelSelect);
   const fableOption = await screen.findByRole("option", { name: "Claude Fable" });
   fireEvent.pointerDown(fableOption);
   fireEvent.click(fableOption);
-  await waitFor(() => assert.match(modelSelect.textContent ?? "", /Claude Fable/));
+  await waitFor(() => assert.match(comboboxText(modelSelect), /Claude Fable/));
   fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "Alice" } });
 
   await act(async () => releaseRuntimeOptions());
   await waitFor(() => {
     assert.equal(hasSelectedValue("Claude Code"), true);
-    assert.match(modelSelect.textContent ?? "", /Claude Fable/);
+    assert.match(comboboxText(modelSelect), /Claude Fable/);
   });
   assert.equal(
     (screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement).disabled,
@@ -324,7 +324,7 @@ test("Claude's static model choice stays labeled while runtime admission is pend
 
   await act(async () => releaseRuntimeModels());
   await waitFor(() => {
-    assert.match(modelSelect.textContent ?? "", /Claude Fable/);
+    assert.match(comboboxText(modelSelect), /Claude Fable/);
     assert.equal(
       (screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement).disabled,
       false,
@@ -337,7 +337,7 @@ test("Create Agent hides deprecated runtimes even when the Computer reports them
   useMachineStore.setState((state) => ({
     machines: state.machines.map((machine) => ({
       ...machine,
-      runtimes: [...machine.runtimes, "gemini", "kimi", "antigravity"],
+      runtimes: [...machine.runtimes, "gemini", "kimi", "antigravity", "copilot"],
     })),
   }));
   stubCreateAgentGet({ models: [] });
@@ -351,6 +351,10 @@ test("Create Agent hides deprecated runtimes even when the Computer reports them
   const runtimeSelect = screen.getAllByRole("combobox")[1];
   fireEvent.click(runtimeSelect);
 
+  // Positive control: the open list renders the Computer's other runtimes, so
+  // an absent option below means filtered out, not "list not rendered yet".
+  assert.ok(await screen.findByRole("option", { name: "Claude Code" }));
+  assert.ok(screen.queryByRole("option", { name: "Copilot CLI" }) === null);
   assert.equal(screen.queryByRole("option", { name: "Antigravity CLI" }), null);
   assert.equal(screen.queryByRole("option", { name: /Gemini CLI/i }), null);
   assert.equal(screen.queryByRole("option", { name: /Kimi CLI/i }), null);
@@ -410,10 +414,10 @@ test("explicit Computer context wins while remembered runtime and model remain a
   assert.ok(await screen.findByText("Mac (mac.local)"));
   await waitFor(() => {
     assert.equal(hasSelectedValue("Claude Code"), true);
-    assert.equal(hasSelectedValue("Claude Sonnet"), false);
+    assert.equal(hasSelectedValue("Claude Sonnet"), true);
   });
   fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "Alice" } });
-  assert.equal((screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement).disabled, true);
+  assert.equal((screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement).disabled, false);
 
   first.unmount();
   useMachineStore.setState((state) => ({
@@ -509,7 +513,7 @@ test("selected OpenCode cannot submit after the Computer probe removes it", asyn
   assert.equal(createAttempts, 0);
 });
 
-test("Kimi missing config shows login recovery, no model options, and blocks create", async () => {
+test("Kimi missing config keeps login recovery alongside unverified model options", async () => {
   seedStores();
   useMachineStore.setState((state) => ({
     machines: state.machines.map((machine) => ({ ...machine, runtimes: ["kimi-sdk"] })),
@@ -532,20 +536,21 @@ test("Kimi missing config shows login recovery, no model options, and blocks cre
   );
 
   await waitFor(() => {
-    const selectedValues = screen.getAllByRole("combobox").map((select) => select.textContent?.trim());
+    const selectedValues = screen.getAllByRole("combobox").map((select) => comboboxText(select).trim());
     assert.ok(selectedValues.includes("Kimi Code"), `selected values: ${JSON.stringify(selectedValues)}`);
   });
   assert.ok(await screen.findByText(/Kimi is not signed in on this Computer/));
   assert.ok(screen.getByText("kimi login"));
-  assert.equal(hasSelectedValue("Kimi for Coding (default)"), false);
+  assert.equal(hasSelectedValue("Kimi for Coding (default)"), true);
 
   const modelSelect = screen.getAllByRole("combobox")[2];
-  assert.ok(modelSelect, "empty model source must render an empty model control");
-  fireEvent.click(modelSelect);
-  assert.equal(screen.queryByRole("option", { name: /Kimi for Coding/ }), null);
+  assert.ok(modelSelect);
+  openCombobox(modelSelect);
+  assert.ok(screen.getByRole("option", { name: /Kimi for Coding/ }));
+  fireEvent.keyDown(modelSelect, { key: "Escape" });
 
   fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "Alice" } });
-  assert.equal((screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement).disabled, true);
+  assert.equal((screen.getByRole("button", { name: "Create Agent" }) as HTMLButtonElement).disabled, false);
   assert.equal(createAttempts, 0);
 
   const checksBeforeRetry = modelChecks;
@@ -611,11 +616,12 @@ test("runtime model interpolation and rescan accessibility localize in zh-cn", a
     { locale: "zh-cn" },
   );
 
-  const rescan = await screen.findByTitle("重新扫描此 Computer 上的模型");
-  assert.equal(rescan.getAttribute("aria-label"), "重新扫描此 Computer 上的模型");
+  const rescan = await screen.findByRole("button", { name: "重新扫描此 Computer 上的模型" });
+  assert.equal(rescan.getAttribute("title"), null);
+  assert.ok(rescan.hasAttribute("data-base-ui-tooltip-trigger"));
 });
 
-test("Cursor probe error cannot promote remembered bundled Auto into create options or submit", async () => {
+test("Cursor probe error offers remembered Auto as unverified and permits submission", async () => {
   seedStores();
   useMachineStore.setState((state) => ({
     machines: state.machines.map((machine) => ({
@@ -643,25 +649,27 @@ test("Cursor probe error cannot promote remembered bundled Auto into create opti
   );
 
   await waitFor(() => assert.equal(hasSelectedValue("Cursor CLI"), true));
-  assert.equal(hasSelectedValue("Auto"), false);
   assert.ok(await screen.findByText("Could not load models from this Computer."));
+  assert.equal(hasSelectedValue("Auto"), true);
+  assert.ok(screen.getByText(/not been verified/));
 
   const modelSelect = screen.getAllByRole("combobox")[2];
-  assert.ok(modelSelect, "Cursor error must render a model control without bundled presets");
-  fireEvent.click(modelSelect);
-  assert.equal(screen.queryByRole("option", { name: "Auto" }), null);
+  assert.ok(modelSelect);
+  openCombobox(modelSelect);
+  const option = screen.getByRole("option", { name: "Auto" });
+  fireEvent.pointerDown(option);
+  fireEvent.click(option);
 
   fireEvent.change(screen.getByPlaceholderText("e.g. Alice"), { target: { value: "Alice" } });
   const createButton = screen.getByRole("button", { name: "Create Agent" });
-  assert.equal((createButton as HTMLButtonElement).disabled, true);
+  assert.equal((createButton as HTMLButtonElement).disabled, false);
   const form = createButton.closest("form");
   assert.ok(form);
   fireEvent.submit(form);
-  assert.ok(await screen.findByText("Select a model reported by this computer, or enter an allowed custom model."));
-  assert.equal(createAttempts, 0);
+  await waitFor(() => assert.equal(createAttempts, 1));
 });
 
-test("Cursor non-live model validation error is localized in zh-cn", async () => {
+test("Cursor unverified model warning is localized in zh-cn", async () => {
   seedStores();
   useMachineStore.setState((state) => ({
     machines: state.machines.map((machine) => ({ ...machine, runtimes: ["cursor"] })),
@@ -683,10 +691,5 @@ test("Cursor non-live model validation error is localized in zh-cn", async () =>
 
   await waitFor(() => assert.equal(hasSelectedValue("Cursor CLI"), true));
   assert.ok(await screen.findByText("无法从此 Computer 加载模型。"));
-  fireEvent.change(screen.getByPlaceholderText("例如 Alice"), { target: { value: "Alice" } });
-  const createButton = screen.getByRole("button", { name: "创建 Agent" });
-  const form = createButton.closest("form");
-  assert.ok(form);
-  fireEvent.submit(form);
-  assert.ok(await screen.findByText("请选择此 Computer 报告的模型，或输入允许的自定义模型。"));
+  assert.ok(screen.getByText(/尚未验证/));
 });

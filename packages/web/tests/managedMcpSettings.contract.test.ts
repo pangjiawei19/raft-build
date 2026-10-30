@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import test from "node:test";
 import {
   legacySettingsRouteRedirectSlug,
   normalizeSettingsTab,
@@ -17,7 +16,12 @@ test("Server MCP configuration lives in global Settings while Agent MCP shows re
   const settingsPanel = readSource("src/components/settings/SettingsPanel.tsx");
   const sidebar = readSource("src/components/layout/Sidebar.tsx");
   const agentPanel = readSource("src/components/agent/AgentDetailPanel.tsx");
-  const mcpPanel = readSource("src/components/agent/AgentMcpTab.tsx");
+  const mcpPanel = [
+    readSource("src/components/agent/AgentMcpTab.tsx"),
+    readSource("src/components/agent/McpServerListItem.tsx"),
+    readSource("src/components/agent/McpRecommendationItem.tsx"),
+    readSource("src/components/agent/McpHeaderRow.tsx"),
+  ].join("\n");
 
   assert.match(navigation, /id: "integrations", label: "Applications", title: "Applications"[\s\S]*id: "mcp", label: "MCP Servers", title: "MCP Servers"/u);
   assert.match(englishMessages, /"settings\.tabs\.mcp": "MCP Servers"/u);
@@ -41,18 +45,18 @@ test("Server MCP configuration lives in global Settings while Agent MCP shows re
   assert.doesNotMatch(mcpPanel, /pendingCount|Apply &amp; restart|assignmentDrafts/u);
   assert.doesNotMatch(mcpPanel, /<select/u);
   assert.match(mcpPanel, /<SelectTrigger className="w-full">/u);
-  assert.match(mcpPanel, /const added = catalog\.servers\.some/u);
+  assert.match(mcpPanel, /added=\{catalog\.servers\.some\(\(server\) => server\.provider === recommendation\.provider\)\}/u);
   assert.match(mcpPanel, /disabled=\{added\}/u);
   assert.match(mcpPanel, /id: added \? "agent\.mcp\.added" : "agent\.mcp\.add"/u);
   assert.match(englishMessages, /"agent\.mcp\.added": "Added"/u);
   assert.match(englishMessages, /"agent\.mcp\.add": "Add"/u);
   assert.match(mcpPanel, /max-h-80 overflow-y-auto/u);
   assert.match(mcpPanel, /grid grid-cols-1 sm:grid-cols-2/u);
-  assert.match(mcpPanel, /line-clamp-2 text-xs leading-4/u);
+  assert.match(mcpPanel, /line-clamp-2 text-caption/u);
   assert.match(mcpPanel, /aria-label=\{formatMessage\(\{ id: "agent\.mcp\.aboutTool" \}, \{ name: label \}\)\}/u);
   assert.match(englishMessages, /"agent\.mcp\.aboutTool": "About \{name\}"/u);
   assert.match(mcpPanel, /normalizeManagedMcpToolDescription\(tool\.description\)/u);
-  assert.match(mcpPanel, /max-h-64 w-80[\s\S]*?bg-white[\s\S]*?font-normal/u);
+  assert.match(mcpPanel, /max-h-64 w-80[\s\S]*?font-normal/u);
   assert.match(mcpPanel, /new BroadcastChannel\(MANAGED_MCP_OAUTH_RESULT_CHANNEL\)/u);
   assert.match(mcpPanel, /event\.data[\s\S]*MANAGED_MCP_OAUTH_RESULT_CHANNEL[\s\S]*void load\(\)/u);
   assert.doesNotMatch(mcpPanel, /waitForPopupClose|Date\.now|setInterval/u);

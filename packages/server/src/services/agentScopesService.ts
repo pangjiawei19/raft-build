@@ -18,9 +18,9 @@
 //   revision 1. This keeps existing agents (created before this migration)
 //   working without a backfill migration step.
 
-import { eq } from "drizzle-orm";
-import { getDb } from "../db/index.js";
-import { agentScopes, agents } from "../db/schema.js";
+import { eq, inArray } from "drizzle-orm";
+import { getDb, withDbTraceAttributes, type DatabaseExecutor } from "../db/index";
+import { agentScopes, agents, raftbenchServiceAgents } from "../db/schema";
 import {
   AGENT_GRANTABLE_SCOPES,
   hasScope as hasScopeShared,
@@ -35,6 +35,9 @@ export class AgentScopesNotFoundError extends Error {
     super(`Agent ${agentId} not found`);
     this.name = "AgentScopesNotFoundError";
   }
+}
+export class DedicatedAgentScopeError extends Error {
+  constructor() { super("This RaftBench service agent can only hold its dedicated read scopes; default or write scopes are unavailable."); }
 }
 
 function completeDefaultScopes(raw: readonly string[] | null | undefined): AgentGrantableScope[] {
@@ -53,18 +56,7 @@ export async function loadAgentScopes(agentId: string): Promise<AgentScopeSet> {
   const row = await db.query.agentScopes.findFirst({
     where: eq(agentScopes.agentId, agentId),
   });
-  if (row) {
-    const mode = row.mode ?? "custom";
-    return {
-      agentId,
-      granted: mode === "default"
-        ? completeDefaultScopes(row.scopes as readonly string[] | null)
-        : sanitizeGrantedScopes(row.scopes as readonly string[] | null),
-      mode,
-      revision: row.revision,
-      updatedAt: row.updatedAt.toISOString(),
-    };
-  }
+  if (row) return scopeSetFromRow(agentId, row);
   // No row yet — synthesize the full grantable set (every scope default-on
   // in v1). Treat it as revision 0 so the first explicit write bumps to
   // revision 1 and triggers the initial cache push.
@@ -92,8 +84,7 @@ export interface UpdateAgentScopesArgs {
   updatedByUserId: string;
 }
 
-async function findAgentScopeTarget(agentId: string) {
-  const db = getDb();
+async function findAgentScopeTarget(agentId: string, db: DatabaseExecutor = getDb()) {
   const agentRow = await db.query.agents.findFirst({
     where: eq(agents.id, agentId),
     columns: { id: true, serverId: true },
@@ -109,11 +100,19 @@ async function findAgentScopeTarget(agentId: string) {
  * Returns the post-write `AgentScopeSet` (callers push this verbatim
  * over the `agent:scope-updated` ws event).
  */
-export async function updateAgentScopes(args: UpdateAgentScopesArgs): Promise<AgentScopeSet> {
-  const db = getDb();
+export async function updateAgentScopes(
+  args: UpdateAgentScopesArgs,
+  options: { executor?: DatabaseExecutor } = {},
+): Promise<AgentScopeSet> {
+  const db = options.executor ?? getDb();
   const sanitized = sanitizeGrantedScopes(args.scopes);
+  const [dedicated] = await db.select({ agentId: raftbenchServiceAgents.agentId })
+    .from(raftbenchServiceAgents).where(eq(raftbenchServiceAgents.agentId, args.agentId));
+  if (dedicated && sanitized.some(scope => !["server:read", "channel:read", "message:read"].includes(scope))) {
+    throw new DedicatedAgentScopeError();
+  }
 
-  const agentRow = await findAgentScopeTarget(args.agentId);
+  const agentRow = await findAgentScopeTarget(args.agentId, db);
 
   const existing = await db.query.agentScopes.findFirst({
     where: eq(agentScopes.agentId, args.agentId),
@@ -163,9 +162,12 @@ export async function updateAgentScopes(args: UpdateAgentScopesArgs): Promise<Ag
 export async function resetAgentScopesToDefault(args: {
   agentId: string;
   updatedByUserId: string;
-}): Promise<AgentScopeSet> {
-  const db = getDb();
-  const agentRow = await findAgentScopeTarget(args.agentId);
+}, options: { executor?: DatabaseExecutor } = {}): Promise<AgentScopeSet> {
+  const db = options.executor ?? getDb();
+  const [dedicated] = await db.select({ agentId: raftbenchServiceAgents.agentId })
+    .from(raftbenchServiceAgents).where(eq(raftbenchServiceAgents.agentId, args.agentId));
+  if (dedicated) throw new DedicatedAgentScopeError();
+  const agentRow = await findAgentScopeTarget(args.agentId, db);
   const existing = await db.query.agentScopes.findFirst({
     where: eq(agentScopes.agentId, args.agentId),
   });
@@ -210,6 +212,45 @@ export async function resetAgentScopesToDefault(args: {
     revision: 1,
     updatedAt: now.toISOString(),
   };
+}
+
+function scopeSetFromRow(agentId: string, row: typeof agentScopes.$inferSelect): AgentScopeSet {
+  const mode = row.mode ?? "custom";
+  return {
+    agentId,
+    granted: mode === "default"
+      ? completeDefaultScopes(row.scopes as readonly string[] | null)
+      : sanitizeGrantedScopes(row.scopes as readonly string[] | null),
+    mode,
+    revision: row.revision,
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * agentHasScope for several agents that are known to exist (the caller holds
+ * their rows), in one query. An agent without an `agent_scopes` row has the
+ * default-on set, as in loadAgentScopes.
+ */
+export async function existingAgentsHaveScope(
+  agentIds: readonly string[],
+  scope: AgentScope,
+): Promise<Map<string, boolean>> {
+  if (agentIds.length === 0) return new Map();
+  const rows = await withDbTraceAttributes(
+    { db_callsite: "agent_scopes.existing_agents_have_scope" },
+    () => getDb().select().from(agentScopes).where(inArray(agentScopes.agentId, [...agentIds])),
+  );
+  const defaultSet: AgentScopeSet = {
+    agentId: "",
+    granted: [...AGENT_GRANTABLE_SCOPES],
+    mode: "default",
+    revision: 0,
+    updatedAt: new Date(0).toISOString(),
+  };
+  const allowed = new Map(agentIds.map((id) => [id, hasScopeShared(defaultSet, scope)]));
+  for (const row of rows) allowed.set(row.agentId, hasScopeShared(scopeSetFromRow(row.agentId, row), scope));
+  return allowed;
 }
 
 /** Convenience wrapper around `loadAgentScopes` + `hasScope` for callers

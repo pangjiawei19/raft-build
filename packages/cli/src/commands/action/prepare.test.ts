@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { Readable } from "node:stream";
-import test from "node:test";
 
 import {
   actionCardActionSchema,
@@ -9,7 +8,7 @@ import {
   validateActionCardAction,
 } from "@botiverse/raft-shared";
 
-import { resolveActionInput, PrepareActionInputError } from "./prepare.js";
+import { resolveActionInput, PrepareActionInputError } from "./prepare";
 
 test("resolveActionInput parses well-formed channel:create JSON", async () => {
   const input = Readable.from([
@@ -245,7 +244,7 @@ test("extractHandleName strips the sigil when present and trims", () => {
   assert.equal(extractHandleName("@alice", "#"), "@alice");
 });
 
-test("actionCardActionSchema rejects agent-prefilled runtime/model fields on agent:create", () => {
+test("actionCardActionSchema drops an agent-prefilled runtime on agent:create; a model needs hosting antiproton", () => {
   // Per stdrc 2026-05-10 #proj-approval msg=ae4ecedd: technical fields
   // (runtime / model / reasoningEffort) are a human prerogative,
   // not agent-prefillable. Computer placement is now a structured,
@@ -261,9 +260,17 @@ test("actionCardActionSchema rejects agent-prefilled runtime/model fields on age
   // CLI only forwards the parsed (.data) shape, so technical fields are
   // dropped before reaching the server. We assert that the parsed data
   // does NOT carry the rejected fields back through.
+  // Exception (tygg/Tenny 2026-10-13, #raft-antiproton:8008c6f0): a hosted
+  // agent's model may be preset, and only with `hosting: "antiproton"`.
   assert.ok(result.success);
   if (result.success) {
     assert.equal((result.data as Record<string, unknown>).runtime, undefined);
-    assert.equal((result.data as Record<string, unknown>).model, undefined);
+    assert.match(validateActionCardAction(result.data) ?? "", /model is only for a cloud agent \(hosting: "antiproton"\)/);
+  }
+  const hosted = actionCardActionSchema.safeParse({ type: "agent:create", name: "scout", hosting: "antiproton", model: "gpt-5.6-luna" });
+  assert.ok(hosted.success);
+  if (hosted.success) {
+    assert.equal(validateActionCardAction(hosted.data), null);
+    assert.equal((hosted.data as Record<string, unknown>).model, "gpt-5.6-luna");
   }
 });

@@ -1,15 +1,14 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
-import type { ApiResponse } from "../../client.js";
-import type { AgentContext } from "../../auth/env.js";
-import { createCommandContext } from "../../core/context.js";
-import { CliError } from "../../core/errors.js";
-import type { CliIo } from "../../core/io.js";
+import type { ApiResponse } from "../../client";
+import type { AgentContext } from "../../auth/env";
+import { createCommandContext } from "../../core/context";
+import { CliError } from "../../core/errors";
+import type { CliIo } from "../../core/io";
 import {
   channelAddMemberCommand,
   formatAddMemberResult,
-} from "./add-member.js";
+} from "./add-member";
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];
@@ -77,7 +76,7 @@ test("add-member command posts normalized user handle payload", async () => {
           ok: true,
           status: 200,
           error: null,
-          data: { ok: true, alreadyMember: false, member: { type: "human", name: "alice" } },
+          data: { ok: true, alreadyMember: false, channelId: "channel-1", member: { type: "human", id: "user-1", name: "alice" } },
         };
       },
     }) as any,
@@ -96,7 +95,7 @@ test("add-member command posts normalized user handle payload", async () => {
     },
     {
       method: "POST",
-      path: "/internal/agent/agent-1/channels/channel-1/members",
+      path: "/internal/agent-api/channels/channel-1/members",
       body: { user: "alice" },
     },
   ]);
@@ -125,7 +124,7 @@ test("add-member command posts normalized agent handle payload", async () => {
           ok: true,
           status: 200,
           error: null,
-          data: { ok: true, alreadyMember: true, member: { type: "agent", name: "assistant" } },
+          data: { ok: true, alreadyMember: true, channelId: "channel-1", member: { type: "agent", id: "agent-2", name: "assistant" } },
         };
       },
     }) as any,

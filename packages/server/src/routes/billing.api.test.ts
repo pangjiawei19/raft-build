@@ -1,15 +1,15 @@
-import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials.js";
-import { createApiTest } from "../test/integration/apiTest.js";
+import { fixturePasswordHash, tokenForHuman } from "../test/integration/credentials";
+import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
 import type Stripe from "stripe";
 import { getEffectiveLimits, TRIAL_START_DATE } from "@botiverse/raft-shared";
-import { openTestApp } from "../test/integration/app.js";
-import { getDb } from "../db/index.js";
-import { servers as serversTable, subscriptions, users } from "../db/schema.js";
-import { addMember, createServer } from "../services/serverService.js";
-import { __resetStripeForTests, __setStripeForTests } from "../services/billingService.js";
+import { openTestApp } from "../test/integration/app";
+import { getDb } from "../db/index";
+import { servers as serversTable, subscriptions, users } from "../db/schema";
+import { addMember, createServer } from "../services/serverService";
+import { __resetStripeForTests, __setStripeForTests } from "../services/billingService";
 import { eq } from "drizzle-orm";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
@@ -516,4 +516,52 @@ test("joint channel creation allows Free during full-featured trial and Pro afte
   } finally {
     await app.close();
   }
+});
+
+test("retired referral preview is absent and legacy codes are rejected before Checkout creation", async ({ app }) => {
+  const billingEnv = snapshotBillingEnv();
+  configureBillingEnv();
+  try {
+    const owner = await seedVerifiedUser("retired-preview-owner@slock.test");
+    const server = await createServer("Retired preview", `retired-preview-${randomUUID()}`, owner.id);
+    const token = await tokenForHuman(owner.email);
+    let creates = 0;
+    __setStripeForTests({ checkout: { sessions: { create: async () => {
+      creates += 1;
+      return { url: "https://checkout.stripe.test/session" };
+    } } } } as unknown as Stripe);
+    const preview = await fetch(`${app.baseUrl}/api/billing/referral-discount/preview`, {
+      method: "POST", headers: headers(token, server.id), body: JSON.stringify({ referralCode: "RETIRED" }),
+    });
+    assert.equal(preview.status, 404);
+    const checkout = await fetch(`${app.baseUrl}/api/billing/checkout`, {
+      method: "POST", headers: headers(token, server.id), body: JSON.stringify({
+        successUrl: "http://127.0.0.1:4173/billing/success",
+        cancelUrl: "http://127.0.0.1:4173/billing/cancel",
+        referralCode: "RETIRED",
+      }),
+    });
+    assert.equal(checkout.status, 400);
+    assert.match((await checkout.json() as { error: string }).error, /Stripe Checkout/);
+    assert.equal(creates, 0);
+  } finally {
+    __resetStripeForTests();
+    restoreBillingEnv(billingEnv);
+  }
+});
+
+test("first Checkout invalid code is a generic owner-only 400 without Stripe creation or raw-code leakage", async ({ app }) => {
+  const env = snapshotBillingEnv(); configureBillingEnv();
+  try {
+    const owner = await seedVerifiedUser("native-code-api-owner@slock.test");
+    const member = await seedVerifiedUser("native-code-api-member@slock.test");
+    const server = await createServer("Native Code", `native-code-${randomUUID()}`, owner.id); await addMember(server.id, member.id, "member");
+    let creates = 0;
+    __setStripeForTests({ checkout: { sessions: { create: async () => { creates++; return { url: "unexpected" }; } } } } as unknown as Stripe);
+    const body = JSON.stringify({ targetPlan: "pro", promotionCode: "PRIVATE\u0000CODE", successUrl: "http://127.0.0.1:4173/billing/success", cancelUrl: "http://127.0.0.1:4173/billing/cancel" });
+    const denied = await fetch(`${app.baseUrl}/api/billing/checkout`, { method: "POST", headers: headers(await tokenForHuman(member.email), server.id), body });
+    assert.equal(denied.status, 403);
+    const response = await fetch(`${app.baseUrl}/api/billing/checkout`, { method: "POST", headers: headers(await tokenForHuman(owner.email), server.id), body });
+    assert.equal(response.status, 400); assert.deepEqual(await response.json(), { error: "Promotion code is unavailable", code: "promotion_code_unavailable" }); assert.equal(creates, 0);
+  } finally { __resetStripeForTests(); restoreBillingEnv(env); }
 });

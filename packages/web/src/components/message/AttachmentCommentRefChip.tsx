@@ -1,4 +1,5 @@
 import { MessageSquare } from "lucide-react";
+import { useCallback } from "react";
 import { useIntl } from "react-intl";
 import type { Message } from "../../store/messageStore";
 import { ReferenceChip } from "./ReferenceChip";
@@ -12,8 +13,9 @@ export function AttachmentCommentRefChip({
   commentRef: Message["commentRef"] | null | undefined;
   commentsEnabled: boolean;
   onJumpToHost: () => void;
-  // The chip box (`MSG_REF_CHIP`, via ReferenceChip) is `[font-size:inherit]`,
-  // so its size comes from this wrapper. Pass the same `messageBodyFontSizeClass`
+  // The chip box (RUI message-reference recipe, via
+  // ReferenceChip) renders at its container's font size, so its size comes
+  // from this wrapper. Pass the same `messageBodyFontSizeClass`
   // the message body uses so the comment-ref chip scales with the user's
   // font-size preference instead of the outer base size (stdrc task #463: chip
   // looked larger than the body when the preference shrank the body but not the
@@ -21,6 +23,10 @@ export function AttachmentCommentRefChip({
   bodyFontSizeClass?: string;
 }) {
   const { formatMessage } = useIntl();
+  const handleJumpToHost = useCallback((event: React.MouseEvent) => {
+    event.preventDefault();
+    onJumpToHost();
+  }, [onJumpToHost]);
   if (!commentRef || !commentsEnabled) return null;
 
   const detail = `${commentRef.filename}${commentRef.anchorLabel ? ` · ${commentRef.anchorLabel}` : ""}`;
@@ -33,13 +39,10 @@ export function AttachmentCommentRefChip({
           <ReferenceChip
             as="a"
             href="#"
-            onClick={(e) => {
-              e.preventDefault();
-              onJumpToHost();
-            }}
+            onClick={handleJumpToHost}
             data-message-affordance="attachment-comment-ref-chip"
             icon={MessageSquare}
-            colorClass="bg-brutal-stone/25 text-black transition-colors hover:bg-brutal-stone/40"
+            variant="muted"
             label={label}
             title={formatMessage({ id: "message.attachmentComment.jumpTitle" }, { detail })}
           />
@@ -48,14 +51,14 @@ export function AttachmentCommentRefChip({
             as="span"
             data-message-affordance="attachment-comment-ref-chip"
             icon={MessageSquare}
-            colorClass="bg-brutal-stone/25 text-black"
+            variant="muted"
             label={label}
             title={formatMessage({ id: "message.attachmentComment.commentTitle" }, { detail })}
           />
         )}
       </div>
       {commentRef.anchorQuote ? (
-        <div className="mb-1 whitespace-pre-wrap break-words border-l-2 border-black/20 pl-2 text-xs italic text-black/55">
+        <div className="mb-1 whitespace-pre-wrap break-words border-l-2 border-line-seam pl-2.5 text-caption font-normal text-foreground-muted">
           {commentRef.anchorQuote}
         </div>
       ) : null}

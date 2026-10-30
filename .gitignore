@@ -1,5 +1,9 @@
 node_modules/
+# A symlinked node_modules (worktree setups) is a file, which "node_modules/" does not match.
+node_modules
+.amp/portals/*
 dist/
+h5-bundle/
 dist-electron/
 shim-dist/
 *.log
@@ -24,6 +28,8 @@ artifacts/perf/
 packages/web/.playwright/
 packages/cli/test-results/
 packages/web/test-results/
+# Playwright HTML report and e2e transport evidence (CI uploads it as an artifact).
+packages/web/playwright-report/
 packages/visual-testing/test-results/
 # Local `slock-visual` / visual-testing playwright runs write these at the repo root.
 artifacts/visual-testing/
@@ -38,3 +44,6 @@ scripts/app-name-ratchet-baseline.txt.mutating
 # Written by scripts/source-available/export-snapshot.mjs into exported snapshots only;
 # tests skip private-layout contracts when it exists.
 /RELEASE_SOURCE
+
+# vitest coverage reports (e.g. packages/sync-core test:coverage)
+coverage/

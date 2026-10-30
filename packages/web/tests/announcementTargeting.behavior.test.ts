@@ -1,0 +1,49 @@
+import assert from "node:assert/strict";
+import api from "../src/api/client";
+import { useServerStore } from "../src/store/serverStore";
+import { useAnnouncementStore } from "../src/store/announcementStore";
+import { asServerId } from "@botiverse/raft-shared";
+import type { Server } from "../src/store/serverStore";
+const a = asServerId("10000000-0000-4000-8000-000000000001");
+const b = asServerId("10000000-0000-4000-8000-000000000002");
+const row = { id: "20000000-0000-4000-8000-000000000001", title: "A", pages: [{ body: "A" }], publishedAt: "2026-01-01", startsAt: "2026-01-01", endsAt: null, locale: "en" as const, deliveryVersion: 1, deliveryScope: { type: "server" as const, serverId: a } };
+function context(id: typeof a) { useServerStore.setState({ current: { id } as Server }); }
+afterEach(() => { useAnnouncementStore.getState().reset(); useServerStore.setState({ current: null }); });
+test("late A response cannot open a popup after changing to B", async () => {
+  context(a);
+  let resolve!: (value: { data: { announcements: typeof row[] } }) => void;
+  const late = new Promise<{ data: { announcements: typeof row[] } }>((r) => { resolve = r; });
+  const get = vi.spyOn(api, "get").mockImplementationOnce(() => late).mockResolvedValueOnce({ data: { announcements: [] } });
+  const first = useAnnouncementStore.getState().load();
+  context(b);
+  await useAnnouncementStore.getState().load();
+  resolve({ data: { announcements: [row] } });
+  await first;
+  assert.deepEqual(useAnnouncementStore.getState().pending, []);
+  assert.equal(get.mock.calls[0][1]?.params.server_id, a);
+  assert.equal(get.mock.calls[1][1]?.params.server_id, b);
+});
+test("switching server drops scoped popup without recording it as read", async () => {
+  context(a);
+  vi.spyOn(api, "get").mockResolvedValue({ data: { announcements: [row] } });
+  const post = vi.spyOn(api, "post").mockResolvedValue({ data: { ok: true } });
+  await useAnnouncementStore.getState().load();
+  context(b);
+  vi.mocked(api.get).mockResolvedValue({ data: { announcements: [] } });
+  await useAnnouncementStore.getState().load();
+  assert.deepEqual(useAnnouncementStore.getState().pending, []);
+  assert.equal(post.mock.calls.length, 0);
+});
+test("failed writes cannot advance the next workspace's queue", async () => {
+  context(a);
+  vi.spyOn(api, "get").mockResolvedValue({ data: { announcements: [row] } });
+  vi.spyOn(api, "post").mockRejectedValue(new Error("offline"));
+  await useAnnouncementStore.getState().load();
+  await useAnnouncementStore.getState().dismiss(row.id);
+  context(b);
+  const get = vi.mocked(api.get).mockResolvedValue({ data: { announcements: [] } });
+  await useAnnouncementStore.getState().load();
+  const last = get.mock.calls.at(-1)?.[1]?.params;
+  assert.equal(last.server_id, b);
+  assert.equal(last.after, undefined);
+});

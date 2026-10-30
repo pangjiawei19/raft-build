@@ -119,7 +119,7 @@ async function openServer(
     localStorage.setItem("slock_last_server_slug", data.serverSlug);
   }, { ...login, serverSlug });
   const page = await context.newPage();
-  await page.route("**/api/announcements/active", async (route) => {
+  await page.route(/\/api\/announcements\/active(?:\?|$)/, async (route) => {
     await route.fulfill({
       status: 200,
       contentType: "application/json",

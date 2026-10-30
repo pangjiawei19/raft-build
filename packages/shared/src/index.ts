@@ -1,23 +1,34 @@
+export { normalizeAppSetupUrl, normalizeAppSetupDescription, projectAppSetup, asAppSetupInstallationId, AppSetupValidationError } from "./appSetup";
+export type { AppSetupState, AppSetupInstallationId } from "./appSetup";
+export { validateAnnouncementAudience, matchesAnnouncementAudience, asAnnouncementRecipientUserId, ANNOUNCEMENT_AUDIENCE_MAX_IDS } from "../announcement-audience";
+export type { AnnouncementAudience, AnnouncementDeliveryScope, AnnouncementAudienceSnapshot, AnnouncementRecipientUserId } from "../announcement-audience";
+import type { ActivityTurnSummary } from "./activityTurnSummary";
+import type { AnnouncementContent, AnnouncementPresentation } from "../announcement-presentation";
+export { validateAnnouncementPresentation } from "../announcement-presentation";
+export type { AnnouncementContent, AnnouncementPresentation } from "../announcement-presentation";
 // Shared types for Slock — used by server, web, and machine (daemon process)
 
-import { makeIsMember } from "./typeGuards.js";
-import { currentDate } from "./clock.js";
+import { makeIsMember } from "./typeGuards";
+import { EXTERNAL_AGENT_RUNTIME_DISPLAY_NAME, EXTERNAL_AGENT_RUNTIME_ID, EXTERNAL_AGENT_RUNTIME_MODEL, RUNTIMES, RuntimeInfo } from "./runtimeCatalog";
+import { currentDate } from "./clock";
 import {
   PI_BUILTIN_PROVIDER_API_KEY_ENV_KEYS_GENERATED,
   PI_BUILTIN_PROVIDER_BLOCKED_HOST_ENV_KEYS_GENERATED,
   PI_BUILTIN_PROVIDER_CONNECTION_PROBES_GENERATED,
   PI_BUILTIN_PROVIDER_DEFAULT_MODELS_GENERATED,
   PI_BUILTIN_PROVIDER_MODELS_GENERATED,
-} from "./piBuiltinModels.generated.js";
-import { formatRuntimeProviderModelLabel } from "./runtimeProviderDisplay.js";
-import { hydrateLegacyRuntimeConfigWithTrace } from "./runtimeConfigLegacy.js";
-import type { AttentionHint } from "./attentionDependencyOracle.js";
+} from "./piBuiltinModels.generated";
+import { formatRuntimeProviderModelLabel } from "./runtimeProviderDisplay";
+import { hydrateLegacyRuntimeConfigWithTrace } from "./runtimeConfigLegacy";
+import type { AttentionHint } from "./attentionDependencyOracle";
+import type { EXTERNAL_AGENT_ACTIVITY_LEGACY_STATUS_VALUES, RaftAgentStatus } from "./agentStatusStandard";
+import type { EXTERNAL_AGENT_ACTIVITY_DRAIN_SCHEMA, EXTERNAL_AGENT_ACTIVITY_EVENT_SCHEMA, EXTERNAL_AGENT_ACTIVITY_INGEST_SCHEMA } from "./externalAgentActivity";
 import type {
   ComputerBoundDueReceiptMessage,
   ServerBoundDueReceiptMessage,
-} from "./apps/reminder/protocol.js";
+} from "./apps/reminder/protocol";
 
-export { formatUtcTimestamp } from "./utcTimestamp.js";
+export { formatUtcTimestamp } from "./utcTimestamp";
 
 export {
   joinRaftChannelByTarget,
@@ -31,7 +42,7 @@ export {
   type RaftChannelJoinResult,
   type RaftChannelJoinSuccess,
   type RaftChannelJoinTransportError,
-} from "./agentApiChannelJoin.js";
+} from "./agentApiChannelJoin";
 
 export {
   AGENT_MIGRATION_STATES,
@@ -39,33 +50,55 @@ export {
   MAX_AGENT_MIGRATION_TRANSFER_FILE_COUNT,
   MAX_AGENT_MIGRATION_TRANSFER_BYTES,
   MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT,
+  AGENT_MIGRATION_SOURCE_BUILD_PHASES,
+  agentMigrationSourceBuildProgressReportSchema,
   agentMigrationSupportRefSchema,
   agentMigrationTransferSummarySchema,
   agentMigrationUpdatedPayloadSchema,
+  AGENT_MIGRATION_TARGET_KINDS,
+  AGENT_MIGRATION_HOSTED_SKIP_REASONS,
+  type AgentMigrationSourceBuildProgress,
   type AgentMigrationTransferSummary,
   type AgentMigrationUpdatedPayload,
-} from "./agentMigration.js";
+  type AgentMigrationTargetKind,
+  type AgentMigrationHostedImportLimits,
+  type AgentMigrationHostedSkipReason,
+  type AgentMigrationHostedImportSummary,
+} from "./agentMigration";
 export {
   AGENT_MIGRATION_TERMINAL_FAILURE_CODES,
   AGENT_MIGRATION_USER_ERROR_CODES,
   type AgentMigrationTerminalFailureCode,
   type AgentMigrationUserErrorCode,
-} from "./agentMigrationErrors.js";
+} from "./agentMigrationErrors";
 export {
   FEATURE_FLAG_ADMIN_COLUMN_PROJECTIONS,
   FEATURE_FLAG_ADMIN_OPERATOR_ROLE,
   FORBIDDEN_FEATURE_FLAG_ADMIN_PRIVILEGES,
   REQUIRED_FEATURE_FLAG_ADMIN_PRIVILEGES,
   FeatureFlagAdminPrivilegeError,
+  featureFlagAdminPrivilegeLabel,
+  readFeatureFlagAdminPrivilegeMatrix,
   verifyFeatureFlagAdminPrivileges,
+  type FeatureFlagAdminPrivilegeCheck,
   type FeatureFlagAdminPrivilegeQuery,
-} from "./featureFlagAdminPrivileges.js";
-import type { DisplayLocale } from "./displayLocales.js";
-import type { ProviderConnectionLaunchProjection } from "./providerConnections.js";
-import type { RuntimeAccountUsageProvider, RuntimeAccountUsageSnapshot } from "./runtimeAccountUsage.js";
-import type { AgentVisibleExternalMessageProvenance } from "./externalProjection.js";
+} from "./featureFlagAdminPrivileges";
+import type { DisplayLocale } from "./displayLocales";
+import type { ProviderConnectionLaunchProjection } from "./providerConnections";
+import type { ProviderProbeCategory, ProviderProbeDaemonCategory, ProviderProbeId } from "./providerProbes";
+import type { RuntimeAccountUsageProvider, RuntimeAccountUsageSnapshot } from "./runtimeAccountUsage";
+import type { RuntimeModelCatalogEntry } from "./runtimeModelCatalog";
+import type { AgentVisibleExternalMessageProvenance } from "./externalProjection";
+import type { FeedbackTranscriptLookupOutcome, FeedbackTranscriptOutcomeObjectPlan, FeedbackTranscriptUploadOutcome } from "./feedbackTranscriptOutcome";
 
-export const MAX_JOINT_CHANNEL_SERVERS = 3;
+// Joint channel limits (contract v0.3 §18.6). Servers include the host and
+// unexpired pending invite targets; the free-server cap uses the same billing
+// projection as every other paid gate (`canUseProBillingFeatures`).
+export const MAX_JOINT_CHANNEL_SERVERS = 30;
+export const MAX_JOINT_CHANNEL_FREE_SERVERS = 2;
+// §18.8: a joint that goes over the free-server cap after joining stays
+// writable for this long, then becomes read-only until back within the cap.
+export const JOINT_CHANNEL_OVER_LIMIT_GRACE_MS = 3 * 24 * 60 * 60 * 1000;
 
 export type AgentMessageSenderType = "human" | "agent" | "system" | "third_party_app";
 
@@ -73,6 +106,8 @@ export interface AgentThreadContextMessage {
   message_id: string;
   sender_name: string;
   sender_description?: string | null;
+  /** IANA zone the human sender's browser reported (web sends); null otherwise. */
+  sender_timezone?: string | null;
   sender_type: AgentMessageSenderType;
   content: string;
   timestamp: string;
@@ -104,6 +139,8 @@ export interface AgentMessage {
   sender_id: string;
   sender_name: string;
   sender_description?: string | null;
+  /** IANA zone the human sender's browser reported (web sends); null otherwise. */
+  sender_timezone?: string | null;
   sender_type: AgentMessageSenderType;
   content: string;
   timestamp: string;
@@ -189,60 +226,89 @@ export interface AgentMessage {
   external_message?: AgentVisibleExternalMessageProvenance;
 }
 
-export * from "./activityMute.js";
-export * from "./channelPermissions.js";
-export * from "./raftPermalinks.js";
-export * from "./raftRefs.js";
-export * from "./thirdPartyInertRenderer.js";
-export * from "./producerFactLineage.js";
-export * from "./apmHeldFreshness.js";
-export * from "./emailValidation.js";
-export * from "./serverSlugValidation.js";
-export * from "./tracing/index.js";
-export * from "./tracing/eventRows.js";
-export * from "./tracing/fields.js";
-export * from "./tracing/memory.js";
-export * from "./tracing/assertions.js";
-export * from "./toolDisplay.js";
-export * from "./attachmentPreview.js";
-export * from "./typeGuards.js";
-export * from "./brandedIds.js";
-export * from "./actionCards.js";
-export * from "./featureFlags.js";
-export * from "./externalProjection.js";
-export * from "./slackBridgeDelivery.js";
-export * from "./slackBridgeProvisioning.js";
-export * from "./agentApiContract.js";
-export * from "./agentApiRawClient.js";
-export * from "./agentApiClient.js";
-export * from "./agentApiMessageClient.js";
-export * from "./daemonApiContract.js";
-export * from "./authRefreshTiming.js";
-export * from "./safeReturnPath.js";
-export * from "./clock.js";
-export * from "./daemonApiRawClient.js";
-export * from "./daemonApiClient.js";
-export * from "./agentInbox.js";
-export * from "./agentInboxApp.js";
-export * from "./attentionDependencyOracle.js";
-export * from "./runtimeProviderDisplay.js";
-export * from "./runtimeAccountUsage.js";
-export * from "./externalAgentIntegration.js";
-export * from "./translationLanguages.js";
-export * from "./displayLocales.js";
-export * from "./timeFormatPreference.js";
-export * from "./legalAcceptance.js";
-export * from "./agentScopes.js";
-export * from "./oauthScopes.js";
-export * from "./oauthRedirect.js";
-export * from "./oauthClientCategories.js";
-export * from "./appNotifications.js";
+export * from "./observedFailureSummary";
+export * from "./agentNameGenerator";
+export * from "./diagnosticRedaction";
+export * from "./feedbackMachineEvidence";
+export * from "./machineDuplicateConnection";
+export * from "./feedbackTranscriptOutcome";
+export * from "./feedbackAgentEventTail";
+export * from "./scopeAttestationBudget";
+export * from "./activityMute";
+export * from "./channelPermissions";
+export * from "./raftPermalinks";
+export * from "./raftRefs";
+export * from "./dmPeerRef";
+export * from "./liveExecutablePath";
+export * from "./thirdPartyInertRenderer";
+export * from "./agentRuntimeProvider";
+export * from "./producerFactLineage";
+export * from "./apmHeldFreshness";
+export * from "./emailValidation";
+export * from "./serverSlugValidation";
+export * from "./tracing/index";
+export * from "./raftCliGuide";
+export * from "./tracing/eventRows";
+export * from "./tracing/fields";
+export * from "./tracing/memory";
+export * from "./tracing/assertions";
+export * from "./toolDisplay";
+export * from "./activityTurnSummary";
+export * from "./attachmentPreview";
+export * from "./typeGuards";
+export * from "./brandedIds";
+export * from "./actionCards";
+export * from "./featureFlags";
+export * from "./productEvents";
+export * from "./externalProjection";
+export * from "./slackBridgeDelivery";
+export * from "./slackBridgeProvisioning";
+export * from "./agentApiContract";
+export { lazySchemaStats, warmContractSchemas } from "./lazySchema";
+export * from "./thirdPartyEventId";
+export * from "./agentApiRouteMeta";
+export * from "./agentApiDescription";
+export * from "./agentMessageText";
+export * from "./agentOps/index";
+export * from "./agentText/index";
+export * from "./agentApiRawClient";
+export * from "./agentApiClient";
+export * from "./agentApiMessageClient";
+export * from "./daemonApiContract";
+export * from "./authRefreshTiming";
+export * from "./socketHandshakeErrors";
+export * from "./safeReturnPath";
+export * from "./integrationInvitePaths";
+export * from "./clock";
+export * from "./daemonApiRawClient";
+export * from "./daemonApiClient";
+export * from "./agentInbox";
+export * from "./agentInboxProjection";
+export * from "./agentInboxApp";
+export * from "./attentionDependencyOracle";
+export * from "./runtimeProviderDisplay";
+export * from "./runtimeAccountUsage";
+export * from "./systemAttention";
+export * from "./runtimeModelCatalog";
+export * from "./externalAgentIntegration";
+export * from "./translationLanguages";
+export * from "./displayLocales";
+export * from "./computerReleaseNotes";
+export * from "./timeFormatPreference";
+export * from "./legalAcceptance";
+export * from "./agentScopes";
+export * from "./oauthScopes";
+export * from "./oauthRedirect";
+export * from "./oauthClientCategories";
+export * from "./appNotifications";
+export * from "./startupMemoryContract";
 // sync-core now lives in its own workspace package; this stays as a
 // compatibility re-export so existing `@botiverse/raft-shared` consumers keep working.
 export * from "@botiverse/raft-sync-core";
-export * from "./onboardingStateMachineContract.js";
-export * from "./knowledgeContext.js";
-export * from "./capabilityInventories.js";
+export * from "./onboardingStateMachineContract";
+export * from "./cindyOnboardingContent";
+export * from "./knowledgeContext";
+export * from "./capabilityInventories";
 
 // ── Reminders (contract types) ────────────────────────────────────────────────
 // Server DB owns lifecycle/recurrence. The Computer keeps a durable, versioned
@@ -308,6 +374,39 @@ export interface ReminderSummary {
   recurrence: ReminderRecurrence | null;
 }
 
+/**
+ * One event a connected app sent to an agent (`POST /oauth/agent-events`), as
+ * listed in the Agent panel. Visible to the agent's creator and server
+ * owners/admins only. `status` is the display status: an event not delivered
+ * before `expiresAt` reads as `expired`.
+ */
+export interface AgentAppEventSummary {
+  id: string;
+  app: { clientId: string; clientKey: string; name: string; logoUrl: string | null };
+  kind: "event" | "notification" | "action_request";
+  summary: string;
+  status: "queued" | "delivered" | "expired";
+  externalEventId: string | null;
+  /** ISO-8601 UTC */
+  createdAt: string;
+  /** ISO-8601 UTC, or null while not delivered. */
+  deliveredAt: string | null;
+  /** ISO-8601 UTC */
+  expiresAt: string;
+  payloadBytes: number;
+}
+
+export interface AgentAppEventListResponse {
+  events: AgentAppEventSummary[];
+  /** Pass as `before` to read the next (older) page; null on the last page. */
+  nextCursor: string | null;
+}
+
+export interface AgentAppEventDetail extends AgentAppEventSummary {
+  /** App-supplied data. Render as inert JSON, never as instructions or links. */
+  payload: Record<string, unknown>;
+}
+
 export type ReminderEventType = "scheduled" | "fired" | "snoozed" | "updated" | "canceled";
 
 export interface ReminderEventSummary {
@@ -366,11 +465,16 @@ export interface AgentMigrationTransportReady {
   provider?: AgentMigrationTransferProvider | null;
   role?: AgentMigrationTransferRole | null;
   transferKind?: AgentMigrationTransferKind | null;
-  url?: string | null;
   expiresAt?: string | null;
   maxBytes?: number | null;
   protocol?: string | null;
   capabilities?: string[] | null;
+  /**
+   * Transfer runs alive in this daemon process. Only meaningful when
+   * `capabilities` includes AGENT_MIGRATION_CAPABILITY: then a pre-flip
+   * migration missing here means its run was lost (e.g. restart).
+   */
+  activeLeases?: Array<{ migrationId: string; transportGeneration: string; role: AgentMigrationTransferRole }>;
   observedAt: string;
 }
 
@@ -414,11 +518,88 @@ export interface AgentRuntimeProfileSummary {
 }
 
 // Server ↔ Machine WebSocket protocol
-export const DAEMON_CAPABILITY_MODEL_SEEN_BOUNDARY = "agent:model-seen-boundary";
-export const COMPUTER_CAPABILITY_SUPERVISOR_MUTATIONS = "computer:supervisor-mutations-v1";
-export const COMPUTER_LEGACY_SUPERVISOR_AUTO_BRIDGE_FLOOR = "0.72.1";
-export const COMPUTER_LEGACY_WEB_UPGRADE_TARGET_FLOOR = "0.72.9";
+/** One conversation's messages the model was shown: `channelId` is the conversation (thread channel for threads). */
+export interface AgentModelSeenItem {
+  channelId: string;
+  seqs: number[];
+}
 
+/** Most conversations one `agent:model-seen` report may carry; the Server ignores the rest, the daemon splits. */
+export const MODEL_SEEN_MAX_ITEMS_PER_REPORT = 50;
+
+export const DAEMON_CAPABILITY_MODEL_SEEN_BOUNDARY = "agent:model-seen-boundary";
+/**
+ * RFC 069 §8: the daemon reports agent state only through sequenced, replayed
+ * `agent:status` frames (`daemonInstanceId` + `clientSeq`, same counter as
+ * activity). A server that sees this capability lets activity frames change
+ * display only, never the state that wake decisions read.
+ */
+export const DAEMON_CAPABILITY_SEQUENCED_STATUS = "agent:status-sequenced";
+/**
+ * RFC 071 §7: the daemon reports launch-bound runtime outcomes
+ * (`agent:runtime:outcome` v1: E1 `terminal_failure`, E2 `turn_completed`)
+ * and process identity (`agent:process_spawned`, `agent:process_exited`,
+ * `processInstanceId` on a rebind `agent:start:ack`), and echoes
+ * `catchupBatchId` from `agent:start`. Without it the terminal-failure
+ * breaker never counts for this machine (RFC 7 "Old daemons").
+ */
+export const DAEMON_CAPABILITY_RUNTIME_OUTCOME_V1 = "agent:runtime-outcome-v1";
+/**
+ * RFC 071 outbox (server capability, on `machine:context.capabilities`): the
+ * server acknowledges every outbox frame with `agent:outcome:ack`. A daemon
+ * sends outbox frames only to a server that advertises this; otherwise it
+ * pauses and keeps its queue.
+ */
+export const SERVER_CAPABILITY_RUNTIME_OUTCOME_ACK_V1 = "agent:runtime-outcome-ack-v1";
+/**
+ * task #365 (server capability, on `machine:context.capabilities`): the server
+ * counts a start the daemon proved never created a process (`not_spawned`
+ * reason `spawn_error`) in its own bounded backoff, and stamps automatic
+ * `agent:start` frames with the claim-time `connectionEpochId`. Without it the
+ * daemon keeps today's behaviour (the failed spawn is reported as a crash, so
+ * the #1119 crash-loop breaker still protects an older server).
+ */
+export const SERVER_CAPABILITY_START_SPAWN_ERROR_V1 = "agent:start-spawn-error-v1";
+/**
+ * task #1268 (server capability, on `machine:context.capabilities` AND on the
+ * daemon WebSocket 101 response header `RAFT_SERVER_CAPABILITIES_HEADER`): the
+ * server understands `ready.runtimeDetection`. Only then may a daemon send a
+ * `pending` ready (no inventory fields) and finish detection afterwards; without
+ * it the daemon keeps today's synchronous detection before `ready`.
+ */
+export const SERVER_CAPABILITY_RUNTIME_DETECTION_ASYNC_V1 = "machine:runtime-detection-async-v1";
+/**
+ * task #1268: HTTP response header on the daemon WebSocket upgrade (101) carrying
+ * the server's machine-context capabilities, space-separated. The daemon reads it
+ * before its first `ready` (the `machine:context` frame arrives after `open`);
+ * `machine:context.capabilities` stays authoritative and corrects a mismatch.
+ */
+export const RAFT_SERVER_CAPABILITIES_HEADER = "raft-server-capabilities";
+/**
+ * task #1268: runtime detection state carried on `ready`. `pending` = detection
+ * runs after this ready and the message carries NO inventory fields; `complete`
+ * = `runtimes`/`runtimeVersions` are this round's full result; `incomplete` =
+ * the round ended early (deadline, child failure, cancel) and
+ * `unfinishedRuntimes` were not probed — their previous state is unconfirmed,
+ * not unavailable. Absent on older daemons = `complete` (synchronous detection).
+ */
+export type RuntimeDetectionReport =
+  | { status: "pending" }
+  | { status: "complete"; durationMs: number }
+  | { status: "incomplete"; reason: "deadline" | "child_failed" | "cancelled"; unfinishedRuntimes: string[]; durationMs: number };
+export const COMPUTER_CAPABILITY_SUPERVISOR_MUTATIONS = "computer:supervisor-mutations-v1";
+
+/**
+ * Summary of the most recent external-installer upgrade receipt on a machine,
+ * read once by the successor process and carried on `ready`. Only the
+ * failure reason is consumed (one human-readable line); the outcome is the
+ * version comparison the Server performs itself.
+ */
+export interface ComputerLastUpgradeReceipt {
+  targetVersion: string;
+  outcome: "promoted" | "rolled_back" | "failed" | "held" | "unresolved";
+  reason?: string;
+}
 export const COMPUTER_LIFECYCLE_ACTIONS = ["start", "stop", "restart", "upgrade"] as const;
 export type ComputerLifecycleAction = (typeof COMPUTER_LIFECYCLE_ACTIONS)[number];
 export const COMPUTER_LIFECYCLE_TERMINALS = [
@@ -443,17 +624,7 @@ export interface ComputerLifecycleExecutionAck {
   oldProcessIdentitiesDead?: boolean;
   deadProcessIdentities?: string[];
 }
-export const WIKI_FEATURE_FLAG_KEY = "wiki_v0";
-export const WIKI_AGENT_WORKSPACE_ENV = "SLOCK_WIKI_AGENT_WORKSPACE";
-export const WIKI_AGENT_WORKSPACE_ENABLED = "enabled";
-export const WIKI_WORKSPACE_PACK_PROTOCOL_VERSION = 1 as const;
-export const WIKI_WORKSPACE_PACK_CAPABILITY = "wiki-workspace-pack:v1";
-/**
- * User-facing release floor for choosing a Computer during Wiki setup. The
- * authoritative setup gate is WIKI_WORKSPACE_PACK_CAPABILITY, not semver.
- */
-export const MIN_WIKI_DAEMON_VERSION = "1.0.15";
-
+/** @deprecated Wire-only retirement compatibility; never install these files. */
 export interface WikiWorkspacePackFile {
   relativePath: string;
   content: string;
@@ -462,7 +633,7 @@ export interface WikiWorkspacePackFile {
 }
 
 export interface WikiWorkspacePack {
-  protocolVersion: typeof WIKI_WORKSPACE_PACK_PROTOCOL_VERSION;
+  protocolVersion: 1;
   packId: string;
   files: WikiWorkspacePackFile[];
 }
@@ -471,54 +642,6 @@ export interface WikiWorkspaceFileReceipt {
   relativePath: string;
   sha256: string;
   size: number;
-}
-
-export interface WikiWorkspaceEnsureReceipt {
-  agentId: string;
-  packId: string;
-  files: WikiWorkspaceFileReceipt[];
-}
-
-export function canonicalizeWikiWorkspacePackFiles(
-  files: readonly Pick<WikiWorkspacePackFile, "relativePath" | "content">[],
-): string {
-  return JSON.stringify({
-    protocolVersion: WIKI_WORKSPACE_PACK_PROTOCOL_VERSION,
-    files: [...files]
-      .map(({ relativePath, content }) => ({ relativePath, content }))
-      // Compare code units directly so pack IDs do not depend on the host's
-      // default ICU locale.
-      .sort((a, b) => (
-        a.relativePath < b.relativePath ? -1 : a.relativePath > b.relativePath ? 1 : 0
-      )),
-  });
-}
-
-export function isCompleteWikiWorkspaceEnsureReceipt(
-  receipt: WikiWorkspaceEnsureReceipt,
-  agentId: string,
-  expectedPack: WikiWorkspacePack,
-): boolean {
-  if (
-    receipt.agentId !== agentId
-    || receipt.packId !== expectedPack.packId
-    || receipt.files.length !== expectedPack.files.length
-  ) {
-    return false;
-  }
-  const expectedByPath = new Map(expectedPack.files.map((file) => [file.relativePath, file]));
-  const receivedPaths = new Set<string>();
-  return receipt.files.every((file) => {
-    if (receivedPaths.has(file.relativePath)) return false;
-    receivedPaths.add(file.relativePath);
-    const expected = expectedByPath.get(file.relativePath);
-    return Boolean(expected)
-      && /^[0-9a-f]{64}$/.test(file.sha256)
-      && file.sha256 === expected!.sha256
-      && Number.isSafeInteger(file.size)
-      && file.size > 0
-      && file.size === expected!.size;
-  });
 }
 
 export type MentionDeliveryIdentitySnapshot = {
@@ -534,13 +657,140 @@ export type MentionDeliveryTransitionStage =
   | "daemon_pending"
   | "daemon_drained";
 
-export type MentionDeliveryTerminalErrorCode =
-  | "IDENTITY_UNKNOWN"
-  | "IDENTITY_DRIFT"
-  | "QUOTA_LIMITED"
-  | "DELIVERY_REJECTED"
-  | "UNSUPPORTED_DELIVERY_PATH"
-  | "INSTRUMENT_FAILED";
+// Single authoritative definition of the terminal error codes on the
+// mention-delivery wire (daemon → server `agent:delivery:terminal_error`) and
+// in server persistence. task #154: this union previously existed in THREE
+// places (here, packages/server/src/services/mentionDeliveryOccurrenceService.ts
+// with an extra REDELIVERY_EXHAUSTED, and an inline copy in
+// packages/daemon/src/core.ts) and the copies silently diverged — a reader of
+// any one copy undercounted the codes. Everything now derives from this array;
+// adding a member here propagates to every consumer at compile time.
+export const MENTION_DELIVERY_TERMINAL_ERROR_CODES = [
+  "IDENTITY_UNKNOWN",
+  "IDENTITY_DRIFT",
+  "QUOTA_LIMITED",
+  "DELIVERY_REJECTED",
+  "UNSUPPORTED_DELIVERY_PATH",
+  "INSTRUMENT_FAILED",
+  "REDELIVERY_EXHAUSTED",
+] as const;
+
+export type MentionDeliveryTerminalErrorCode = typeof MENTION_DELIVERY_TERMINAL_ERROR_CODES[number];
+
+/** Bounded provenance of the winning terminal decision; absent on legacy rows.
+ * The daemon code is the code actually received, not inferred from the final code.
+ * No message bodies, runtime identities, or arbitrary diagnostic attributes.
+ */
+export type MentionDeliveryTerminalDecision = {
+  layer: "daemon" | "server";
+  stage: "terminal_receipt" | "stage_receipt" | "ack_receipt" | "recovery"
+    | "retry" | "redrive" | "instrumentation_fallback" | "recovery_exhausted";
+  originalDaemonCode: MentionDeliveryTerminalErrorCode | null;
+};
+
+
+/** RFC 071 §7: which terminal path ended the launch. */
+export const AGENT_RUNTIME_TERMINAL_FAILURE_KINDS = [
+  "compaction_failed",
+  "compaction_input_too_large",
+  "compaction_recovery_exhausted",
+  "sticky_runtime_error",
+  "fingerprint_fence",
+  "billing_rejected",
+] as const;
+export type AgentRuntimeTerminalFailureKind = (typeof AGENT_RUNTIME_TERMINAL_FAILURE_KINDS)[number];
+
+/** RFC 071 outbox: what a gap / cross-instance marker folded. */
+export interface AgentRuntimeOutcomeGapCounts {
+  e1: number;
+  turnCompleted: number;
+  spawned: number;
+  exited: number;
+  startOutcome: number;
+}
+
+/** RFC 071 §7: the `outcome` of an `agent:runtime:outcome` v1 frame. */
+export type AgentRuntimeOutcome =
+  | {
+      kind: "terminal_failure";
+      failureKind: AgentRuntimeTerminalFailureKind;
+      /** 16 hex, from the RAW SDK/runtime text (never the display constant). */
+      fingerprint: string;
+      errorClass: RuntimeErrorClass;
+    }
+  | {
+      kind: "turn_completed";
+      textEvents: number;
+      toolCalls: number;
+      /** Only on the turn whose input rendered that batch, and only once per batch (RFC 071 §6). */
+      catchupBatchId?: string;
+      /**
+       * With `catchupBatchId`: how many batch rows were rendered into that
+       * turn's input. Always >= 1: a batch with zero rendered rows is never
+       * echoed, so a cursor-only coverage (no rows) is the server's to settle
+       * from read cursors, never from an echo.
+       */
+      catchupRenderedRows?: number;
+    };
+
+/**
+ * Why no process was created for a launch the daemon accepted (RFC 071
+ * `agent:start:outcome`). Sent only when the daemon KNOWS no process exists
+ * for the launch; never for timeouts, disconnects or unknown results.
+ *  - `start_rejected`: refused before the start reached the process manager
+ *    (validation, credential, retired start type);
+ *  - `spawn_failed`: the start failed before any runtime process existed;
+ *  - `cancelled`: stopped or cancelled before any runtime process existed;
+ *  - `deferred`: the runtime defers its spawn until a concrete message; a later
+ *    spawn for the same launch reports `agent:process_spawned` with `respawn`;
+ *  - `admission_full`: refused before acceptance because the agent already has
+ *    the maximum number of launches still waiting for a final result.
+ */
+export const AGENT_START_NOT_SPAWNED_REASONS = [
+  "start_rejected",
+  "spawn_failed",
+  "cancelled",
+  "deferred",
+  "admission_full",
+  /** The daemon refused an automatic start locally: its outcome evidence has an un-acked gap, or is unreliable. */
+  "terminal_failure_needs_manual",
+  /** The daemon refused a start (human or automatic): its outcome outbox cannot reserve room for this launch until acks drain. */
+  "terminal_failure_outcome_storage_blocked",
+  /**
+   * task #365: proven never created: the child has no pid and the spawn
+   * syscall itself failed (EACCES, ENOENT, ...). Sent only to a server with
+   * `SERVER_CAPABILITY_START_SPAWN_ERROR_V1`, which counts it in its own
+   * bounded backoff. Says nothing about whether the cause is temporary.
+   */
+  "spawn_error",
+  /** task #365: an automatic start claimed against an earlier connection (`connectionEpochId`); refused, never counted. */
+  "stale_dispatch",
+] as const;
+export type AgentStartNotSpawnedReason = (typeof AGENT_START_NOT_SPAWNED_REASONS)[number];
+
+export type AgentWakeRefusedReason =
+  | "manual_stop"
+  | "wake_lock_held"
+  /** task #1119: automatic wakes are paused after consecutive early exits; a human start lifts it. */
+  | "wake_crash_loop_blocked"
+  /**
+   * RFC 071: the terminal-failure breaker is open and its backoff has not
+   * passed; the next wake after it (or a manual start) retries.
+   */
+  | "terminal_failure_paused"
+  /** RFC 071: one probe launch is already running under a lease. */
+  | "terminal_failure_probe_in_flight"
+  /**
+   * RFC 071: an earlier process could not be confirmed stopped, or this
+   * machine cannot report outcomes after protection; only a manual start
+   * proceeds.
+   */
+  | "terminal_failure_needs_manual"
+  /** RFC 071 outbox: the daemon's outcome storage is blocked until acknowledgements drain. */
+  | "terminal_failure_outcome_storage_blocked"
+  | "agent_not_found"
+  | "machine_mismatch"
+  | "server_error";
 
 export type ServerToMachineMessage =
   /**
@@ -548,22 +798,58 @@ export type ServerToMachineMessage =
    * first frame after accepting a machine connection so the daemon can bind
    * Computer-local App state to a logical Server identity before use.
    */
-  | { type: "machine:context"; machineId: string; serverId: string }
-  | { type: "agent:start"; agentId: string; config: AgentConfig; wakeMessage?: AgentMessage; wakeMessageTransient?: boolean; resumeMessages?: AgentMessage[]; unreadSummary?: Record<string, number>; resumePrompt?: string; launchId?: string; startDispatchId?: string; traceparent?: string }
+  | { type: "machine:context"; machineId: string; serverId: string; /** Additive: server capabilities, e.g. `SERVER_CAPABILITY_RUNTIME_OUTCOME_ACK_V1`. */ capabilities?: string[]; /** Additive (task #365): the server's id for this connection; an automatic `agent:start` carrying another one is stale. */ connectionEpochId?: string }
   /**
-   * Fail-closed Wiki start. Daemons without workspace-pack v1 ignore this
-   * unknown message instead of starting the configured Agent with stale or
-   * missing instructions.
+   * Same-machine grouping: asks the daemon for its per-server host hash. Sent
+   * after registration only while `computer_host_identity_v0` is on for the
+   * server; older daemons ignore it.
    */
-  | { type: "agent:start:wiki"; agentId: string; config: AgentConfig; wikiWorkspacePack: WikiWorkspacePack; wakeMessage?: AgentMessage; wakeMessageTransient?: boolean; resumeMessages?: AgentMessage[]; unreadSummary?: Record<string, number>; resumePrompt?: string; launchId?: string; startDispatchId?: string; traceparent?: string }
+  | { type: "machine:host_identity:request" }
+  /**
+   * RFC 071 outbox: the server applied (or deliberately ignored) one outbox
+   * entry. A normal entry is named by `(daemonInstanceId, clientSeq)`; a gap
+   * or cross-instance marker by its `gapId`. The daemon deletes only the
+   * exactly matching entry.
+   */
+  | { type: "agent:outcome:ack"; agentId: string; daemonInstanceId?: string; clientSeq?: number; gapId?: string }
+  /**
+   * `catchupBatchId` (RFC 071 §6/§7, optional): identifies the resume
+   * catch-up batch carried in `resumeMessages`. A daemon with
+   * `DAEMON_CAPABILITY_RUNTIME_OUTCOME_V1` echoes it once, on the
+   * `turn_completed` outcome of the turn whose input rendered that batch.
+   * Old daemons ignore it; then nothing is echoed and nothing is fulfilled.
+   *
+   * RFC 071 outbox (all optional, additive):
+   *  - `breakerGeneration`: the breaker generation at claim; every outbox
+   *    frame of this launch echoes it as `generation`.
+   *  - `takeoverEpoch`: bumped by the server on each human takeover; a new
+   *    value seals the daemon's open gap markers of the older epoch.
+   *  - `humanStart`: an explicit human start (RFC 071 §5 E3). The daemon's
+   *    local refusal of automatic starts does not apply to it.
+   */
+  | { type: "agent:start"; agentId: string; config: AgentConfig; wakeMessage?: AgentMessage; wakeMessageTransient?: boolean; resumeMessages?: AgentMessage[]; unreadSummary?: Record<string, number>; resumePrompt?: string; launchId?: string; startDispatchId?: string; traceparent?: string; catchupBatchId?: string; breakerGeneration?: number; takeoverEpoch?: number; humanStart?: boolean; /** Additive (task #365): the connection the server claimed this automatic start against; the daemon refuses it on any other connection. */ connectionEpochId?: string }
+  /**
+   * Retired wire request: new Computers reject it without launching an Agent.
+   * Retained for rolling upgrades; new Servers never emit it.
+   */
+  | { type: "agent:start:wiki"; agentId: string; config: AgentConfig; wikiWorkspacePack: WikiWorkspacePack; wakeMessage?: AgentMessage; wakeMessageTransient?: boolean; resumeMessages?: AgentMessage[]; unreadSummary?: Record<string, number>; resumePrompt?: string; launchId?: string; startDispatchId?: string; traceparent?: string; catchupBatchId?: string; breakerGeneration?: number; takeoverEpoch?: number; humanStart?: boolean }
   | { type: "agent:stop"; agentId: string }
+  /**
+   * Answer to a daemon `agent:wake:request` (task #1103). `dispatched` means
+   * the Server issued its ordinary `agent:start` for this agent; `refused` is
+   * terminal for this request and carries why, so the daemon can surface it
+   * instead of retrying locally.
+   */
+  | { type: "agent:wake:outcome"; agentId: string; wakeRequestId: string; outcome: "dispatched" | "refused"; reason?: AgentWakeRefusedReason }
   // Remote control of a managed Computer (web → server → machine WS → the
   // Computer's own service IPC). `computer:restart` → restart-service;
   // `computer:upgrade` → upgrade-start (§12 self-update). Additive: raw
   // daemons (and Computers running older bundles) ignore unknown types via
   // the daemon's unmatched-switch fallthrough, so this is backward-safe.
   | { type: "computer:restart"; operationId?: string; requestId?: string }
-  | { type: "computer:upgrade"; operationId?: string; requestId?: string }
+  // v2 (task #873): the Server resolves the exact target; the Computer runs
+  // the external installer against it and reports nothing until it is back.
+  | { type: "computer:upgrade"; operationId?: string; requestId?: string; targetVersion?: string }
   | { type: "computer:lifecycle:receipt"; operationId: string; phase: "shutdown" | "ready" }
   | { type: "agent:reset-workspace"; agentId: string }
   | { type: "agent:deliver"; agentId: string; message: AgentMessage; seq: number; traceparent?: string; deliveryId?: string; transient?: boolean; mentionDelivery?: MentionDeliveryIdentitySnapshot }
@@ -573,7 +859,13 @@ export type ServerToMachineMessage =
   | { type: "agent:workspace:ensure-wiki"; agentId: string; requestId: string; pack: WikiWorkspacePack }
   | { type: "agent:skills:list"; agentId: string; runtime?: string; requestId?: string }
   | { type: "agent:diagnostic:session_transcript"; agentId: string; requestId: string }
-  | { type: "agent:diagnostic:feedback_transcript"; agentId: string; feedbackReportId: string; requestId: string; feedbackReportGeneratedAt?: string; feedbackReportTimeSource?: FeedbackTranscriptReportTimeSource }
+  /**
+   * `includeMachineLogTail` (task #272 tier 2): the machine OWNER opted in to
+   * attach the redacted runner log tail for this one report. The server sets
+   * it only after checking the reporter owns the machine; older daemons ignore
+   * the field and upload the transcript exactly as before.
+   */
+  | { type: "agent:diagnostic:feedback_transcript"; agentId: string; feedbackReportId: string; requestId: string; feedbackReportGeneratedAt?: string; feedbackReportTimeSource?: FeedbackTranscriptReportTimeSource; includeMachineLogTail?: boolean }
   /**
    * Ask the daemon to re-emit current activity ground-truth for an agent.
    * Replaces the server-side "synthesize online when transient state is
@@ -590,7 +882,26 @@ export type ServerToMachineMessage =
   | { type: "agent:activity_probe"; agentId: string; probeId: string; purpose: "sweep" | "manual" }
   | { type: "machine:workspace:scan" }
   | { type: "machine:workspace:delete"; directoryName: string }
-  | { type: "machine:runtime_models:detect"; requestId: string; runtime: string }
+  /**
+   * `force`: bypass the daemon's model-list cache (a form's refresh action).
+   * Optional and additive: daemons without a cache ignore it, as they detect
+   * on every request anyway.
+   */
+  | { type: "machine:runtime_models:detect"; requestId: string; runtime: string; force?: boolean }
+  /**
+   * Ask the owning Computer to run one bounded provider probe for an opaque
+   * probe intent. Carries no credential, endpoint or connection id: the daemon
+   * resolves the one-time materialization itself with machine auth. Older
+   * daemons ignore the additive message, which the Server detects through the
+   * missing `provider-probe:v1` capability before dispatch.
+   */
+  | {
+      type: "machine:provider_probe:request";
+      requestId: string;
+      probeId: string;
+      runtime: string;
+      model: string;
+    }
   /**
    * Ask the owning Computer to refresh one provider's sanitized account-usage
    * snapshot. This is never sent by a cache-read endpoint without the
@@ -612,6 +923,11 @@ export type ServerToMachineMessage =
       requestId: string;
       migrationId: string;
       agentId: string;
+      /**
+       * Creation time of the migration being cleaned up (added; optional). A
+       * daemon refuses to archive a workspace committed by a later migration.
+       */
+      migrationCreatedAt?: string;
     }
   | {
       type: "machine:migration_transport:lease";
@@ -621,49 +937,21 @@ export type ServerToMachineMessage =
       migrationGeneration: string;
       sessionId: string;
       role: "source" | "target";
-      provider: "object_store" | "tunnel";
-      transferKind: "upload" | "download" | "exposed_endpoint" | "peer_endpoint";
-      url: string;
+      provider: "object_store";
+      transferKind: "upload" | "download";
       leaseSource: "server";
       bearerToken: string;
       expiresAt: string;
       maxBytes: number;
-      protocol?: string;
-      capabilities?: string[];
-      controlUrl?: string;
-      leaseId?: string;
-      transportGeneration?: string;
-      sourceMachineId?: string;
-      targetMachineId?: string;
-      expectedMigrationRevision?: number;
-      sourceQuiesceReceipt?: import("./agentMigrationResumable.js").AgentMigrationSourceQuiesceReceipt;
+      controlUrl: string;
+      leaseId: string;
+      transportGeneration: string;
+      sourceMachineId: string;
+      targetMachineId: string;
+      expectedMigrationRevision: number;
+      sourceQuiesceReceipt?: import("./agentMigrationResumable").AgentMigrationSourceQuiesceReceipt;
     }
   | { type: "agent:runtime_profile:migration"; agentId: string; migrationKey: string; message: string; launchId?: string; traceparent?: string }
-  | {
-      type: "machine:migration_transport:lease";
-      agentId: string;
-      migrationId: string;
-      migrationRef: string;
-      migrationGeneration: string;
-      sessionId: string;
-      role: "source" | "target";
-      provider: "object_store" | "tunnel";
-      transferKind: "upload" | "download" | "exposed_endpoint" | "peer_endpoint";
-      url: string;
-      leaseSource: "server";
-      bearerToken: string;
-      expiresAt: string;
-      maxBytes: number;
-      protocol?: string;
-      capabilities?: string[];
-      controlUrl?: string;
-      leaseId?: string;
-      transportGeneration?: string;
-      sourceMachineId?: string;
-      targetMachineId?: string;
-      expectedMigrationRevision?: number;
-      sourceQuiesceReceipt?: import("./agentMigrationResumable.js").AgentMigrationSourceQuiesceReceipt;
-    }
   | {
       type: "machine:migration:cancel";
       agentId: string;
@@ -689,12 +977,12 @@ export type ServerToMachineMessage =
   | {
       type: "app_config.upsert";
       agentId: string;
-      config: import("./appConfigTransport.js").AppConfigWireSnapshot;
+      config: import("./appConfigTransport").AppConfigWireSnapshot;
     }
   | {
       type: "app_config.snapshot";
       agentId: string;
-      configs: import("./appConfigTransport.js").AppConfigWireSnapshot[];
+      configs: import("./appConfigTransport").AppConfigWireSnapshot[];
     }
   | { type: "ping" };
 
@@ -719,6 +1007,11 @@ export const RUNTIME_ERROR_CLASSES = [
   "ProviderStreamError",
   "ProviderServerError",
   "ProviderApiError",
+  "OperationAbortedError",
+  /** task #1127 — the model produced tool-call arguments the runtime could not deserialize. */
+  "ToolArgumentParseError",
+  /** task #917 — the provider's billing or credit balance is exhausted (HTTP 402). Retrying cannot succeed. */
+  "BillingError",
 ] as const;
 export type RuntimeErrorClass = (typeof RUNTIME_ERROR_CLASSES)[number];
 
@@ -735,6 +1028,11 @@ export const RUNTIME_ERROR_REASONS = [
   "provider_stream_error",
   "provider_server_error",
   "provider_api_error",
+  "operation_aborted",
+  /** task #1127 — pairs with ToolArgumentParseError. */
+  "model_tool_args_invalid",
+  /** task #917 — pairs with BillingError. */
+  "billing_exhausted",
 ] as const;
 export type RuntimeErrorReason = (typeof RUNTIME_ERROR_REASONS)[number];
 
@@ -742,8 +1040,49 @@ export const RUNTIME_ERROR_REASON_PROVENANCES = [
   "runtime_error_event",
   "codex_native_reason",
   "daemon_fallback",
+  /**
+   * task #1127 — the reason was recovered from a pinned upstream stderr
+   * sentence because no structured event carries the fact. Distinct from
+   * `daemon_fallback`, which means the daemon guessed from whatever text it had:
+   * this one names a specific, tested signature, so the share of typed errors
+   * resting on text remains countable rather than hidden in the fallback bucket.
+   */
+  "codex_stderr_signature",
 ] as const;
 export type RuntimeErrorReasonProvenance = (typeof RUNTIME_ERROR_REASON_PROVENANCES)[number];
+
+/**
+ * The one canonical class → reason pairing. The server rejects any carrier whose
+ * reason disagrees with this, so keeping a second copy on the daemon side would
+ * turn a compile error into a silently dropped carrier.
+ */
+export function runtimeErrorReasonForClass(errorClass: RuntimeErrorClass): RuntimeErrorReason {
+  switch (errorClass) {
+    case "InputTooLargeError": return "input_too_large";
+    case "RateLimitError": return "rate_limited";
+    case "AuthError": return "auth_failed";
+    case "LauncherError": return "launcher_error";
+    case "NotFoundError": return "not_found";
+    case "ModelConfigError": return "model_config_error";
+    case "TimeoutError": return "provider_timeout";
+    case "ProviderConnectionError": return "provider_connection_error";
+    case "ProviderStreamError": return "provider_stream_error";
+    case "ProviderServerError": return "provider_server_error";
+    case "ProviderApiError": return "provider_api_error";
+    case "OperationAbortedError": return "operation_aborted";
+    case "ToolArgumentParseError": return "model_tool_args_invalid";
+    case "BillingError": return "billing_exhausted";
+    case "RuntimeError": return "unclassified_runtime_error";
+  }
+}
+
+/**
+ * What the owner has to do before this agent can run again: sign in / fix the
+ * provider credential, or pick a model the plan allows. Retrying cannot fix it.
+ */
+export type RuntimeErrorRequiredAction = "user_reauth" | "user_model_access";
+
+export const RUNTIME_ERROR_REQUIRED_ACTIONS: readonly RuntimeErrorRequiredAction[] = ["user_reauth", "user_model_access"];
 
 export interface RuntimeErrorActivityDiagnostic {
   errorClass: RuntimeErrorClass;
@@ -753,14 +1092,211 @@ export interface RuntimeErrorActivityDiagnostic {
   reasonProvenance: RuntimeErrorReasonProvenance;
   /** Absent means that the runtime event contract cannot answer this fact. */
   nativeReasonPresent?: boolean;
+  /**
+   * Set when the daemon decided the owner must act (the same decision that
+   * stops the runtime). Absent: no action needed, or a daemon older than this
+   * field.
+   */
+  requiredAction?: RuntimeErrorRequiredAction;
+}
+
+/**
+ * task #1116 — typed carrier for the daemon's delivery-consumption observation
+ * (task #1114). Ids, classes, counts and times only; never message text or
+ * credentials. Attached to `agent:activity` with detailKind
+ * "delivery_unconsumed" and passed through by the server unchanged.
+ */
+export interface DeliveryConsumptionActivityDiagnostic {
+  launchId: string;
+  episode: number;
+  unconsumedDeliveries: number;
+  firstUnconsumedAtMs: number | null;
+  lastDeliveryAtMs: number | null;
+  /** deliveryId ?? message_id ?? app-inbox item id. */
+  lastDeliveryKey: string | null;
+  lastDeliveryPath: "stdin_idle_delivery" | "stdin_turn_end_delivery" | "busy_stdin_notification" | "app_inbox_notice" | null;
+  lastConsumptionKind: "thinking" | "text" | "tool_call" | "tool_output" | "turn_end" | null;
+  lastConsumptionAtMs: number | null;
+  lastRuntimeResult: { kind: "completed"; atMs: number; empty: boolean } | { kind: "error"; atMs: number; errorClass: string } | null;
+  lastDeliveryErrorClass: string | null;
+  processAlive: boolean;
+}
+
+/**
+ * task #1119 — typed carrier for the server's wake crash-loop breaker state,
+ * attached to `agent:activity` with detailKind "wake_crash_loop_blocked".
+ * Counts, classes, ids and times only.
+ */
+export interface WakeCrashLoopActivityDiagnostic {
+  episode: number;
+  earlyExitCount: number;
+  threshold: number;
+  windowMs: number;
+  blocked: boolean;
+  blockedAtMs: number | null;
+  firstExitAtMs: number | null;
+  lastExitAtMs: number | null;
+  lastExitKind: "machine_disconnected" | "agent_process_exited" | null;
+  lastSignal: string | null;
+  lastLaunchId: string | null;
 }
 
 export type FeedbackTranscriptReportTimeSource = "web_report_bundle" | "server_request_received";
+
+/**
+ * task #1120/#1123 — stable, machine-readable reason a daemon could not
+ * launch an agent. Decided by typed error code on the daemon (never by message
+ * text) and carried to the web unchanged so copy is chosen by reason, not by
+ * parsing the detail string. Adding a member is compatible; older servers and
+ * web builds ignore the carrier, older daemons never send it.
+ */
+export const SPAWN_FAILURE_REASONS = [
+  "agent_proxy_bind_failed",
+  "runner_credential_mint_failed",
+  "provider_connection_materialization_failed",
+  "runtime_not_found",
+  "model_not_found",
+  "runtime_version_too_old",
+  "runtime_spawn_failed",
+  "runtime_login_required",
+  "runtime_config_invalid",
+  "model_not_configured",
+  "session_needs_reset",
+  // task #1258: the saved session belongs to another major line of the
+  // runtime (OpenCode 1.x vs 2.x); resuming is refused, never guessed.
+  "session_runtime_mismatch",
+] as const;
+export type SpawnFailureReason = (typeof SPAWN_FAILURE_REASONS)[number];
+
+/**
+ * task #1242 — how the daemon's PATH lookup ended when a start failed with
+ * `runtime_not_found`. Written from the Windows launch resolution (task
+ * #1240); absent on older daemons and when the lookup had no verdict to give
+ * (a plain POSIX ENOENT). Only `not_on_path` is a confirmed absence that may
+ * suggest installing; the other three say the lookup did not decide, so copy
+ * stays neutral. Unknown values are dropped by the server, never echoed.
+ */
+export const SPAWN_FAILURE_LOOKUP_REASONS = [
+  "not_on_path",
+  "lookup_timed_out",
+  "lookup_permission_denied",
+  "lookup_failed",
+] as const;
+export type SpawnFailureLookupReason = (typeof SPAWN_FAILURE_LOOKUP_REASONS)[number];
+export function isSpawnFailureLookupReason(value: unknown): value is SpawnFailureLookupReason {
+  return typeof value === "string" && (SPAWN_FAILURE_LOOKUP_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * task #1221 — start failures that retrying cannot fix: the runtime refused
+ * this agent's configuration (model not configured, config invalid) or needs a
+ * human login. The server stops automatic relaunches after one of these until
+ * a person restarts the agent or changes its runtime configuration.
+ */
+export const NON_RETRYABLE_SPAWN_FAILURE_REASONS: readonly SpawnFailureReason[] = [
+  "model_not_configured",
+  "runtime_login_required",
+  "runtime_config_invalid",
+  // task #10: the session's context compaction failed repeatedly; resuming it
+  // again cannot succeed. Only Reset Session (a new session id) gets out.
+  "session_needs_reset",
+  // task #1258: the session was made by another runtime major line; retrying
+  // the same resume cannot succeed. Reset Session or reinstall that line.
+  "session_runtime_mismatch",
+];
+
+/**
+ * Start failures that are almost always configuration (the model name is not
+ * in the runtime's list on this computer: renamed or removed upstream, or its
+ * provider has no usable key there) but could be a momentarily empty model
+ * list. The server retries once after SPAWN_FAILURE_RETRY_ONCE_DELAY_MS; a
+ * second failure in a row stops automatic relaunches like the reasons above.
+ */
+export const RETRY_ONCE_SPAWN_FAILURE_REASONS: readonly SpawnFailureReason[] = [
+  "model_not_found",
+];
+export const SPAWN_FAILURE_RETRY_ONCE_DELAY_MS = 60_000;
+
+/**
+ * task #1123 — typed carrier on the `runtime_unavailable` activity frame the
+ * daemon sends when a start fails. `model` is present only for
+ * `model_not_found` (the configured model name, not provider output).
+ */
+export interface SpawnFailureActivityDiagnostic {
+  reason: SpawnFailureReason;
+  model?: string;
+  /**
+   * task #1242 — present only with `reason: "runtime_not_found"`, when the
+   * daemon's PATH lookup could say how it ended. Absent means "no verdict":
+   * the web must not read it as confirmed missing.
+   */
+  lookupReason?: SpawnFailureLookupReason;
+  /**
+   * Set by the server, never by a daemon: automatic restarts are paused after
+   * this failure (a reason retrying cannot fix, or too many failed starts in a
+   * row) until the owner changes the model or key settings or restarts the
+   * agent. `reason` is the last failure.
+   */
+  autoRestartPaused?: boolean;
+}
+/** Tier-2 (task #272) machine log tail outcome, reported beside the transcript result. Absent from older daemons. */
+export interface FeedbackMachineLogTailOutcome {
+  reachable: boolean;
+  traceBundleId?: string;
+  fallbackReason?: string;
+  error?: string;
+  lineCount?: number;
+  sourceLineCount?: number;
+  truncated?: boolean;
+}
+/**
+ * Outcome of the machine_evidence attachment, reported beside the transcript
+ * result. Additive and absent from older daemons. Never decides the transcript
+ * result: the transcript is uploaded and reported regardless of this outcome.
+ *   uploaded    stored by the worker as kind machine_evidence
+ *   omitted     not uploaded: even with every trace record dropped the object exceeds the byte cap
+ *   unsupported the server or worker did not acknowledge the machine_evidence kind (older deployment); nothing uploaded
+ *   failed      generation, signing or upload failed (see `error`)
+ *   timeout     did not finish within the bounded wait; the transcript result was returned without it
+ */
+export interface FeedbackMachineEvidenceOutcome {
+  status: "uploaded" | "omitted" | "unsupported" | "failed" | "timeout";
+  traceBundleId?: string;
+  error?: string;
+  reason?: "over_byte_cap";
+  /** Raw UTF-8 JSON bytes of the object (uploaded) or of its smallest form (omitted). */
+  bytes?: number;
+  truncated?: boolean;
+  droppedOverBytes?: number;
+  /** Sections whose provider failed; they were sent as null. */
+  unavailable?: ("observedFailureSummary" | "feedbackTraceTail" | "feedbackMachineState")[];
+}
 export type FeedbackTranscriptWindowCoverage =
   | "covered"
   | "outside_report_window"
   | "timestamps_unavailable"
   | "report_time_invalid";
+export type FeedbackTranscriptTruncationDirection = "head" | "tail" | "window";
+
+export interface FeedbackTraceBundleTranscriptMetadata {
+  feedbackReportTimeSource?: FeedbackTranscriptReportTimeSource;
+  feedbackTranscriptFirstEventAt?: string;
+  feedbackTranscriptLastEventAt?: string;
+  feedbackTranscriptTruncated?: "true" | "false";
+  feedbackTranscriptTruncationDirection?: FeedbackTranscriptTruncationDirection;
+  feedbackTranscriptWindowCoverage?: FeedbackTranscriptWindowCoverage;
+}
+
+export const FEEDBACK_TRACE_BUNDLE_TRANSCRIPT_METADATA_KEYS = {
+  feedbackReportTimeSource: true,
+  feedbackTranscriptFirstEventAt: true,
+  feedbackTranscriptLastEventAt: true,
+  feedbackTranscriptTruncated: true,
+  feedbackTranscriptTruncationDirection: true,
+  feedbackTranscriptWindowCoverage: true,
+} satisfies Record<keyof FeedbackTraceBundleTranscriptMetadata, true>;
+export type FeedbackTraceBundleTranscriptMetadataKey =
+  keyof typeof FEEDBACK_TRACE_BUNDLE_TRANSCRIPT_METADATA_KEYS;
 
 export interface FeedbackTranscriptWindow {
   reportGeneratedAt: string;
@@ -772,7 +1308,26 @@ export interface FeedbackTranscriptWindow {
   transcriptLastEventAt?: string;
 }
 
+/** Shape of `machine:host_identity.hostIdHash`; anything else is dropped by the Server. */
+export const HOST_ID_HASH_PATTERN = /^[0-9a-f]{32}$/;
+
+/**
+ * Coarse kind of machine a Computer runs on, for its icon. Reported by the
+ * daemon (`ready.deviceClass`); the Server drops values outside this list.
+ */
+export const DEVICE_CLASSES = ["laptop", "mini", "studio", "imac", "desktop", "server", "vm"] as const;
+export type DeviceClass = (typeof DEVICE_CLASSES)[number];
+export const isDeviceClass = (value: unknown): value is DeviceClass =>
+  typeof value === "string" && (DEVICE_CLASSES as readonly string[]).includes(value);
+
 export type MachineToServerMessage =
+  /**
+   * Reply to `machine:host_identity:request`: HMAC(key = this machine's
+   * hardware ID, "raft-host-id-v1:" + serverId), 32 hex chars. Equal for every
+   * Computer on one machine within a server, unrelated across servers; the
+   * hardware ID itself never leaves the machine.
+   */
+  | { type: "machine:host_identity"; hostIdHash: string }
   /**
    * TODO(lifecycle-v2/daemon-protocol): `agent:status`,
    * `agent:activity`, and `agent:session` are legacy lifecycle signal
@@ -784,7 +1339,26 @@ export type MachineToServerMessage =
    * supported daemon window speaks that protocol, delete these lifecycle
    * compatibility frames from the reducer path.
    */
-  | { type: "agent:status"; agentId: string; status: string; launchId?: string }
+  | {
+      type: "agent:status";
+      agentId: string;
+      status: string;
+      launchId?: string;
+      /**
+       * task #1119: when `status` reports a process exit, the daemon attaches
+       * how the process ended so the server's crash-loop breaker can record
+       * the signal (ids/classes only). Absent on older daemons.
+       */
+      exit?: { code: number | null; signal: string | null };
+      /**
+       * RFC 069 §8 (with `DAEMON_CAPABILITY_SEQUENCED_STATUS`): the sending
+       * daemon process and its per-agent sequence, shared with
+       * `agent:activity`. Sequences compare only within one
+       * `daemonInstanceId`. Absent on older daemons.
+       */
+      daemonInstanceId?: string;
+      clientSeq?: number;
+    }
   /**
    * `probeId` (optional) — when this activity message is the daemon's
    * response to a prior `agent:activity_probe`, the daemon echoes back
@@ -825,23 +1399,176 @@ export type MachineToServerMessage =
    * producerFactId (both advance on heartbeat replays).
    * Introduced 2026-07-04 #proj-runtime:19709f22 task #460 PR-beta-2.
    */
-  | { type: "agent:activity"; agentId: string; activity?: string; activityKind?: AgentActivityKind; detail: string; detailKind?: AgentActivityDetailKind; entries?: DaemonTrajectoryEntry[]; launchId?: string; daemonInstanceId?: string; probeId?: string; clientSeq?: number; producerFactId?: string; observedAtMs?: number; isHeartbeat?: boolean; runtimeError?: RuntimeErrorActivityDiagnostic }
+  | { type: "agent:activity"; agentId: string; activity?: string; activityKind?: AgentActivityKind; detail: string; detailKind?: AgentActivityDetailKind; entries?: DaemonTrajectoryEntry[]; launchId?: string; daemonInstanceId?: string; probeId?: string; clientSeq?: number; producerFactId?: string; observedAtMs?: number; isHeartbeat?: boolean; runtimeError?: RuntimeErrorActivityDiagnostic; deliveryConsumption?: DeliveryConsumptionActivityDiagnostic; spawnFailure?: SpawnFailureActivityDiagnostic; providerRequest?: import("./providerRequestActivity").ProviderRequestActivity }
   | { type: "agent:session"; agentId: string; sessionId: string; launchId?: string }
   | { type: "agent:session:invalidate"; agentId: string; sessionId: string; launchId?: string; reason: "missing" | "provider_replay_rejected" }
   | { type: "agent:runtime_profile"; agentId: string; facts: AgentRuntimeProfileReport; launchId?: string; traceparent?: string; source?: RuntimeProfileReportSource }
   | { type: "agent:runtime_profile:migration:ack"; agentId: string; migrationKey: string; launchId?: string; traceparent?: string }
   | { type: "agent:runtime_profile:migration_done"; agentId: string; migrationKey: string; launchId?: string; traceparent?: string }
   | { type: "agent:runtime_profile:daemon_release_notice:ack"; agentId: string; noticeKey: string; launchId?: string; traceparent?: string }
-  | { type: "agent:start:ack"; agentId: string; startDispatchId: string; launchId?: string; queueState: "queued" | "starting" | "running" | "rebound"; queueDepth: number; queueAgeMs: number; traceparent?: string }
+  /**
+   * The daemon has an app-inbox item due for an agent that has no local
+   * process and no in-memory restart snapshot (e.g. every idle agent after a
+   * daemon restart). The Server owns the agent config, so it decides and
+   * dispatches the start (task #1103). `wakeRequestId` is derived from the
+   * agent and the inbox item, so a duplicate fire or a resend after reconnect
+   * carries the same id and the Server can replay its outcome.
+   */
+  | { type: "agent:wake:request"; agentId: string; wakeRequestId: string; reason: "app_inbox_notice"; appId: string; sourceRef: { kind: string; id: string; revision?: string }; pendingAppItems: number; traceparent?: string }
+  /**
+   * `processInstanceId` (RFC 071 §4.3 rule 2, optional): the registered
+   * process that now carries `launchId`. Set only when `queueState` is
+   * `running`/`rebound` AND a process is registered (a rebind); a
+   * `queued`/`starting` ack never carries one, because the daemon mints the
+   * id only after the spawn (it arrives on `agent:process_spawned`).
+   */
+  | { type: "agent:start:ack"; agentId: string; startDispatchId: string; launchId?: string; queueState: "queued" | "starting" | "running" | "rebound"; queueDepth: number; queueAgeMs: number; traceparent?: string; processInstanceId?: string }
+  /**
+   * RFC 071 §7 (with `DAEMON_CAPABILITY_RUNTIME_OUTCOME_V1`): a launch-bound
+   * runtime outcome. E1 `terminal_failure` is sent once, from the daemon's
+   * terminal cleanup, before the process record is removed; its fingerprint
+   * is computed from the RAW runtime text, never from display copy. E2
+   * `turn_completed` is sent at turn end only for a registered launch whose
+   * turn produced model output with zero runtime errors. `clientSeq` is the
+   * per-agent counter shared with `agent:status`/`agent:activity` (RFC 069
+   * §8); it compares only within one `daemonInstanceId`. A server ignores a
+   * frame with an unknown `v`. Servers without a handler drop the type.
+   */
+  | {
+      type: "agent:runtime:outcome";
+      v: 1;
+      agentId: string;
+      launchId: string;
+      sessionId: string | null;
+      daemonInstanceId: string;
+      clientSeq: number;
+      observedAtMs: number;
+      traceparent?: string;
+      outcome: AgentRuntimeOutcome;
+      /** RFC 071 outbox: `breakerGeneration` of this launch's agent:start, when it had one. */
+      generation?: number;
+    }
+  /**
+   * RFC 071 §4.3 rule 2: sent right after a successful spawn, with the
+   * process identity the daemon minted for it. `launchId` is the launch the
+   * process was spawned for.
+   */
+  | {
+      type: "agent:process_spawned";
+      agentId: string;
+      daemonInstanceId: string;
+      processInstanceId: string;
+      launchId: string;
+      clientSeq: number;
+      /**
+       * Other launches the daemon accepted and folded into this spawn (a start
+       * that arrived while this one was queued or starting). Each is bound to
+       * this process identity; none of them gets a process of its own.
+       */
+      supersededLaunchIds?: string[];
+      /**
+       * True when no accepted server start was waiting for this spawn: the
+       * daemon restarted the runtime on its own (idle/cold restart, a deferred
+       * spawn woken by a message) under an already-settled `launchId`.
+       */
+      respawn?: boolean;
+      /** RFC 071 outbox: `breakerGeneration` of `launchId`'s agent:start, when it had one. */
+      generation?: number;
+    }
+  /**
+   * RFC 071: the final result for an accepted launch that is not reported by
+   * `agent:process_spawned`. Every launch the daemon accepts from
+   * `agent:start` ends in exactly one of: named in a `process_spawned`
+   * (`launchId` or `supersededLaunchIds`), `rebound` onto a running process,
+   * or `not_spawned` with a reason. `not_spawned` is sent only when the
+   * daemon knows no process was created for the launch.
+   */
+  | {
+      type: "agent:start:outcome";
+      agentId: string;
+      daemonInstanceId: string;
+      launchId: string;
+      clientSeq: number;
+      result:
+        | { kind: "rebound"; processInstanceId: string }
+        | { kind: "not_spawned"; reason: AgentStartNotSpawnedReason };
+      /** RFC 071 outbox: `breakerGeneration` of this launch's agent:start, when it had one. */
+      generation?: number;
+    }
+  /**
+   * RFC 071 outbox markers. Overflow folds the oldest un-acked critical
+   * frames of one daemon instance and takeover epoch into a gap; the counts
+   * say what was folded. The server must treat the range conservatively.
+   */
+  | {
+      type: "agent:runtime:outcome_gap";
+      agentId: string;
+      daemonInstanceId: string;
+      gapId: string;
+      fromSeq: number;
+      toSeq: number;
+      counts: AgentRuntimeOutcomeGapCounts;
+      takeoverEpoch: number;
+    }
+  /** Gaps of more daemon instances than the outbox keeps, merged. */
+  | {
+      type: "agent:runtime:outcome_cross_instance_unknown";
+      agentId: string;
+      gapId: string;
+      instances: string[];
+      counts: AgentRuntimeOutcomeGapCounts;
+      takeoverEpoch: number;
+    }
+  /** The daemon's outcome storage for this agent failed (write/fsync error or corrupt file): evidence may be missing. Best effort. */
+  | { type: "agent:runtime:outcome_unreliable"; agentId: string; daemonInstanceId: string; takeoverEpoch: number }
+  /**
+   * RFC 071 §4.3 rule 3: sent from the runtime's own `exit` event with the
+   * identity of the process that exited (closure-captured, not the current
+   * registry entry), whether or not the daemon still has it registered.
+   * `spawnLaunchId` is the launch it was spawned for: `null` when the daemon
+   * started it on its own without a server launch (an internal restart) and
+   * a server start was later rebound onto it (the rebind is never treated as
+   * its birth). `launchId` is the associated launch: the last server launch
+   * it carried (a rebind changes it). The process is identified by
+   * `(daemonInstanceId, processInstanceId)`, the identity the server bound
+   * through `process_spawned` or the `rebound` start outcome; a null
+   * `spawnLaunchId` is settled by that identity only. The only exit evidence
+   * the terminal-failure breaker uses.
+   */
+  | { type: "agent:process_exited"; agentId: string; daemonInstanceId: string; processInstanceId: string; spawnLaunchId: string | null; launchId: string; clientSeq: number; code: number | null; signal: string | null; /** RFC 071 outbox: `breakerGeneration` of `launchId`'s agent:start, when it had one. */ generation?: number }
   | { type: "agent:deliver:ack"; agentId: string; seq: number; traceparent?: string; deliveryId?: string; mentionDelivery?: MentionDeliveryIdentitySnapshot }
+  /**
+   * Message bodies the daemon itself put in front of the model (startup
+   * catch-up, wake with thread context, full-body stdin delivery), reported
+   * once the runtime showed it took the input. The Server moves the agent's
+   * read position over them only where they join it without a gap. Sent with
+   * or without `agent:model-seen-boundary`; that capability additionally
+   * means pulls are reported elsewhere (design-model-seen-boundary).
+   */
+  | { type: "agent:model-seen"; agentId: string; launchId?: string; items: AgentModelSeenItem[] }
   | { type: "agent:delivery:transition"; agentId: string; stage: MentionDeliveryTransitionStage; outcome: "accepted" | "coalesced"; mentionDelivery: MentionDeliveryIdentitySnapshot; traceparent?: string }
   | { type: "agent:delivery:terminal_error"; agentId: string; code: MentionDeliveryTerminalErrorCode; mentionDelivery: MentionDeliveryIdentitySnapshot; traceparent?: string }
+  /**
+   * The daemon received an `agent:deliver` for an agent that has no running
+   * process and no cached idle/restart config (task #1113). It cannot wake the
+   * agent itself; the Server owns the config and must fall back to an
+   * `agent:start` that carries this message. Keyed like the delivery ack
+   * (deliveryId, else agentId+seq) so duplicates are idempotent.
+   */
+  | { type: "agent:delivery:rejected"; agentId: string; seq: number; deliveryId?: string; reason: "no_process"; mentionDelivery?: MentionDeliveryIdentitySnapshot; traceparent?: string }
   | { type: "agent:workspace:file_tree"; agentId: string; files: FileNode[]; dirPath?: string; includeHidden?: boolean }
   | { type: "agent:workspace:file_content"; agentId: string; requestId: string; content: string | null; binary: boolean; size?: number; mimeType?: string; encoding?: "utf-8" | "base64" }
   | { type: "agent:workspace:wiki_ensured"; agentId: string; requestId: string; success: boolean; packId: string; files: WikiWorkspaceFileReceipt[]; error?: string }
   | { type: "agent:skills:list_result"; agentId: string; requestId?: string; global: SkillInfo[]; workspace: SkillInfo[] }
   | { type: "agent:diagnostic:session_transcript_result"; agentId: string; requestId: string; runtime: string; sessionId: string; reachable: boolean; path: string | null; fallbackReason?: string; transcript: string | null; sizeBytes: number; truncated: boolean; redacted: boolean; tier: string; error?: string }
-  | { type: "agent:diagnostic:feedback_transcript_result"; agentId: string; feedbackReportId: string; requestId: string; traceBundleId?: string; reachable: boolean; fallbackReason?: string; error?: string; transcriptWindow?: FeedbackTranscriptWindow }
+  | {
+      type: "agent:diagnostic:feedback_transcript_result"; agentId: string; feedbackReportId: string; requestId: string; traceBundleId?: string; reachable: boolean; fallbackReason?: string; error?: string; transcriptWindow?: FeedbackTranscriptWindow; machineLogTail?: FeedbackMachineLogTailOutcome; machineEvidence?: FeedbackMachineEvidenceOutcome;
+      // task #1228 ① (additive; absent from older daemons, ignored by older servers).
+      outcomeVersion?: 1;
+      lookup?: FeedbackTranscriptLookupOutcome;
+      upload?: FeedbackTranscriptUploadOutcome;
+      outcomeObject?: FeedbackTranscriptOutcomeObjectPlan;
+    }
   | { type: "machine:workspace:scan_result"; directories: WorkspaceDirectoryInfo[] }
   | { type: "machine:workspace:delete_result"; directoryName: string; success: boolean }
   | {
@@ -849,7 +1576,11 @@ export type MachineToServerMessage =
       requestId: string;
       migrationId: string;
       agentId: string;
-      outcome: "archived" | "already_archived" | "error";
+      // "source_absent": nothing of the agent is left on the source (added; older
+      // servers treat any non-"error" outcome as success).
+      outcome: "archived" | "already_archived" | "source_absent" | "error";
+      /** Code-shaped failure cause when outcome is "error" (added; optional). */
+      errorCode?: string;
     }
   | {
       type: "machine:runtime_models:result";
@@ -863,12 +1594,53 @@ export type MachineToServerMessage =
       default?: string;
       error?: string;
     }
+  /**
+   * Unsolicited: this machine's current model list for one runtime, with the
+   * runtime's own display names. The server keeps one copy per (machine,
+   * runtime) and every model-name surface reads it, so the runtime config
+   * selector and the rest of the UI show the same name. Sent only for a live
+   * detection result; replaces the previous copy whole.
+   */
+  | {
+      /**
+       * Proactive model-list report (task #700): the daemon reports each
+       * runtime's model list so every display surface can read one shared
+       * catalog instead of re-deriving names. Sent on connect (after
+       * `ready`, per runtime in `ready.runtimes`) and again after a runtime
+       * rescan; whole-list replacement per runtime. Only `live` detections
+       * are sent — errors/unsupported keep the server's previous copy.
+       */
+      type: "machine:runtime_models:catalog";
+      runtime: string;
+      models: RuntimeModelCatalogEntry[];
+    }
+  | {
+      type: "machine:provider_probe:result";
+      requestId: string;
+      probeId: ProviderProbeId;
+      outcome: "success" | "failure";
+      category: ProviderProbeDaemonCategory | null;
+      latencyMs: number | null;
+      responseSha256: string | null;
+      responseBytes: number | null;
+      resultDigest: string;
+      authorityEcho: { connectionEpochId: string; replicaGeneration: string };
+      daemonVersion: string | null;
+      computerVersion: string | null;
+      runtimeVersion: string | null;
+      reply: string | null;
+    }
   /** Closed, sanitized payload; provider credentials/raw responses never cross this boundary. */
   | {
       type: "machine:runtime_account_usage:snapshot";
       requestId?: string;
       snapshot: RuntimeAccountUsageSnapshot;
     }
+  /**
+   * Space on the disk holding agent data, sent on connect and hourly. Servers
+   * that predate it ignore the unknown type.
+   */
+  | { type: "machine:disk_status"; availableBytes: number; totalBytes: number }
   /**
    * Best-effort graceful shutdown notice sent immediately before the daemon
    * closes its WebSocket. The server uses it to distinguish an intentional
@@ -888,19 +1660,15 @@ export type MachineToServerMessage =
    */
   | { type: "computer:restart:done"; requestId: string; ok: boolean; error?: string }
   /**
-   * Progress + completion of a remote Computer self-upgrade, driven by a
-   * `computer:upgrade{requestId}` command (requestId-for-everything flow).
-   * The managed Computer runs the SEA upgrade in-process (download → verify
-   * → swap), streaming `computer:upgrade:progress` frames over the live WS,
-   * then exits gracefully so the `__service` supervisor respawns the swapped
-   * binary. The new process reads the pending-upgrade marker on reconnect and
-   * emits `computer:upgrade:done` (stitching the connection blip via
-   * requestId). Additive: the server relays these to the web client; older
-   * servers ignore unknown upstream types. `requestId` echoes the command's.
+   * task #917: terminal outcome of a remote `computer:upgrade` request that
+   * never reached the installer. `ok: false` carries the refusal (an external
+   * supervisor that cannot be upgraded in place, a busy service, an
+   * unreachable IPC seam) so the server settles the request at once instead
+   * of waiting out its deadline; the same receipt is also written to disk and
+   * relayed on the next `ready`. Older servers ignore the type.
    */
-  | { type: "computer:upgrade:progress"; requestId: string; phase: "downloading" | "verifying" | "applying" | "restarting"; message?: string; percent?: number; fromVersion?: string; targetVersion?: string }
-  | { type: "computer:upgrade:done"; requestId: string; ok: boolean; newVersion?: string; rolledBack?: boolean; error?: string }
-  | { type: "ready"; capabilities?: string[]; runtimes: string[]; runtimeVersions?: Record<string, string>; runningAgents: string[]; hostname?: string; os?: string; daemonVersion?: string; computerVersion?: string; migrationTransport?: AgentMigrationTransportReady; lifecycleAcks?: ComputerLifecycleExecutionAck[] };
+  | { type: "computer:upgrade:done"; requestId: string; ok: boolean; reason?: string; code?: string }
+  | { type: "ready"; capabilities?: string[]; /** RFC 069 §8: this daemon process's generation. */ daemonInstanceId?: string; /** RFC 071 outbox: agents whose outcome storage is unreliable; `agent:runtime-outcome-v1` does not apply to them. */ runtimeOutcomeUnreliableAgents?: string[]; /** task #1268: omitted entirely while `runtimeDetection.status` is "pending" (a pending ready carries no inventory); otherwise this round's detected runtime ids. */ runtimes?: string[]; runtimeVersions?: Record<string, string>; /** task #1268: absent on daemons that detect synchronously before ready (= complete). */ runtimeDetection?: RuntimeDetectionReport; runningAgents: string[]; hostname?: string; os?: string; /** Set only on WSL (`os` still says `linux`); absent on older daemons and other hosts. */ osVariant?: "wsl1" | "wsl2"; /** Coarse kind of machine for the Computer icon, classified on the machine (the model it comes from is not sent); absent when unknown and on older daemons. */ deviceClass?: DeviceClass; daemonVersion?: string; computerVersion?: string; migrationTransport?: AgentMigrationTransportReady; lifecycleAcks?: ComputerLifecycleExecutionAck[]; lastUpgradeReceipt?: ComputerLastUpgradeReceipt };
 
 export type MachineShutdownReason =
   | "computer_stop"
@@ -1091,6 +1859,8 @@ export type BuiltInRuntimeConfig = RuntimeConfigBase & {
   runtime: "builtin";
   provider: BuiltInRuntimeProviderConfig;
   hostUserState: "forbidden";
+  /** Opt in to extensions installed in the host Pi agent directory. */
+  loadLocalPlugins?: boolean;
   command?: never;
 };
 
@@ -1191,6 +1961,81 @@ export interface AgentConfig {
     key: string;
     message: string;
   } | null;
+  /**
+   * Server-evaluated `constructed_wake_context` feature flag (RFC 070): at-wake
+   * session recycling with a constructed briefing, the cold-idle sweep, and the
+   * startup MEMORY.md block. Absent or false means off; older servers never
+   * send it, so the behavior stays off until a server turns it on. The
+   * `RAFT_WAKE_RECYCLE=0` / `RAFT_STARTUP_MEMORY_BLOCK=0` env vars remain local
+   * off switches and cannot turn it on.
+   */
+  constructedWakeContext?: boolean;
+  /**
+   * Server-evaluated `subagent_delegation_prompt` feature flag. When true, a
+   * daemon driver that declares sub-agent support adds the "Working through
+   * sub-agents" section to the standing prompt. Absent or false means off;
+   * older servers never send it, and drivers without sub-agent support ignore
+   * it, so the prompt stays byte-identical to the ungated one.
+   */
+  subagentDelegation?: boolean;
+  /**
+   * Server-evaluated `passive_ax` feature flag (RFC 072 §7, the passive AX
+   * "peripheral vision": command-guidance holds and context-scoped thread
+   * evidence). Absent or false means off; older servers never send it. The
+   * daemon composes it with the local `RAFT_PASSIVE_AX=0` kill switch (which
+   * cannot turn it on) and publishes the result in the context-generation
+   * record the CLI reads; on the daemon's effective spawn config this field
+   * already holds that composed value.
+   */
+  passiveAx?: boolean;
+  /**
+   * Installed-app discovery catalog (task #319). The daemon renders these
+   * entries into the agent's system prompt so the agent knows which apps
+   * exist on this server and when to reach for them — before it has logged
+   * in to any of them.
+   *
+   * Contract:
+   *   - Server-scoped, not agent-scoped: `services` is identical for every
+   *     agent on a server, so it rides `agent:start` config rather than
+   *     being fetched per-agent (the host is forbidden from outbound-calling
+   *     `/internal/agent-api/*` with `agentCredentialKey`).
+   *   - Only enabled, user-managed apps are included, and only those with a
+   *     non-empty `whenToUse` — an app with no hint contributes nothing to
+   *     the prompt.
+   *   - All three strings are already inert-rendered server-side; the
+   *     daemon MUST NOT unescape or re-render reference tokens.
+   *   - Snapshot semantics: the catalog reflects the moment of agent:start;
+   *     apps installed/disabled mid-session appear on the NEXT launch. An
+   *     agent needing a fresher view can run `raft integration list`.
+   *   - Optional and absent on old servers; an absent or empty catalog
+   *     degrades to the historical prompt (no apps section).
+   */
+  installedApps?: AgentInstalledAppCatalogEntry[] | null;
+  /**
+   * Server-evaluated `reminder_app` rollout flag. When true, the prompt's
+   * Reminders section and command-list entry point at the Reminder app (found
+   * in the installed-app list) instead of `raft reminder schedule`, which the
+   * Server then refuses with `reminders_moved_to_app`. Absent or false means
+   * off; older servers never send it, and older daemons ignore it and learn of
+   * the move from that refusal.
+   */
+  reminderApp?: boolean;
+  /**
+   * Server-evaluated `vault_app` rollout flag. When true, the prompt's
+   * Credential handling section tells the agent to request secrets through
+   * the Vault app. Absent or false means off.
+   */
+  vaultApp?: boolean;
+}
+
+/** One entry of {@link AgentConfig.installedApps} — the prompt-facing
+ * app directory. `whenToUse` is always non-empty here (server filters). */
+export interface AgentInstalledAppCatalogEntry {
+  name: string;
+  description: string | null;
+  whenToUse: string;
+  /** `raft integration invoke --service <id>` id (the app's client id). Absent on older servers. */
+  service?: string;
 }
 
 export type ProfileVisibilityMembershipStatus = "active" | "left" | "removed";
@@ -1287,6 +2132,12 @@ export interface WorkspaceDirectoryInfo {
   lastModified: string;
   /** Number of top-level files */
   fileCount: number;
+  /**
+   * Where the workspace is on the machine, `~`-relative when under the user's
+   * home (e.g. `~/.raft/agents/<id>/`). Absent from daemons before 1.0.46,
+   * which only ever used `~/.slock/agents/`.
+   */
+  displayPath?: string;
 }
 
 /** A Claude Code skill (slash command) from SKILL.md */
@@ -1332,6 +2183,25 @@ export const AGENT_ACTIVITY_DETAIL_KINDS = [
   "runtime_crashed",
   "runtime_unavailable",
   "runtime_stalled",
+  /**
+   * task #1116 — the daemon wrote stdin deliveries to a live process and no
+   * model-driven runtime event followed for a whole episode (see
+   * DeliveryConsumptionActivityDiagnostic). Observation only.
+   */
+  "delivery_unconsumed",
+  /**
+   * task #1119 — the server paused automatic wakes for this agent after
+   * consecutive early exits (see WakeCrashLoopActivityDiagnostic). Only a
+   * human start lifts it.
+   */
+  "wake_crash_loop_blocked",
+  /**
+   * RFC 071 §9 — the server's terminal-failure breaker stopped automatic
+   * wakes for this agent: paused until a time after repeated terminal runtime
+   * failures, or a manual start is needed. The server-authored detail says
+   * which. A manual start lifts it.
+   */
+  "terminal_failure_paused",
   "stalled_recovery",
   "stopped",
   "ready",
@@ -1350,6 +2220,8 @@ export const AGENT_ACTIVITY_DETAIL_KINDS = [
   // stream events / system status) — a "working" liveness signal with no rendered
   // content. NOT a subagent. (APM 1.6 6a)
   "runtime_progress",
+  // Passive provider HTTP observation; not model progress or lifecycle authority.
+  "provider_request_status",
   // Strong daemon execution-boundary events. These are intentionally distinct
   // from heartbeat/display rows so the server reducer can derive live activity
   // and elapsed/error transitions without parsing text or trajectory entries.
@@ -1384,14 +2256,15 @@ export interface AgentRuntimeErrorState {
 
 export const VALID_ACTIVITIES = new Set<AgentActivityKind>(AGENT_ACTIVITIES);
 
+// Runtime catalog (RuntimeInfo, RUNTIMES, display names, external runtime): its own
+// dependency-light module so SDK bundles can render runtime labels without this index.
+export * from "./runtimeCatalog";
+
 // ── Agent Trajectory ──
 
-export const EXTERNAL_AGENT_ACTIVITY_EVENT_SCHEMA = "raft-activity.v1" as const;
-export const EXTERNAL_AGENT_ACTIVITY_DRAIN_SCHEMA = "raft-activity-drain.v1" as const;
-export const EXTERNAL_AGENT_ACTIVITY_INGEST_SCHEMA = "raft-agent-activity-ingest.v1" as const;
-export const EXTERNAL_AGENT_ACTIVITY_PROVENANCE = "external/plugin-reported" as const;
-export const EXTERNAL_AGENT_ACTIVITY_TEXT_LIMIT = 4096;
-export const EXTERNAL_AGENT_ACTIVITY_TOOL_NAME_LIMIT = 120;
+export * from "./externalAgentActivity";
+
+export * from "./agentStatusStandard";
 
 export type ExternalAgentActivityHookEventName =
   | "PreToolUse"
@@ -1402,6 +2275,9 @@ export type ExternalAgentActivityHookEventName =
   | "Stop"
   | "SessionStart"
   | "SessionEnd"
+  // A subagent of this agent started / finished; only with the `subagent` marker.
+  | "SubagentStart"
+  | "SubagentStop"
   | (string & {});
 
 export interface ExternalAgentActivityEvent {
@@ -1414,11 +2290,34 @@ export interface ExternalAgentActivityEvent {
   hook_event_name?: ExternalAgentActivityHookEventName;
   toolName?: string;
   tool_name?: string;
-  status?: "started" | "succeeded" | "failed" | "completed" | string;
+  /**
+   * raft-agent-status.v1 agent status after this event (`online` idle/ready,
+   * `thinking`, `working`, `error`, `offline`). Legacy hook-outcome values
+   * (`started`/`succeeded`/`failed`/`completed`) are accepted and ignored for
+   * status. An event may carry `status` without `hookEventName`.
+   */
+  status?: RaftAgentStatus | (typeof EXTERNAL_AGENT_ACTIVITY_LEGACY_STATUS_VALUES)[number];
+  /** Optional one-line human detail for `status` (at most 200 characters). */
+  detail?: string;
   occurredAt?: string;
   occurred_at?: string;
   durationMs?: number;
   duration_ms?: number;
+  /** Tool call id (Claude Code `tool_use_id`); recorded as `callId` on the tool rows. */
+  toolUseId?: string;
+  tool_use_id?: string;
+  /** Exit code of a command the tool ran; independent of `ok`. */
+  exitCode?: number;
+  exit_code?: number;
+  /**
+   * The event belongs to a subagent of this agent, not to the agent itself
+   * (same marker as `SubagentLineage`). Such events are recorded in the
+   * activity log under the subagent and never change the agent's status or
+   * end its turn. Ids and enums only.
+   */
+  subagent?: SubagentLineage["subagent"];
+  /** Whether the tool call itself succeeded. `null` = unknown (no `ok` recorded); absent = inferred from the hook name. */
+  ok?: boolean | null;
   errorClass?: string;
   error_class?: string;
   toolInput?: unknown;
@@ -1471,24 +2370,87 @@ export interface SubagentLineage {
     subagentType?: string;
     /** Claude `system` task-lifecycle envelope id (task_started/task_progress/…). */
     taskId?: string;
-    /** Bounded lifecycle phase of the subagent, from the `system` envelope kind. */
-    phase?: "started" | "progress" | "notification" | "active";
+    /**
+     * Bounded lifecycle phase of the subagent, from the `system` envelope kind.
+     * `ended`: the subagent finished (hosted agents' `send_to_agent`), with
+     * `outcome` and `reportChars`.
+     */
+    phase?: SubagentPhase;
+    /** Only with `phase: "ended"`: how the subagent finished. */
+    outcome?: SubagentOutcome;
+    /** Only with `phase: "ended"`: length of the subagent's report in characters (JS string length; never the report). */
+    reportChars?: number;
   };
 }
 
+export const SUBAGENT_PHASES = ["started", "progress", "notification", "active", "ended"] as const;
+export type SubagentPhase = (typeof SUBAGENT_PHASES)[number];
+/** `ceiling`: stopped by a limit (turns, time or budget), not by the subagent itself. */
+export const SUBAGENT_OUTCOMES = ["done", "failed", "stopped", "ceiling"] as const;
+export type SubagentOutcome = (typeof SUBAGENT_OUTCOMES)[number];
+
+/** Bounded runtime facts; never provider text, summaries, or prompt contents. */
+export interface RuntimeCompactionInterruption {
+  outcome: "compaction_failed_or_exhausted" | "aborted" | "unknown";
+  reason: "manual" | "threshold" | "overflow" | "unknown";
+  failureReason?: "recovery_exhausted" | "input_too_large" | "compaction_failed" | "unknown";
+  willRetry: boolean | "unknown";
+  /** Safe diagnostic projected from this exact compaction_end event. */
+  failureDiagnostic?: RuntimeErrorActivityDiagnostic;
+}
+
 /** A single entry in the agent's trajectory log — rich activity data from stream-json */
+/**
+ * What a runtime reported when one tool call finished, carried on the
+ * "Tool finished" status entry (`detailKind: "tool_end"`). Every field is
+ * optional: a runtime that does not report a value leaves it out, and it
+ * reads as unknown, never as success.
+ */
+export type ExternalHookTurnBoundary = "turn_start" | "turn_end" | "session_end";
+
+export interface ToolCallOutcome {
+  /** The runtime's id for the call; the matching `tool_start` entry carries the same `callId`. */
+  callId?: string;
+  /**
+   * Whether the tool call itself succeeded. A command that ran and exited
+   * non-zero is still `ok: true`; see `exitCode`.
+   */
+  ok?: boolean;
+  /** Time from the call's start to its end in ms, measured by the daemon or reported by the runtime. */
+  durationMs?: number;
+  /** Exit status of the command the tool ran, as reported. Independent of `ok`. */
+  exitCode?: number;
+}
+
 export type TrajectoryEntry =
   | ({ kind: "thinking"; text: string } & TrajectoryProducerLineage & SubagentLineage)
-  | ({ kind: "tool_start"; toolName: string; toolInput: string } & TrajectoryProducerLineage & SubagentLineage)
+  | ({ kind: "tool_start"; toolName: string; toolInput: string; callId?: string } & TrajectoryProducerLineage & SubagentLineage)
   | ({ kind: "text"; text: string } & TrajectoryProducerLineage & SubagentLineage)
   // Durable history of an agent-visible action performed through Slock itself
   // (send / claim / reminder / profile update, etc.). This is not a live-status
   // subtitle, and it must not carry agent-facing recovery instructions.
   | ({ kind: "slock_action"; title: string; text: string } & TrajectoryProducerLineage)
-  | ({ kind: "system"; title: string; text: string } & TrajectoryProducerLineage)
+  | ({ kind: "system"; title: string; text: string } & TrajectoryProducerLineage & SubagentLineage)
   | ({ kind: "compaction_started" } & TrajectoryProducerLineage)
   | ({ kind: "compaction_finished" } & TrajectoryProducerLineage)
-  | ({ kind: "status"; activity: AgentActivityKind; activityKind?: AgentActivityKind; detail: string; detailKind?: AgentActivityDetailKind } & TrajectoryProducerLineage & SubagentLineage);
+  | ({
+      kind: "status";
+      activity: AgentActivityKind;
+      activityKind?: AgentActivityKind;
+      detail: string;
+      detailKind?: AgentActivityDetailKind;
+      compaction?: RuntimeCompactionInterruption;
+      tool?: ToolCallOutcome;
+      /**
+       * A hook turn boundary (UserPromptSubmit / Stop / SessionEnd) stored for
+       * an agent that reports its own status, where the hook-derived status is
+       * not the agent's state (task #17 turn summaries read it).
+       */
+      hookBoundary?: ExternalHookTurnBoundary;
+    } & TrajectoryProducerLineage & SubagentLineage)
+  // One record per finished turn (task #17): see activityTurnSummary.ts. The
+  // Activity overview reads only these; the other kinds are the raw log.
+  | ({ kind: "turn_summary"; summary: ActivityTurnSummary } & TrajectoryProducerLineage);
 
 /**
  * Daemon-to-server trajectory payload. Daemons emit the full trajectory union
@@ -1504,6 +2466,8 @@ export type DaemonTrajectoryEntry =
       activityKind?: AgentActivityKind;
       detail: string;
       detailKind?: AgentActivityDetailKind;
+      compaction?: RuntimeCompactionInterruption;
+      tool?: ToolCallOutcome;
     } & TrajectoryProducerLineage & SubagentLineage);
 
 /** Normalize backend activity string to a valid frontend AgentActivity.
@@ -1521,28 +2485,24 @@ export function normalizeActivityDetailKind(raw: string | undefined): AgentActiv
 
 // ── Runtimes ──
 
-export const EXTERNAL_AGENT_RUNTIME_ID = "external" as const;
-export const EXTERNAL_AGENT_RUNTIME_MODEL = "external" as const;
-export const EXTERNAL_AGENT_RUNTIME_DISPLAY_NAME = "External agent" as const;
 
-export function isExternalAgentRuntime(runtime: string | null | undefined): boolean {
-  return runtime === EXTERNAL_AGENT_RUNTIME_ID;
+/**
+ * External-agent presence: an external agent is online when its credential was
+ * seen (any authenticated agent-API call, or an open wake-hint stream's
+ * heartbeat) within this window; otherwise the UI shows "last active".
+ */
+export const EXTERNAL_AGENT_ONLINE_WINDOW_MS = 120_000;
+
+/**
+ * Server → web socket event (`agent:seen`), pushed to the agent's server room
+ * when an external agent's credential-use timestamp is persisted.
+ */
+export interface AgentSeenEvent {
+  agentId: string;
+  /** ISO timestamp — same value `GET /agents` serves as `lastSeenAt`. */
+  lastSeenAt: string;
 }
 
-export interface RuntimeInfo {
-  /** Short ID used in DB, protocol, and config (e.g. "claude") */
-  id: string;
-  /** Human-readable name (e.g. "Claude Code") */
-  displayName: string;
-  /** Stable, designed short label for compact runtime icons (e.g. "CC") */
-  abbreviation: string;
-  /** CLI binary name to detect on PATH (e.g. "claude") */
-  binary: string;
-  /** Whether this runtime is currently supported */
-  supported: boolean;
-  /** Deprecated runtimes are hidden from selectors + detection display, but kept for backward compat with existing agents on that runtime. */
-  deprecated?: boolean;
-}
 
 export type RuntimeCapabilityStatus = "available" | "not_installed" | "update_required";
 export type RuntimeAdmissionStatus = "available_for_new" | "grandfathered_current";
@@ -1571,6 +2531,18 @@ export interface RuntimeSelectionOption {
    * form renderer from runtimeId.
    */
   formDefinitionRef?: RuntimeFormDefinitionRef;
+  /**
+   * Presence means the server serves this runtime's form on protocol v2
+   * (GET .../runtime-forms/v2/:runtimeId; packages/runtime-form README,
+   * "Protocol v2"). Independent of `formDefinitionRef`: a runtime may have a v2
+   * form without any v1 definition, and v1 clients never see it. Additive;
+   * clients that do not know it ignore it.
+   */
+  runtimeFormV2?: RuntimeFormV2Marker;
+}
+
+export interface RuntimeFormV2Marker {
+  protocolVersion: 2;
 }
 
 export interface RuntimeFormDefinitionRef {
@@ -1700,96 +2672,6 @@ export interface RuntimeSelectionCatalog {
   options: RuntimeSelectionOption[];
 }
 
-export const RUNTIMES: RuntimeInfo[] = [
-  { id: "claude", displayName: "Claude Code", abbreviation: "CC", binary: "claude", supported: true },
-  { id: "codex", displayName: "Codex CLI", abbreviation: "CX", binary: "codex", supported: true },
-  { id: "grok", displayName: "Grok Build", abbreviation: "GK", binary: "grok", supported: true },
-  { id: "builtin", displayName: "Built-in Pi", abbreviation: "BP", binary: "", supported: true },
-  { id: "antigravity", displayName: "Antigravity CLI", abbreviation: "AG", binary: "agy", supported: true, deprecated: true },
-  // Kimi: prefer the in-process SDK (`kimi-sdk` → "Kimi Code") for new agents.
-  // The legacy `kimi` (kimi-cli child-process) entry stays for backward compat
-  // with existing `runtime=kimi` agents but is labelled deprecated.
-  { id: "kimi-sdk", displayName: "Kimi Code", abbreviation: "KC", binary: "", supported: true },
-  { id: "kimi", displayName: "Kimi CLI", abbreviation: "KL", binary: "kimi", supported: true, deprecated: true },
-  { id: "copilot", displayName: "Copilot CLI", abbreviation: "CP", binary: "copilot", supported: true },
-  { id: "cursor", displayName: "Cursor CLI", abbreviation: "CU", binary: "cursor-agent", supported: true },
-  // Gemini CLI: deprecated — no longer maintained upstream, replaced by
-  // Antigravity CLI (`antigravity` → "Antigravity CLI"). Kept for backward
-  // compat with existing `runtime=gemini` agents but hidden from selectors.
-  { id: "gemini", displayName: "Gemini CLI", abbreviation: "GM", binary: "gemini", supported: true, deprecated: true },
-  { id: "opencode", displayName: "OpenCode", abbreviation: "OC", binary: "opencode", supported: true },
-  { id: "pi", displayName: "Pi", abbreviation: "PI", binary: "pi", supported: true },
-];
-
-/**
- * Label suffix for a runtime in a machine's runtime picker. A runtime is offered
- * only when the daemon reports it in `machineRuntimeIds` (its capability list) —
- * that gating is intentional: a runtime the daemon can't run must not be
- * selectable. This helper only chooses the *wording* for an unavailable one:
- *
- * - unsupported → " (coming soon)"
- * - in-process runtime (`binary === ""`, e.g. Built-in, Kimi Code) that the
- *   daemon doesn't report → " (update computer)": there is nothing to install
- *   locally; the daemon/computer simply predates the runtime, so "(not
- *   installed)" would be misleading.
- * - local CLI runtime (`binary !== ""`) the daemon didn't detect → " (not installed)"
- * - available → "" (no suffix)
- */
-export type RuntimeAvailabilitySuffix =
-  | { kind: "none" }
-  | { kind: "comingSoon" }
-  | { kind: "updateComputer" }
-  | { kind: "notInstalled" };
-
-/**
- * Locale-free runtime availability classifier (the machineRunLabel pattern):
- * returns a KIND, never display text. Web consumers map the kind to a catalog
- * id so the zh UI renders （未安装）/（需更新计算机）instead of the old hardcoded
- * English suffixes (" (not installed)" etc.).
- */
-export function runtimeAvailabilitySuffix(r: RuntimeInfo, machineRuntimeIds: readonly string[]): RuntimeAvailabilitySuffix {
-  if (!r.supported) return { kind: "comingSoon" };
-  if (machineRuntimeIds.includes(r.id)) return { kind: "none" };
-  return r.binary === "" ? { kind: "updateComputer" } : { kind: "notInstalled" };
-}
-
-export function isRuntimeDeprecated(runtimeId: string): boolean {
-  return RUNTIMES.some((runtime) => runtime.id === runtimeId && Boolean(runtime.deprecated));
-}
-
-export function isRuntimeSelectableForNewAgent(runtime: RuntimeInfo): boolean {
-  return runtime.supported && !runtime.deprecated;
-}
-
-export function getCreatableRuntimeOptions(): RuntimeInfo[] {
-  return RUNTIMES.filter(isRuntimeSelectableForNewAgent);
-}
-
-export function isRuntimeVisibleForExistingAgent(runtime: RuntimeInfo, currentRuntime: string): boolean {
-  return !runtime.deprecated || runtime.id === currentRuntime;
-}
-
-export function getExistingAgentRuntimeOptions(currentRuntime: string): RuntimeInfo[] {
-  return RUNTIMES.filter((runtime) => isRuntimeVisibleForExistingAgent(runtime, currentRuntime));
-}
-
-export function isRuntimeSetupCandidate(runtime: RuntimeInfo): boolean {
-  return runtime.supported && !runtime.deprecated && runtime.id !== "builtin";
-}
-
-export function getSetupRuntimeOptions(): RuntimeInfo[] {
-  return RUNTIMES.filter(isRuntimeSetupCandidate);
-}
-
-export function getMachineRuntimeDisplayOptions(): RuntimeInfo[] {
-  return RUNTIMES.filter((runtime) => runtime.supported && !runtime.deprecated);
-}
-
-/** Map runtime ID → display name. Falls back to the ID itself. */
-export function getRuntimeDisplayName(id: string): string {
-  if (isExternalAgentRuntime(id)) return EXTERNAL_AGENT_RUNTIME_DISPLAY_NAME;
-  return RUNTIMES.find((r) => r.id === id)?.displayName ?? id;
-}
 
 export {
   __resetFailpointsForTests,
@@ -1797,7 +2679,7 @@ export {
   failpoints,
   InMemoryFailpointRegistry,
   noopFailpointRegistry,
-} from "./testing/failpoints.js";
+} from "./testing/failpoints";
 export type {
   FailpointEffect,
   FailpointMode,
@@ -1806,7 +2688,7 @@ export type {
   FailpointTraceEntry,
   InMemoryFailpointRegistryOptions,
   MaybePromise,
-} from "./testing/failpoints.js";
+} from "./testing/failpoints";
 
 // ── Runtime Models ──
 
@@ -1857,15 +2739,69 @@ export interface RuntimeModelCatalogCapability {
 /**
  * Terminal model-source truth reported by a Computer.
  *
- * Bundled suggestions are deliberately absent: they are presentation metadata,
- * not selectable availability after a non-live result.
+ * Bundled fallback options remain presentation metadata, never live availability.
  */
 export type RuntimeModelSourceOutcome =
   | { kind: "live"; value: RuntimeModelSet }
   | { kind: "missing_config"; recovery?: string }
   | { kind: "no_models"; recovery?: string }
   | { kind: "unsupported" }
-  | { kind: "error"; retryable: boolean };
+  | {
+    kind: "error";
+    retryable: boolean;
+    code?: RuntimeModelDetectionErrorCode;
+    /**
+     * task #1242 — present only with `code: "runtime_not_found"`, when the
+     * daemon's runtime probe could say how its PATH lookup ended. Absent on
+     * older daemons and when the probe had no verdict; absent is not
+     * "confirmed missing".
+     */
+    reason?: RuntimeModelDetectionLookupReason;
+  };
+
+/**
+ * task #1242 — the daemon runtime probe's structured cause for an unavailable
+ * runtime, carried beside `runtime_not_found`. Only `not_installed` is a
+ * confirmed absence; the others say the lookup did not decide.
+ */
+export const RUNTIME_MODEL_DETECTION_LOOKUP_REASONS = [
+  "not_installed",
+  "probe_timeout",
+  "permission_denied",
+  "probe_failed",
+] as const;
+export type RuntimeModelDetectionLookupReason = (typeof RUNTIME_MODEL_DETECTION_LOOKUP_REASONS)[number];
+export function isRuntimeModelDetectionLookupReason(value: unknown): value is RuntimeModelDetectionLookupReason {
+  return typeof value === "string" && (RUNTIME_MODEL_DETECTION_LOOKUP_REASONS as readonly string[]).includes(value);
+}
+
+export const RUNTIME_MODEL_DETECTION_ERROR_CODES = [
+  "runtime_not_found",
+  "runtime_not_authenticated",
+  "detect_timeout",
+  "protocol_unsupported",
+  "detect_failed",
+  "computer_offline",
+] as const;
+export type RuntimeModelDetectionErrorCode = (typeof RUNTIME_MODEL_DETECTION_ERROR_CODES)[number];
+
+// Grok 1.x can take over five seconds to initialize its model catalog.
+export const GROK_MODEL_DETECTION_TIMEOUT_MS = 15_000;
+// `cursor-agent models` asks Cursor's backend for the account's catalog and can
+// exceed five seconds. With the daemon probe and the server request both at 5s
+// the server gave up first, so the live list never arrived.
+export const CURSOR_MODEL_DETECTION_TIMEOUT_MS = 15_000;
+// One server-side budget for every runtime (artin 2026-09-27: 统一放宽到 20s).
+// It must stay above the longest daemon probe (Grok/Cursor 15s) so the daemon
+// can report its own timeout instead of losing the race.
+export const MODEL_DETECTION_REQUEST_TIMEOUT_MS = 20_000;
+export function runtimeModelDetectionRequestTimeoutMs(_runtime: string): number {
+  return MODEL_DETECTION_REQUEST_TIMEOUT_MS;
+}
+
+export function isRuntimeModelDetectionErrorCode(value: unknown): value is RuntimeModelDetectionErrorCode {
+  return typeof value === "string" && (RUNTIME_MODEL_DETECTION_ERROR_CODES as readonly string[]).includes(value);
+}
 
 /** Convert a detector's catalog into the closed source-outcome contract. */
 export function runtimeModelSourceOutcomeFromSet(
@@ -1906,6 +2842,9 @@ export function hasStaticRuntimeModelSource(runtimeId: string): boolean {
   return (STATIC_RUNTIME_MODEL_SOURCE_IDS as readonly string[]).includes(runtimeId);
 }
 
+/** Effort levels every listed Claude Code model accepts (`claude --effort`); never `ultra`. */
+const CLAUDE_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
+
 export const RUNTIME_MODELS: Record<string, RuntimeModelInfo[]> = {
   [EXTERNAL_AGENT_RUNTIME_ID]: [
     { id: EXTERNAL_AGENT_RUNTIME_MODEL, label: EXTERNAL_AGENT_RUNTIME_DISPLAY_NAME },
@@ -1914,26 +2853,59 @@ export const RUNTIME_MODELS: Record<string, RuntimeModelInfo[]> = {
     .flat()
     .map((model) => ({ id: model.id, label: model.label || formatRuntimeProviderModelLabel(model.id), verified: "launchable" as const })),
   claude: [
-    { id: "opus", label: "Claude Opus" },
-    { id: "fable", label: "Claude Fable" },
-    { id: "sonnet", label: "Claude Sonnet" },
+    // Claude Code takes `--effort low|medium|high|xhigh|max`, and every current
+    // Claude model accepts `max`. Haiku 4.5 takes no effort at all, and the `haiku`
+    // alias may still resolve to it, so both keep the base set; Claude Code drops an
+    // effort a model does not take, and Opus/Sonnet 4.6 run `xhigh` as `high`
+    // (OAR probe, #oar-raft 2026-10-14). Per-model levels should come from Claude
+    // Code's own model list (`supportedEffortLevels`) rather than this table.
+    { id: "opus", label: "Claude Opus", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "fable", label: "Claude Fable", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "sonnet", label: "Claude Sonnet", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
     { id: "haiku", label: "Claude Haiku" },
-    { id: "claude-opus-5", label: "Claude Opus 5" },
-    { id: "claude-opus-4-8", label: "Claude Opus 4.8" },
-    { id: "claude-opus-4-7", label: "Claude Opus 4.7" },
-    { id: "claude-opus-4-6", label: "Claude Opus 4.6" },
-    { id: "claude-fable-5-1", label: "Claude Fable 5.1" },
-    { id: "claude-fable-5", label: "Claude Fable 5" },
-    { id: "claude-sonnet-5", label: "Claude Sonnet 5" },
-    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
+    { id: "claude-opus-5-5", label: "Claude Opus 5.5", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-opus-5", label: "Claude Opus 5", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-opus-4-8", label: "Claude Opus 4.8", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-opus-4-7", label: "Claude Opus 4.7", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-opus-4-6", label: "Claude Opus 4.6", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-fable-5-1", label: "Claude Fable 5.1", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-fable-5", label: "Claude Fable 5", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-sonnet-5", label: "Claude Sonnet 5", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-sonnet-4-6", label: "Claude Sonnet 4.6", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
+    { id: "claude-haiku-5-5", label: "Claude Haiku 5.5", supportedReasoningEfforts: CLAUDE_REASONING_EFFORTS },
     { id: "claude-haiku-4-5", label: "Claude Haiku 4.5" },
   ],
   codex: [
+    // Order and per-model reasoning metadata follow upstream Codex's bundled
+    // catalog (codex-rs/models-manager/models.json, rust-v0.162.0): picker
+    // priority, `default_reasoning_level`, `supported_reasoning_levels`.
+    {
+      id: "gpt-6.1-sol",
+      label: "GPT-6.1 Sol",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultReasoningEffort: "low",
+      verified: "launchable",
+    },
     {
       id: "gpt-6-astra",
       label: "GPT-6-Astra",
       supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
       defaultReasoningEffort: "low",
+      verified: "launchable",
+    },
+    {
+      id: "gpt-6-sol",
+      label: "GPT-6 Sol",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max", "ultra"],
+      defaultReasoningEffort: "medium",
+      verified: "launchable",
+    },
+    {
+      id: "gpt-6-luna",
+      label: "GPT-6 Luna",
+      supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"],
+      defaultReasoningEffort: "medium",
       verified: "launchable",
     },
     {
@@ -1976,6 +2948,8 @@ export const RUNTIME_MODELS: Record<string, RuntimeModelInfo[]> = {
       defaultReasoningEffort: "high",
       verified: "launchable",
     },
+    // New choice without changing the bundled default; live detection owns availability.
+    { id: "grok-4.6", label: "Grok 4.6", verified: "suggestion_only" },
     {
       id: "grok-composer-2.5-fast",
       label: "Composer 2.5",
@@ -2024,10 +2998,13 @@ export const RUNTIME_MODELS: Record<string, RuntimeModelInfo[]> = {
   // whatever the user has actually provisioned — including new rollouts
   // (e.g. K2.7) without a daemon bump.
   //
-  // This static entry is explanatory/default-seeding metadata only. Missing
-  // config, an empty grant, or a detector error remains a typed non-live source
-  // and must never make this entry selectable. Keeping one entry prevents
-  // getDefaultModel("kimi-sdk") from falling through to Claude's "sonnet".
+  // This static entry is explanatory/default-seeding metadata plus ONE bounded
+  // exception: the create-form option source may offer it as the managed
+  // default when the machine reports missing_config (the normal first-install
+  // shape — nothing provisioned yet). An empty grant (no_models) or a detector
+  // error remains a typed non-live source and must never make this entry
+  // selectable. Keeping one entry prevents getDefaultModel("kimi-sdk") from
+  // falling through to Claude's "sonnet".
   "kimi-sdk": [
     { id: "kimi-code/kimi-for-coding", label: "Kimi for Coding (default)", verified: "launchable" },
   ],
@@ -2164,6 +3141,7 @@ const RUNTIME_CONFIG_FIELDS = [
   "envVars",
   "command",
   "hostUserState",
+  "loadLocalPlugins",
 ] as const;
 const MODEL_CONFIG_FIELDS = ["kind", "id", "name"] as const;
 const MODE_CONFIG_FIELDS = ["kind"] as const;
@@ -2537,6 +3515,7 @@ function composeRuntimeConfig(input: {
   reasoningEffort?: RuntimeReasoningEffort | null;
   envVars?: Record<string, string> | null;
   command?: string | null;
+  loadLocalPlugins?: boolean;
 }): RuntimeConfig {
   const base = {
     version: RUNTIME_CONFIG_VERSION,
@@ -2551,6 +3530,7 @@ function composeRuntimeConfig(input: {
       runtime: "builtin",
       provider: input.provider as BuiltInRuntimeProviderConfig,
       hostUserState: "forbidden",
+      ...(input.loadLocalPlugins !== undefined ? { loadLocalPlugins: input.loadLocalPlugins } : {}),
     };
   }
   if (input.runtime === "claude") {
@@ -2637,8 +3617,19 @@ export function parseRuntimeConfig(input: RuntimeConfigHydrationInput): RuntimeC
   }
   const runtime = typeof raw.runtime === "string" ? raw.runtime.trim() : "";
   if (!runtime) return runtimeConfigError("missing_runtime", "runtimeConfig.runtime is required");
-  if (runtime === "builtin" && raw.hostUserState !== undefined && raw.hostUserState !== "forbidden") {
+  // Installed mobile clients (kotlinx.serialization with encodeDefaults and
+  // explicit nulls) send every optional field, unset ones as `null`. An
+  // explicit null means "not set", exactly like an omitted key, so it must not
+  // fail validation; any other non-boolean value is still refused, and a null
+  // never turns local extensions on.
+  const hostUserState = raw.hostUserState === null ? undefined : raw.hostUserState;
+  const loadLocalPlugins = raw.loadLocalPlugins === null ? undefined : raw.loadLocalPlugins;
+  if (runtime === "builtin" && hostUserState !== undefined && hostUserState !== "forbidden") {
     return runtimeConfigError("unknown_field", "runtimeConfig.hostUserState must be forbidden for runtime: builtin", runtime);
+  }
+
+  if (loadLocalPlugins !== undefined && (runtime !== "builtin" || typeof loadLocalPlugins !== "boolean")) {
+    return runtimeConfigError("unknown_field", "runtimeConfig.loadLocalPlugins must be a boolean for runtime: builtin", runtime);
   }
 
   const model = parseStrictModelConfig(runtime, raw.model);
@@ -2726,6 +3717,7 @@ export function parseRuntimeConfig(input: RuntimeConfigHydrationInput): RuntimeC
     model,
     mode,
     reasoningEffort: gatedReasoningEffort,
+    loadLocalPlugins: loadLocalPlugins as boolean | undefined,
     envVars: stripControlledRuntimeEnvVars(runtime, envVars),
     command,
   });
@@ -2849,8 +3841,9 @@ export const REASONING_EFFORTS: { id: KnownReasoningEffort; label: string }[] = 
 /**
  * The reasoning efforts available to any reasoning-capable model that does NOT
  * declare an explicit `supportedReasoningEfforts` gate. `max`/`ultra` are opt-in
- * only — Codex GPT-5.6 (sol/terra) declares them; they must never leak to models
- * that inherit this base set (e.g. Claude). tygg/stdrc 2026-07-10 task #496.
+ * only — a model must declare them (Codex GPT-5.6+ declares both; Claude models
+ * declare `max`, never `ultra`); they must never leak to models that inherit this
+ * base set (e.g. a custom model id). tygg/stdrc 2026-07-10 task #496.
  */
 export const BASE_REASONING_EFFORTS: readonly ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
@@ -2898,24 +3891,7 @@ export type TaskStatus = "todo" | "in_progress" | "in_review" | "done" | "closed
 // Single source of truth for runtime validation (see REMINDER_STATUSES above).
 export const TASK_STATUSES = ["todo", "in_progress", "in_review", "done", "closed"] as const satisfies readonly TaskStatus[];
 
-/**
- * Refusal reason a claim carries when the task is already assigned to the
- * caller. It is a *refusal* — no state was written, so the row's `success` is
- * false — but it authorises work, because it proves the caller already holds
- * the task.
- *
- * Shared rather than written out at each site because the server produces this
- * string and the CLI branches on it: the claim exit status treats it as
- * authorising work (so an agent re-confirming its own claim is not told the
- * claim failed), and the result formatter gives it its own line. Comparing
- * against a copied literal would mean a pure copy edit on the producer could
- * silently flip the consumer's branch, with production broken and tests still
- * green because each side held its own copy of the old wording.
- *
- * One symbol keeps the sides from diverging at all, rather than relying on a
- * test to notice that they have (@Kaiming, `#proj-runtime:941d4a53`).
- */
-export const TASK_CLAIM_REASON_ALREADY_CLAIMED_BY_YOU = "already claimed by you";
+export { TASK_CLAIM_REASON_ALREADY_CLAIMED_BY_YOU } from "./taskClaimReason";
 export const isTaskStatus = (s: string): s is TaskStatus =>
   (TASK_STATUSES as readonly string[]).includes(s);
 
@@ -2964,8 +3940,8 @@ export interface TaskInfo {
   createdAt: string;
 }
 
-export * from "./serverPermissions.js";
-export * from "./taskPermissions.js";
+export * from "./serverPermissions";
+export * from "./taskPermissions";
 
 // ── Server Plans ──
 
@@ -2979,6 +3955,7 @@ export interface PlanLimits {
   maxMachines: number;       // -1 = unlimited
   maxAgents: number;         // -1 = unlimited
   maxChannels: number;       // -1 = unlimited
+  maxGuestJoinableChannelsPerServer: number; // -1 = unlimited
   messageHistoryDays: number; // -1 = unlimited
   includedAgents: number;    // [UNUSED] legacy extra-agent billing field
 }
@@ -3061,11 +4038,12 @@ export const PRO_PACK_AGENT_SEATS = PRO_AGENT_SEAT_BLOCK_SIZE;
 export const PRO_PACK_MONTHLY_USD = PRO_SEAT_MONTHLY_USD;
 export const PRO_PACK_ANNUAL_MONTHLY_USD = PRO_SEAT_ANNUAL_MONTHLY_USD;
 export const PRO_PACK_ANNUAL_USD = PRO_SEAT_ANNUAL_USD;
+export const DEFAULT_MAX_GUEST_JOINABLE_CHANNELS_PER_SERVER = -1;
 
 export const PLAN_CONFIG: Record<ServerPlan, PlanConfig> = {
   free: {
     displayName: "Free",
-    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, messageHistoryDays: 30, includedAgents: -1 },
+    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, maxGuestJoinableChannelsPerServer: DEFAULT_MAX_GUEST_JOINABLE_CHANNELS_PER_SERVER, messageHistoryDays: 30, includedAgents: -1 },
     comingSoon: false,
     price: 0,
     extraAgentPrice: 0,
@@ -3081,21 +4059,21 @@ export const PLAN_CONFIG: Record<ServerPlan, PlanConfig> = {
   },
   founder: {
     displayName: "Founder",
-    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, messageHistoryDays: -1, includedAgents: -1 },
+    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, maxGuestJoinableChannelsPerServer: DEFAULT_MAX_GUEST_JOINABLE_CHANNELS_PER_SERVER, messageHistoryDays: -1, includedAgents: -1 },
     comingSoon: false,
     price: 0,
     extraAgentPrice: 0,
   },
   partner: {
     displayName: "Partner",
-    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, messageHistoryDays: -1, includedAgents: -1 },
+    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, maxGuestJoinableChannelsPerServer: DEFAULT_MAX_GUEST_JOINABLE_CHANNELS_PER_SERVER, messageHistoryDays: -1, includedAgents: -1 },
     comingSoon: false,
     price: 0,
     extraAgentPrice: 0,
   },
   pro: {
     displayName: "Pro",
-    limits: { maxMachines: -1, maxAgents: PRO_PACK_AGENT_SEATS, maxChannels: -1, messageHistoryDays: -1, includedAgents: PRO_PACK_AGENT_SEATS },
+    limits: { maxMachines: -1, maxAgents: PRO_PACK_AGENT_SEATS, maxChannels: -1, maxGuestJoinableChannelsPerServer: DEFAULT_MAX_GUEST_JOINABLE_CHANNELS_PER_SERVER, messageHistoryDays: -1, includedAgents: PRO_PACK_AGENT_SEATS },
     comingSoon: false,
     price: PRO_SEAT_MONTHLY_USD,
     extraAgentPrice: 0,
@@ -3107,7 +4085,7 @@ export const DISPLAY_PLAN_CONFIG: Record<DisplayPlan, PlanConfig> = {
   free: PLAN_CONFIG.free,
   pro: {
     displayName: "Pro",
-    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, messageHistoryDays: -1, includedAgents: -1 },
+    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, maxGuestJoinableChannelsPerServer: DEFAULT_MAX_GUEST_JOINABLE_CHANNELS_PER_SERVER, messageHistoryDays: -1, includedAgents: -1 },
     comingSoon: false,
     price: PRO_SEAT_MONTHLY_USD,
     priceCadence: "/ seat / month",
@@ -3124,7 +4102,7 @@ export const DISPLAY_PLAN_CONFIG: Record<DisplayPlan, PlanConfig> = {
   },
   enterprise: {
     displayName: "Enterprise",
-    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, messageHistoryDays: -1, includedAgents: -1 },
+    limits: { maxMachines: -1, maxAgents: -1, maxChannels: -1, maxGuestJoinableChannelsPerServer: DEFAULT_MAX_GUEST_JOINABLE_CHANNELS_PER_SERVER, messageHistoryDays: -1, includedAgents: -1 },
     comingSoon: false,
     price: 0,
     priceLabel: "Coming soon",
@@ -3254,7 +4232,7 @@ export function calculateProMonthlyPrice(packQuantity: number): BillingPriceSumm
 
 function getTrialFreeLimits(now: Date): PlanLimits {
   return isTrialActive(now)
-    ? { maxMachines: -1, maxAgents: -1, maxChannels: -1, messageHistoryDays: -1, includedAgents: -1 }
+    ? { maxMachines: -1, maxAgents: -1, maxChannels: -1, maxGuestJoinableChannelsPerServer: DEFAULT_MAX_GUEST_JOINABLE_CHANNELS_PER_SERVER, messageHistoryDays: -1, includedAgents: -1 }
     : PLAN_CONFIG.free.limits;
 }
 
@@ -3400,6 +4378,8 @@ export const RESERVED_AGENT_NAMES = [
   "idle",
   "busy",
   "system",
+  // `dm:@reminders` names each agent's private reminder conversation.
+  "reminders",
 ] as const;
 
 /** Validate a name and return an error message, or null if valid.
@@ -3484,17 +4464,12 @@ export interface AnnouncementPage {
 }
 
 /** Fully translated content for one renderable display locale. */
-export interface AnnouncementContent {
-  title: string;
-  pages: AnnouncementPage[];
-}
-
 /** Announcement content is authored only for display locales shipped by Raft. */
 export type AnnouncementContentByLocale = Partial<Record<DisplayLocale, AnnouncementContent>>;
 
 /** An account-level popup announcement. Shown exactly once per user (by id)
  *  until dismissed; a new announcement always means a new id. */
-export interface Announcement {
+export interface Announcement extends AnnouncementPresentation {
   id: string;
   title: string;
   pages: AnnouncementPage[];
@@ -3502,6 +4477,9 @@ export interface Announcement {
   startsAt: string;
   endsAt: string | null;
   locale: DisplayLocale;
+  /** Additive for installed clients; omitted legacy values mean version 1/account scope. */
+  deliveryVersion?: number;
+  deliveryScope?: import("../announcement-audience").AnnouncementDeliveryScope;
 }
 
 // ── Daemon Version ──
@@ -3546,6 +4524,69 @@ export function isComputerOutdated(version: string | null | undefined, latestVer
   return isDaemonOutdated(version, latestVersion);
 }
 
+/** Full SemVer 2.0.0 (prerelease and build metadata allowed, no leading zeros
+ *  in numeric parts). The form the server's upgrade policy accepts for a
+ *  Computer's reported version and a published release; staging / rc / branch
+ *  builds report prerelease versions such as `1.0.41-staging.<ts>.sha.<sha>`. */
+const COMPUTER_SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z.-]+)?$/;
+
+export function isComputerSemver(value: string): boolean {
+  if (!COMPUTER_SEMVER.test(value)) return false;
+  const pre = value.split("+", 1)[0]!.split("-").slice(1).join("-");
+  return !pre.split(".").some((part) => /^0\d+$/.test(part));
+}
+
+/** SemVer precedence of two Computer versions (-1 / 0 / 1); build metadata is
+ *  ignored and a prerelease sorts below its release. The server's upgrade
+ *  policy uses this for `already_current`; the web uses it for "is a newer
+ *  version available". Both inputs must pass `isComputerSemver`. */
+export function compareComputerVersions(left: string, right: string): number {
+  const parse = (value: string) => {
+    const withoutBuild = value.split("+", 1)[0]!;
+    const separator = withoutBuild.indexOf("-");
+    return {
+      core: (separator < 0 ? withoutBuild : withoutBuild.slice(0, separator)).split(".").map(BigInt),
+      pre: separator < 0 ? null : withoutBuild.slice(separator + 1).split("."),
+    };
+  };
+  const a = parse(left), b = parse(right);
+  for (let i = 0; i < 3; i++) {
+    if (a.core[i] !== b.core[i]) return a.core[i]! < b.core[i]! ? -1 : 1;
+  }
+  if (a.pre === null || b.pre === null) return a.pre === b.pre ? 0 : a.pre === null ? 1 : -1;
+  for (let i = 0; i < Math.max(a.pre.length, b.pre.length); i++) {
+    const x = a.pre[i], y = b.pre[i];
+    if (x === y) continue;
+    if (x === undefined || y === undefined) return x === undefined ? -1 : 1;
+    const nx = /^\d+$/.test(x), ny = /^\d+$/.test(y);
+    if (nx && ny) return BigInt(x) < BigInt(y) ? -1 : 1;
+    if (nx !== ny) return nx ? -1 : 1;
+    return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * Oldest Computer the web drives a remote upgrade v2 (task #873) on. v2 itself
+ * landed in 1.0.37, but from 1.0.37–1.0.44 the old service's own upgrade path
+ * proved unreliable in production: over 24 h (2026-10-18) 4 of 11 web upgrades
+ * from ≤1.0.44 never took effect (acknowledged, then silent until the deadline,
+ * or rolled back), against 11 of 11 from ≥1.0.45. Older Computers are not
+ * driven from the web; the web shows a one-time hint to upgrade locally instead.
+ */
+export const COMPUTER_REMOTE_UPGRADE_MIN_VERSION = "1.0.45";
+
+/** null when the version is unknown; otherwise whether the web may drive an
+ *  upgrade. Full SemVer, fail-closed: a version that is not SemVer is not
+ *  supported, and a prerelease sorts below its release (1.0.45-rc.1 is below
+ *  1.0.45). The server projection and the upgrade route's guard both use this. */
+export function isRemoteUpgradeSupported(version: string | null | undefined): boolean | null {
+  const trimmed = version?.trim();
+  if (!trimmed) return null;
+  if (!isComputerSemver(trimmed)) return false;
+  return compareComputerVersions(trimmed, COMPUTER_REMOTE_UPGRADE_MIN_VERSION) >= 0;
+}
+
 // ── Server system notification feed ──
 //
 // Machine operational notices used to be re-derived independently by Web and
@@ -3557,6 +4598,35 @@ export const SERVER_SYSTEM_NOTIFICATIONS_CONTRACT_VERSION = "server-system-notif
 export const MACHINE_SYSTEM_NOTIFICATION_SCHEMA_VERSION = 1 as const;
 
 export type ServerSystemNotificationKind = "error" | "warning" | "info";
+/** Same threshold as the cleaner's low-disk check (apps/cleaner/configProtocol). */
+export const MACHINE_DISK_LOW_FREE_PERCENT = 10;
+/**
+ * At or above this much free space a disk is never "low", whatever the
+ * percentage: 10% of a 2 TB disk is still 200 GB.
+ */
+export const MACHINE_DISK_LOW_MAX_AVAILABLE_BYTES = 20 * 1024 ** 3;
+
+/** Latest disk report of a connected machine; byte counts are whole numbers. */
+export interface MachineDiskStatus {
+  availableBytes: number;
+  totalBytes: number;
+}
+
+export function isValidMachineDiskStatus(value: unknown): value is MachineDiskStatus {
+  if (!value || typeof value !== "object") return false;
+  const { availableBytes, totalBytes } = value as Record<string, unknown>;
+  return typeof availableBytes === "number" && typeof totalBytes === "number"
+    && Number.isSafeInteger(availableBytes) && Number.isSafeInteger(totalBytes)
+    && availableBytes >= 0 && totalBytes > 0 && availableBytes <= totalBytes;
+}
+
+/** The one low-disk rule shared by the cleaner, the server and the web. */
+export function isMachineDiskLow(disk: MachineDiskStatus | null | undefined): boolean {
+  if (!disk) return false;
+  return disk.availableBytes < MACHINE_DISK_LOW_MAX_AVAILABLE_BYTES
+    && disk.availableBytes / disk.totalBytes * 100 < MACHINE_DISK_LOW_FREE_PERCENT;
+}
+
 export type MachineSystemNotificationType = "machine.offline" | "machine.outdated";
 export type MachineSystemNotificationTitleCopyKey =
   | "machine.offline.title.one"
@@ -3757,12 +4827,14 @@ export function signupRoleLabel(id: string | null | undefined): string | null {
   return SIGNUP_ROLES.find((role) => role.id === id)?.label ?? null;
 }
 
-export * from "./canonicalMessageManifest.js";
-export * from "./canonicalMessageV2.js";
-export * from "./agentMigrationResumable.js";
-export * from "./discussionGraph.js";
-export * from "./managedMcp.js";
-export * from "./providerConnections.js";
+export * from "./canonicalMessageManifest";
+export * from "./canonicalMessageV2";
+export * from "./agentMigrationResumable";
+export * from "./agentArchive";
+export * from "./discussionGraph";
+export * from "./managedMcp";
+export * from "./providerConnections";
+export * from "./providerProbes";
 
 
 // ── Identity setup: who still owes us a handle ──
@@ -3803,4 +4875,11 @@ export function accountNeedsIdentitySetup(user: {
   // the backfill missed, not a person who never set up — and a real handle is a real handle.
   return hasPlaceholderHandle(user.name) || !user.name;
 }
-export * from "./inboxScopeReadFrontier.js";
+export * from "./inboxScopeReadFrontier";
+
+export * from "./channelConversionState";
+export * from "./providerRequestActivity";
+
+export * from "./appWhenToUse";
+
+export * from "./raftbenchContract";

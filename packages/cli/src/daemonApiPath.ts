@@ -1,19 +1,21 @@
+import type {
+  DaemonApiClientFailure,
+  DaemonApiClientResult,
+  DaemonApiContractRejectionDiagnostic,
+  DaemonApiRawFailure,
+  DaemonApiRawTransport,
+  DaemonApiRequestBodyByRoute,
+  DaemonApiRequestQueryByRoute,
+  DaemonApiResponseByRoute,
+  DaemonApiRouteKey,
+} from "@botiverse/raft-shared";
 import {
   buildDaemonApiRawRoutePath,
   createDaemonApiClient as createSharedDaemonApiClient,
-  type DaemonApiClientFailure,
-  type DaemonApiClientResult,
-  type DaemonApiContractRejectionDiagnostic,
-  type DaemonApiRawFailure,
-  type DaemonApiRawTransport,
-  type DaemonApiRequestBodyByRoute,
-  type DaemonApiRequestQueryByRoute,
-  type DaemonApiResponseByRoute,
-  type DaemonApiRouteKey,
-} from "@botiverse/raft-shared";
+} from "@botiverse/raft-shared/src/agentCliSurface";
 
-import type { ApiResponse } from "./client.js";
-import { CliError } from "./core/errors.js";
+import type { ApiResponse } from "./client";
+import { CliError } from "./core/errors";
 
 interface CliDaemonApiHttpClient {
   request<T>(method: string, pathname: string, body?: unknown): Promise<ApiResponse<T>>;
@@ -156,6 +158,14 @@ export function createDaemonApiSurfaceClient(client: CliDaemonApiHttpClient) {
         requestClientAsApiResponse(daemonApi.inbox.check()),
       ack: (body: DaemonApiRequestBodyByRoute["inboxAck"]) =>
         requestClientAsApiResponse(daemonApi.inbox.ack(body)),
+      seal: (body: DaemonApiRequestBodyByRoute["inboxSeal"]) =>
+        requestClientAsApiResponse(daemonApi.inbox.seal(body)),
+      unseal: (body: DaemonApiRequestBodyByRoute["inboxUnseal"]) =>
+        requestClientAsApiResponse(daemonApi.inbox.unseal(body)),
+    },
+    thirdPartyEvents: {
+      ack: (body: DaemonApiRequestBodyByRoute["thirdPartyEventsAck"]) =>
+        requestClientAsApiResponse(daemonApi.thirdPartyEvents.ack(body)),
     },
     wakeHints: {
       fetch: (query: DaemonApiRequestQueryByRoute["wakeHintsFetch"]) =>

@@ -1,15 +1,15 @@
-import type { RuntimeDriver } from "./types.js";
-import { ClaudeDriver } from "./claude.js";
-import { CodexDriver } from "./codex.js";
-import { GrokDriver } from "./grok.js";
-import { AntigravityDriver } from "./antigravity.deprecated.js";
-import { CopilotDriver } from "./copilot.js";
-import { CursorDriver } from "./cursor.js";
-import { GeminiDriver } from "./gemini.js";
-import { KimiDriver } from "./kimi.js";
-import { KimiSdkDriver } from "./kimi-sdk.js";
-import { OpenCodeDriver } from "./opencode.js";
-import { BuiltInDriver, PiDriver } from "./pi.js";
+import type { RuntimeDriver } from "./types";
+import { ClaudeDriver } from "./claude";
+import { CodexDriver } from "./codex";
+import { GrokDriver } from "./grok";
+import { AntigravityDriver } from "./antigravity.deprecated";
+import { CopilotDriver } from "./copilot";
+import { CursorDriver } from "./cursor";
+import { GeminiDriver } from "./gemini";
+import { KimiDriver } from "./kimi";
+import { KimiSdkDriver } from "./kimi-sdk";
+import { OpenCodeDriver } from "./opencode";
+import { BuiltInDriver, PiDriver } from "./pi";
 
 export type {
   RuntimeDriver,
@@ -22,23 +22,30 @@ export type {
   RuntimeSendResult,
   RuntimeSessionDescriptor,
   RuntimeTurnAttribution,
-} from "./types.js";
-export { createChildProcessRuntimeSession, ChildProcessRuntimeSession } from "./runtimeSession.js";
+} from "./types";
+export { createChildProcessRuntimeSession, ChildProcessRuntimeSession } from "./runtimeSession";
 export {
   allowedTranscriptRootsForRuntime,
   ensureRuntimeHomeDir,
   resolveRuntimeHomeDir,
   resolveRuntimeSessionRef,
+  resolveRuntimeSessionRefDetailed,
+  writeRuntimeLifecycleDiagnosticRecord,
   writeRuntimeTerminalCauseRecord,
+  type RuntimeLifecycleDiagnosticEvent,
   type ResolveRuntimeSessionRefOptions,
+  type RuntimeSessionRefResolution,
+  type RuntimeSessionResolution,
   type RuntimeTerminalCausePhase,
-} from "./runtimeArtifacts.js";
+} from "./runtimeArtifacts";
 export {
   projectCompactionInterruptionTraceAttrs,
+  projectCompactionInterruption,
+  formatCompactionInterruption,
   projectStructuredRuntimeTerminalFailure,
-} from "../runtimeCompactionProjection.js";
-export { resolveClaudeCommand } from "./claude.js";
-export { buildCodexAppServerArgs, parseCodexJsonRpcLine, resolveCodexSpawn } from "./codex.js";
+} from "../runtimeCompactionProjection";
+export { resolveClaudeCommand } from "./claude";
+export { buildCodexAppServerArgs, parseCodexJsonRpcLine, resolveCodexSpawn } from "./codex";
 
 const driverFactories: Record<string, () => RuntimeDriver> = {
   builtin: () => new BuiltInDriver(),
@@ -48,6 +55,8 @@ const driverFactories: Record<string, () => RuntimeDriver> = {
   // Deprecated: retain for existing agents to run/resume. Shared availability
   // and server admission prohibit creating agents or switching into this runtime.
   antigravity: () => new AntigravityDriver(),
+  // Deprecated: retain for existing agents to run/resume. Shared availability
+  // and server admission prohibit creating agents or switching into this runtime.
   copilot: () => new CopilotDriver(),
   cursor: () => new CursorDriver(),
   gemini: () => new GeminiDriver(),
@@ -62,6 +71,11 @@ const driverFactories: Record<string, () => RuntimeDriver> = {
   pi: () => new PiDriver(),
 };
 
+/** Every runtime id `getDriver` accepts. */
+export function registeredRuntimeIds(): string[] {
+  return Object.keys(driverFactories);
+}
+
 /** Get the driver for a runtime ID. Throws if unknown. */
 export function getDriver(runtimeId: string): RuntimeDriver {
   const createDriver = driverFactories[runtimeId];
@@ -71,3 +85,6 @@ export function getDriver(runtimeId: string): RuntimeDriver {
   }
   return driver;
 }
+
+// The release smoke loads the kimi SDK the way a launch does (computer native build).
+export { verifyBundledKimiSdk } from "./kimi-sdk";

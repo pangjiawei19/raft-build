@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { relative, resolve } from "node:path";
-import test from "node:test";
 
 /**
  * Reverse-grep contract: Button / Badge must take colors
@@ -47,7 +46,7 @@ test("Button / Badge callsites use semantic props instead of bg-* className", ()
   // element. To stay simple we rely on a regex with a permissive but
   // bounded body length.
   const offenders: { file: string; match: string }[] = [];
-  const pattern = /<(Button|Badge)\b[^>]{0,400}className="[^"]*bg-brutal-/s;
+  const pattern = /<(Button|Badge)\b[^>]{0,400}className="[^"]*bg-(?:palette|brutal)-/s;
 
   for (const sourcePath of [
     ...sourceFilesUnder("src/components"),

@@ -1,8 +1,8 @@
-import { useMemo, useRef, useState } from "react";
+import { Input, InputGroup, InputGroupAddon, InputGroupInput, Textarea, Card, SegmentedControl, SegmentedControlItem, SegmentedControlLabel, Button, CheckboxIndicator, Separator } from "@botiverse/raft-ui";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useIntl } from "react-intl";
 import { formatNameValidationError } from "../../i18n/nameValidation";
-import { Check, Search, Hash, Lock } from "lucide-react";
-import { SegmentedControl, SegmentedControlItem, SegmentedControlLabel } from "raft-ui";
+import { Search, Hash, Lock } from "lucide-react";
 import { useAgentStore } from "../../store/agentStore";
 import { useChannelStore } from "../../store/channelStore";
 import { useServerStore } from "../../store/serverStore";
@@ -15,10 +15,12 @@ import Banner from "../ui/Banner";
 import SectionEyebrow from "../ui/SectionEyebrow";
 import AvatarSlot from "../ui/AvatarSlot";
 import FormField from "../ui/FormField";
+import TextLink from "../ui/TextLink";
 import { usePeopleSuggestionSearch } from "../../hooks/usePeopleSuggestionSearch";
 import { useServerPermissions } from "../../hooks/useServerPermissions";
 import type { PeopleSuggestionCandidate } from "../../utils/peopleSuggestionSearch";
 import { ChannelSlackBridgeField, useChannelSlackBridgeEditor } from "./ChannelSlackBridgeField";
+import { PICKER_GROUP_LABEL_CLASS, PICKER_ROW_CLASS } from "./memberPickerClasses";
 
 interface ArchivedCollision {
   archivedChannelId: string;
@@ -48,6 +50,8 @@ interface PrefillProps {
    * `execute_fail`. Receives the raw error so the caller can classify.
    */
   onSubmitError?: (err: unknown) => void;
+  actionCardMessageId?: string;
+  actionCardConfirmationVersion?: number;
 }
 
 export default function CreateChannelDialog({
@@ -61,6 +65,8 @@ export default function CreateChannelDialog({
   onCreated,
   onSubmitStart,
   onSubmitError,
+  actionCardMessageId,
+  actionCardConfirmationVersion,
 }: {
   onClose: () => void;
 } & PrefillProps) {
@@ -84,6 +90,10 @@ export default function CreateChannelDialog({
   const unarchiveChannel = useChannelStore((s) => s.unarchiveChannel);
   const channels = useChannelStore((s) => s.channels);
   const nav = useAppNavigate();
+  const openBillingSettings = useCallback(() => {
+    onClose();
+    nav.toSettings("billing");
+  }, [nav, onClose]);
   const { capabilities } = useServerPermissions();
   const bridgeEditor = useChannelSlackBridgeEditor({
     visibility,
@@ -171,6 +181,8 @@ export default function CreateChannelDialog({
             visibility,
             agentIds: [...selectedAgentIds],
             userIds: [...selectedHumanIds],
+            actionCardMessageId,
+            actionCardConfirmationVersion,
           }
         );
       try {
@@ -223,7 +235,7 @@ export default function CreateChannelDialog({
     }
   };
 
-  const handleUnarchiveCollision = async () => {
+  const handleUnarchiveCollision = useCallback(async () => {
     if (!archivedCollision) return;
     setUnarchiving(true);
     try {
@@ -236,7 +248,21 @@ export default function CreateChannelDialog({
     } finally {
       setUnarchiving(false);
     }
-  };
+  }, [archivedCollision, unarchiveChannel, onClose, nav, formatMessage]);
+
+  const handleChangeCollidingName = useCallback(() => {
+    setArchivedCollision(null);
+    setName("");
+  }, []);
+  const handleNameChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => setName(e.target.value), []);
+  const handleDescriptionChange = useCallback(
+    (e: React.ChangeEvent<HTMLTextAreaElement>) => setDescription(e.target.value),
+    [],
+  );
+  const handleMemberSearchChange = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => setMemberSearch(e.target.value),
+    [],
+  );
 
   const hasMembers = memberSearchEntries.length > 0;
 
@@ -244,91 +270,84 @@ export default function CreateChannelDialog({
     <DialogCard title={formatMessage({ id: "channel.create.title" })} onClose={onClose}>
         <form onSubmit={handleSubmit} className="space-y-4">
           {atLimit && (
-            <Banner intent="warning" className="font-bold">
+            <Banner intent="warning">
               {formatMessage(
                 { id: "channel.create.limitReached" },
                 { used: channels.length, max: maxChannels, plan: PLAN_CONFIG[plan].displayName },
               )}{" "}
-              <button
-                type="button"
-                onClick={() => {
-                  onClose();
-                  nav.toSettings("billing");
-                }}
-                className="font-bold text-black underline"
+              <TextLink
+                variant="primary"
+                onClick={openBillingSettings}
               >
                 {formatMessage({ id: "channel.create.upgradeForMore" })}
-              </button>
+              </TextLink>
             </Banner>
           )}
           {error && !atLimit && (
-            <Banner intent="warning" className="font-bold">
+            <Banner intent="warning">
               {error}
             </Banner>
           )}
           {archivedCollision && (
-            <Banner intent="warning" className="space-y-2">
-              <p className="font-bold">
-                {formatMessage(
-                  { id: "channel.create.archivedNameHeld" },
-                  {
-                    name: archivedCollision.archivedChannelName,
-                    // <name> keeps the mono styling INSIDE the message so translators
-                    // can move it. Splitting the sentence around a bare <span> is
-                    // exactly what hid this string from both scanners.
-                    mono: (chunks: React.ReactNode) => (
-                      <span key="archived-name" className="font-mono">{chunks}</span>
-                    ),
-                  },
-                )}
-              </p>
-              <p className="text-xs text-black/70">
-                {formatMessage({
-                  id: archivedCollision.canUnarchiveArchivedChannel
-                    ? "channel.create.archivedCanManage"
-                    : "channel.create.archivedCannotManage",
-                })}
-              </p>
-              <div className="flex flex-wrap gap-2">
-                {archivedCollision.canUnarchiveArchivedChannel && (
-                  <button
+            <Banner
+              intent="warning"
+              title={formatMessage(
+                { id: "channel.create.archivedNameHeld" },
+                {
+                  name: archivedCollision.archivedChannelName,
+                  // <name> keeps the mono styling INSIDE the message so translators
+                  // can move it. Splitting the sentence around a bare <span> is
+                  // exactly what hid this string from both scanners.
+                  mono: (chunks: React.ReactNode) => (
+                    <span key="archived-name" className="font-mono">{chunks}</span>
+                  ),
+                },
+              )}
+              actions={(
+                <>
+                  {archivedCollision.canUnarchiveArchivedChannel && (
+                    <Button size="sm"
+                      variant="outline"
+                      type="button"
+                      onClick={handleUnarchiveCollision}
+                      disabled={unarchiving}
+                    >
+                      {unarchiving ? formatMessage({ id: "channel.create.unarchiving" }) : formatMessage({ id: "channel.create.unarchive" })}
+                    </Button>
+                  )}
+                  <Button size="sm"
+                    variant="ghost"
                     type="button"
-                    onClick={handleUnarchiveCollision}
-                    disabled={unarchiving}
-                    className="btn-brutal-sm bg-brutal-lime px-2 py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
+                    onClick={handleChangeCollidingName}
                   >
-                    {unarchiving ? formatMessage({ id: "channel.create.unarchiving" }) : formatMessage({ id: "channel.create.unarchive" })}
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={() => {
-                    setArchivedCollision(null);
-                    setName("");
-                  }}
-                  className="btn-brutal-sm bg-white px-2 py-1 text-xs"
-                >
-                  {formatMessage({ id: "channel.create.changeName" })}
-                </button>
-              </div>
+                    {formatMessage({ id: "channel.create.changeName" })}
+                  </Button>
+                </>
+              )}
+            >
+              {formatMessage({
+                id: archivedCollision.canUnarchiveArchivedChannel
+                  ? "channel.create.archivedCanManage"
+                  : "channel.create.archivedCannotManage",
+              })}
             </Banner>
           )}
           <FormField label={formatMessage({ id: "channel.create.nameLabel" })} required>
-            <input
+            <Input
               type="text"
               value={name}
-              onChange={(e) => setName(e.target.value)}
-              className="input-brutal w-full"
+              onChange={handleNameChange}
+              className="w-full"
               placeholder={formatMessage({ id: "channel.create.namePlaceholder" })}
               required
               autoFocus
             />
           </FormField>
           <FormField label={formatMessage({ id: "channel.create.descriptionLabel" })} optional>
-            <textarea
+            <Textarea
               value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              className="input-brutal w-full"
+              onChange={handleDescriptionChange}
+              className="w-full"
               placeholder={formatMessage({ id: "channel.create.descriptionPlaceholder" })}
               rows={2}
             />
@@ -340,11 +359,11 @@ export default function CreateChannelDialog({
               aria-label={formatMessage({ id: "channel.create.visibilityAriaLabel" })}
             >
               <SegmentedControlItem value="public">
-                <Hash size={12} />
+                <Hash size={16} aria-hidden="true" />
                 <SegmentedControlLabel>{formatMessage({ id: "channel.create.public" })}</SegmentedControlLabel>
               </SegmentedControlItem>
               <SegmentedControlItem value="private">
-                <Lock size={12} />
+                <Lock size={16} aria-hidden="true" />
                 <SegmentedControlLabel>{formatMessage({ id: "channel.create.private" })}</SegmentedControlLabel>
               </SegmentedControlItem>
             </SegmentedControl>
@@ -352,22 +371,25 @@ export default function CreateChannelDialog({
           <FormField label={formatMessage({ id: "channel.create.membersLabel" })} optional>
             {hasMembers ? (
               <div className="space-y-2">
-                <div className="relative">
-                  <Search size={14} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-black/40" />
-                  <input
+                <InputGroup>
+                  <InputGroupAddon align="inline-start">
+                    <Search aria-hidden="true" />
+                  </InputGroupAddon>
+                  <InputGroupInput
                     type="text"
                     value={memberSearch}
-                    onChange={(e) => setMemberSearch(e.target.value)}
-                    className="input-brutal input-member-search w-full pl-9"
+                    onChange={handleMemberSearchChange}
                     placeholder={formatMessage({ id: "channel.create.membersSearchPlaceholder" })}
                   />
-                </div>
+                </InputGroup>
 
-                <div className="border-2 border-black bg-white shadow-brutal-sm max-h-48 overflow-y-auto">
+                {/* A multi-select list (DS Select, multiple): grouped by kind, a
+                    check box per option (checked = ink), menu-row hover. */}
+                <Card className="max-h-48 overflow-y-auto p-1.5">
                   {/* Agents section */}
                   {filteredAgents.length > 0 && (
                     <>
-                      <SectionEyebrow as="div" className="px-3 py-1.5 bg-white/50">
+                      <SectionEyebrow as="div" className={PICKER_GROUP_LABEL_CLASS}>
                         {formatMessage({ id: "channel.create.agents" })}
                       </SectionEyebrow>
                       {filteredAgents.map((agent) => {
@@ -377,13 +399,11 @@ export default function CreateChannelDialog({
                             key={agent.id}
                             type="button"
                             onClick={() => toggleAgent(agent.id)}
-                            className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm font-medium text-black transition-colors ${
-                              selected ? "bg-brutal-pink/20" : "hover:bg-soft-signal"
-                            }`}
+                            className={PICKER_ROW_CLASS}
                           >
+                            <CheckboxIndicator checked={selected} />
                             <AvatarSlot context="sidebar-list" type="agent" agentAvatarUrl={agent.avatarUrl} />
-                            <span className="flex-1 text-left truncate">{agent.displayName || agent.name}</span>
-                            {selected && <Check size={14} className="shrink-0 text-brutal-pink" />}
+                            <span className="min-w-0 flex-1 truncate">{agent.displayName || agent.name}</span>
                           </button>
                         );
                       })}
@@ -393,7 +413,7 @@ export default function CreateChannelDialog({
                   {/* Humans section */}
                   {filteredHumans.length > 0 && (
                     <>
-                      <SectionEyebrow as="div" className="px-3 py-1.5 bg-white/50">
+                      <SectionEyebrow as="div" className={PICKER_GROUP_LABEL_CLASS}>
                         {formatMessage({ id: "channel.create.humans" })}
                       </SectionEyebrow>
                       {filteredHumans.map((human) => {
@@ -403,13 +423,11 @@ export default function CreateChannelDialog({
                             key={human.userId}
                             type="button"
                             onClick={() => toggleHuman(human.userId)}
-                            className={`flex w-full items-center gap-2 px-3 py-1.5 text-sm font-medium text-black transition-colors ${
-                              selected ? "bg-brutal-pink/20" : "hover:bg-soft-signal"
-                            }`}
+                            className={PICKER_ROW_CLASS}
                           >
+                            <CheckboxIndicator checked={selected} />
                             <AvatarSlot context="sidebar-list" type="human" humanPlaceholder />
-                            <span className="flex-1 text-left truncate">{human.displayName || human.name}</span>
-                            {selected && <Check size={14} className="shrink-0 text-brutal-pink" />}
+                            <span className="min-w-0 flex-1 truncate">{human.displayName || human.name}</span>
                           </button>
                         );
                       })}
@@ -417,33 +435,40 @@ export default function CreateChannelDialog({
                   )}
 
                   {!hasFilteredMembers && (
-                    <div className="px-3 py-4 text-sm text-black/50 font-mono text-center">
+                    <div className="px-2.5 py-2 text-callout text-foreground-hint">
                       {formatMessage({ id: "channel.create.noMatchesFor" }, { query: memberSearch.trim() })}
                     </div>
                   )}
-                </div>
+                </Card>
               </div>
             ) : (
-              <div className="text-sm text-black/50 font-mono">{formatMessage({ id: "channel.create.noMembersAvailable" })}</div>
+              <div className="text-callout text-foreground-hint">{formatMessage({ id: "channel.create.noMembersAvailable" })}</div>
             )}
           </FormField>
-          <ChannelSlackBridgeField editor={bridgeEditor} visibility={visibility} disabled={submitting || !!createdChannelForBridge} />
-          <div className="flex justify-end gap-3">
-            <button
+          {bridgeEditor.available && (
+            <div>
+              <Separator />
+              <ChannelSlackBridgeField editor={bridgeEditor} visibility={visibility} disabled={submitting || !!createdChannelForBridge} className="pb-0" />
+            </div>
+          )}
+          {/* DS Dialog actions: Cancel is ghost on the left, the one pink
+              button (Create Channel) on the right. */}
+          <div className="flex flex-wrap justify-end gap-2 pt-1">
+            <Button size="lg"
+              variant="ghost"
               type="button"
               onClick={onClose}
               disabled={submitting}
-              className="btn-brutal bg-white px-4 py-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {formatMessage({ id: "settings.common.cancel" })}
-            </button>
-            <button
+            </Button>
+            <Button size="lg"
+              variant="accent"
               type="submit"
               disabled={atLimit || submitting}
-              className="btn-brutal bg-brutal-pink px-4 py-2 text-sm disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {submitting ? formatMessage({ id: "channel.create.creating" }) : formatMessage({ id: "channel.create.title" })}
-            </button>
+            </Button>
           </div>
         </form>
     </DialogCard>

@@ -51,14 +51,15 @@ const FREE_INCLUDED_FEATURES: MessageId[] = [
 ];
 
 const FREE_NOT_INCLUDED_FEATURES: MessageId[] = [
+  "billing.agentMigration",
   "billing.higherFileUploadLimits",
   "billing.unlimitedMessageHistory",
-  "billing.unlimitedJointChannels",
   "billing.moreProfessionalFeaturesComingSoon",
 ];
 
 const PRO_INCLUDED_FEATURES: MessageId[] = [
   "billing.everythingInFree",
+  "billing.agentMigration",
   "billing.unlimitedMessageHistory",
   "billing.higherFileUploadLimits",
   "billing.unlimitedJointChannels",

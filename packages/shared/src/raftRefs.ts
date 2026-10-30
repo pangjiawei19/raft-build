@@ -1,14 +1,59 @@
+import { markdownStructure, visitOutsideRanges } from "./markdownRanges";
 export const RAFT_REF_CHANNEL_NAME_PATTERN = String.raw`[\p{L}\p{N}_-]+`;
 export const RAFT_REF_USER_NAME_PATTERN = RAFT_REF_CHANNEL_NAME_PATTERN;
 // Built-in app conversations use dotted peer names. Keep this a literal
 // peer-name grammar (not a path/glob): dots are the only addition to the
 // existing word/hyphen alphabet.
-export const RAFT_REF_DM_PEER_PATTERN = String.raw`[\w.-]+`;
+// A DM peer may carry an explicit kind (`skyzh~agent`, see dmPeerRef.ts) when a
+// human and an agent in one server share a name.
+export const RAFT_REF_DM_PEER_PATTERN = String.raw`[\w.-]+(?:~(?:agent|human))?(?![\w.~-])`;
 export const RAFT_REF_THREAD_SHORT_ID_PATTERN = String.raw`[\da-f]{6,8}`;
 export const RAFT_REF_MESSAGE_ID_PATTERN = String.raw`[A-Za-z0-9][A-Za-z0-9-]{1,63}`;
 export const RAFT_REF_TASK_NUMBER_PATTERN = String.raw`[1-9]\d*`;
 export const RAFT_REF_COMPUTER_ID_PATTERN = String.raw`[\da-f]{8}-[\da-f]{4}-[1-5][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}`;
 export const RAFT_REF_APP_ID_PATTERN = String.raw`[a-z][a-z0-9]*(?:\.[a-z][a-z0-9]*)+`;
+
+// Han, kana and hangul may follow a handle directly: CJK writing puts particles
+// and suffixes (`@ops的`, `@opsさん`, `@ops와`) against the name without a
+// space. Latin letters, digits, `_` and `-` still continue the handle.
+const RAFT_MENTION_CJK_SUFFIX_START = String.raw`[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]`;
+const RAFT_MENTION_CJK_SUFFIX_START_RE = new RegExp(`^${RAFT_MENTION_CJK_SUFFIX_START}`, "u");
+const RAFT_MENTION_NON_CJK_HANDLE_END_RE = /[\p{Script=Latin}\p{N}_-]$/u;
+
+/**
+ * Resolve a free-text mention token against known handles.
+ *
+ * An exact match wins. Otherwise the token is split only where the writing
+ * system changes: a Latin/digit/`_`/`-` character followed by Han, kana or
+ * hangul. Nothing is guessed inside one script, so `@opsteam` never reaches
+ * `ops` and a CJK handle with a glued particle (`@민수가`) stays unresolved;
+ * the composer's identity-backed mention covers that case. If the split point
+ * is a guess (two valid splits both name members, or a longer member name is
+ * also a prefix of the token), the token stays unresolved.
+ */
+export function resolveRaftMentionHandle(
+  token: string,
+  isKnownHandle: (handle: string) => boolean,
+): { handle: string; suffix: string } | null {
+  if (isKnownHandle(token)) return { handle: token, suffix: "" };
+  const chars = Array.from(token);
+  const splits = [];
+  for (let length = 1; length < chars.length; length += 1) {
+    const handle = chars.slice(0, length).join("");
+    const suffix = chars.slice(length).join("");
+    if (!RAFT_MENTION_NON_CJK_HANDLE_END_RE.test(handle)) continue;
+    if (!RAFT_MENTION_CJK_SUFFIX_START_RE.test(suffix)) continue;
+    if (isKnownHandle(handle)) splits.push({ length, handle, suffix });
+  }
+  // `ops` and `ops君a` for `@ops君a的`: two members fit, so the split is a guess.
+  if (splits.length !== 1) return null;
+  const [{ length, handle, suffix }] = splits;
+  // A longer member name also fits (`ops` and `ops君` for `@ops君的`).
+  for (let longer = length + 1; longer < chars.length; longer += 1) {
+    if (isKnownHandle(chars.slice(0, longer).join(""))) return null;
+  }
+  return { handle, suffix };
+}
 
 export function createRaftUserRefRegex(): RegExp {
   return new RegExp(`(^|[^\\p{L}\\p{N}_-])@(${RAFT_REF_USER_NAME_PATTERN})`, "gu");
@@ -18,7 +63,9 @@ export function createRaftUserRefRegex(): RegExp {
  * Match one identity-backed mention that the composer already resolved.
  *
  * Unlike free-text discovery, this intentionally has no left boundary: a
- * selected mention remains an entity in `草案@Mona` or `draft@Mona`. The
+ * selected mention remains an entity in `草案@Mona` or `draft@Mona`. On the
+ * right it may be followed by Han, kana or hangul (`@Mona的`), but not by
+ * Latin letters, digits, `_` or `-`. The
  * caller must already hold structured identity metadata for `handle`; using
  * this regex to discover mentions in arbitrary text would turn emails and
  * package-like strings into accidental notifications.
@@ -26,7 +73,7 @@ export function createRaftUserRefRegex(): RegExp {
 export function createRaftStructuredUserRefRegex(handle: string): RegExp | null {
   if (!new RegExp(`^${RAFT_REF_USER_NAME_PATTERN}$`, "u").test(handle)) return null;
   const escapedHandle = handle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  return new RegExp(`@${escapedHandle}(?![\\p{L}\\p{N}_-])`, "gu");
+  return new RegExp(`@${escapedHandle}(?!(?!${RAFT_MENTION_CJK_SUFFIX_START})[\\p{L}\\p{N}_-])`, "gu");
 }
 
 export function createRaftChannelThreadRefRegex(): RegExp {
@@ -43,6 +90,16 @@ export function createRaftDmThreadRefRegex(): RegExp {
 
 export function createRaftDmRefRegex(): RegExp {
   return new RegExp(`dm:@(${RAFT_REF_DM_PEER_PATTERN})`, "giu");
+}
+
+/**
+ * A `dm:@name~<suffix>` token whose suffix is not a known peer kind
+ * (`~bot`, `~agentXYZ`, a bare `~`). Renderers claim it as plain text so it
+ * never degrades into a link to a different target (`dm:@name` or `@name`).
+ * Run after the valid DM passes; it also matches valid refs.
+ */
+export function createRaftMalformedDmKindRefRegex(): RegExp {
+  return new RegExp(String.raw`dm:@[\w.-]+~[\w.~-]*(?::${RAFT_REF_THREAD_SHORT_ID_PATTERN})?`, "giu");
 }
 
 export function createRaftMessageRefRegex(): RegExp {
@@ -221,173 +278,91 @@ export interface ExtractRaftRefTargetsOptions {
   includeMarkdownCode?: boolean;
 }
 
-interface MarkdownCodeSpan {
-  start: number;
-  end: number;
-}
-
-function markdownCodeSpans(source: string): MarkdownCodeSpan[] {
-  const spans: MarkdownCodeSpan[] = [];
-  const fenced = /```[\s\S]*?```/g;
-  for (const match of source.matchAll(fenced)) {
-    spans.push({ start: match.index ?? 0, end: (match.index ?? 0) + match[0].length });
-  }
-
-  // FIX A -- scan for inline code only OUTSIDE the fenced regions.
-  //
-  // Previously the inline pass ran over the whole source and kept any match not
-  // WHOLLY inside a fence. A fence's closing backticks and the opening backtick
-  // of a following wrapped name therefore paired into a span straddling the
-  // fence boundary. That is the commonest shape we write -- a code block, then
-  // a backtick-wrapped name -- and the straddle made every consumer's forward
-  // cursor skip past the wrapped name into prose, so it was extracted and, on
-  // the delivery face, actually paged the person (probe c548d35f; the same
-  // message without the fence, 48ca364e, did not page).
-  //
-  // Discarding straddling matches after the fact is NOT enough: matchAll has
-  // already consumed the real name's opening backtick, so its true span is
-  // never found and the name still lands in prose. The scan itself has to be
-  // confined to the gaps between fences.
-  const fences = [...spans];
-  const scanInline = (from: number, to: number) => {
-    if (from >= to) return;
-    const segment = source.slice(from, to);
-    for (const match of segment.matchAll(/``[^`]+``|`[^`]+`/g)) {
-      const start = from + (match.index ?? 0);
-      spans.push({ start, end: start + match[0].length });
-    }
-  };
-  let cursor = 0;
-  for (const fence of fences) {
-    scanInline(cursor, fence.start);
-    cursor = fence.end;
-  }
-  scanInline(cursor, source.length);
-
-  return spans.sort((a, b) => a.start - b.start);
-}
-
+/**
+ * Run `replacer` over every stretch of `source` outside markdown code, as the
+ * markdown parser sees it (task #762: `~~~` fences, longer backtick runs and
+ * unclosed fences included), and return the reassembled text. Code is copied
+ * through unchanged.
+ */
 export function replaceOutsideMarkdownCode(
   source: string,
   replacer: (chunk: string) => string,
 ): string {
-  const spans = markdownCodeSpans(source);
-  if (spans.length === 0) return replacer(source);
-
   let output = "";
   let cursor = 0;
-  for (const span of spans) {
-    // FIX B -- tolerate ranges that overlap or trail the cursor.
-    //
-    // Independent of FIX A: this walk assumed the ranges were disjoint and
-    // ascending, so a straddling range re-emitted [span.start, cursor) -- text
-    // already written -- and skipped the replacer for it.
-    //
-    // The two fixes are NOT equivalent, and an earlier draft of this comment
-    // said they were. Measured per-fix (@Huaihuai, four-cell matrix):
-    //
-    //   variant   extraction (S1)          identity (duplication)
-    //   neither   leaks                    broken
-    //   A only    clean                    ok
-    //   B only    LEAKS                    ok
-    //   both      clean                    ok
-    //
-    // So A alone closes both the leak and the duplication; B alone closes only
-    // the duplication.
-    //
-    // What each deletion would cost, also measured -- and the asymmetry is the
-    // opposite of what you would guess:
-    //
-    //   drop A, keep B  =>  S1 goes red      => the criteria CATCH it
-    //                       (harmful, but detectable)
-    //   drop B, keep A  =>  both faces green => the criteria MISS it
-    //                       (undetectable, and harmless today)
-    //
-    // The harmful deletion is the detectable one. So B is not here to prevent a
-    // regression -- S1 already does that. B is here so that the depth survives:
-    // it keeps the walk independent of whether ranges overlap, which is the
-    // margin that matters only if A itself ever regresses. That kind of value
-    // is the easiest thing to delete during a tidy-up, because by definition it
-    // produces no signal while everything is working.
-    if (span.end <= cursor) continue;
-    const start = span.start > cursor ? span.start : cursor;
-    if (start > cursor) output += replacer(source.slice(cursor, start));
-    output += source.slice(start, span.end);
-    cursor = span.end;
-  }
-  if (cursor < source.length) output += replacer(source.slice(cursor));
-  return output;
+  visitOutsideRanges(source, markdownStructure(source).code, (chunk, offset) => {
+    output += source.slice(cursor, offset) + replacer(chunk);
+    cursor = offset + chunk.length;
+  });
+  return output + source.slice(cursor);
 }
 
-function visitMarkdownProseChunks(
+/** Visit each stretch of `source` outside markdown code, with its offset. */
+export function visitOutsideMarkdownCode(
   source: string,
   visitor: (chunk: string, offset: number) => void,
 ) {
-  const spans = markdownCodeSpans(source);
-  if (spans.length === 0) {
-    visitor(source, 0);
-    return;
-  }
+  visitOutsideRanges(source, markdownStructure(source).code, visitor);
+}
 
-  let cursor = 0;
-  for (const span of spans) {
-    // FIX B (same defect, second consumer). Here a straddling range silently
-    // swallowed prose instead of duplicating it -- the visitor was never
-    // called for it -- so the failure was invisible rather than visible.
-    if (span.end <= cursor) continue;
-    const start = span.start > cursor ? span.start : cursor;
-    if (start > cursor) visitor(source.slice(cursor, start), cursor);
-    cursor = span.end;
+// A bare URL the parser did not link (glued to a word, e.g. `seehttps://…`)
+// is still a link on the web (remarkAutolinkBareUrls), so its `@` is not a
+// mention either.
+const BARE_URL_PATTERN = /https?:\/\/[^\s<>]+/g;
+
+/**
+ * Visit the text where an `@handle` is a mention: outside code and outside
+ * links, the same places the web renders mention chips (task #762). Labels
+ * and URLs of links are not mentions; a link whose destination is a user ref
+ * (`[label](<@dave>)`, `<@dave>` as an autolink) is reported as that handle.
+ */
+function visitMentionProse(
+  source: string,
+  visitText: (chunk: string) => void,
+  visitLinkedHandle: (handle: string) => void,
+) {
+  const { code, links } = markdownStructure(source);
+  visitOutsideRanges(source, [...code, ...links], (chunk) => {
+    visitText(chunk.replace(/\\<@[\p{L}\p{N}_-]+>/gu, "").replace(BARE_URL_PATTERN, " "));
+  });
+  for (const link of links) {
+    if (!link.angleBracketed) continue;
+    const target = parseRaftRefTarget(link.url);
+    if (target?.kind === "user") visitLinkedHandle(target.name);
   }
-  if (cursor < source.length) visitor(source.slice(cursor), cursor);
 }
 
 export function extractRaftMentionHandles(source: string): string[] {
   const handles = new Set<string>();
-
-  replaceOutsideMarkdownCode(source, (chunk) => {
-    const withoutEscapedAngleRefs = chunk.replace(/\\<@[\p{L}\p{N}_-]+>/gu, "");
-    const withoutResourceRefLabels = withoutEscapedAngleRefs.replace(
-      /\[((?:\\.|[^\]\\])*)\]\(<([^<>\n]+)>\)/g,
-      (match, _label: string, rawTarget: string) => {
-        const target = parseRaftRefTarget(rawTarget);
-        return target?.kind === "computer" || target?.kind === "app" ? "" : match;
-      },
-    );
-    for (const match of withoutResourceRefLabels.matchAll(createRaftUserRefRegex())) {
-      handles.add(match[2]);
-    }
-    return chunk;
-  });
-
+  visitMentionProse(
+    source,
+    (chunk) => {
+      for (const match of chunk.matchAll(createRaftUserRefRegex())) handles.add(match[2]);
+    },
+    (handle) => handles.add(handle),
+  );
   return [...handles];
 }
 
 /**
  * Whether an already-selected structured mention still has an exact visible
- * token in the authored message. Code spans/blocks and typed resource-ref
- * labels stay non-mention surfaces, matching free-text extraction.
+ * token in the authored message. Code, link labels and URLs stay non-mention
+ * surfaces, matching free-text extraction and the web's mention chips.
  */
 export function structuredRaftMentionStillAppears(source: string, handle: string): boolean {
   const mentionRegex = createRaftStructuredUserRefRegex(handle);
   if (!mentionRegex) return false;
   let appears = false;
-
-  replaceOutsideMarkdownCode(source, (chunk) => {
-    if (appears) return chunk;
-    const withoutEscapedAngleRefs = chunk.replace(/\\<@[\p{L}\p{N}_-]+>/gu, "");
-    const withoutResourceRefLabels = withoutEscapedAngleRefs.replace(
-      /\[((?:\\.|[^\]\\])*)\]\(<([^<>\n]+)>\)/g,
-      (match, _label: string, rawTarget: string) => {
-        const target = parseRaftRefTarget(rawTarget);
-        return target?.kind === "computer" || target?.kind === "app" ? "" : match;
-      },
-    );
-    mentionRegex.lastIndex = 0;
-    appears = mentionRegex.test(withoutResourceRefLabels);
-    return chunk;
-  });
-
+  visitMentionProse(
+    source,
+    (chunk) => {
+      mentionRegex.lastIndex = 0;
+      if (mentionRegex.test(chunk)) appears = true;
+    },
+    (linked) => {
+      if (linked === handle) appears = true;
+    },
+  );
   return appears;
 }
 
@@ -471,6 +446,9 @@ function extractRaftRefTargetsFromChunk(
     );
     occupy(match);
   }
+  for (const match of chunk.matchAll(createRaftMalformedDmKindRefRegex())) {
+    if (!isInsideOccupied(match)) occupy(match);
+  }
   for (const match of chunk.matchAll(createRaftChannelThreadRefRegex())) {
     if (isInsideOccupied(match)) continue;
     collectParsedRef(
@@ -536,7 +514,7 @@ export function extractRaftRefTargets(
   if (options.includeMarkdownCode) {
     collectChunk(source, 0);
   } else {
-    visitMarkdownProseChunks(source, collectChunk);
+    visitOutsideMarkdownCode(source, collectChunk);
   }
 
   return [...refs.values()].sort((a, b) => a.start - b.start || a.end - b.end);

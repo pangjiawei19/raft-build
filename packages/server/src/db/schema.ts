@@ -1,7 +1,11 @@
-import { pgTable, text, timestamp, integer, bigint, bigserial, uuid, primaryKey, unique, uniqueIndex, index, json, jsonb, boolean, customType, check, date, foreignKey } from "drizzle-orm/pg-core";
+import type { ActivityTurnSummary, AnnouncementAudience, AnnouncementAudienceSnapshot, AnnouncementContent, MentionDeliveryTerminalDecision } from "@botiverse/raft-shared";
+import { pgTable, text, timestamp, integer, bigint, bigserial, uuid, primaryKey, unique, uniqueIndex, index, json, jsonb, boolean, customType, check, date, foreignKey, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { randomUUID } from "node:crypto";
 import type {
+  AgentMigrationHostedImportLimits,
+  AgentMigrationHostedImportSummary,
+  AgentMigrationSourceBuildProgress,
   AgentMigrationTransferSummary,
   AgentRuntimeErrorState,
   AgentMessage,
@@ -92,10 +96,26 @@ export const users = pgTable("users", {
   // that same login family while allowing them on the next login.
   firstOnboardingCompletedAt: timestamp("first_onboarding_completed_at", { withTimezone: true }),
   firstOnboardingCompletedSessionFamilyId: uuid("first_onboarding_completed_session_family_id"),
+  // RFC-067 §3.6 product-analytics controls, read only through
+  // services/productAnalyticsGate.ts. Opting out deletes the user's
+  // user_analytics_ids row; this column records the choice.
+  analyticsOptedOutAt: timestamp("analytics_opted_out_at", { withTimezone: true }),
+  // "Share usage data" (client events). null = not chosen; the regional
+  // default is pending legal review (RFC-067 §9.4) and is off until then.
+  shareUsageData: boolean("share_usage_data"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  // The only user identifier traces carry (as `trace_user_id`): random, not
+  // derivable from `id`. Traces are kept indefinitely, so retiring or deleting an
+  // account rotates this value (never clears it); the old value then matches no
+  // one.
+  traceUserId: uuid("trace_user_id").notNull().defaultRandom(),
 }, (table) => [
   uniqueIndex("idx_users_name_exact_unique").on(table.name),
+  // Traces carry only trace_user_id; mapping one back to a user is a lookup on
+  // this column. Random, so unique by construction; the index makes duplicates
+  // impossible and the reverse lookup one probe.
+  uniqueIndex("idx_users_trace_user_id_unique").on(table.traceUserId),
   check(
     "users_timezone_observation_consistent",
     sql`(
@@ -124,6 +144,17 @@ export const users = pgTable("users", {
     )`,
   ),
 ]);
+
+// RFC-067 §3.4: each user's random product-analytics id. Product tables
+// (ScopeDB) store only analytics_id; deleting this row makes them unlinkable.
+// It must stay random and stored (never derived from the user id). Rows are
+// created by the users insert trigger (migration 0321) and removed on opt-out;
+// the derivation job maps ids in memory through productAnalyticsGate.
+export const userAnalyticsIds = pgTable("user_analytics_ids", {
+  userId: uuid("user_id").primaryKey().references(() => users.id, { onDelete: "cascade" }),
+  analyticsId: uuid("analytics_id").notNull().unique(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export const userAuthIdentities = pgTable("user_auth_identities", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
@@ -208,7 +239,7 @@ export const socialAuthCompletions = pgTable("social_auth_completions", {
   mode: text("mode", { enum: ["login", "link"] }).notNull(),
   intendedAction: text("intended_action", { enum: ["login", "link"] }).notNull(),
   status: text("status", {
-    enum: ["pending_provider", "provider_processing", "provider_completed", "completed", "failed", "expired"],
+    enum: ["pending_provider", "provider_processing", "provider_completed", "pending_link", "completed", "failed", "expired"],
   }).notNull().default("provider_completed"),
   codeChallenge: text("code_challenge"),
   userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
@@ -227,6 +258,29 @@ export const socialAuthCompletions = pgTable("social_auth_completions", {
 ]);
 
 export const oauthTransactions = socialAuthCompletions;
+
+/**
+ * App login handoff: a native app (HarmonyOS first) opens the ordinary web
+ * login, the signed-in web user confirms, and the app exchanges a one-time
+ * code plus its PKCE verifier for a normal user session. Not an OAuth
+ * transaction: no provider, no provider callback.
+ */
+export const appLoginRequests = pgTable("app_login_requests", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  codeChallenge: text("code_challenge").notNull(),
+  returnUri: text("return_uri").notNull(),
+  status: text("status", { enum: ["pending", "approved", "denied", "completed"] }).notNull().default("pending"),
+  userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
+  codeHash: text("code_hash"),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  approvedAt: timestamp("approved_at", { withTimezone: true }),
+  consumedAt: timestamp("consumed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("idx_app_login_requests_code_hash").on(table.codeHash),
+  index("idx_app_login_requests_expires_at").on(table.expiresAt),
+  check("app_login_requests_status_check", sql`${table.status} IN ('pending', 'approved', 'denied', 'completed')`),
+]);
 
 export const userLegalAcceptances = pgTable("user_legal_acceptances", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
@@ -262,13 +316,32 @@ export const servers = pgTable("servers", {
   // (@cindyz, hard requirement 2). Already-downloaded content and a query that passed its check
   // cannot be revoked; the contract deliberately does not pretend otherwise.
   publiclyVisible: boolean("publicly_visible").notNull().default(false),
+  // Task #74. This is a separate admission decision from public reading. A
+  // public server remains read-only unless its owner explicitly enables this.
+  // The database constraint below prevents a latent join permission surviving
+  // while public visibility is off and unexpectedly reviving later.
+  publicGuestJoinEnabled: boolean("public_guest_join_enabled").notNull().default(false),
+  // Public server SEO (#proj-public-server-seo). Whether a public server's
+  // pages may be indexed on raft.build. Reading stays governed by
+  // publiclyVisible; this only decides search indexing. Default true, but
+  // nothing is exposed by the default alone: the indexing master switch
+  // (public_server_search_index_v0) stays closed until owners are notified.
+  publicSearchEnabled: boolean("public_search_enabled").notNull().default(true),
   plan: text("plan", { enum: ["free", "founder", "partner", "pro"] }).notNull().default("free"),
   translationEnabled: boolean("translation_enabled").notNull().default(false),
+  // RFC-067 §3.6: the owner's workspace-wide product-analytics switch. When
+  // false, nobody's activity in this server is linked to an analytics_id.
+  productAnalyticsEnabled: boolean("product_analytics_enabled").notNull().default(true),
   planDowngradedAt: timestamp("plan_downgraded_at", { withTimezone: true }),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-});
+}, (table) => [
+  check(
+    "servers_public_guest_join_requires_visibility",
+    sql`NOT ${table.publicGuestJoinEnabled} OR ${table.publiclyVisible}`,
+  ),
+]);
 
 // Server members — user ↔ server relationship
 export const serverMembers = pgTable("server_members", {
@@ -318,6 +391,10 @@ export const serverMembers = pgTable("server_members", {
   onboardingOwnerOpenerV2MessageIds: json("onboarding_owner_opener_v2_message_ids").$type<string[]>().notNull().default([]),
   onboardingOwnerOpenerV2Version: text("onboarding_owner_opener_v2_version"),
   onboardingOwnerOpenerV2Topics: json("onboarding_owner_opener_v2_topics").$type<string[]>().notNull().default([]),
+  // One sender at a time: a trigger claims the opener before briefing and
+  // posting it, so concurrent entry points cannot send it twice. A claim older
+  // than the lease (a sender that died) can be taken over.
+  onboardingOwnerOpenerClaimedAt: timestamp("onboarding_owner_opener_claimed_at", { withTimezone: true }),
   crossChannelHintShownAt: timestamp("cross_channel_hint_shown_at", { withTimezone: true }),
   allChannelUnlockInstructionSentAt: timestamp("all_channel_unlock_instruction_sent_at", { withTimezone: true }),
   sidebarChannelOrder: json("sidebar_channel_order").$type<string[]>(),
@@ -499,6 +576,10 @@ export const featureFlags = pgTable("feature_flags", {
   defaultEnabled: boolean("default_enabled").notNull().default(false),
   defaultVariant: text("default_variant"),
   salt: text("salt").notNull(),
+  // Task #205: the flag may be read before login through GET /api/public/feature-flags. Only its
+  // kill switch, enabled bit, platform rules and default decide the answer there; no identity rule
+  // can match without a user or server.
+  preAuthEvaluable: boolean("pre_auth_evaluable").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
@@ -529,18 +610,25 @@ export const featureFlagAudienceMembers = pgTable("feature_flag_audience_members
 export const featureFlagRules = pgTable("feature_flag_rules", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   flagKey: text("flag_key").notNull().references(() => featureFlags.key, { onDelete: "cascade" }),
-  stage: text("stage", { enum: ["user", "platform", "server", "audience", "lab", "plan", "percentage"] }).notNull(),
+  stage: text("stage", { enum: ["user", "platform", "client", "server", "audience", "lab", "plan", "percentage"] }).notNull(),
   priority: integer("priority").notNull().default(0),
   decision: text("decision", { enum: ["allow", "deny"] }).notNull(),
   values: jsonb("values").$type<string[]>().notNull().default(sql`'[]'::jsonb`),
   percentageBasisPoints: integer("percentage_basis_points"),
   variant: text("variant"),
+  // `client` stage only (task #1144): the rule additionally requires the client's OS / build type to be
+  // listed and its build number to be >= min_client_build (each only when set). Other stages must leave
+  // all three NULL (CHECK below), so an evaluator that does not know the `client` stage can only skip
+  // these constraints, never drop them.
+  clientOs: jsonb("client_os").$type<string[]>(),
+  minClientBuild: integer("min_client_build"),
+  clientBuildTypes: jsonb("client_build_types").$type<string[]>(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   index("idx_feature_flag_rules_flag").on(t.flagKey),
   index("idx_feature_flag_rules_flag_stage_priority").on(t.flagKey, t.stage, t.priority),
-  check("feature_flag_rules_stage_valid", sql`${t.stage} IN ('user', 'platform', 'server', 'audience', 'lab', 'plan', 'percentage')`),
+  check("feature_flag_rules_stage_valid", sql`${t.stage} IN ('user', 'platform', 'client', 'server', 'audience', 'lab', 'plan', 'percentage')`),
   check("feature_flag_rules_decision_valid", sql`${t.decision} IN ('allow', 'deny')`),
   check(
     "feature_flag_rules_percentage_valid",
@@ -553,6 +641,26 @@ export const featureFlagRules = pgTable("feature_flag_rules", {
   check(
     "feature_flag_rules_audience_shape_valid",
     sql`${t.stage} <> 'audience' OR (${t.percentageBasisPoints} IS NULL AND ${t.variant} IS NULL AND jsonb_array_length(${t.values}) > 0)`,
+  ),
+  check(
+    "feature_flag_rules_client_fields_scoped",
+    sql`${t.stage} = 'client' OR (${t.clientOs} IS NULL AND ${t.minClientBuild} IS NULL AND ${t.clientBuildTypes} IS NULL)`,
+  ),
+  check(
+    "feature_flag_rules_client_shape_valid",
+    sql`${t.stage} <> 'client' OR (${t.percentageBasisPoints} IS NULL AND ${t.variant} IS NULL AND jsonb_array_length(${t.values}) > 0 AND (${t.clientOs} IS NOT NULL OR ${t.minClientBuild} IS NOT NULL OR ${t.clientBuildTypes} IS NOT NULL))`,
+  ),
+  check(
+    "feature_flag_rules_client_os_valid",
+    sql`${t.clientOs} IS NULL OR (jsonb_typeof(${t.clientOs}) = 'array' AND jsonb_array_length(${t.clientOs}) > 0 AND ${t.clientOs} <@ '["android","ios","ohos"]'::jsonb)`,
+  ),
+  check(
+    "feature_flag_rules_client_build_types_valid",
+    sql`${t.clientBuildTypes} IS NULL OR (jsonb_typeof(${t.clientBuildTypes}) = 'array' AND jsonb_array_length(${t.clientBuildTypes}) > 0 AND ${t.clientBuildTypes} <@ '["release","alpha","debug"]'::jsonb)`,
+  ),
+  check(
+    "feature_flag_rules_min_client_build_valid",
+    sql`${t.minClientBuild} IS NULL OR ${t.minClientBuild} >= 0`,
   ),
 ]);
 
@@ -868,13 +976,59 @@ export const agents = pgTable("agents", {
   creatorType: text("creator_type", { enum: ["user", "agent"] }),
   creatorId: uuid("creator_id"),
   machineId: uuid("daemon_id").references(() => machines.id, { onDelete: "set null" }),
+  // External agents: set once, on the first accepted raft-agent-status.v1
+  // report. From then on `/activity` hook events no longer drive the live
+  // status (they are still logged). Only ever goes NULL -> set.
+  statusProtocolAdoptedAt: timestamp("status_protocol_adopted_at", { withTimezone: true }),
+  // RFC 074 §2 personal assistant: set = this agent may read as this user
+  // (minus DMs). Only that user sets or clears it, and only on an agent they
+  // created. Effective only while `identity_borrowing` is on for the server.
+  assistantOwnerUserId: uuid("assistant_owner_user_id").references(() => users.id, { onDelete: "set null" }),
+  // App-owned Bot: when set, this agent is a managed Bot identity bound to
+  // the given installation. Sender remains `sender_type=agent` (design-v3).
+  // The binding row carries the durable install/server/handle contract.
+  managedByAppInstallId: uuid("managed_by_app_install_id").references((): AnyPgColumn => oauthClientInstalls.id, { onDelete: "set null" }),
   deletedAt: timestamp("deleted_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   uniqueIndex("idx_agents_server_name").on(t.serverId, t.name).where(sql`deleted_at is null`),
+  // One live assistant per person per server.
+  uniqueIndex("idx_agents_server_assistant_owner")
+    .on(t.serverId, t.assistantOwnerUserId)
+    .where(sql`assistant_owner_user_id is not null and deleted_at is null`),
   index("idx_agents_server").on(t.serverId),
   index("idx_agents_creator").on(t.serverId, t.creatorType, t.creatorId),
+  // RFC-067 product-data derivation reads new agents by a created_at watermark.
+  index("idx_agents_created_at").on(t.createdAt),
+]);
+
+// Agent archive: one row per archived (soft-deleted) agent that has a
+// workspace decision. Agents deleted before archive existed have no row.
+export const agentArchives = pgTable("agent_archives", {
+  agentId: uuid("agent_id").primaryKey().references(() => agents.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  archivedAt: timestamp("archived_at", { withTimezone: true }).notNull().defaultNow(),
+  archivedByUserId: uuid("archived_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  // The Computer that holds the workspace. Not an FK: the workspace evidence
+  // outlives the Computer row, and `agents.daemon_id` is cleared on archive.
+  machineId: uuid("machine_id"),
+  machineNameSnapshot: text("machine_name_snapshot"),
+  workspaceState: text("workspace_state", { enum: ["on_computer", "deleted", "unknown"] }).notNull(),
+  pendingOp: text("pending_op", { enum: ["delete"] }),
+  opId: uuid("op_id"),
+  opRequestedAt: timestamp("op_requested_at", { withTimezone: true }),
+  opRequestedByUserId: uuid("op_requested_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  // Lease: set when the op is sent to the Computer.
+  opDispatchedAt: timestamp("op_dispatched_at", { withTimezone: true }),
+  opAttempts: integer("op_attempts").notNull().default(0),
+  lastErrorCode: text("last_error_code"),
+  lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index("idx_agent_archives_server").on(t.serverId),
+  index("idx_agent_archives_pending").on(t.machineId).where(sql`pending_op is not null`),
+  check("agent_archives_op_consistent", sql`(${t.pendingOp} is null) = (${t.opId} is null)`),
 ]);
 
 export const agentMigrations = pgTable("agent_migrations", {
@@ -884,11 +1038,15 @@ export const agentMigrations = pgTable("agent_migrations", {
   // Historical identity snapshots, intentionally not entity FKs. Terminal
   // migration evidence must survive after a Computer is deleted.
   sourceMachineId: uuid("source_machine_id").notNull(),
-  targetMachineId: uuid("target_machine_id").notNull(),
+  // A Computer target names its machine; a hosted target has no machine, so
+  // both target columns are null (agent_migrations_target_kind_shape). Hosted
+  // details live in agent_migration_hosted_targets.
+  targetKind: text("target_kind", { enum: ["computer", "hosted"] }).notNull().default("computer"),
+  targetMachineId: uuid("target_machine_id"),
   // Frozen names are mandatory durable evidence. The migration backfills
   // historical rows before applying these NOT NULL constraints.
   sourceMachineNameSnapshot: text("source_machine_name_snapshot").notNull(),
-  targetMachineNameSnapshot: text("target_machine_name_snapshot").notNull(),
+  targetMachineNameSnapshot: text("target_machine_name_snapshot"),
   receiptChannelId: uuid("receipt_channel_id").references(() => channels.id, { onDelete: "restrict" }),
   state: text("state", {
     enum: [
@@ -983,11 +1141,28 @@ export const agentMigrations = pgTable("agent_migrations", {
   readyAt: timestamp("ready_at", { withTimezone: true }),
   flippedAt: timestamp("flipped_at", { withTimezone: true }),
   arrivedAt: timestamp("arrived_at", { withTimezone: true }),
-  // Durable proof that the source daemon atomically moved the old workspace
-  // into its migration-specific archive. Completion must fail closed while
-  // this is null; retries close a lost response through the daemon's
-  // migrationId-idempotent `already_archived` result.
+  // Durable proof that the source daemon moved the old workspace into its
+  // migration-specific archive (or that nothing was left on the source).
+  // Not a completion precondition: "completed" means the agent runs on the
+  // target; a null value after completion means source cleanup is still
+  // pending and the remediation worker retries it (see the columns below).
+  // Retries close a lost response through the daemon's migrationId-idempotent
+  // `already_archived` result.
   sourceWorkspaceArchivedAt: timestamp("source_workspace_archived_at", { withTimezone: true }),
+  // Background source-archive retry bookkeeping. `retry_at` doubles as the
+  // claim lease; `abandoned_at` is the visible terminal state when retries are
+  // exhausted or the agent moved again (leftovers are then handled by the
+  // target-side preexisting-workspace quarantine).
+  sourceWorkspaceArchiveAttempts: integer("source_workspace_archive_attempts").notNull().default(0),
+  sourceWorkspaceArchiveRetryAt: timestamp("source_workspace_archive_retry_at", { withTimezone: true }),
+  sourceWorkspaceArchiveLastError: text("source_workspace_archive_last_error"),
+  sourceWorkspaceArchiveAbandonedAt: timestamp("source_workspace_archive_abandoned_at", { withTimezone: true }),
+  // Latest bundle-build progress reported by the source between quiesce and
+  // control registration; only a report whose counts grew slides prepDeadlineAt.
+  sourceBuildProgress: jsonb("source_build_progress").$type<AgentMigrationSourceBuildProgress>(),
+  // Entry limit fixed at creation from the target's capabilities; null on rows
+  // created before streamed bundles, which keep the legacy limit.
+  transportMaxArchiveEntries: integer("transport_max_archive_entries"),
   completedAt: timestamp("completed_at", { withTimezone: true }),
   abortedAt: timestamp("aborted_at", { withTimezone: true }),
   canceledAt: timestamp("canceled_at", { withTimezone: true }),
@@ -1001,9 +1176,50 @@ export const agentMigrations = pgTable("agent_migrations", {
   index("idx_agent_migrations_target_machine").on(t.targetMachineId),
   uniqueIndex("idx_agent_migrations_active_agent").on(t.agentId).where(sql`${t.state} IN ('provisioning', 'prep', 'ready', 'in_transit', 'arriving', 'starting')`),
   check("agent_migrations_distinct_machines", sql`${t.sourceMachineId} <> ${t.targetMachineId}`),
+  check("agent_migrations_target_kind_shape", sql`(${t.targetKind} = 'computer' AND ${t.targetMachineId} IS NOT NULL AND ${t.targetMachineNameSnapshot} IS NOT NULL) OR (${t.targetKind} = 'hosted' AND ${t.targetMachineId} IS NULL AND ${t.targetMachineNameSnapshot} IS NULL)`),
   check("agent_migrations_contract_version_check", sql`${t.contractVersion} >= 1`),
   check("agent_migrations_receipt_contract_version_check", sql`${t.contractVersion} >= 2`),
 ]);
+
+/** The agent's runtime columns just before a hosted switch; read only to revert a never-created provider agent. */
+export type AgentMigrationHostedRuntimeSnapshot = {
+  runtime: string;
+  model: string;
+  reasoningEffort: string | null;
+  envVarsPresent: boolean;
+  machineId: string;
+  /**
+   * `{runtimeConfig, envVars}` as AES-GCM ciphertext (encryptProviderSecret,
+   * scope = the migration id). Both can hold secrets (env values, a builtin
+   * provider's API key), so they are never stored in the clear; only the
+   * never-created revert decrypts them.
+   */
+  encryptedRuntime: string;
+};
+
+// One row per migration whose target is Raft hosted (target_kind = 'hosted').
+// Only the hosted import path reads it; Computer migrations never have a row.
+export const agentMigrationHostedTargets = pgTable("agent_migration_hosted_targets", {
+  migrationId: uuid("migration_id").primaryKey().references(() => agentMigrations.id, { onDelete: "cascade" }),
+  provider: text("provider", { enum: ["antiproton"] }).notNull(),
+  // A model offered by the provider and picked in the dialog; null = provider default.
+  hostedModel: text("hosted_model"),
+  // GET /provision/import-limits, fixed at preflight.
+  importLimits: jsonb("import_limits").$type<AgentMigrationHostedImportLimits>(),
+  // The agent's runtime columns just before the switch, for the never-created
+  // revert only. envVars is recorded as present/absent, never its values.
+  runtimeSnapshot: jsonb("runtime_snapshot").$type<AgentMigrationHostedRuntimeSnapshot>(),
+  // Filtered file set in object storage; deleted once the migration completes.
+  fileSetObjectKey: text("file_set_object_key"),
+  fileSetSha256: text("file_set_sha256"),
+  importSummary: jsonb("import_summary").$type<AgentMigrationHostedImportSummary>(),
+  reviewReadyAt: timestamp("review_ready_at", { withTimezone: true }),
+  reviewConfirmedAt: timestamp("review_confirmed_at", { withTimezone: true }),
+  importerLeaseId: text("importer_lease_id"),
+  importerLeaseExpiresAt: timestamp("importer_lease_expires_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export const agentMigrationChunkReceipts = pgTable("agent_migration_chunk_receipts", {
   migrationId: uuid("migration_id").notNull().references(() => agentMigrations.id, { onDelete: "cascade" }),
@@ -1051,11 +1267,24 @@ export const oauthClients = pgTable("oauth_clients", {
   homepageUrl: text("homepage_url"),
   returnUrl: text("return_url"),
   agentManifestUrl: text("agent_manifest_url"),
+  // Optional installation onboarding. URL changes invalidate prior completion;
+  // progress never grants permissions or changes OAuth availability.
+  setupUrl: text("setup_url"),
+  setupDescription: text("setup_description"),
+  setupRevision: integer("setup_revision").notNull().default(1),
+  // Agent-facing "when to use this app" hint (task #319). Nullable; empty is
+  // stored as null by the write path. Hard cap 160 code points, no control
+  // characters, single line — enforced again by the shared validator on both
+  // write paths (Web PATCH and agent app update); this CHECK is the DB-level
+  // backstop so a missed write path cannot store a longer value.
+  whenToUse: text("when_to_use"),
   allowedScopes: json("allowed_scopes").$type<string[]>(),
   logoUrl: text("logo_url"),
   logoStorageKey: text("logo_storage_key"),
   category: text("category").default("Other").notNull(),
   dataAccessSummary: text("data_access_summary"),
+  // Unread since Agent JWT became built in; kept one release for rollback, then dropped.
+  agentJwtEnabled: boolean("agent_jwt_enabled").default(false),
   enabled: boolean("enabled").default(true).notNull(),
   humanMarketplaceVisible: boolean("human_marketplace_visible").default(true).notNull(),
   publishStatus: text("publish_status", { enum: ["private", "publish_requested", "in_review", "published", "rejected", "unpublish_requested"] }).default("private").notNull(),
@@ -1071,6 +1300,11 @@ export const oauthClients = pgTable("oauth_clients", {
   // on the same server, may regenerate the client secret. Never overwritten by
   // rotation — rotation changes the secret, not ownership.
   ownerAgentId: uuid("owner_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  // App-owned Bot capability declaration (design-v3). Declaration alone does
+  // not create or grant a Bot; install-time grant + activation still required.
+  // Only editable while enabled=true on a private/non-published app OR when the
+  // current publish revision already includes this capability.
+  enableBot: boolean("enable_bot").notNull().default(false),
   // RFC 051 outbound authority is derived from immutable request revisions.
   // These fields are the closed runtime ceiling; remote manifests are never
   // consulted while authorizing pull or delivery.
@@ -1082,7 +1316,12 @@ export const oauthClients = pgTable("oauth_clients", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
+  check("oauth_clients_setup_revision_positive", sql`${t.setupRevision} > 0`),
   index("idx_oauth_clients_server").on(t.serverId),
+  // Declared as a UNIQUE constraint. A unique index alone would also back the
+  // composite FK from official_app_registry; migration 0281 adopts the index
+  // from 0277 in place with UNIQUE USING INDEX.
+  unique("idx_oauth_clients_registry_identity").on(t.id, t.clientId, t.serverId),
   index("idx_oauth_clients_app_type").on(t.appType),
   index("idx_oauth_clients_owner_agent").on(t.ownerAgentId),
   index("idx_oauth_clients_publish_status").on(t.publishStatus),
@@ -1090,6 +1329,10 @@ export const oauthClients = pgTable("oauth_clients", {
   check(
     "oauth_clients_publish_status_valid",
     sql`${t.publishStatus} IN ('private', 'publish_requested', 'in_review', 'published', 'rejected', 'unpublish_requested')`,
+  ),
+  check(
+    "oauth_clients_when_to_use_valid",
+    sql`${t.whenToUse} IS NULL OR (length(${t.whenToUse}) <= 160 AND ${t.whenToUse} !~ '[\\x00-\\x1F\\x7F]')`,
   ),
 ]);
 
@@ -1152,25 +1395,139 @@ export const oauthClientInstalls = pgTable("oauth_client_installs", {
   clientId: uuid("client_id").notNull().references(() => oauthClients.id, { onDelete: "cascade" }),
   installedByUserId: uuid("installed_by_user_id").references(() => users.id, { onDelete: "cascade" }),
   installedByAgentId: uuid("installed_by_agent_id").references(() => agents.id, { onDelete: "cascade" }),
+  installedBySystem: boolean("installed_by_system").notNull().default(false),
+  // Unread since Agent JWT became built in; kept one release for rollback, then dropped.
+  agentJwtEnabled: boolean("agent_jwt_enabled").notNull().default(false),
   status: text("status", { enum: ["active", "suspended"] }).notNull().default("active"),
   approvedRequestRevisionId: uuid("approved_request_revision_id").references(() => oauthAppPermissionRevisions.id, { onDelete: "set null" }),
   approvedGroups: jsonb("approved_groups").$type<string[]>().notNull().default([]),
   subscribedEvents: jsonb("subscribed_events").$type<string[]>().notNull().default([]),
   grantRevision: integer("grant_revision").notNull().default(0),
   subscriptionRevision: integer("subscription_revision").notNull().default(0),
+  setupCompletedRevision: integer("setup_completed_revision"),
+  setupCompletedAt: timestamp("setup_completed_at", { withTimezone: true }),
+  // Per-installation Bot grant: set at install approval or explicit opt-in.
+  // NULL = no Bot declared/requested; 'granted' = binding may be created.
+  // Set separately from global App enablement; revoking never back-fills.
+  botGrant: text("bot_grant", { enum: ["pending", "granted", "revoked"] }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
+  check("oauth_client_installs_setup_completion_valid", sql`
+    (${t.setupCompletedRevision} IS NULL AND ${t.setupCompletedAt} IS NULL)
+    OR (${t.setupCompletedRevision} IS NOT NULL AND ${t.setupCompletedRevision} > 0 AND ${t.setupCompletedAt} IS NOT NULL)
+  `),
   uniqueIndex("idx_oauth_client_installs_server_client").on(t.serverId, t.clientId),
   index("idx_oauth_client_installs_client").on(t.clientId),
   check(
     "oauth_client_installs_actor_valid",
-    sql`(${t.installedByUserId} IS NOT NULL AND ${t.installedByAgentId} IS NULL)
-      OR (${t.installedByUserId} IS NULL AND ${t.installedByAgentId} IS NOT NULL)`,
+    sql`(${t.installedByUserId} IS NOT NULL AND ${t.installedByAgentId} IS NULL AND ${t.installedBySystem} = false)
+      OR (${t.installedByUserId} IS NULL AND ${t.installedByAgentId} IS NOT NULL AND ${t.installedBySystem} = false)
+      OR (${t.installedByUserId} IS NULL AND ${t.installedByAgentId} IS NULL AND ${t.installedBySystem} = true)`,
   ),
   index("idx_oauth_client_installs_status").on(t.clientId, t.status),
   check("oauth_client_installs_grant_revision_nonnegative", sql`${t.grantRevision} >= 0`),
   check("oauth_client_installs_subscription_revision_nonnegative", sql`${t.subscriptionRevision} >= 0`),
+]);
+
+// App-owned Bot identity binding. One App has at most one active Bot per
+// installation (unique index on install_id, state != 'uninstalled'). The Bot's
+// agent_id is immutable once assigned; generation/tombstone survive reinstall.
+// display name conflicts are resolved at activation; handle is the app's
+// stable client-ID-derived handle, not the agent's Raft name.
+export const appBotBindings = pgTable("app_bot_bindings", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  installId: uuid("install_id").notNull().references(() => oauthClientInstalls.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
+  generation: integer("generation").notNull().default(1),
+  state: text("state", { enum: ["active", "disabled", "uninstalled"] }).notNull().default("active"),
+  handle: text("handle").notNull(),
+  requestedPermissions: jsonb("requested_permissions").$type<string[]>().notNull().default([]),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  disabledAt: timestamp("disabled_at", { withTimezone: true }),
+  uninstalledAt: timestamp("uninstalled_at", { withTimezone: true }),
+}, (t) => [
+  // Exactly one live (non-uninstalled) Bot per install.
+  uniqueIndex("idx_app_bot_install_live").on(t.installId).where(sql`state != 'uninstalled'`),
+  // The Bot agent is attributed to exactly one install.
+  uniqueIndex("idx_app_bot_agent_install").on(t.agentId).where(sql`state = 'active'`),
+  index("idx_app_bot_server").on(t.serverId),
+  index("idx_app_bot_state").on(t.installId, t.state),
+  check("app_bot_generation_positive", sql`${t.generation} > 0`),
+  check("app_bot_handle_nonempty", sql`length(btrim(${t.handle})) > 0`),
+]);
+
+// Sticky policy state is deliberately independent of the installation row:
+// uninstall deletes the installation, but must not erase the user's opt-out.
+export const officialAppAutoInstallStates = pgTable("official_app_auto_install_states", {
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id").notNull().references(() => oauthClients.id, { onDelete: "cascade" }),
+  state: text("state", { enum: ["default_auto", "auto_suppressed"] }).notNull(),
+  revision: integer("revision").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.serverId, t.clientId] }),
+  index("idx_official_app_auto_install_states_client").on(t.clientId, t.state),
+  check("official_app_auto_install_states_state_valid", sql`${t.state} IN ('default_auto', 'auto_suppressed')`),
+  check("official_app_auto_install_states_revision_nonnegative", sql`${t.revision} >= 0`),
+]);
+
+// Platform-owned authority for official-app discovery and default delivery.
+// Identity columns deliberately duplicate the OAuth client identity so the
+// composite FK can reject publisher/client-key drift at the database boundary.
+export const officialAppRegistry = pgTable("official_app_registry", {
+  oauthClientId: uuid("oauth_client_id").primaryKey(),
+  clientKey: text("client_key").notNull().unique(),
+  publisherServerId: uuid("publisher_server_id").notNull(),
+  autoInstall: boolean("auto_install").notNull().default(false),
+  purpose: text("purpose").notNull(),
+  status: text("status", { enum: ["pending_review", "approved", "disabled"] }).notNull().default("pending_review"),
+  revision: integer("revision").notNull().default(1),
+  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  updatedByUserId: uuid("updated_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  foreignKey({
+    columns: [t.oauthClientId, t.clientKey, t.publisherServerId],
+    foreignColumns: [oauthClients.id, oauthClients.clientId, oauthClients.serverId],
+    name: "official_app_registry_client_identity_fk",
+  }).onUpdate("restrict").onDelete("restrict"),
+  index("idx_official_app_registry_defaults").on(t.status, t.autoInstall),
+  check("official_app_registry_status_valid", sql`${t.status} IN ('pending_review', 'approved', 'disabled')`),
+  check("official_app_registry_revision_positive", sql`${t.revision} > 0`),
+  check("official_app_registry_client_key_valid", sql`${t.clientKey} ~ '^[a-z][a-z0-9-]{2,63}$'`),
+  check("official_app_registry_purpose_valid", sql`length(btrim(${t.purpose})) BETWEEN 1 AND 160 AND ${t.purpose} !~ '[\\r\\n]'`),
+]);
+
+export const officialAppAutoInstallTransitions = pgTable("official_app_auto_install_transitions", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id").notNull().references(() => oauthClients.id, { onDelete: "cascade" }),
+  revision: integer("revision").notNull(),
+  state: text("state", { enum: ["default_auto", "auto_suppressed"] }).notNull(),
+  transitionSource: text("transition_source", { enum: ["auto_install", "user_install", "user_uninstall", "migration"] }).notNull(),
+  actorType: text("actor_type", { enum: ["human", "system"] }).notNull(),
+  actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+  installationId: uuid("installation_id").references(() => oauthClientInstalls.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("idx_official_app_auto_install_transitions_revision").on(t.serverId, t.clientId, t.revision),
+  index("idx_official_app_auto_install_transitions_latest").on(t.serverId, t.clientId, t.createdAt),
+  check("official_app_auto_install_transitions_state_valid", sql`${t.state} IN ('default_auto', 'auto_suppressed')`),
+  check(
+    "official_app_auto_install_transitions_source_valid",
+    sql`${t.transitionSource} IN ('auto_install', 'user_install', 'user_uninstall', 'migration')`,
+  ),
+  check("official_app_auto_install_transitions_revision_positive", sql`${t.revision} > 0`),
+  check(
+    "official_app_auto_install_transitions_actor_valid",
+    sql`(${t.actorType} = 'human' AND ${t.actorUserId} IS NOT NULL)
+      OR (${t.actorType} = 'system' AND ${t.actorUserId} IS NULL)`,
+  ),
 ]);
 
 // Distinct, opaque installation credentials. Only a hash is stored; the
@@ -1273,6 +1630,10 @@ export const oauthGrants = pgTable("oauth_grants", {
   scopes: json("scopes").$type<string[]>().notNull(),
   resource: text("resource"),
   grantedByUserId: uuid("granted_by_user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  // How the grant came about: a person approved or granted it, the agent's own
+  // login, or the app's request auto-granted. Null on grants made before this
+  // was recorded.
+  grantSource: text("grant_source", { enum: ["person", "agent_login", "app_request"] }),
   revokedByUserId: uuid("revoked_by_user_id").references(() => users.id, { onDelete: "set null" }),
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -1280,6 +1641,20 @@ export const oauthGrants = pgTable("oauth_grants", {
 }, (t) => [
   index("idx_oauth_grants_server_agent").on(t.serverId, t.agentId),
   index("idx_oauth_grants_client").on(t.clientId),
+]);
+
+// A person revoked this app's grant for this agent: the app no longer gets an
+// automatic grant for the pair (requests come back pending). Cleared when a
+// person grants again (approval or the on-behalf grant). Uninstall and app
+// deletion revoke grants without writing here.
+export const oauthAgentAutoGrantBlocks = pgTable("oauth_agent_auto_grant_blocks", {
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  clientId: uuid("client_id").notNull().references(() => oauthClients.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  blockedByUserId: uuid("blocked_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.agentId, t.clientId] }),
 ]);
 
 // Integration audit events — append-only security/product audit trail for
@@ -1340,7 +1715,12 @@ export const thirdPartyAgentEvents = pgTable("third_party_agent_events", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
   agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
-  clientId: uuid("client_id").notNull().references(() => oauthClients.id, { onDelete: "cascade" }),
+  // Exactly one of clientId / systemApp is set (check constraint). OAuth-client
+  // paths always filter by client_id, so a system row (client_id NULL) is
+  // invisible to every client.
+  clientId: uuid("client_id").references(() => oauthClients.id, { onDelete: "cascade" }),
+  // A Raft system app's event (RFC 074 §2 assistant doorbell: "system.assistant").
+  systemApp: text("system_app", { enum: ["system.assistant", "system.raftbench"] }),
   accessTokenId: uuid("access_token_id").references(() => oauthAccessTokens.id, { onDelete: "set null" }),
   externalEventId: text("external_event_id"),
   kind: text("kind", { enum: ["event", "notification", "action_request"] }).notNull(),
@@ -1357,7 +1737,24 @@ export const thirdPartyAgentEvents = pgTable("third_party_agent_events", {
   index("idx_third_party_agent_events_agent_status").on(t.agentId, t.status),
   index("idx_third_party_agent_events_client").on(t.clientId),
   uniqueIndex("idx_third_party_agent_events_dedupe").on(t.clientId, t.agentId, t.externalEventId),
+  // Agent panel list: one agent's events newest first (keyset on created_at, id).
+  index("idx_third_party_agent_events_agent_created").on(t.agentId, t.createdAt.desc(), t.id.desc()),
+  // Retention sweep: events are deleted 30 days after they expire.
+  index("idx_third_party_agent_events_expires").on(t.expiresAt),
+  check("third_party_agent_events_one_source", sql`num_nonnulls(${t.clientId}, ${t.systemApp}) = 1`),
 ]);
+
+// RFC 074 §2 assistant doorbell: at most one pending "owner inbox changed" per
+// assistant. Written with INSERT ... ON CONFLICT DO NOTHING inside the
+// transaction that records the owner's inbox fact (no lock on an existing
+// row); a worker turns it into a `system.assistant` event in
+// third_party_agent_events and deletes it, at most once per 30 s per assistant.
+export const assistantDoorbells = pgTable("assistant_doorbells", {
+  agentId: uuid("agent_id").primaryKey().references(() => agents.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  ownerUserId: uuid("owner_user_id").notNull(),
+  firstChangeAt: timestamp("first_change_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 // Canonical source events shared by notification adapters. App webhooks are a
 // delivery adapter over this substrate, not a parallel webhook event stream.
@@ -1451,6 +1848,11 @@ export const channels = pgTable("channels", {
   guestVisible: boolean("guest_visible").notNull().default(false),
   guestJoinable: boolean("guest_joinable").notNull().default(false),
   parentMessageId: uuid("parent_message_id"),
+  // Derived: for a thread, the channel its parent message currently lives in;
+  // NULL otherwise. Maintained only by the channels_parent_channel_id_* and
+  // messages_parent_channel_id_follow triggers (0297), never by app writes.
+  // No FK: it is a cached fact, checked by an alert-only invariant.
+  parentChannelId: uuid("parent_channel_id"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   archivedAt: timestamp("archived_at", { withTimezone: true }),
   archivedByUserId: uuid("archived_by_user_id").references(() => users.id, { onDelete: "set null" }),
@@ -1463,8 +1865,59 @@ export const channels = pgTable("channels", {
   uniqueIndex("idx_channels_server_name_type").on(t.serverId, t.name).where(sql`type in ('channel', 'private', 'joint') and deleted_at is null`),
   index("idx_channels_parent_message").on(t.parentMessageId),
   uniqueIndex("idx_channels_active_thread_parent").on(t.parentMessageId).where(sql`type = 'thread' and deleted_at is null`),
+  // Live threads by parent channel: "threads under these visible channels" as an index-only scan.
+  // Built with CREATE INDEX CONCURRENTLY by db:create-channels-thread-parent-channel-index; migration 0298 is a no-op.
+  index("idx_channels_thread_parent_channel").on(t.parentChannelId, t.id).where(sql`type = 'thread' AND deleted_at IS NULL`),
   index("idx_channels_archived").on(t.serverId, t.archivedAt),
   check("channels_guest_joinable_requires_visible", sql`NOT ${t.guestJoinable} OR ${t.guestVisible}`),
+]);
+
+// Public server SEO (#proj-public-server-seo): stable public routing ids for
+// raft.build URLs and the lastmod stamps of what public pages show. Kept out
+// of `servers` / `channels` on purpose: those rows are returned whole by many
+// member and agent routes, and a routing id must only ever leave the server
+// through the search API, after its predicate passed (Ark). Ids are 128
+// random bits (gen_random_uuid() as 32 hex), never derived from the row id,
+// and never change once issued.
+//
+// Rows are created by the 0347 triggers (every new server; every new channel
+// and thread), by the 0347 backfill (all servers; live channels and threads
+// of servers public at the time) and when a server goes public. A channel
+// without a row is never indexable. `public_changed_at` is stamped by the
+// 0347 update triggers only, never by app code.
+export const serverPublicRoutes = pgTable("server_public_routes", {
+  serverId: uuid("server_id").primaryKey().references(() => servers.id, { onDelete: "cascade" }),
+  publicId: text("public_id").notNull().unique().default(sql`replace(gen_random_uuid()::text, '-', '')`),
+  // Name, slug, avatar, public/search switches or deletion last changed.
+  publicChangedAt: timestamp("public_changed_at", { withTimezone: true }),
+});
+
+export const channelPublicRoutes = pgTable("channel_public_routes", {
+  channelId: uuid("channel_id").primaryKey().references(() => channels.id, { onDelete: "cascade" }),
+  publicId: text("public_id").notNull().unique().default(sql`replace(gen_random_uuid()::text, '-', '')`),
+  // Name, description, type, Guest visibility, archive or deletion last
+  // changed while the row was or became a Guest-visible live channel, or for
+  // a thread. Private channel edits never set it.
+  publicChangedAt: timestamp("public_changed_at", { withTimezone: true }),
+});
+
+// Public server SEO, task #4: service credentials for the raft.build Pages
+// Function (lib/publicSearchServiceAccess.ts). Only SHA-256 digests of the
+// tokens are stored. Read on every service request, so removing or replacing
+// a row takes effect on the next request without a deploy. One current key
+// (no expiry) per client, enforced here; at most one previous key, which
+// stops working at its `expires_at`. Rows are managed by operators.
+export const publicSearchServiceKeys = pgTable("public_search_service_keys", {
+  keyId: text("key_id").primaryKey(),
+  clientId: text("client_id").notNull(),
+  sha256: text("sha256").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("idx_public_search_service_keys_current").on(t.clientId).where(sql`expires_at IS NULL`),
+  index("idx_public_search_service_keys_client").on(t.clientId),
+  check("public_search_service_keys_key_id_shape", sql`${t.keyId} ~ '^[A-Za-z0-9_-]{1,32}$'`),
+  check("public_search_service_keys_sha256_shape", sql`${t.sha256} ~ '^[0-9a-f]{64}$'`),
 ]);
 
 // Durable DM provenance. Membership rows are intentionally mutable (for
@@ -1500,6 +1953,10 @@ export const jointChannels = pgTable("joint_channels", {
   createdByServerId: uuid("created_by_server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
   createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
   status: text("status", { enum: ["active", "closed"] }).notNull().default("active"),
+  // Contract v0.3 §18.8: first time the system observed this top-level joint
+  // over its free-server limit. Null while within the limit. Only top-level
+  // joints carry it; sub-thread joint records follow their parent.
+  overLimitSince: timestamp("over_limit_since", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
@@ -1536,7 +1993,14 @@ export const jointChannelInvites = pgTable("joint_channel_invites", {
   expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+  // How an accepted invite was accepted (RFC 075 §4.5): "invitee" when the
+  // invited admin accepted it (email link or in-app), "same_admin" when the
+  // inviter administers both servers and connected directly without email.
+  // NULL for pending/declined/expired invites and for invites accepted before
+  // this column existed.
+  acceptedVia: text("accepted_via", { enum: ["invitee", "same_admin"] }),
 }, (t) => [
+  check("joint_channel_invites_accepted_via_known", sql`${t.acceptedVia} IS NULL OR ${t.acceptedVia} IN ('invitee', 'same_admin')`),
   uniqueIndex("idx_joint_channel_invites_token_hash").on(t.tokenHash),
   uniqueIndex("idx_joint_channel_invites_pending_target_user").on(t.jointChannelId, t.toServerId, t.invitedUserId).where(sql`status = 'pending'`),
   index("idx_joint_channel_invites_to_server").on(t.toServerId, t.status),
@@ -1554,15 +2018,37 @@ export const channelConversionJobs = pgTable("channel_conversion_jobs", {
   sourceChannelId: uuid("source_channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
   sourceChannelType: text("source_channel_type", { enum: ["channel", "private"] }).notNull(),
   targetKind: text("target_kind", { enum: ["joint"] }).notNull().default("joint"),
+  // `status`/`phase` are retained for rolling compatibility with the v0
+  // runner. `state` is the durable contract state machine; it is monotonic
+  // across retries and is never inferred from the legacy phase strings.
+  state: text("state", {
+    enum: [
+      "prepared",
+      "fenced",
+      "draining",
+      "copying",
+      "projections_rebuilt",
+      "audience_cutover",
+      "residual_cleanup",
+      "verifying",
+      "succeeded",
+      "retry_waiting",
+      "failed",
+      "canceled",
+    ],
+  }).notNull().default("prepared"),
+  conversionEpoch: uuid("conversion_epoch").notNull().default(sql`gen_random_uuid()`),
   status: text("status", { enum: ["pending", "running", "failed", "done", "canceled"] }).notNull().default("pending"),
   phase: text("phase", {
     enum: [
       "prepare",
-      "drop_task_identity",
+      "prepare_tasks",
       "move_parent_messages",
       "prepare_threads",
       "move_thread_messages",
       "verify",
+      "audience_cutover",
+      "residual_cleanup",
       "finalize",
       "done",
     ],
@@ -1584,6 +2070,73 @@ export const channelConversionJobs = pgTable("channel_conversion_jobs", {
   uniqueIndex("idx_channel_conversion_jobs_active_source")
     .on(t.sourceChannelId)
     .where(sql`status in ('pending', 'running', 'failed')`),
+  index("idx_channel_conversion_jobs_epoch").on(t.conversionEpoch),
+]);
+
+// Published before a conversion command waits on the source lock. This is
+// admission/observation state, not an assertion that copying has succeeded.
+export const channelConversionCommands = pgTable("channel_conversion_commands", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  sourceChannelId: uuid("source_channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
+  requestedByUserId: uuid("requested_by_user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  kind: text("kind", { enum: ["start", "retry", "cancel"] }).notNull(),
+  status: text("status", { enum: ["pending", "completed", "failed"] }).notNull().default("pending"),
+  jobId: uuid("job_id").references(() => channelConversionJobs.id, { onDelete: "set null" }),
+  error: text("error"),
+  errorCode: text("error_code"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index("idx_channel_conversion_commands_source").on(t.serverId, t.sourceChannelId, t.createdAt),
+  index("idx_channel_conversion_commands_pending").on(t.status, t.createdAt),
+]);
+
+// A fence is durable state, not a projection of channels.archived_at. The
+// source row remains useful for the UI, but every writer must consult this
+// table while holding the per-source advisory lock. Historical released rows
+// are retained for audit and retry evidence; only one active row is allowed.
+export const channelConversionFences = pgTable("channel_conversion_fences", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  jobId: uuid("job_id").notNull().references(() => channelConversionJobs.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  sourceChannelId: uuid("source_channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
+  conversionEpoch: uuid("conversion_epoch").notNull(),
+  status: text("status", { enum: ["active", "released"] }).notNull().default("active"),
+  reason: text("reason"),
+  acquiredAt: timestamp("acquired_at", { withTimezone: true }).notNull().defaultNow(),
+  releasedAt: timestamp("released_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("idx_channel_conversion_fences_job_epoch").on(t.jobId, t.conversionEpoch),
+  uniqueIndex("idx_channel_conversion_fences_active_source")
+    .on(t.sourceChannelId)
+    .where(sql`status = 'active'`),
+  index("idx_channel_conversion_fences_epoch").on(t.conversionEpoch),
+]);
+
+// One row per committed phase/batch. The idempotency key is the crash/retry
+// boundary: duplicate execution can observe the committed row and skip the
+// batch without copying a second projection.
+export const channelConversionPhaseLedger = pgTable("channel_conversion_phase_ledger", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  jobId: uuid("job_id").notNull().references(() => channelConversionJobs.id, { onDelete: "cascade" }),
+  conversionEpoch: uuid("conversion_epoch").notNull(),
+  phase: text("phase").notNull(),
+  batchKey: text("batch_key").notNull().default("all"),
+  idempotencyKey: text("idempotency_key").notNull(),
+  status: text("status", { enum: ["started", "committed", "failed"] }).notNull().default("started"),
+  sourceCount: integer("source_count").notNull().default(0),
+  targetCount: integer("target_count").notNull().default(0),
+  checksum: text("checksum").notNull(),
+  error: text("error"),
+  retryCount: integer("retry_count").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("idx_channel_conversion_phase_ledger_idempotency").on(t.jobId, t.conversionEpoch, t.idempotencyKey),
+  index("idx_channel_conversion_phase_ledger_job_phase").on(t.jobId, t.phase),
 ]);
 
 // Channel-Agent assignments
@@ -1647,10 +2200,22 @@ export const messages = pgTable("messages", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   seq: bigserial("seq", { mode: "number" }).notNull(),
   channelId: uuid("channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
+  // The channel's server, set by a BEFORE INSERT / UPDATE OF channel_id trigger
+  // (0317), so per-server reads (the (server_id, search_vector) GIN) need no
+  // channels join. Never written by application code. Nullable until the
+  // operator backfill of older rows is verified; a NOT VALID CHECK already
+  // holds new rows to NOT NULL. Joint messages carry the joint_storage server.
+  // Not in slock_rw_publication's column list.
+  serverId: uuid("server_id"),
   senderType: text("sender_type", { enum: ["user", "agent", "external_projection"] }).notNull(),
   senderId: text("sender_id").notNull(), // user UUID, agent UUID, or external actor projection UUID
   agentSendKey: text("agent_send_key"),
   randomId: text("random_id"),
+  // IANA time zone the human sender's browser reported when sending from the
+  // web client (e.g. "Asia/Shanghai"). Exposed to agents only, never to other
+  // humans' clients. Null for agent/system/forwarded/non-web messages and for
+  // rows written before it existed. Not in slock_rw_publication's column list.
+  senderTimezone: text("sender_timezone"),
   messageType: text("message_type", { enum: ["chat", "system"] }).notNull().default("chat"),
   content: text("content").notNull(),
   actionMetadata: json("action_metadata"),
@@ -1665,6 +2230,13 @@ export const messages = pgTable("messages", {
   // Renaming the column would require a migration; reading code should rely on
   // this comment, not the field name's natural reading.
   threadId: text("thread_id"),
+  // 061 Stage 2 (P5/A2): causal actor for system messages, and the system-subtype
+  // discriminator. Together they let the derivation apply the born-read / skip /
+  // notify-exclude classification (systemMessageBornReadRegistry) without a fact
+  // snapshot. Null for ordinary user/agent/external_projection messages.
+  causalActorType: text("causal_actor_type", { enum: ["user", "agent"] }),
+  causalActorId: text("causal_actor_id"),
+  systemSubtype: text("system_subtype"),
   // Task fields — DEAD STORAGE as of v1.4 P3. These are NOT read by application
   // code any more: `tasks` is the source of truth and a task's link to its host
   // message is `tasks.message_id`, not state stored here. A non-null
@@ -1695,7 +2267,7 @@ export const messages = pgTable("messages", {
   // post-migration lifecycle step; 0248 is a protected no-op marker.
   index("idx_messages_sender_created_at").on(t.senderId, t.createdAt, t.id),
   index("idx_messages_thread").on(t.threadId),
-  index("idx_messages_search_vector_gin").using("gin", t.searchVector),
+  index("idx_messages_search_vector_gin").using("gin", t.searchVector).with({ fastupdate: false }),
   uniqueIndex("idx_messages_channel_task_number").on(t.channelId, t.taskNumber),
   uniqueIndex("idx_messages_agent_send_key")
     .on(t.senderId, t.agentSendKey)
@@ -1707,6 +2279,22 @@ export const messages = pgTable("messages", {
   index("idx_messages_task_assignee")
     .on(t.taskAssigneeType, t.taskAssigneeId)
     .where(sql`task_assignee_type is not null and task_assignee_id is not null`),
+]);
+
+// One row per message: its server in time order, so a newest-first search can
+// read one server's messages instead of every server's (idx_messages_created_at).
+// Derived data owned by the 0310 triggers only (message insert, channel_id /
+// created_at change; channels.server_id is immutable, guarded by a trigger).
+// Deliberately NOT in the RisingWave publication (slock_rw_publication): it is
+// a Postgres-only read path, and keeping it out keeps its backfill off the CDC
+// stream (messageServerTimelineMigration.test.ts pins this).
+export const messageServerTimeline = pgTable("message_server_timeline", {
+  messageId: uuid("message_id").primaryKey().references(() => messages.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull(),
+  channelId: uuid("channel_id").notNull(),
+}, (t) => [
+  index("idx_message_server_timeline_server_created").on(t.serverId, t.createdAt, t.messageId),
 ]);
 
 // Provider-neutral external app control plane. These rows carry durable,
@@ -1832,7 +2420,7 @@ export const externalAppManifestReceipts = pgTable("external_app_manifest_receip
 
 export const externalAppInstalls = pgTable("external_app_installs", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
-  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "restrict" }),
   registrationId: uuid("registration_id").notNull().references(() => externalAppRegistrations.id, { onDelete: "restrict" }),
   serverGrantId: uuid("server_grant_id").notNull().references(() => externalAppServerGrants.id, { onDelete: "restrict" }),
   grantEpoch: integer("grant_epoch").notNull(),
@@ -1853,6 +2441,15 @@ export const externalAppInstalls = pgTable("external_app_installs", {
   providerBotId: text("provider_bot_id"),
   workspaceName: text("workspace_name"),
   lastVerifiedAt: timestamp("last_verified_at", { withTimezone: true }),
+  // Last lifecycle reconcile result for agent-mention usergroups; drives the
+  // settings hint (e.g. workspace restricts usergroup creation to admins).
+  agentMentionSync: jsonb("agent_mention_sync").$type<{
+    state: "synced" | "degraded";
+    slackError: string | null;
+    expected: number;
+    actual: number;
+    observedAt: string;
+  }>(),
   installGrantRenewalLeaseOwner: text("install_grant_renewal_lease_owner"),
   installGrantRenewalLeaseExpiresAt: timestamp("install_grant_renewal_lease_expires_at", { withTimezone: true }),
   installGrantRenewalNextAttemptAt: timestamp("install_grant_renewal_next_attempt_at", { withTimezone: true }),
@@ -1884,6 +2481,40 @@ export const externalAppInstalls = pgTable("external_app_installs", {
     "external_app_install_state_reason_valid",
     sql`(${t.state} IN ('pending', 'active') AND ${t.stateReason} IS NULL)
       OR (${t.state} NOT IN ('pending', 'active') AND ${t.stateReason} IS NOT NULL)`,
+  ),
+]);
+
+// A provider workspace installation and its credential are global to the
+// provider authority. Server authorization is separate: each Raft server that
+// may bind one of that workspace's channels owns an exact, revocable grant row.
+// The legacy server/grant columns on external_app_installs remain the
+// credential-AAD owner during the rolling transition; runtime authority must
+// use this association instead of treating that owner as the only server.
+export const externalAppInstallServerGrants = pgTable("external_app_install_server_grants", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  installId: uuid("install_id").notNull().references(() => externalAppInstalls.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  registrationId: uuid("registration_id").notNull().references(() => externalAppRegistrations.id, { onDelete: "restrict" }),
+  serverGrantId: uuid("server_grant_id").notNull().references(() => externalAppServerGrants.id, { onDelete: "restrict" }),
+  grantEpoch: integer("grant_epoch").notNull(),
+  state: text("state", { enum: ["active", "revoked"] }).notNull().default("active"),
+  authorizedByType: text("authorized_by_type", { enum: ["human", "agent"] }).notNull(),
+  authorizedById: uuid("authorized_by_id").notNull(),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  revokeReason: text("revoke_reason"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("idx_external_app_install_server_grant_scope").on(t.installId, t.serverId),
+  index("idx_external_app_install_server_grant_server_state").on(t.serverId, t.registrationId, t.state),
+  index("idx_external_app_install_server_grant_authority").on(t.serverGrantId, t.grantEpoch),
+  check("external_app_install_server_grant_epoch_positive", sql`${t.grantEpoch} > 0`),
+  check("external_app_install_server_grant_state_valid", sql`${t.state} IN ('active', 'revoked')`),
+  check("external_app_install_server_grant_actor_type_valid", sql`${t.authorizedByType} IN ('human', 'agent')`),
+  check(
+    "external_app_install_server_grant_revocation_valid",
+    sql`(${t.state} = 'active' AND ${t.revokedAt} IS NULL AND ${t.revokeReason} IS NULL)
+      OR (${t.state} = 'revoked' AND ${t.revokedAt} IS NOT NULL AND length(btrim(${t.revokeReason})) > 0)`,
   ),
 ]);
 
@@ -2071,6 +2702,9 @@ export const externalChannelBindings = pgTable("external_channel_bindings", {
     enum: ["public_channel", "private_channel"],
   }).notNull(),
   privacyClass: text("privacy_class", { enum: ["public", "private"] }).notNull(),
+  privacyFreshUntil: timestamp("privacy_fresh_until", { withTimezone: true })
+    .notNull()
+    .default(sql`now() + interval '10 minutes'`),
   state: text("state", { enum: ["active", "paused", "revoked", "quarantined"] }).notNull().default("active"),
   stateReason: text("state_reason"),
   grantEpoch: integer("grant_epoch").notNull(),
@@ -2108,8 +2742,10 @@ export const externalChannelBindings = pgTable("external_channel_bindings", {
     sql`(${t.privacyClass} = 'public' AND ${t.providerConversationKind} = 'public_channel'
       AND ${t.audienceRevision} IS NULL AND ${t.audienceFreshUntil} IS NULL)
       OR (${t.privacyClass} = 'private' AND ${t.providerConversationKind} = 'private_channel'
-      AND ${t.audienceRevision} IS NOT NULL AND ${t.audienceRevision} > 0
-      AND ${t.audienceFreshUntil} IS NOT NULL)`,
+      AND ((${t.audienceRevision} IS NOT NULL AND ${t.audienceRevision} > 0
+        AND ${t.audienceFreshUntil} IS NOT NULL)
+        OR (${t.state} = 'paused' AND ${t.stateReason} = 'privacy_changed_audience_migration_required'
+          AND ${t.audienceRevision} IS NULL AND ${t.audienceFreshUntil} IS NULL)))`,
   ),
   check("external_channel_binding_consent_valid", sql`${t.consentedAt} IS NOT NULL`),
   check(
@@ -2224,7 +2860,7 @@ export const externalActorProjections = pgTable("external_actor_projections", {
 // when no current artifact exists.
 export const externalProjectionAvatarArtifacts = pgTable("external_projection_avatar_artifacts", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
-  ownerType: text("owner_type", { enum: ["user", "agent", "external_projection"] }).notNull(),
+  ownerType: text("owner_type", { enum: ["external_projection"] }).notNull(),
   ownerId: text("owner_id").notNull(),
   sourceDigest: text("source_digest").notNull(),
   sourceLocatorDigest: text("source_locator_digest"),
@@ -2247,7 +2883,7 @@ export const externalProjectionAvatarArtifacts = pgTable("external_projection_av
   index("idx_external_avatar_owner_state").on(t.ownerType, t.ownerId, t.state),
   check(
     "external_avatar_shape_valid",
-    sql`${t.ownerType} IN ('user', 'agent', 'external_projection')
+    sql`${t.ownerType} = 'external_projection'
       AND length(btrim(${t.ownerId})) > 0
       AND ${t.sourceDigest} ~ '^[0-9a-f]{64}$'
       AND (${t.sourceLocatorDigest} IS NULL OR ${t.sourceLocatorDigest} ~ '^[0-9a-f]{64}$')
@@ -2321,50 +2957,6 @@ export const externalAddressabilityProjections = pgTable("external_addressabilit
   ),
 ]);
 
-// Raft authors opt into one exact outbound binding epoch. The immutable
-// display/avatar revision is frozen into each delivery later by task #7.
-export const externalAuthorPolicies = pgTable("external_author_policies", {
-  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
-  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
-  provider: text("provider").notNull(),
-  appRegistrationId: text("app_registration_id").notNull(),
-  installId: text("install_id").notNull(),
-  bindingId: text("binding_id").notNull(),
-  bindingEpoch: integer("binding_epoch").notNull(),
-  authorType: text("author_type", { enum: ["user", "agent"] }).notNull(),
-  authorId: text("author_id").notNull(),
-  displayName: text("display_name").notNull(),
-  avatarArtifactId: uuid("avatar_artifact_id").references(() => externalProjectionAvatarArtifacts.id, { onDelete: "restrict" }),
-  fallbackKind: text("fallback_kind", { enum: ["human", "agent"] }).notNull(),
-  consentRevision: integer("consent_revision").notNull(),
-  state: text("state", { enum: ["granted", "revoked"] }).notNull(),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [
-  uniqueIndex("idx_external_author_policy_epoch").on(
-    t.provider,
-    t.installId,
-    t.bindingId,
-    t.bindingEpoch,
-    t.authorType,
-    t.authorId,
-  ),
-  index("idx_external_author_policy_server_state").on(t.serverId, t.state),
-  check(
-    "external_author_policy_values_valid",
-    sql`length(btrim(${t.provider})) > 0
-      AND length(btrim(${t.appRegistrationId})) > 0
-      AND length(btrim(${t.installId})) > 0
-      AND length(btrim(${t.bindingId})) > 0
-      AND length(btrim(${t.authorId})) > 0
-      AND length(btrim(${t.displayName})) > 0
-      AND ${t.bindingEpoch} > 0 AND ${t.consentRevision} > 0
-      AND ${t.authorType} IN ('user', 'agent')
-      AND ${t.fallbackKind} IN ('human', 'agent')
-      AND ${t.state} IN ('granted', 'revoked')`,
-  ),
-]);
-
 // Immutable author fact for a canonical external-origin message. Reads never
 // resolve senderId through Raft users/agents; tombstoning the mutable actor
 // projection does not rewrite historical attribution.
@@ -2375,6 +2967,7 @@ export const externalMessageAuthorFacts = pgTable("external_message_author_facts
   appRegistrationId: text("app_registration_id").notNull(),
   installId: text("install_id").notNull(),
   workspaceId: text("workspace_id").notNull(),
+  workspaceName: text("workspace_name"),
   externalActorId: text("external_actor_id").notNull(),
   externalConversationId: text("external_conversation_id").notNull(),
   externalMessageId: text("external_message_id").notNull(),
@@ -2691,7 +3284,7 @@ export const externalOutboundDeliveries = pgTable("external_outbound_deliveries"
       "quarantined",
     ],
   }).notNull().default("queued"),
-  renderSnapshotSchema: text("render_snapshot_schema").notNull().default("slack-bridge-render-snapshot.v1"),
+  renderSnapshotSchema: text("render_snapshot_schema").notNull().default("slack-bridge-render-snapshot.v4"),
   renderSnapshot: jsonb("render_snapshot").$type<Record<string, unknown>>().notNull(),
   renderSnapshotDigest: text("render_snapshot_digest").notNull(),
   reconciliationMarker: text("reconciliation_marker").notNull(),
@@ -2737,7 +3330,7 @@ export const externalOutboundDeliveries = pgTable("external_outbound_deliveries"
   check(
     "external_outbound_delivery_contract_valid",
     sql`${t.deliveryContractVersion} = 'slack-bridge-delivery.v1'
-      AND ${t.renderSnapshotSchema} IN ('slack-bridge-render-snapshot.v1', 'slack-bridge-render-snapshot.v2')`,
+      AND ${t.renderSnapshotSchema} IN ('slack-bridge-render-snapshot.v3', 'slack-bridge-render-snapshot.v4')`,
   ),
   check(
     "external_outbound_delivery_state_valid",
@@ -3247,12 +3840,10 @@ export const legacyWikiSpaces = pgTable("wiki_spaces", {
   index("idx_wiki_spaces_channel").on(t.wikiChannelId),
 ]);
 
-// Wiki — one server-level binding to the dedicated Agent + Channel.
-//
-// S3 manifest/revisions are canonical for cursor, documents, provenance, and
-// publication receipts. Do not add derived Wiki state here unless it cannot be
-// represented safely in the manifest.
-export const wikiBindings = pgTable("wiki_bindings", {
+// Retained table declaration only: prevents future schema generation from
+// deleting stored bindings as a side effect of feature code removal.
+// No runtime consumer; see docs/operations/wiki-retirement.md.
+export const legacyWikiBindings = pgTable("wiki_bindings", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
   wikiAgentId: uuid("wiki_agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
@@ -3389,10 +3980,18 @@ export const machines = pgTable("daemons", {
   runtimes: json("runtimes").$type<string[]>(),
   hostname: text("hostname"),
   os: text("os"),
+  // Coarse machine kind for the Computer icon (shared DEVICE_CLASSES), from
+  // the daemon's `ready`; null when unknown or reported by an older daemon.
+  deviceClass: text("device_class"),
   daemonVersion: text("daemon_version"),
   computerVersion: text("computer_version"),
   computerVersionReportedAt: timestamp("computer_version_reported_at", { withTimezone: true }),
   lastHeartbeat: timestamp("last_heartbeat", { withTimezone: true }),
+  // When this Computer first came online (onboarding funnel, T3). The row is
+  // created when its key is minted and `last_heartbeat` is overwritten, so
+  // nothing else records it. Set once on `machine:online`; null for machines
+  // that never connected or that last connected before the column existed.
+  firstConnectedAt: timestamp("first_connected_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   legacyKeyMigratedAt: timestamp("legacy_key_migrated_at", { withTimezone: true }),
 }, (t) => [
@@ -3400,6 +3999,16 @@ export const machines = pgTable("daemons", {
   index("idx_daemons_api_key_prefix").on(t.apiKeyPrefix),
   index("idx_daemons_api_key_fingerprint").on(t.apiKeyFingerprint),
 ]);
+
+// Same-machine grouping (computer_host_identity_v0): the daemon's per-server
+// HMAC(hardware ID, serverId). Its own table, not a `daemons` column, so no
+// machine-row read can return it; it leaves the Server only as an opaque
+// per-response group label. Deleted with the machine.
+export const computerHostIdentities = pgTable("computer_host_identities", {
+  machineId: uuid("daemon_id").primaryKey().references(() => machines.id, { onDelete: "cascade" }),
+  hostIdHash: text("host_id_hash").notNull(),
+  reportedAt: timestamp("reported_at", { withTimezone: true }).notNull(),
+});
 
 // Tasks — THE CANONICAL TASK TABLE (v1.4).
 //
@@ -3515,6 +4124,8 @@ export const taskEvents = pgTable("task_events", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   index("idx_task_events_task").on(t.taskId, t.seq),
+  // RFC-067 product-data derivation reads task events by a seq watermark.
+  index("idx_task_events_seq").on(t.seq),
 ]);
 
 export type PersistableJsonValue =
@@ -3757,7 +4368,7 @@ export const readMutations = pgTable("read_mutations", {
   mutationId: uuid("mutation_id").notNull(),
   payloadHash: text("payload_hash").notNull(),
   authoritySeq: bigint("authority_seq", { mode: "number" }).notNull(),
-  kind: text("kind", { enum: ["row_read", "row_unread", "channel_read_all", "global_read_all", "done"] }).notNull(),
+  kind: text("kind", { enum: ["row_read", "row_unread", "channel_read_all", "conversation_read_all", "global_read_all", "done"] }).notNull(),
   scopeId: uuid("scope_id"),
   requestedThroughSeq: integer("requested_through_seq"),
   // RFC 057 phase-A shadow of requested_through_seq (nullable like its authority).
@@ -3779,6 +4390,14 @@ export const readMutations = pgTable("read_mutations", {
     enum: ["effect_applied", "already_satisfied", "authorization_revoked", "done_frontier_beyond_latest"],
   }),
   terminalDigest: text("terminal_digest"),
+  // Timing semantics (PR #8256, 2026-09-24):
+  //   queue     = admitted_at -> executing_at  (valid for all rows)
+  //   execution = executing_at -> terminal_at  (claim to finish; valid only for
+  //               rows terminalized after #8256 deployed)
+  // Before #8256, terminal_at reused the clock captured at executor entry, so
+  // executing_at -> terminal_at was only the claim-to-entry gap. Never compare
+  // admitted_at -> terminal_at across the deploy: its meaning changed there
+  // (queue before, queue + execution after).
   admittedAt: timestamp("admitted_at", { withTimezone: true }).notNull().defaultNow(),
   executingAt: timestamp("executing_at", { withTimezone: true }),
   terminalAt: timestamp("terminal_at", { withTimezone: true }),
@@ -3796,7 +4415,7 @@ export const readMutations = pgTable("read_mutations", {
   check("read_mutations_attempt_count_nonnegative", sql`${t.attemptCount} >= 0`),
   check("read_mutations_scope_shape", sql`
     (${t.kind} = 'global_read_all' AND ${t.scopeId} IS NULL AND ${t.requestedThroughSeq} IS NULL AND ${t.doneTargetKind} IS NULL AND ${t.doneThroughSeq} IS NULL)
-    OR (${t.kind} = 'channel_read_all' AND ${t.scopeId} IS NOT NULL AND ${t.requestedThroughSeq} IS NULL AND ${t.doneTargetKind} IS NULL AND ${t.doneThroughSeq} IS NULL)
+    OR (${t.kind} IN ('channel_read_all', 'conversation_read_all') AND ${t.scopeId} IS NOT NULL AND ${t.requestedThroughSeq} IS NULL AND ${t.doneTargetKind} IS NULL AND ${t.doneThroughSeq} IS NULL)
     OR (${t.kind} IN ('row_read', 'row_unread') AND ${t.scopeId} IS NOT NULL AND ${t.requestedThroughSeq} IS NOT NULL AND ${t.requestedThroughSeq} >= 0 AND ${t.doneTargetKind} IS NULL AND ${t.doneThroughSeq} IS NULL)
     OR (${t.kind} = 'done' AND ${t.scopeId} IS NOT NULL AND ${t.requestedThroughSeq} IS NULL AND ${t.doneTargetKind} IN ('channel', 'thread') AND ${t.doneThroughSeq} IS NOT NULL AND ${t.doneThroughSeq} > 0)
   `),
@@ -3934,10 +4553,61 @@ export const agentMigrationReceiptChannels = pgTable("agent_migration_receipt_ch
   index("idx_agent_migration_receipt_channels_agent").on(t.agentId, t.channelId),
 ]);
 
+// Agent-only private DM surfaces, one per (agent, kind). `reminders` renders as
+// `dm:@reminders` for its owning agent only: exactly one agent member, no
+// humans, no dm_channel_identities row, never sendable by the agent.
+export const agentPrivateSurfaces = pgTable("agent_private_surfaces", {
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  kind: text("kind", { enum: ["reminders"] }).notNull(),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  channelId: uuid("channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.agentId, t.kind] }),
+  uniqueIndex("idx_agent_private_surfaces_channel").on(t.channelId),
+  check("agent_private_surfaces_kind_valid", sql`${t.kind} IN ('reminders')`),
+]);
+
+// Idempotency ledger for app-written agent messages: one row per
+// (client, agent, idempotency key), pointing at the message it produced.
+export const appAgentMessages = pgTable("app_agent_messages", {
+  clientId: uuid("client_id").notNull().references(() => oauthClients.id, { onDelete: "cascade" }),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  idempotencyKey: text("idempotency_key").notNull(),
+  messageId: uuid("message_id").notNull().references(() => messages.id, { onDelete: "cascade" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.clientId, t.agentId, t.idempotencyKey] }),
+  index("idx_app_agent_messages_message").on(t.messageId),
+]);
+
+// Idempotency ledger for keyed Agent API writes that have no natural
+// per-request row to carry the key (task create, action prepare). One row per
+// (agent, route, idempotency key), written in the same transaction as the
+// write it records: the request fingerprint that bound the key and the exact
+// first response, which a same-key same-request retry replays verbatim. A key
+// is valid for 24 hours; an older row counts as absent.
+// Message send keeps its key on the message row (messages.agent_send_key).
+export const agentApiIdempotencyKeys = pgTable("agent_api_idempotency_keys", {
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  route: text("route").notNull(),
+  idempotencyKey: text("idempotency_key").notNull(),
+  requestFingerprint: text("request_fingerprint").notNull(),
+  responseStatus: integer("response_status").notNull(),
+  responseBody: jsonb("response_body").$type<Record<string, unknown>>().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.agentId, t.route, t.idempotencyKey] }),
+  check("agent_api_idempotency_keys_route_valid", sql`${t.route} IN ('taskCreate', 'actionPrepare')`),
+  // Keys are valid for 24 hours; the hourly maintenance sweep deletes expired
+  // rows oldest-first in bounded batches through this index.
+  index("idx_agent_api_idempotency_keys_created_at").on(t.createdAt),
+]);
+
 export const agentMigrationReceiptOutbox = pgTable("agent_migration_receipt_outbox", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   migrationId: uuid("migration_id").notNull().references(() => agentMigrations.id, { onDelete: "cascade" }),
-  receiptKind: text("receipt_kind", { enum: ["completed", "canceled", "failed"] }).notNull(),
+  receiptKind: text("receipt_kind", { enum: ["completed", "canceled", "failed", "aborted"] }).notNull(),
   serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
   agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
   channelId: uuid("channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
@@ -3953,41 +4623,8 @@ export const agentMigrationReceiptOutbox = pgTable("agent_migration_receipt_outb
   uniqueIndex("idx_agent_migration_receipt_outbox_dedupe").on(t.migrationId, t.receiptKind),
   uniqueIndex("idx_agent_migration_receipt_outbox_message").on(t.messageId),
   index("idx_agent_migration_receipt_outbox_pending").on(t.status, t.createdAt),
-  check("agent_migration_receipt_outbox_kind_check", sql`${t.receiptKind} IN ('completed', 'canceled', 'failed')`),
+  check("agent_migration_receipt_outbox_kind_check", sql`${t.receiptKind} IN ('completed', 'canceled', 'failed', 'aborted')`),
   check("agent_migration_receipt_outbox_status_check", sql`${t.status} IN ('pending', 'processing', 'sent')`),
-]);
-
-// Materialized serving row for fast Activity/Inbox display. It is derived from
-// inbox_notification_facts plus read cursors; facts remain the source of truth.
-export const inboxServingRows = pgTable("inbox_serving_rows", {
-  receiverType: text("receiver_type", { enum: ["user", "agent"] }).notNull(),
-  receiverId: uuid("receiver_id").notNull(),
-  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
-  kind: text("kind", { enum: ["channel", "dm", "thread"] }).notNull(),
-  sourceChannelId: uuid("source_channel_id").notNull().references(() => channels.id, { onDelete: "cascade" }),
-  latestNotifiedMessageId: uuid("latest_notified_message_id").notNull().references(() => messages.id, { onDelete: "cascade" }),
-  latestNotifiedSeq: bigint("latest_notified_seq", { mode: "number" }).notNull(),
-  latestNotifiedAt: timestamp("latest_notified_at", { withTimezone: true }).notNull(),
-  lastActivityAt: timestamp("last_activity_at", { withTimezone: true }),
-  firstUnreadMessageId: uuid("first_unread_message_id").references(() => messages.id, { onDelete: "set null" }),
-  firstUnreadSeq: bigint("first_unread_seq", { mode: "number" }),
-  unreadCount: integer("unread_count").notNull().default(0),
-  latestPersonalMentionMessageId: uuid("latest_personal_mention_message_id").references(() => messages.id, { onDelete: "set null" }),
-  latestPersonalMentionSeq: bigint("latest_personal_mention_seq", { mode: "number" }),
-  unreadMentionCount: integer("unread_mention_count").notNull().default(0),
-  hasAnyMention: boolean("has_any_mention").notNull().default(false),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [
-  primaryKey({ columns: [t.receiverType, t.receiverId, t.sourceChannelId] }),
-  index("idx_inbox_serving_rows_receiver_activity").on(t.receiverType, t.receiverId, t.latestNotifiedAt),
-  index("idx_inbox_serving_rows_receiver_last_activity").on(t.receiverType, t.receiverId, t.lastActivityAt),
-  index("idx_inbox_serving_rows_receiver_server_last_activity").on(
-    t.receiverType,
-    t.receiverId,
-    t.serverId,
-    t.lastActivityAt,
-  ),
-  index("idx_inbox_serving_rows_server").on(t.serverId),
 ]);
 
 // One exact row/tombstone version allocator per authenticated principal.
@@ -4601,6 +5238,23 @@ export const attachments = pgTable("attachments", {
   ),
 ]);
 
+// Cache for expensive on-demand document previews (GET /attachments/:id/preview,
+// services/attachmentPreviews/previewCache.ts). Only results that were slow or
+// came from a heavy provider are stored; cheap text/markdown previews are
+// recomputed. A row is reused only while `content_key` (the original's storage
+// identity) and `provider_version` still match. Read access is checked before
+// the cache is consulted, so a row grants nothing on its own. `last_hit_at` is
+// kept for a future eviction sweep.
+export const attachmentPreviewCache = pgTable("attachment_preview_cache", {
+  attachmentId: uuid("attachment_id").primaryKey().references(() => attachments.id, { onDelete: "cascade" }),
+  contentKey: text("content_key").notNull(),
+  providerVersion: integer("provider_version").notNull(),
+  preview: jsonb("preview").notNull(),
+  computeMs: integer("compute_ms").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  lastHitAt: timestamp("last_hit_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // Provider-neutral identity for one external file. Private provider locators
 // and credentials never enter this table; adapters persist only stable IDs and
 // bounded metadata before a leased transfer performs any network or storage I/O.
@@ -5052,6 +5706,30 @@ export const agentActivityEvents = pgTable("agent_activity_events", {
 ]);
 
 /**
+ * One row per finished agent turn (RFC 069 §6 `agent_activity_summary_v2`;
+ * task #17 Activity overview). `summary` is `ActivityTurnSummary`: times,
+ * outcome, trigger, action counts, problem steps, last reply id; never tool
+ * input/output or message bodies. Written by the daemon (a `turn_summary`
+ * trajectory entry) or rebuilt by the server for agents without a daemon;
+ * `turn_key` makes the write an upsert, so a late event rebuilds its turn.
+ * Additive table: nothing else reads or writes it.
+ */
+export const agentActivitySummaryV2 = pgTable("agent_activity_summary_v2", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  turnKey: text("turn_key").notNull(),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull(),
+  endedAt: timestamp("ended_at", { withTimezone: true }).notNull(),
+  outcome: text("outcome").notNull(),
+  summary: jsonb("summary").$type<ActivityTurnSummary>().notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("idx_agent_activity_summary_v2_agent_turn").on(t.agentId, t.turnKey),
+  index("idx_agent_activity_summary_v2_agent_ended").on(t.agentId, t.endedAt),
+]);
+
+/**
  * Thread contract (authoritative).
  * =============================================================================
  * Thread channels split two authorities that regular channels conflate:
@@ -5143,6 +5821,10 @@ export const threadFollows = pgTable("thread_follows", {
   followerId: uuid("follower_id").notNull(),
   parentMessageId: uuid("parent_message_id").notNull(),
   reason: text("reason", { enum: ["replied", "authored", "mentioned", "manual"] }).notNull(),
+  // Start of the CURRENT follow period, not "row created": reset when a thread
+  // is re-followed after an unfollow, never when an active follow is
+  // re-confirmed (reply, mention). Readers (agent `thread list` followedAt,
+  // follower order, o11y rule 12b) want "since when is this followed now".
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   doneAt: timestamp("done_at", { withTimezone: true }),
   unfollowedAt: timestamp("unfollowed_at", { withTimezone: true }),
@@ -5154,7 +5836,7 @@ export const threadFollows = pgTable("thread_follows", {
 export const pushRegistrations = pgTable("push_registrations", {
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   installationId: text("installation_id").notNull(),
-  provider: text("provider", { enum: ["apns"] }).notNull(),
+  provider: text("provider", { enum: ["apns", "fcm"] }).notNull(),
   userId: uuid("user_id").references(() => users.id, { onDelete: "set null" }),
   serverId: uuid("server_id").references(() => servers.id, { onDelete: "set null" }),
   sessionFamilyId: uuid("session_family_id").references(() => sessionFamilies.id, { onDelete: "set null" }),
@@ -5171,7 +5853,7 @@ export const pushRegistrations = pgTable("push_registrations", {
   index("idx_push_registrations_binding").on(t.userId, t.serverId),
   index("idx_push_registrations_family").on(t.sessionFamilyId),
   index("idx_push_registrations_provider_env").on(t.provider, t.env),
-  check("push_registrations_provider_check", sql`${t.provider} IN ('apns')`),
+  check("push_registrations_provider_check", sql`${t.provider} IN ('apns', 'fcm')`),
   check("push_registrations_env_check", sql`${t.env} IN ('sandbox', 'production')`),
 ]);
 
@@ -5202,6 +5884,9 @@ export const mobilePushOutbox = pgTable("mobile_push_outbox", {
 }, (t) => [
   uniqueIndex("idx_mobile_push_outbox_unique_fact").on(t.receiverType, t.receiverId, t.sourceChannelId, t.messageId),
   index("idx_mobile_push_outbox_pending").on(t.status, t.createdAt),
+  // The drain's candidate read (migration 0357); built CONCURRENTLY in
+  // staging/prod by db:create-mobile-push-outbox-active-index first.
+  index("idx_mobile_push_outbox_active_created").on(t.createdAt).where(sql`${t.status} IN ('pending', 'processing')`),
   index("idx_mobile_push_outbox_message").on(t.messageId),
   check("mobile_push_outbox_receiver_type_check", sql`${t.receiverType} IN ('user')`),
   check("mobile_push_outbox_kind_check", sql`${t.kind} IN ('channel', 'dm', 'thread')`),
@@ -5286,20 +5971,38 @@ export const serverInvites = pgTable("server_invites", {
  * Not server-scoped: announcements follow the user across every server they
  * belong to, so the table holds no serverId.
  */
+export const announcementImageAssets = pgTable("announcement_image_assets", {
+  id: uuid("id").primaryKey(),
+  storageKey: text("storage_key").notNull().unique(),
+  contentType: text("content_type").notNull(),
+  width: integer("width").notNull(),
+  height: integer("height").notNull(),
+  sizeBytes: integer("size_bytes").notNull(),
+  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  unreferencedSince: timestamp("unreferenced_since", { withTimezone: true }),
+  deletingAt: timestamp("deleting_at", { withTimezone: true }),
+});
+
 export const announcements = pgTable("announcements", {
+  audience: jsonb("audience").$type<AnnouncementAudience>().notNull().default({ type: "all" }),
+  deliveryVersion: integer("delivery_version").notNull().default(1),
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   title: text("title").notNull(),
   pages: json("pages").$type<Array<{ title?: string; body: string }>>().notNull(),
   defaultLocale: text("default_locale", { enum: ["en", "zh-cn"] }).notNull().default("en"),
   localizedContent: json("localized_content")
-    .$type<Partial<Record<"en" | "zh-cn", { title: string; pages: Array<{ title?: string; body: string }> }>>>()
+    .$type<Partial<Record<"en" | "zh-cn", AnnouncementContent>>>()
     .notNull()
     .default({}),
   status: text("status", { enum: ["draft", "published", "expired"] }).notNull().default("draft"),
   startsAt: timestamp("starts_at", { withTimezone: true }),
   endsAt: timestamp("ends_at", { withTimezone: true }),
   createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
   updatedByUserId: uuid("updated_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  updatedByAgentId: uuid("updated_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
   publishedByUserId: uuid("published_by_user_id").references(() => users.id, { onDelete: "set null" }),
   // Keep the legacy default during the expand phase so an old server that is
   // still draining can continue to create a published row safely. V2 draft
@@ -5321,9 +6024,12 @@ export const userAnnouncementDismissals = pgTable("user_announcement_dismissals"
 ]);
 
 export const announcementAuditEvents = pgTable("announcement_audit_events", {
+  audienceSnapshot: jsonb("audience_snapshot").$type<AnnouncementAudienceSnapshot>(),
+  reachCount: integer("reach_count"),
   id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
   announcementId: uuid("announcement_id").notNull().references(() => announcements.id, { onDelete: "cascade" }),
   actorUserId: uuid("actor_user_id").references(() => users.id, { onDelete: "set null" }),
+  actorAgentId: uuid("actor_agent_id").references(() => agents.id, { onDelete: "set null" }),
   action: text("action", {
     enum: [
       "created",
@@ -5445,7 +6151,8 @@ export const reminderEvents = pgTable("reminder_events", {
 // carrier message; the message body renders the card from this row.
 //
 // State machine:
-//   prepared → executed
+//   prepared → frozen → reconfirm_required → ready → executed
+//   prepared → ready (explicit cancellation only)
 // Both stored as text (not pg enum) so future states (e.g. cancelled) can
 // land without a schema migration. Migration-friendly per stdrc/tygg
 // 2026-05-10 #proj-approval msg=174b7e16: minimum schema, jsonb where
@@ -5467,12 +6174,24 @@ export const actionCards = pgTable("action_cards", {
   executedAt: timestamp("executed_at", { withTimezone: true }),
   executedByUserId: uuid("executed_by_user_id").references(() => users.id, { onDelete: "set null" }),
   result: jsonb("result"),
+  // Conversion binding is durable authority for action-card credentials. A
+  // prepared card is frozen while this job's source fence is active; after a
+  // successful cutover it must be explicitly reconfirmed in Joint visibility.
+  conversionJobId: uuid("conversion_job_id").references(() => channelConversionJobs.id, { onDelete: "set null" }),
+  conversionSourceChannelId: uuid("conversion_source_channel_id").references(() => channels.id, { onDelete: "set null" }),
+  conversionEpoch: uuid("conversion_epoch"),
+  freezeState: text("freeze_state", { enum: ["ready", "frozen", "reconfirm_required"] }).notNull().default("ready"),
+  confirmationVersion: integer("confirmation_version").notNull().default(1),
+  reconfirmedAt: timestamp("reconfirmed_at", { withTimezone: true }),
+  reconfirmedByUserId: uuid("reconfirmed_by_user_id").references(() => users.id, { onDelete: "set null" }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   uniqueIndex("idx_action_cards_message").on(t.messageId),
   index("idx_action_cards_server_state").on(t.serverId, t.state),
   index("idx_action_cards_requester").on(t.requesterAgentId, t.createdAt),
+  index("idx_action_cards_conversion_job").on(t.conversionJobId, t.freezeState),
+  check("action_cards_freeze_state_check", sql`${t.freezeState} IN ('ready', 'frozen', 'reconfirm_required')`),
 ]);
 
 // Product events — append-only product-funnel / UX-interaction event log.
@@ -5724,15 +6443,27 @@ export const mentionDeliveryOccurrences = pgTable("mention_delivery_occurrences"
   ackedAt: timestamp("acked_at", { withTimezone: true }),
   terminalErrorAt: timestamp("terminal_error_at", { withTimezone: true }),
   terminalErrorCode: text("terminal_error_code"),
+  terminalDecision: jsonb("terminal_decision").$type<MentionDeliveryTerminalDecision>(),
   pendingCoalescedCount: integer("pending_coalesced_count").notNull().default(0),
   version: integer("version").notNull().default(0),
   redriveCount: integer("redrive_count").notNull().default(0),
   lastRedriveAt: timestamp("last_redrive_at", { withTimezone: true }),
+  // task #285: automatic recovery rounds re-sent after the daemon already held the occurrence.
+  // Bounds the recovery loop per occurrence; it is not an age and never counts rounds that
+  // could not reach the daemon (an offline agent keeps its mention).
+  recoveryCount: integer("recovery_count").notNull().default(0),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   uniqueIndex("idx_mention_delivery_occurrences_message_agent").on(t.messageId, t.agentId),
   index("idx_mention_delivery_occurrences_machine_state").on(t.machineIdSnapshot, t.state),
+  // Agent-side recovery (listRecoverableMentionDeliveriesForAgent) filters by agent_id over
+  // unacked, non-terminal rows that carry a delivery payload (~5% of the table; open rows
+  // without a payload are skipped by recovery and would only cost heap rechecks). Built
+  // CONCURRENTLY outside the migration first (scripts/create-mention-delivery-agent-open-index.ts).
+  index("idx_mention_delivery_occurrences_agent_payload_open")
+    .on(t.agentId, t.state)
+    .where(sql`${t.ackedAt} IS NULL AND ${t.terminalErrorAt} IS NULL AND ${t.deliveryPayload} IS NOT NULL`),
   // The right-hand side is an AND over TWO columns, and that AND is the hole (@Hipp, PR #6700
   // comment 5359756944, measured on pglite): "right side is false" has two causes — neither column
   // set, or exactly one set — and a biconditional cannot separate them. So a row with
@@ -5861,7 +6592,8 @@ export const agentScopes = pgTable("agent_scopes", {
 //   2. middleware extracts `apiKeyPrefix`
 //      → SELECT row WHERE prefix = ? AND revoked_at IS NULL
 //        (served by partial index `idx_agent_credentials_prefix_active`)
-//   3. argon2id verify on `apiKeyHash`
+//   3. constant-time HMAC compare on `apiKeyHmac` when set; otherwise argon2id
+//      verify on `apiKeyHash`, then backfill `apiKeyHmac`
 //   4. on success: `req.actingAgentId = row.agentId`,
 //      `req.principalKind = 'agent_credential'`,
 //      `req.agentCredentialId = row.id`,
@@ -5870,6 +6602,7 @@ export const agentScopes = pgTable("agent_scopes", {
 // v0.8 active surface (route allowlist via `routeAuthPolicy` registry, see
 // `internalAgentApiRouter` at `routes/internalAgentApi.ts`):
 //   GET    /internal/agent-api                         — whoami
+//   GET    /internal/agent-api/context                 — identity bootstrap
 //   GET    /internal/agent-api/server
 //   POST   /internal/agent-api/send
 //   GET    /internal/agent-api/history
@@ -5884,6 +6617,7 @@ export const agentScopes = pgTable("agent_scopes", {
 //   POST   /internal/agent-api/channels/:channelId/leave
 //   POST   /internal/agent-api/channels/:channelId/members
 //   GET    /internal/agent-api/events?since=<seq|latest> — catch-up envelope
+//   GET|PUT|DELETE /internal/agent-api/push-webhook — inbox push registration
 //
 // Explicitly NOT permitted in v0 (returns 401 `invalid_principal` via the
 // auth-policy registry — wrong-principal class, not a 404):
@@ -5911,6 +6645,15 @@ export const agentCredentials = pgTable("agent_credentials", {
   // argon2id of the raw `sk_agent_*` key. Returned exactly once at mint;
   // never persisted in raw form. Verified constant-time post-lookup.
   apiKeyHash: text("api_key_hash").notNull(),
+  // HMAC-SHA-256(AGENT_API_KEY_HMAC_SECRET, raw key) as raw bytes. The fast
+  // verifier: when set, auth compares it in constant time and skips argon2
+  // (the key is 256 random bits, so argon2's stretching adds nothing). NULL on
+  // rows minted before it existed or while the secret is unset; those verify
+  // with argon2 and backfill it. Not a lookup key — rows are still found by
+  // `apiKeyPrefix`, so no index.
+  apiKeyHmac: customType<{ data: Buffer; driverData: Buffer }>({
+    dataType: () => "bytea",
+  })("api_key_hmac"),
   // First N chars of raw key for O(1) lookup at auth time. Not identity —
   // a `tokenLookupHash`-style HMAC could replace it later, but partial-
   // prefix is enough at v0 scale and matches the existing `sk_machine_*`
@@ -5944,6 +6687,61 @@ export const agentCredentials = pgTable("agent_credentials", {
   // the canonical migration as raw SQL — see drizzle migration
   // `0072_*` step 2.
 ]);
+
+// External Agent inbox push (raft-agent-inbox.v2). One registration per agent,
+// bound to the `sk_agent_*` credential that created it: a revoked credential
+// disables the registration at the next delivery. The receiver-supplied signing
+// secret is encrypted at rest with the app webhook key and never returned.
+//
+// The row also carries the per-agent delivery lease: a delivery claims the row
+// (lease_token / lease_expires_at) with one conditional UPDATE, so at most one
+// delivery per agent is in flight across all replicas. The durable inbox is the
+// backlog; nothing here stores message bodies or a separate cursor.
+export const agentInboxPushRegistrations = pgTable("agent_inbox_push_registrations", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  credentialId: uuid("credential_id").notNull().references(() => agentCredentials.id, { onDelete: "cascade" }),
+  endpointUrl: text("endpoint_url").notNull(),
+  secretCiphertext: text("secret_ciphertext").notNull(),
+  secretIv: text("secret_iv").notNull(),
+  secretAuthTag: text("secret_auth_tag").notNull(),
+  // Set when pushes stop: 'endpoint_rejected' (3 consecutive 401/404/410) or
+  // 'credential_revoked'. A new PUT clears it.
+  disabledAt: timestamp("disabled_at", { withTimezone: true }),
+  disabledReason: text("disabled_reason"),
+  nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+  // Last time new inbox work was signalled; a delivery that started before it
+  // does not park the row idle.
+  requestedAt: timestamp("requested_at", { withTimezone: true }),
+  leaseToken: uuid("lease_token"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+  consecutiveRejections: integer("consecutive_rejections").notNull().default(0),
+  lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
+  lastDeliveryAt: timestamp("last_delivery_at", { withTimezone: true }),
+  lastError: text("last_error"),
+  // Max pending seq a sweep reminder was claimed for. One conditional update
+  // makes exactly one replica send each reminder; cleared when the inbox is empty.
+  remindedMaxSeq: bigint("reminded_max_seq", { mode: "number" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("idx_agent_inbox_push_registrations_agent").on(t.agentId),
+  index("idx_agent_inbox_push_registrations_due").on(t.nextAttemptAt),
+  index("idx_agent_inbox_push_registrations_credential").on(t.credentialId),
+  check("agent_inbox_push_registrations_failures_nonnegative", sql`${t.consecutiveFailures} >= 0 AND ${t.consecutiveRejections} >= 0`),
+]);
+
+// `GET /internal/agent-api/events?ack=cursor`: the durable inbox seqs handed
+// over by the agent's latest cursor-mode response and not yet acknowledged. The
+// next cursor-mode request acknowledges those <= its `since`, so a lost response
+// is delivered again instead of being acknowledged unseen.
+export const agentInboxEventsPendingAcks = pgTable("agent_inbox_events_pending_acks", {
+  agentId: uuid("agent_id").primaryKey().references(() => agents.id, { onDelete: "cascade" }),
+  seqs: jsonb("seqs").$type<number[]>().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 // Agent bootstrap tokens — single-use tokens minted by the web admin UI
 // (`rfcs/034-slock-credential-rfc.zh.html#section-credential-model`) and
@@ -6144,6 +6942,15 @@ export const computers = pgTable("computers", {
   apiKeyHash: text("api_key_hash").notNull(),
   // First N chars of raw key for O(1) lookup at auth time.
   apiKeyPrefix: text("api_key_prefix").notNull(),
+  // HMAC-SHA-256(AGENT_API_KEY_HMAC_SECRET, raw key) as raw bytes: the fast
+  // verifier, same scheme and secret as `agent_credentials.api_key_hmac`.
+  // When set (and the secret is configured) auth compares it in constant time
+  // and skips argon2. NULL on rows from before it existed or while the secret
+  // is unset; those verify with argon2 and backfill it. Written together with
+  // `apiKeyHash` on every mint/rotation. Not a lookup key, so no index.
+  apiKeyHmac: customType<{ data: Buffer; driverData: Buffer }>({
+    dataType: () => "bytea",
+  })("api_key_hmac"),
   // User who attached the Computer (audit trail). May be null for
   // future device-code / bootstrap-token attachment flows.
   attachedByUserId: uuid("attached_by_user_id").references(() => users.id, { onDelete: "set null" }),
@@ -6169,6 +6976,62 @@ export const computers = pgTable("computers", {
   index("idx_computers_server").on(t.serverId),
   // Partial index `idx_computers_prefix_active` is appended to the
   // canonical migration as raw SQL — see drizzle migration `0074_*`.
+]);
+
+// Durable, receiver-independent attention caused by an authoritative runtime
+// account usage snapshot. The account key is already a one-way SHA-256 value;
+// no provider label, raw response, or error text is retained here.
+export const systemAttentionIncidents = pgTable("system_attention_incidents", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  machineId: uuid("machine_id").notNull().references(() => machines.id, { onDelete: "cascade" }),
+  kind: text("kind", { enum: ["usage_limit_reached"] }).notNull(),
+  provider: text("provider", { enum: ["claude", "codex", "kimi", "grok"] }).notNull(),
+  accountKeyHash: text("account_key_hash").notNull(),
+  windowKey: text("window_key").notNull(),
+  activationGeneration: integer("activation_generation").notNull(),
+  state: text("state", { enum: ["active", "resolved"] }).notNull().default("active"),
+  affectedAgentIds: jsonb("affected_agent_ids").$type<string[]>().notNull().default([]),
+  activatedAt: timestamp("activated_at", { withTimezone: true }).notNull(),
+  lastObservedAt: timestamp("last_observed_at", { withTimezone: true }).notNull(),
+  resetsAt: timestamp("resets_at", { withTimezone: true }),
+  resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("idx_system_attention_incidents_generation")
+    .on(t.serverId, t.machineId, t.kind, t.provider, t.accountKeyHash, t.windowKey, t.activationGeneration),
+  uniqueIndex("idx_system_attention_incidents_active_identity")
+    .on(t.serverId, t.machineId, t.kind, t.provider, t.accountKeyHash, t.windowKey)
+    .where(sql`${t.state} = 'active'`),
+  index("idx_system_attention_incidents_server_state").on(t.serverId, t.state, t.activatedAt),
+  check("system_attention_incidents_generation_positive", sql`${t.activationGeneration} > 0`),
+  check("system_attention_incidents_account_key_hash", sql`${t.accountKeyHash} ~ '^[0-9a-f]{64}$'`),
+  check("system_attention_incidents_window_key", sql`length(btrim(${t.windowKey})) BETWEEN 1 AND 64`),
+  check(
+    "system_attention_incidents_state_shape",
+    sql`(${t.state} = 'active' AND ${t.resolvedAt} IS NULL)
+      OR (${t.state} = 'resolved' AND ${t.resolvedAt} IS NOT NULL)`,
+  ),
+]);
+
+// Seen/dismissed state belongs to each current receiver, so opening or
+// dismissing on one device is immediately reflected on every other device.
+export const systemAttentionReceipts = pgTable("system_attention_receipts", {
+  incidentId: uuid("incident_id").notNull()
+    .references(() => systemAttentionIncidents.id, { onDelete: "cascade" }),
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  seenAt: timestamp("seen_at", { withTimezone: true }),
+  dismissedAt: timestamp("dismissed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  primaryKey({ columns: [t.incidentId, t.userId] }),
+  index("idx_system_attention_receipts_user").on(t.userId, t.updatedAt),
+  check(
+    "system_attention_receipts_dismiss_implies_seen",
+    sql`${t.dismissedAt} IS NULL OR ${t.seenAt} IS NOT NULL`,
+  ),
 ]);
 
 export const computerOutageOccurrences = pgTable("computer_outage_occurrences", {
@@ -6309,6 +7172,27 @@ export const computerLifecycleOperationTargets = pgTable("computer_lifecycle_ope
   index("idx_computer_lifecycle_operation_targets_machine").on(t.machineIdAtIntent),
 ]);
 
+// Remote upgrade v2 (task #873): one request row per web-triggered upgrade.
+// The only observation is the version the machine reports on its next
+// reconnect; the installer guarantees success-or-rollback, so nothing in
+// between is modelled here.
+export const computerUpgradeRequests = pgTable("computer_upgrade_requests", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  machineId: uuid("machine_id").notNull(),
+  targetVersion: text("target_version").notNull(),
+  requestedByUserId: uuid("requested_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  requestedAt: timestamp("requested_at", { withTimezone: true }).notNull().defaultNow(),
+  deadlineAt: timestamp("deadline_at", { withTimezone: true }).notNull(),
+  outcome: text("outcome", { enum: ["done", "failed", "no_response"] }),
+  observedVersion: text("observed_version"),
+  reason: text("reason"),
+  resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+}, (t) => [
+  index("idx_computer_upgrade_requests_machine_outcome").on(t.machineId, t.outcome),
+  index("idx_computer_upgrade_requests_deadline").on(t.deadlineAt),
+]);
+
 // Server-managed MCP control plane. Credentials are split from public catalog
 // metadata so every read surface can remain secret-free by construction.
 export const managedMcpServers = pgTable("managed_mcp_servers", {
@@ -6438,6 +7322,207 @@ export const agentProviderConnections = pgTable("agent_provider_connections", {
   index("idx_agent_provider_connections_connection").on(t.connectionId),
 ]);
 
+// One provisioning record per Agent created on a hosted runtime provider.
+// It is the worker's outbox row (single executor per Agent via the lease
+// columns) and, after the Agent is deleted, the tombstone kept until the
+// provider confirms the DELETE. `encrypted_credential` holds the Agent's raw
+// sk_agent key only until the provider accepted it (needed for identical
+// POST retries); it is nulled on success and on delete.
+export const agentRuntimeProvisions = pgTable("agent_runtime_provisions", {
+  agentId: uuid("agent_id").primaryKey().references(() => agents.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  provider: text("provider", { enum: ["antiproton"] }).notNull(),
+  // Frozen at creation: a canary provision never falls back to the official provider.
+  providerTarget: text("provider_target", { enum: ["default", "canary"] }).notNull().default("default"),
+  state: text("state", { enum: ["provisioning", "active", "failed", "deleting", "deleted"] }).notNull(),
+  providerAgentId: text("provider_agent_id"),
+  credentialId: uuid("credential_id").references(() => agentCredentials.id, { onDelete: "set null" }),
+  encryptedCredential: text("encrypted_credential"),
+  // The frozen POST body: a retried POST must be byte-identical (the provider
+  // answers 409 to a changed body under the same Idempotency-Key).
+  provisionedName: text("provisioned_name").notNull(),
+  provisionedInstructions: text("provisioned_instructions").notNull(),
+  // The model the creator picked, sent as `model` on the POST; null = the
+  // provider's default (the field is left out). Only a retry after the
+  // provider refused the model (422 unknown_model / 409 model_locked) changes it.
+  provisionedModel: text("provisioned_model"),
+  provisionedProfile: text("provisioned_profile", { enum: ["raftbench_service"] }),
+  desiredRevision: integer("desired_revision").notNull().default(0),
+  syncedRevision: integer("synced_revision").notNull().default(0),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+  leaseOwner: text("lease_owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  leaseGeneration: integer("lease_generation").notNull().default(0),
+  lastErrorCode: text("last_error_code"),
+  lastErrorMessage: text("last_error_message"),
+  lastErrorHttpStatus: integer("last_error_http_status"),
+  lastErrorAt: timestamp("last_error_at", { withTimezone: true }),
+  pushRegistered: boolean("push_registered"),
+  pushError: text("push_error"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  activatedAt: timestamp("activated_at", { withTimezone: true }),
+  deletedAt: timestamp("deleted_at", { withTimezone: true }),
+  // Workspace import after create (hosted Cindy's seed files, a computer
+  // agent's migrated workspace). Set at create; the row is then POSTed with
+  // `awaitImport: true` and, once active, imported exactly once. Import
+  // errors are kept apart from the POST's: a failed import never re-POSTs.
+  importSource: text("import_source"),
+  importRef: text("import_ref"),
+  importedAt: timestamp("imported_at", { withTimezone: true }),
+  importFailedAt: timestamp("import_failed_at", { withTimezone: true }),
+  importErrorCode: text("import_error_code"),
+  importErrorMessage: text("import_error_message"),
+  importErrorHttpStatus: integer("import_error_http_status"),
+  importErrorAt: timestamp("import_error_at", { withTimezone: true }),
+  // A hosted Cindy that failed or timed out during setup gets one automatic
+  // retry; this records it, so the second failure falls back to a computer.
+  setupRetryAt: timestamp("setup_retry_at", { withTimezone: true }),
+  /** How that retry ended: ok (she became ready) or failed (the fallback is next). */
+  setupRetryOutcome: text("setup_retry_outcome", { enum: ["ok", "failed"] }),
+}, (t) => [
+  check("agent_runtime_provisions_target_check", sql`${t.providerTarget} IN ('default', 'canary')`),
+  check("agent_runtime_provisions_canary_profile_check", sql`${t.providerTarget} = 'default' OR ${t.provisionedProfile} IS NOT DISTINCT FROM 'raftbench_service'`),
+  index("idx_agent_runtime_provisions_server").on(t.serverId),
+  index("idx_agent_runtime_provisions_due").on(t.nextAttemptAt)
+    .where(sql`state IN ('provisioning', 'deleting') OR (state = 'active' AND (desired_revision > synced_revision OR (import_source IS NOT NULL AND imported_at IS NULL AND import_failed_at IS NULL)))`),
+]);
+
+/**
+ * The plan a hosting provider last confirmed for a server (its daily spend
+ * limit tier). The provision worker PUTs the server's current plan whenever it
+ * differs, for servers that have a hosted agent.
+ */
+/**
+ * The daily pull of hosted spend from the provider, one row per (UTC day,
+ * scope). A scope is `server:<id>` (that server's per-agent spend) or
+ * `onboarding` (the platform onboarding budget). A row completes once, so a
+ * day's events are written once; `pull_id` tags them for the reader.
+ */
+export const hostedRuntimeSpendPulls = pgTable("hosted_runtime_spend_pulls", {
+  day: date("day").notNull(),
+  scope: text("scope").notNull(),
+  pullId: uuid("pull_id").notNull().defaultRandom(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  attempts: integer("attempts").notNull().default(0),
+  nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  lastErrorCode: text("last_error_code"),
+}, (t) => [
+  primaryKey({ columns: [t.day, t.scope] }),
+]);
+
+export const hostedRuntimeServerPlans = pgTable("hosted_runtime_server_plans", {
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  provider: text("provider", { enum: ["antiproton"] }).notNull(),
+  /** Last plan the provider acknowledged; null until the first PUT succeeds. */
+  syncedPlan: text("synced_plan", { enum: ["free", "pro"] }),
+  syncedAt: timestamp("synced_at", { withTimezone: true }),
+  failedAttempts: integer("failed_attempts").notNull().default(0),
+  nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+  lastErrorCode: text("last_error_code"),
+  /** Last `antiproton_model_picker` state the provider acknowledged; null until the first PUT succeeds. */
+  syncedModelPicker: boolean("synced_model_picker"),
+  modelPickerSyncedAt: timestamp("model_picker_synced_at", { withTimezone: true }),
+  modelPickerFailedAttempts: integer("model_picker_failed_attempts").notNull().default(0),
+  modelPickerNextAttemptAt: timestamp("model_picker_next_attempt_at", { withTimezone: true }),
+  modelPickerLastErrorCode: text("model_picker_last_error_code"),
+}, (t) => [
+  primaryKey({ columns: [t.serverId, t.provider] }),
+]);
+
+// Computer-scoped provider probes (Phase 2A foundation). An intent is the
+// client-idempotent, at-most-once dispatch record; its claim column group is
+// the one-time materialization lease (atomic CAS, no third table). A receipt is
+// insert-once per probe and never mutates a terminal state.
+export const providerProbeIntents = pgTable("provider_probe_intents", {
+  id: uuid("id").primaryKey(),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  connectionId: uuid("connection_id").notNull().references(() => providerConnections.id, { onDelete: "cascade" }),
+  configVersion: integer("config_version").notNull(),
+  credentialVersion: integer("credential_version").notNull(),
+  computerId: uuid("computer_id").notNull().references(() => machines.id, { onDelete: "cascade" }),
+  runtime: text("runtime").notNull(),
+  model: text("model").notNull(),
+  probeKind: text("probe_kind").notNull(),
+  probeRequestId: text("probe_request_id").notNull(),
+  requestDigest: text("request_digest").notNull(),
+  intentDigest: text("intent_digest").notNull(),
+  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  // null -> set exactly once: the at-most-one-dispatch guard.
+  dispatchedAt: timestamp("dispatched_at", { withTimezone: true }),
+  closeReason: text("close_reason"),
+  closedAt: timestamp("closed_at", { withTimezone: true }),
+  // Dispatch-time carrier fact, frozen at the dispatch CAS (F1/F7).
+  dispatchRequestId: text("dispatch_request_id"),
+  dispatchEpochId: text("dispatch_epoch_id"),
+  dispatchGeneration: text("dispatch_generation"),
+  capabilityObserved: boolean("capability_observed"),
+  dispatchDaemonVersion: text("dispatch_daemon_version"),
+  dispatchComputerVersion: text("dispatch_computer_version"),
+  dispatchRuntimeVersion: text("dispatch_runtime_version"),
+  dispatchRuntimes: jsonb("dispatch_runtimes").$type<string[]>(),
+  // One-time materialization claim column group. First valid claim wins; the
+  // same claimant may retry inside the lease, everyone else is rejected.
+  claimMachineId: uuid("claim_machine_id").references(() => machines.id, { onDelete: "cascade" }),
+  claimRequestId: text("claim_request_id"),
+  claimEpochId: text("claim_epoch_id"),
+  claimGeneration: text("claim_generation"),
+  claimLeasedAt: timestamp("claim_leased_at", { withTimezone: true }),
+  materializationDigest: text("materialization_digest"),
+}, (t) => [
+  uniqueIndex("idx_provider_probe_intents_server_request").on(t.serverId, t.probeRequestId),
+  index("idx_provider_probe_intents_server_connection").on(t.serverId, t.connectionId),
+  // Wave-3 exact query: latest valid success for one authority coordinate.
+  index("idx_provider_probe_intents_authority_match").on(
+    t.serverId, t.connectionId, t.configVersion, t.credentialVersion, t.computerId, t.runtime, t.model, t.probeKind,
+  ),
+  check("provider_probe_intents_kind_known", sql`${t.probeKind} in ('canary')`),
+  check(
+    "provider_probe_intents_close_reason_known",
+    sql`${t.closeReason} is null or ${t.closeReason} in ('receipt', 'carrier_offline', 'carrier_timeout', 'unsupported_carrier', 'provider_timeout', 'stale_authority', 'intent_expired', 'invalid_carrier_result')`,
+  ),
+]);
+
+export const providerProbeReceipts = pgTable("provider_probe_receipts", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  probeId: uuid("probe_id").notNull().unique().references(() => providerProbeIntents.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  outcome: text("outcome").notNull(),
+  category: text("category"),
+  latencyMs: integer("latency_ms"),
+  responseSha256: text("response_sha256"),
+  responseBytes: integer("response_bytes"),
+  resultDigest: text("result_digest").notNull(),
+  intentDigest: text("intent_digest").notNull(),
+  materializationDigest: text("materialization_digest"),
+  // Null for closures that never had a dispatch authority (pre-dispatch).
+  authorityIdentity: text("authority_identity"),
+  daemonVersion: text("daemon_version"),
+  computerVersion: text("computer_version"),
+  runtimeVersion: text("runtime_version"),
+  dispatchEpochId: text("dispatch_epoch_id"),
+  dispatchGeneration: text("dispatch_generation"),
+  verifiedAt: timestamp("verified_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  check("provider_probe_receipts_outcome_known", sql`${t.outcome} in ('success', 'failure')`),
+  check(
+    "provider_probe_receipts_category_known",
+    sql`${t.category} is null or ${t.category} in ('auth', 'model', 'network', 'dns_tls', 'rate_quota', 'invalid_response', 'carrier_offline', 'carrier_timeout', 'unsupported_carrier', 'provider_timeout', 'stale_authority', 'intent_expired', 'invalid_carrier_result')`,
+  ),
+  check(
+    "provider_probe_receipts_bytes_nonneg",
+    sql`${t.responseBytes} is null or ${t.responseBytes} >= 0`,
+  ),
+  check(
+    "provider_probe_receipts_success_needs_response",
+    sql`${t.outcome} <> 'success' or (${t.responseSha256} is not null and ${t.responseBytes} is not null and ${t.authorityIdentity} is not null)`,
+  ),
+]);
+
 // Locator-only product feedback ingestion. The payload is kept solely because
 // it has already passed the closed consumer schema below the route boundary;
 // it cannot contain feedback body/session/transcript data. Query columns are
@@ -6476,3 +7561,141 @@ export const productFeedbackLocators = pgTable("product_feedback_locators", {
   check("product_feedback_locators_event_kind", sql`${t.eventKind} = 'feedback-locator:created'`),
   check("product_feedback_locators_schema_version", sql`${t.schemaVersion} = 'raft.feedback.locator.v0'`),
 ]);
+
+// Global product release notes; ordinary server ownership grants no write access.
+export const releaseNotes = pgTable('release_notes', {
+  id: uuid('id').primaryKey().$defaultFn(() => randomUUID()),
+  releaseKey: text('release_key').notNull().unique(),
+  version: text('version').unique(),
+  tag: text('tag').unique(),
+  date: date('date').notNull(),
+  generation: integer('generation').notNull().default(1),
+  currentRevision: integer('current_revision'),
+  retractedAt: timestamp('retracted_at', { withTimezone: true }),
+});
+export const releaseNoteRevisions = pgTable('release_note_revisions', {
+  releaseId: uuid('release_id').notNull().references(() => releaseNotes.id),
+  revision: integer('revision').notNull(),
+  snapshotHash: text('snapshot_hash').notNull(),
+  publishedAt: timestamp('published_at', { withTimezone: true }).notNull().defaultNow(),
+}, t => [primaryKey({columns: [t.releaseId, t.revision]})]);
+export const releaseNoteRevisionItems = pgTable('release_note_revision_items', {
+  releaseId: uuid('release_id').notNull(),
+  revision: integer('revision').notNull(),
+  entryId: uuid('entry_id').notNull(),
+  ordinal: integer('ordinal').notNull(),
+  type: text('type', {enum: ['feature','fix','improvement','breaking','deprecated']}).notNull(),
+  text: text('text').notNull(),
+  emphasis: boolean('emphasis').notNull().default(false),
+}, t => [primaryKey({columns: [t.releaseId,t.revision,t.entryId]}),
+  unique().on(t.releaseId,t.revision,t.ordinal),
+  foreignKey({columns: [t.releaseId,t.revision], foreignColumns: [releaseNoteRevisions.releaseId,releaseNoteRevisions.revision]})]);
+export const releaseNoteDrafts = pgTable('release_note_drafts', {
+  releaseId: uuid('release_id').primaryKey().references(() => releaseNotes.id),
+  entries: jsonb('entries').$type<Array<{entryId:string;ordinal:number;type:'feature'|'fix'|'improvement'|'breaking'|'deprecated';text:string;emphasis:boolean}>>().notNull(),
+});
+export const releaseNoteAudit = pgTable('release_note_audit', {
+  id: uuid('id').primaryKey().$defaultFn(() => randomUUID()),
+  releaseId: uuid('release_id').notNull().references(() => releaseNotes.id),
+  actorType: text('actor_type', {enum: ['human', 'agent']}).notNull(),
+  actorId: text('actor_id').notNull(),
+  clientId: text('client_id').notNull(),
+  action: text('action').notNull(),
+  revision: integer('revision'),
+  reason: text('reason').notNull(),
+  entryDeltas: jsonb('entry_deltas').$type<Array<{entryId: string; op: 'add' | 'remove' | 'change'}>>().notNull().default([]),
+  createdAt: timestamp('created_at', {withTimezone:true}).notNull().defaultNow(),
+});
+export const releaseNoteMutationReceipts = pgTable('release_note_mutation_receipts', {
+  actorType: text('actor_type', {enum: ['human', 'agent']}).notNull(),
+  actorId: text('actor_id').notNull(), clientId: text('client_id').notNull(),
+  key: text('key').notNull(), requestDigest: text('request_digest').notNull(),
+  releaseId: uuid('release_id').notNull().references(() => releaseNotes.id),
+  generation: integer('generation').notNull(), revision: integer('revision'),
+}, t => [primaryKey({columns:[t.actorType,t.actorId,t.clientId,t.key]})]);
+
+// RFC 073 durable tasks: follow-up work written in the same transaction as the
+// state change that needs it, run inline by the originating request after
+// commit, and recovered by any replica once its lease has expired.
+export const durableTasks = pgTable("durable_tasks", {
+  id: bigserial("id", { mode: "number" }).primaryKey(),
+  kind: text("kind").notNull(),
+  payloadVersion: integer("payload_version").notNull(),
+  payload: jsonb("payload").notNull(),
+  state: text("state", { enum: ["open", "succeeded", "needs_attention"] }).notNull(),
+  // The creating request's inline run is attempt 1.
+  attempts: integer("attempts").notNull(),
+  maxAttempts: integer("max_attempts").notNull(),
+  // Fencing token of the current attempt; null while waiting for a retry.
+  claimedBy: text("claimed_by"),
+  // While open: claimed until (running) or the next retry time (waiting).
+  leaseUntil: timestamp("lease_until", { withTimezone: true }).notNull(),
+  // Code-shaped cause of the last failure; never free text.
+  lastError: text("last_error"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+}, (t) => [
+  index("idx_durable_tasks_open_lease_until").on(t.leaseUntil).where(sql`${t.state} = 'open'`),
+  index("idx_durable_tasks_succeeded_finished_at").on(t.finishedAt).where(sql`${t.state} = 'succeeded'`),
+  check("durable_tasks_state_check", sql`${t.state} IN ('open', 'succeeded', 'needs_attention')`),
+  check("durable_tasks_attempts_check", sql`${t.attempts} >= 1 AND ${t.maxAttempts} >= 1`),
+]);
+
+// Staging RaftBench pilot: one configuration and latest run per server, no history library.
+/** Dedicated analysis identities remain restricted even while unassigned. */
+export const raftbenchServiceAgents = pgTable("raftbench_service_agents", {
+  agentId: uuid("agent_id").primaryKey().references(() => agents.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").notNull().references(() => servers.id, { onDelete: "cascade" }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, t => [index("idx_raftbench_service_agents_server").on(t.serverId)]);
+
+export const raftbenchConfigs = pgTable("raftbench_configs", {
+  configuredByUserId: uuid("configured_by_user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  serverId: uuid("server_id").primaryKey().references(() => servers.id, { onDelete: "cascade" }),
+  enabled: boolean("enabled").notNull().default(false),
+  revision: integer("revision").notNull().default(1),
+  agentId: uuid("agent_id").references(() => agents.id, { onDelete: "set null" }),
+  channelIds: jsonb("channel_ids").$type<string[]>().notNull().default([]),
+  readMessages: bigint("read_messages", { mode: "number" }).notNull().default(0),
+  readThroughSeq: bigint("read_through_seq", { mode: "number" }).notNull().default(0),
+  completedBatches: integer("completed_batches").notNull().default(0),
+  scannedThroughAt: timestamp("scanned_through_at", { withTimezone: true }),
+  historyFrom: timestamp("history_from", { withTimezone: true }),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, t => [uniqueIndex("idx_raftbench_configs_agent").on(t.agentId).where(sql`${t.agentId} IS NOT NULL`)]);
+export const raftbenchLatestRuns = pgTable("raftbench_latest_runs", {
+  serverId: uuid("server_id").primaryKey().references(() => raftbenchConfigs.serverId, { onDelete: "cascade" }),
+  runId: uuid("run_id").notNull().unique().$defaultFn(() => randomUUID()),
+  revision: integer("revision").notNull(),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  status: text("status", { enum: ["queued", "running", "ready", "partial", "failed"] }).notNull(),
+  from: timestamp("from_at", { withTimezone: true }).notNull(),
+  to: timestamp("to_at", { withTimezone: true }).notNull(),
+  // Only source references and page checkpoints. Raw source text is never copied here.
+  fetched: jsonb("fetched").$type<Array<{ target: string; messageId: string; channelId: string; sourceVersion?: string }>>().notNull().default([]),
+  nextSeq: bigint("next_seq", { mode: "number" }).notNull().default(0),
+  startAfterSeq: bigint("start_after_seq", { mode: "number" }).notNull().default(0),
+  failureCount: integer("failure_count").notNull().default(0),
+  skippedRanges: jsonb("skipped_ranges").$type<Array<{ from: string; to: string; messages: number | null }>>().notNull().default([]),
+  sourceCharacters: integer("source_characters").notNull().default(0),
+  stopReason: text("stop_reason", { enum: ["more_pages", "message_limit", "char_limit", "window_end"] }).notNull().default("more_pages"),
+  exhausted: boolean("exhausted").notNull().default(false),
+  report: jsonb("report").$type<import("@botiverse/raft-shared").RaftbenchReport>(),
+  submissionHash: text("submission_hash"),
+  receiptId: uuid("receipt_id"),
+  failureReason: text("failure_reason"),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+// Latest analysis scope only: derived findings survive batch rotation, never source text.
+export const raftbenchFindings = pgTable("raftbench_findings", {
+  id: uuid("id").primaryKey().$defaultFn(() => randomUUID()),
+  serverId: uuid("server_id").notNull().references(() => raftbenchConfigs.serverId, { onDelete: "cascade" }),
+  revision: integer("revision").notNull(),
+  fingerprint: text("fingerprint").notNull(),
+  pattern: jsonb("pattern").$type<import("@botiverse/raft-shared").RaftbenchReport["patterns"][number]>().notNull(),
+  sourceRefs: jsonb("source_refs").$type<Array<{ messageId: string; channelId: string; storageChannelId: string; sourceVersion: string }>>().notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, t => [uniqueIndex("idx_raftbench_finding_fingerprint").on(t.serverId, t.revision, t.fingerprint)]);

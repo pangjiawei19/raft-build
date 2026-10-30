@@ -1,9 +1,8 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
-import { closeTestDatabase } from "../test/integration/database.js";
+import { dbTest as test } from "../test/integration/dbTest";
+import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
-import { afterEach } from "vitest";
-import { getDb } from "../db/index.js";
-import { servers, users, agents, channels, channelHumans, channelAgents, serverMembers, messages, messageMentions, mentionDeliveryOccurrences, threadFollows, inboxNotificationFacts, inboxServingRows } from "../db/schema.js";
+import { getDb } from "../db/index";
+import { servers, users, agents, channels, channelHumans, channelAgents, serverMembers, messages, messageMentions, mentionDeliveryOccurrences, threadFollows, inboxNotificationFacts } from "../db/schema";
 import {
   broadcastAndDeliver,
   drainSenderReadReceiptsForTests,
@@ -14,9 +13,10 @@ import {
   MentionValidationError,
   __setMessageServiceDepsForTests,
   __resetMessageServiceDepsForTests,
-} from "./messageService.js";
-import { getInboxItems, markRead } from "./channelService.js";
+} from "./messageService";
+import { getInboxItems, markRead } from "./channelService";
 import { eq, and } from "drizzle-orm";
+import { withChannelDelivery } from "../test/orchestratorStub";
 
 
 let previousFixtureDb: ReturnType<typeof getDb> | null = null;
@@ -48,7 +48,7 @@ function createIo() {
   } as any;
 }
 
-const noopOrchestrator = { deliverMessage: async () => undefined } as any;
+const noopOrchestrator = withChannelDelivery({ deliverMessage: async () => undefined }) as any;
 
 async function seedPublicChannel() {
   const db = getDb();
@@ -203,6 +203,29 @@ test("mention write: resolves user and agent @handles in public channel (server-
   assert.equal(occurrenceRows[0]?.state, "recorded");
 });
 
+test("mention write: an agent mentioning itself records the fact but no delivery occurrence", async ({ db: database }) => {
+
+  const { db, agent, channel, server } = await seedPublicChannel();
+  setupDepsForIntegration(server.id);
+  await db.insert(channelAgents).values({ channelId: channel.id, agentId: agent.id }).onConflictDoNothing();
+
+  await broadcastAndDeliver(createIo(), noopOrchestrator, {
+    channelId: channel.id,
+    senderType: "agent",
+    senderId: agent.id,
+    senderName: "TestBot",
+    content: "note to self @TestBot",
+  });
+
+  const rows = await db.select().from(messageMentions).where(eq(messageMentions.channelId, channel.id));
+  assert.equal(rows.length, 1, "the lexical mention fact is still recorded");
+  assert.equal(rows[0]?.targetId, agent.id);
+  // The sender is never delivered its own message, so an occurrence would stay
+  // `recorded` with no payload forever (unrecoverable and never terminal).
+  const occurrenceRows = await db.select().from(mentionDeliveryOccurrences);
+  assert.equal(occurrenceRows.length, 0, "no delivery occurrence for a self-mention");
+});
+
 test("mention write: Slock Ref user targets mention in angle and named-link forms outside code", async ({ db: database }) => {
 
   const { db, user, user2, agent, channel, server } = await seedPublicChannel();
@@ -213,7 +236,8 @@ test("mention write: Slock Ref user targets mention in angle and named-link form
     senderType: "user",
     senderId: user.id,
     senderName: "Alice",
-    content: "angle <@Bob> named [same](<@Bob>) escaped \\<@Nope> code `@TestBot` ```txt\n@TestBot\n```",
+    // A fence opens only at the start of a line (as the web renders it).
+    content: "angle <@Bob> named [same](<@Bob>) escaped \\<@Nope> code `@TestBot`\n```txt\n@TestBot\n```",
   });
 
   const rows = await db.select().from(messageMentions).where(eq(messageMentions.channelId, channel.id));
@@ -224,6 +248,26 @@ test("mention write: Slock Ref user targets mention in angle and named-link form
   );
   assert.equal(rows.find((row) => row.handleAtSendTime === "Bob")?.targetId, user2.id);
   assert.equal(rows.some((row) => row.targetId === agent.id), false, "code-wrapped names are literal references, not recipients");
+});
+
+// Task #762: the server decides mentions from the same markdown parse the web
+// renders, so a name in `~~~` code, a link label or a URL is not notified.
+test("mention write: no mention from ~~~ code, link labels or URLs", async ({ db: database }) => {
+
+  const { db, user, user2, channel, server } = await seedPublicChannel();
+  setupDepsForIntegration(server.id);
+
+  await broadcastAndDeliver(createIo(), noopOrchestrator, {
+    channelId: channel.id,
+    senderType: "user",
+    senderId: user.id,
+    senderName: "Alice",
+    content: "~~~\n@TestBot in tilde code\n~~~\n[hi @TestBot](https://e.com) https://x.com/@TestBot and @Bob",
+  });
+
+  const rows = await db.select().from(messageMentions).where(eq(messageMentions.channelId, channel.id));
+  assert.deepEqual(rows.map((row) => row.handleAtSendTime), ["Bob"]);
+  assert.equal(rows[0]?.targetId, user2.id);
 });
 
 test("mention write: stores message_seq from the created message", async ({ db: database }) => {
@@ -316,7 +360,6 @@ test("mention write: user randomId replay preserves winning mention facts after 
     messages: (await db.select().from(messages)).length,
     mentions: (await db.select().from(messageMentions)).length,
     inboxFacts: (await db.select().from(inboxNotificationFacts)).length,
-    inboxServingRows: (await db.select().from(inboxServingRows)).length,
   };
 
   await db.update(users).set({ name: "Robert" }).where(eq(users.id, user2.id));
@@ -327,7 +370,6 @@ test("mention write: user randomId replay preserves winning mention facts after 
     messages: (await db.select().from(messages)).length,
     mentions: (await db.select().from(messageMentions)).length,
     inboxFacts: (await db.select().from(inboxNotificationFacts)).length,
-    inboxServingRows: (await db.select().from(inboxServingRows)).length,
   }, beforeReplay, "replay must not create new message, mention, or inbox facts");
 
   const [persistedMention] = await db.select().from(messageMentions)
@@ -347,7 +389,6 @@ test("mention write: user randomId replay preserves winning mention facts after 
     .filter((fact) => fact.messageId === fresh.id);
   assert.ok(freshFacts.length > 0, "fresh message still creates ordinary channel inbox facts");
   assert.equal(freshFacts.some((fact) => fact.personalMention), false, "stale identity creates no personal mention fact");
-  assert.ok((await db.select().from(inboxServingRows)).length >= beforeReplay.inboxServingRows);
 });
 
 test("mention write: unmatched handle case does not resolve a target", async ({ db: database }) => {
@@ -800,6 +841,60 @@ test("mention write: identity-backed mention survives a CJK left-boundary edit",
   const rows = await db.select().from(messageMentions).where(eq(messageMentions.channelId, channel.id));
   assert.equal(rows.length, 1);
   assert.equal(rows[0].targetType, "agent");
+  assert.equal(rows[0].targetId, agent.id);
+  assert.equal(rows[0].handleAtSendTime, "TestBot");
+});
+
+test("mention write v2: free-text handle splits only where Latin meets CJK", async ({ db: database }) => {
+
+  const { db, user, user2, agent, channel, server } = await seedPublicChannel();
+  setupDepsForIntegration(server.id);
+
+  const content = "@TestBot的方案 @Bob와 @TestBotteam";
+  const sent = await broadcastAndDeliver(createIo(), noopOrchestrator, {
+    channelId: channel.id,
+    senderType: "user",
+    senderId: user.id,
+    senderName: "Alice",
+    content,
+    mentionContract: "v2",
+  });
+
+  assert.equal(sent.content, content, "the CJK suffix stays in the persisted body");
+  assert.deepEqual(
+    getSenderUnresolvedMentionHandles(sent),
+    ["@TestBotteam"],
+    "a same-script continuation is never guessed as a prefix mention",
+  );
+  const rows = await db.select().from(messageMentions).where(eq(messageMentions.channelId, channel.id));
+  assert.deepEqual(
+    rows.map((row) => [row.targetType, row.targetId, row.handleAtSendTime]).sort(),
+    [["agent", agent.id, "TestBot"], ["user", user2.id, "Bob"]].sort(),
+  );
+});
+
+test("mention write: identity-backed mention survives a glued CJK suffix", async ({ db: database }) => {
+
+  const { db, user, agent, channel, server } = await seedPublicChannel();
+  setupDepsForIntegration(server.id);
+
+  const content = "@TestBotさん 확인";
+  const sent = await broadcastAndDeliver(createIo(), noopOrchestrator, {
+    channelId: channel.id,
+    senderType: "user",
+    senderId: user.id,
+    senderName: "Alice",
+    content,
+    randomId: "structured-mention-cjk-suffix",
+    mentions: [{ type: "agent", id: agent.id, name: "TestBot" }],
+    mentionContract: "v2",
+  });
+
+  assert.equal(sent.content, content);
+  assert.deepEqual(sent.mentions, [{ type: "agent", id: agent.id, name: "TestBot" }]);
+  assert.deepEqual(getSenderUnresolvedMentionHandles(sent), []);
+  const rows = await db.select().from(messageMentions).where(eq(messageMentions.channelId, channel.id));
+  assert.equal(rows.length, 1);
   assert.equal(rows[0].targetId, agent.id);
   assert.equal(rows[0].handleAtSendTime, "TestBot");
 });

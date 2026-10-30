@@ -1,13 +1,14 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { formatTraceparent, setClockTimeout } from "@botiverse/raft-shared";
+import { currentTimeMs, formatTraceparent, setClockTimeout } from "@botiverse/raft-shared";
 import type { Request, Response } from "express";
 import {
   clearMachineReplicaOwnerIfMatches,
   getFlyInstanceForMachine,
   getMachineReplicaReplayTarget,
+  shouldCleanupStaleMachineOwner,
   type MachineReplicaReplayTarget,
-} from "./replicaRouter.js";
-import { addTraceEvent, getCurrentTraceContext } from "./tracing/semanticTrace.js";
+} from "./replicaRouter";
+import { addTraceEvent, errorClassOf, getCurrentTraceContext } from "./tracing/semanticTrace";
 
 const REPLAY_MARKER_HEADER = "x-raft-replica-replay";
 const REPLAY_MACHINE_HEADER = "x-raft-replica-replay-machine";
@@ -54,6 +55,7 @@ const MACHINE_LOCAL_ROUTE_ALLOWLIST: Array<{ method: string; path: RegExp }> = [
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/workspaces$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-models\/[^/]+$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-form-definitions\/[^/]+\/option-sources\/[^/]+$/ },
+  { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/runtime-forms\/v2\/[^/]+\/option-sources\/[^/]+$/ },
   { method: "GET", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/agents\/[^/]+\/diagnostic\/session-transcript$/ },
   { method: "POST", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/agents\/[^/]+\/feedback\/[^/]+\/transcript$/ },
   { method: "DELETE", path: /^\/api\/servers\/[^/]+\/machines\/[^/]+\/workspaces\/[^/]+$/ },
@@ -86,9 +88,16 @@ export interface MachineLocalRoutingDeps {
   getFlyInstance(machineId: string): Promise<string | null>;
   fetch(input: string | URL, init?: RequestInit): Promise<globalThis.Response>;
   sleep(ms: number): Promise<void>;
+  nowMs(): number;
 }
 
-export type MachineLocalRoutingResult = "handled" | "confirmed_local" | "not_routed";
+/**
+ * `owner_missing`: no replica holds this machine's socket, even after the
+ * handoff wait (the machine is offline). `not_routed`: the request stays on
+ * this replica for another reason (route not replayable, a write while another
+ * replica owns the machine, a stale local owner), so "offline" would be wrong.
+ */
+export type MachineLocalRoutingResult = "handled" | "confirmed_local" | "not_routed" | "owner_missing";
 
 const defaultRoutingDeps: MachineLocalRoutingDeps = {
   getReplayTarget: getMachineReplicaReplayTarget,
@@ -96,6 +105,7 @@ const defaultRoutingDeps: MachineLocalRoutingDeps = {
   getFlyInstance: getFlyInstanceForMachine,
   fetch: (input, init) => fetch(input, init),
   sleep: (ms) => new Promise((resolve) => setClockTimeout(resolve, ms)),
+  nowMs: currentTimeMs,
 };
 
 export function isMachineLocalReplayAllowed(method: string, originalUrl: string): boolean {
@@ -204,19 +214,27 @@ export async function handleMachineLocalRouting(
     return "handled";
   }
 
-  return "not_routed";
+  return "owner_missing";
 }
 
+/**
+ * Answer a machine-local request that could not run here. Only `owner_missing`
+ * (no replica holds the machine's socket after the handoff wait) means the
+ * machine is offline: that is the client's state, answered like the agent
+ * routes' daemon_offline mapping (409 machine_offline). Every other reason the
+ * request stayed here (for example a write while another replica owns the
+ * machine) keeps the retryable 503.
+ */
 export function sendMachineAffinityUnavailable(
   res: Response,
   machineId: string,
-  status = 503,
-  code = "machine_affinity_unavailable",
+  routing: MachineLocalRoutingResult = "not_routed",
 ): void {
   addMachineAffinityTrace("owner_missing", machineId);
-  res.status(status).json({
-    error: "Machine is not connected to this server replica",
-    code,
+  const offline = routing === "owner_missing";
+  res.status(offline ? 409 : 503).json({
+    error: offline ? "Machine is offline" : "Machine is not connected to this server replica",
+    code: offline ? "machine_offline" : "machine_affinity_unavailable",
     machineAffinityRoute: "owner_missing",
   });
 }
@@ -267,7 +285,7 @@ async function replayToReplica(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REPLAY_TIMEOUT_MS);
   try {
-    const targetUrl = new URL(req.originalUrl || req.url, target.endpoint);
+    const targetUrl = buildReplayTargetUrl(req.originalUrl || req.url, target.endpoint);
     const body = serializeReplayBody(req);
     const response = await deps.fetch(targetUrl, {
       method: req.method,
@@ -284,7 +302,7 @@ async function replayToReplica(
     if (error instanceof Error && error.name === "AbortError") {
       return { kind: "timeout" };
     }
-    return { kind: "replay_failed", errorClass: error instanceof Error ? error.name : typeof error };
+    return { kind: "replay_failed", errorClass: errorClassOf(error) };
   } finally {
     clearTimeout(timer);
   }
@@ -312,13 +330,7 @@ async function routeToReplica(
   const failureKind: ReplayFailureKind | "owner_not_local" = first.kind === "response"
     ? "owner_not_local"
     : first.kind;
-  const clearResult = await deps.clearOwner(
-    machineId,
-    target.replicaId,
-    target.generation,
-    target.version,
-    target.endpoint,
-  );
+  const clearResult = await clearOwnerAfterFailedReplay(machineId, target, failureKind, deps);
   addMachineAffinityTrace(failureKind, machineId, {
     owner_replica_present: true,
     stale_owner_clear_result: clearResult,
@@ -360,12 +372,11 @@ async function routeToReplica(
     const secondFailureKind: ReplayFailureKind | "owner_not_local" = second.kind === "response"
       ? "owner_not_local"
       : second.kind;
-    const secondClearResult = await deps.clearOwner(
+    const secondClearResult = await clearOwnerAfterFailedReplay(
       machineId,
-      replacement.replicaId,
-      replacement.generation,
-      replacement.version,
-      replacement.endpoint,
+      { ...replacement, endpoint: replacement.endpoint },
+      secondFailureKind,
+      deps,
     );
     addMachineAffinityTrace(secondFailureKind, machineId, {
       owner_replica_present: true,
@@ -379,6 +390,35 @@ async function routeToReplica(
 
   sendReplayFailure(first, res);
   return "handled";
+}
+
+/**
+ * Only the owner replica's typed `machine_owner_not_local` answer proves the
+ * owner has no live socket. A timeout or transport error proves nothing about
+ * the owner: a live owner refreshes its lease on every heartbeat, so clearing it
+ * here strands every cross-replica command until the next pong, and a polling
+ * page clears it again (task #440). Treat the failure as evidence only once the
+ * lease has gone unrefreshed for the same minimum age the command router uses
+ * before cleaning an owner with no pub/sub receivers.
+ */
+async function clearOwnerAfterFailedReplay(
+  machineId: string,
+  target: MachineReplicaReplayTarget & { endpoint: string },
+  failureKind: ReplayFailureKind | "owner_not_local",
+  deps: MachineLocalRoutingDeps,
+): Promise<"deleted" | "mismatch" | "missing" | "owner_fresh"> {
+  if (failureKind !== "owner_not_local") {
+    const updatedAtMs = Number(target.version);
+    const ownerAgeMs = Number.isFinite(updatedAtMs) ? Math.max(0, deps.nowMs() - updatedAtMs) : undefined;
+    if (!shouldCleanupStaleMachineOwner(ownerAgeMs)) return "owner_fresh";
+  }
+  return deps.clearOwner(
+    machineId,
+    target.replicaId,
+    target.generation,
+    target.version,
+    target.endpoint,
+  );
 }
 
 function isIdempotentRead(method: string): boolean {
@@ -515,6 +555,21 @@ function getHeader(req: Request, name: string): string | null {
   const value = req.headers[name.toLowerCase()];
   if (Array.isArray(value)) return value[0] ?? null;
   return value ?? null;
+}
+
+/**
+ * The replay target: the owner replica's endpoint with only the incoming path
+ * and query. Never `new URL(originalUrl, endpoint)`: an absolute-form request
+ * line ("GET http://host/path") or a "//host/path" path would replace the
+ * endpoint's host and send this replica's request to an arbitrary host.
+ */
+export function buildReplayTargetUrl(originalUrl: string, endpoint: string): URL {
+  const incoming = new URL(originalUrl, "http://localhost");
+  const target = new URL(endpoint);
+  target.pathname = incoming.pathname;
+  target.search = incoming.search;
+  target.hash = "";
+  return target;
 }
 
 function getPathname(originalUrl: string): string {

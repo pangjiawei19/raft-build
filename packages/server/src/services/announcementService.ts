@@ -1,4 +1,5 @@
-import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
+import { validateAnnouncementPresentation, validateAnnouncementAudience, type AnnouncementAudience } from "@botiverse/raft-shared";
+import { and, asc, desc, eq, gt, inArray, isNull, lte, or, sql } from "drizzle-orm";
 import {
   currentDate,
   DISPLAY_LOCALES,
@@ -8,14 +9,17 @@ import {
   type AnnouncementContentByLocale,
   type AnnouncementPage,
   type DisplayLocale,
+  type ServerId,
 } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   announcementAuditEvents,
   announcements,
   userAnnouncementDismissals,
   users,
-} from "../db/schema.js";
+  servers,
+  serverMembers,
+} from "../db/schema";
 
 export type {
   Announcement,
@@ -40,6 +44,7 @@ export type AnnouncementAuditAction =
 export interface AnnouncementDraftInput {
   defaultLocale: DisplayLocale;
   content: AnnouncementContentByLocale;
+  audience?: AnnouncementAudience;
   startsAt?: Date | null;
   endsAt?: Date | null;
 }
@@ -50,6 +55,8 @@ export interface AdminAnnouncement {
   content: AnnouncementContentByLocale;
   status: AnnouncementStatus;
   effectiveStatus: AnnouncementEffectiveStatus;
+  audience: AnnouncementAudience;
+  deliveryVersion: number;
   startsAt: string | null;
   endsAt: string | null;
   publishedAt: string | null;
@@ -75,6 +82,7 @@ function validateContentEntry(content: AnnouncementContent): AnnouncementContent
     throw new Error("each locale must contain 1-20 pages");
   }
   return {
+    ...validateAnnouncementPresentation(content),
     title: content.title.trim(),
     pages: content.pages.map((page) => {
       if (
@@ -145,6 +153,7 @@ function validateWindow(startsAt: Date | null | undefined, endsAt: Date | null |
 function storedContent(row: AnnouncementRow): AnnouncementContentByLocale {
   const content: AnnouncementContentByLocale = { ...row.localizedContent };
   content[row.defaultLocale] = {
+    ...row.localizedContent?.[row.defaultLocale],
     title: row.title,
     pages: row.pages,
   };
@@ -167,17 +176,24 @@ export function resolveAnnouncementContent(
   return { locale, content: resolved };
 }
 
-function toAnnouncement(row: AnnouncementRow, preferredLocale?: string | null): Announcement {
+function toAnnouncement(row: AnnouncementRow, preferredLocale?: string | null, serverId?: ServerId): Announcement {
   const { locale, content } = resolveAnnouncementContent(row, preferredLocale);
   const startsAt = row.startsAt ?? row.publishedAt ?? row.createdAt;
+  const serverScoped = row.audience.type === "server_members" || row.audience.type === "server_users";
+  if (serverScoped && !serverId) throw new Error("server-scoped delivery requires an eligible Server context");
   return {
     id: row.id,
+    ...validateAnnouncementPresentation(content),
     title: content.title,
     pages: content.pages,
     publishedAt: (row.publishedAt ?? startsAt).toISOString(),
     startsAt: startsAt.toISOString(),
     endsAt: row.endsAt?.toISOString() ?? null,
     locale,
+    deliveryVersion: row.deliveryVersion,
+    deliveryScope: serverScoped && serverId
+      ? { type: "server", serverId }
+      : { type: "account" },
   };
 }
 
@@ -198,6 +214,8 @@ function toAdminAnnouncement(row: AnnouncementRow, now = currentDate()): AdminAn
     content: storedContent(row),
     status: row.status,
     effectiveStatus: effectiveAnnouncementStatus(row, now),
+    audience: row.audience,
+    deliveryVersion: row.deliveryVersion,
     startsAt: row.startsAt?.toISOString() ?? null,
     endsAt: row.endsAt?.toISOString() ?? null,
     publishedAt: row.publishedAt?.toISOString() ?? null,
@@ -220,21 +238,12 @@ function normalizedDraftValues(input: AnnouncementDraftInput) {
     pages: fallback.pages,
     defaultLocale: input.defaultLocale,
     localizedContent: content,
+    audience: validateAnnouncementAudience(input.audience),
     startsAt: input.startsAt ?? null,
     endsAt: input.endsAt ?? null,
   };
 }
 
-function windowsOverlap(
-  firstStart: Date,
-  firstEnd: Date | null,
-  secondStart: Date,
-  secondEnd: Date | null,
-): boolean {
-  const firstEndMs = firstEnd?.getTime() ?? Number.POSITIVE_INFINITY;
-  const secondEndMs = secondEnd?.getTime() ?? Number.POSITIVE_INFINITY;
-  return firstStart.getTime() < secondEndMs && secondStart.getTime() < firstEndMs;
-}
 
 async function recordActivationIfNeeded(
   announcementId: string,
@@ -314,11 +323,51 @@ async function recordActivationIfNeeded(
  * post-check would make "the oldest row is already read" collapse to "no
  * announcement", which is the old defect facing the other way.
  */
+/** Apply targeting before oldest-first selection; context alone never grants membership. */
+function audienceEligibility(userId: string, serverId?: ServerId) {
+  const currentMember = serverId ? sql`exists (
+    select 1 from ${serverMembers} join ${servers} on ${servers.id} = ${serverMembers.serverId}
+    where ${serverMembers.userId} = ${userId} and ${serverMembers.serverId} = ${serverId}
+      and ${servers.deletedAt} is null and ${servers.kind} <> 'joint_storage'
+      and ${serverMembers.role} <> 'guest'
+  )` : sql`false`;
+  // Guest is a Server role. A normal membership elsewhere must not grant
+  // delivery while viewing a Server as Guest. Context-free clients may receive
+  // account announcements only when the account is not Guest-only.
+  const guestInServer = serverId ? sql`exists (
+    select 1 from ${serverMembers} join ${servers} on ${servers.id} = ${serverMembers.serverId}
+    where ${serverMembers.userId} = ${userId}
+      and ${serverMembers.serverId} = ${serverId} and ${serverMembers.role} = 'guest'
+      and ${servers.deletedAt} is null and ${servers.kind} <> 'joint_storage'
+  )` : sql`false`;
+  const guestOnly = sql`(exists (
+    select 1 from ${serverMembers} join ${servers} on ${servers.id} = ${serverMembers.serverId}
+    where ${serverMembers.userId} = ${userId} and ${serverMembers.role} = 'guest'
+      and ${servers.deletedAt} is null and ${servers.kind} <> 'joint_storage'
+  ) and not exists (
+    select 1 from ${serverMembers} join ${servers} on ${servers.id} = ${serverMembers.serverId}
+    where ${serverMembers.userId} = ${userId} and ${serverMembers.role} <> 'guest'
+      and ${servers.deletedAt} is null and ${servers.kind} <> 'joint_storage'
+  ))`;
+  return sql`(not ${guestInServer} and not ${guestOnly}) and (
+    ${announcements.audience}->>'type' = 'all'
+    or (${announcements.audience}->>'type' = 'users' and ${announcements.audience}->'userIds' @> ${JSON.stringify([userId])}::jsonb)
+    or (${currentMember} and (
+      (${announcements.audience}->>'type' = 'server_members' and ${announcements.audience}->'serverIds' @> ${JSON.stringify([serverId])}::jsonb)
+      or (${announcements.audience}->>'type' = 'server_users' and exists (
+        select 1 from jsonb_array_elements(case when ${announcements.audience}->>'type' = 'server_users' then ${announcements.audience}->'targets' else '[]'::jsonb end) target
+        where target->>'serverId' = ${serverId ?? null} and target->'userIds' @> ${JSON.stringify([userId])}::jsonb
+      ))
+    ))
+  )`;
+}
+
 export async function listUndismissedForUser(
   userId: string,
   sessionFamilyId?: string,
   now = currentDate(),
   afterAnnouncementId?: string,
+  serverId?: ServerId,
 ): Promise<Announcement[]> {
   const db = getDb();
   const [user] = await db
@@ -390,6 +439,7 @@ export async function listUndismissedForUser(
       lte(announcements.startsAt, now),
       or(isNull(announcements.endsAt), gt(announcements.endsAt, now)),
       isNull(userAnnouncementDismissals.userId),
+      audienceEligibility(userId, serverId),
       afterCondition,
     ))
     .orderBy(
@@ -403,13 +453,14 @@ export async function listUndismissedForUser(
   const row = oldestUnread?.announcement;
   if (!row) return [];
   await recordActivationIfNeeded(row.id, now);
-  return [toAnnouncement(row, user.displayLanguage)];
+  return [toAnnouncement(row, user.displayLanguage, serverId)];
 }
 
 export async function dismiss(
   userId: string,
   announcementId: string,
   now = currentDate(),
+  serverId?: ServerId,
 ): Promise<boolean> {
   const db = getDb();
   const [exists] = await db
@@ -417,6 +468,7 @@ export async function dismiss(
     .from(announcements)
     .where(and(
       eq(announcements.id, announcementId),
+      audienceEligibility(userId, serverId),
       eq(announcements.status, "published"),
       lte(announcements.startsAt, now),
       or(isNull(announcements.endsAt), gt(announcements.endsAt, now)),
@@ -506,27 +558,14 @@ export async function updateDraft(
       .limit(1);
     if (!existing) return null;
 
+    const deliveryChanged = JSON.stringify(existing.audience) !== JSON.stringify(values.audience) || JSON.stringify(storedContent(existing)) !== JSON.stringify(values.localizedContent) || existing.defaultLocale !== values.defaultLocale;
+    if (existing.status === "published" && deliveryChanged) {
+      throw new Error("published announcement content and audience are fixed");
+    }
+
     if (existing.status === "published" && existing.startsAt && existing.startsAt.getTime() > now.getTime()) {
       if (!values.startsAt || values.startsAt.getTime() <= now.getTime()) {
         throw new Error("a scheduled announcement update must keep startsAt in the future");
-      }
-      const publishedRows = await tx
-        .select({
-          id: announcements.id,
-          startsAt: announcements.startsAt,
-          endsAt: announcements.endsAt,
-        })
-        .from(announcements)
-        .where(and(
-          eq(announcements.status, "published"),
-          ne(announcements.id, announcementId),
-        ));
-      const conflict = publishedRows.find((row) => (
-        row.startsAt
-        && windowsOverlap(values.startsAt as Date, values.endsAt, row.startsAt, row.endsAt)
-      ));
-      if (conflict) {
-        throw new Error(`announcement window overlaps published announcement ${conflict.id}`);
       }
       const [row] = await tx
         .update(announcements)
@@ -554,6 +593,7 @@ export async function updateDraft(
       .update(announcements)
       .set({
         ...values,
+        deliveryVersion: existing.deliveryVersion + (deliveryChanged ? 1 : 0),
         updatedByUserId: actorUserId,
         updatedAt: now,
       })
@@ -587,22 +627,6 @@ export async function publishDraft(
     validateWindow(startsAt, draft.endsAt);
     if (draft.endsAt && draft.endsAt.getTime() <= now.getTime()) {
       throw new Error("endsAt must be in the future when publishing");
-    }
-
-    const publishedRows = await tx
-      .select({
-        id: announcements.id,
-        startsAt: announcements.startsAt,
-        endsAt: announcements.endsAt,
-      })
-      .from(announcements)
-      .where(eq(announcements.status, "published"));
-    const conflict = publishedRows.find((row) => (
-      row.startsAt
-      && windowsOverlap(startsAt, draft.endsAt, row.startsAt, row.endsAt)
-    ));
-    if (conflict) {
-      throw new Error(`announcement window overlaps published announcement ${conflict.id}`);
     }
 
     const [row] = await tx

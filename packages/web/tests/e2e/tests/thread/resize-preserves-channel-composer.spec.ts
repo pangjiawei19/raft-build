@@ -62,6 +62,55 @@ test("thread presentation follows the phone, iPad orientation, and desktop width
   const channelComposer = page.getByPlaceholder(`Message #${seedState.channel.name}`);
   await expect(channelComposer).toBeVisible();
 
+  // Compare painted boundaries, rather than just checking that both panels
+  // reuse MessageInput. Nested RUI footers previously added a second inset.
+  const geometry = await page.evaluate(() => {
+    const sidebar = document.querySelector('[data-slot="sidebar-root"]')!;
+    const channel = document.querySelector('[data-slot="conversation-panel-root"]')!;
+    const thread = document.querySelector('[data-slot="thread-panel-root"]')!;
+    const channelInput = channel.querySelector('[data-slot="composer"]')!;
+    const threadInput = thread.querySelector('[data-slot="composer"]')!;
+    const channelRect = channel.getBoundingClientRect();
+    const threadRect = thread.getBoundingClientRect();
+    return {
+      bottomDelta: channelInput.getBoundingClientRect().bottom - threadInput.getBoundingClientRect().bottom,
+      channelInset: channelRect.bottom - channelInput.getBoundingClientRect().bottom,
+      threadInset: threadRect.bottom - threadInput.getBoundingClientRect().bottom,
+      sidebarHeight: sidebar.getBoundingClientRect().height,
+      panelHeight: channelRect.height,
+      sidebarDivider: parseFloat(getComputedStyle(sidebar).borderRightWidth) + parseFloat(getComputedStyle(channel).borderLeftWidth),
+      threadDivider: parseFloat(getComputedStyle(thread).borderLeftWidth),
+    };
+  });
+  expect(Math.abs(geometry.bottomDelta)).toBeLessThanOrEqual(1);
+  expect(geometry.channelInset).toBe(geometry.threadInset);
+  expect(geometry.sidebarHeight).toBe(geometry.panelHeight);
+  expect(geometry.sidebarDivider).toBe(geometry.threadDivider);
+  expect(geometry.sidebarDivider).toBeGreaterThan(0);
+
+  await page.getByRole("tab", { name: "Tasks", exact: true }).click();
+  const toolbar = page.locator('[data-slot="tasks-panel-toolbar"]');
+  await expect(toolbar.getByTestId("channel-task-view-board")).toBeVisible();
+  // Toolbar controls share one height (32: Raft DS sizes buttons by use, and
+  // a toolbar's are 32). Their edges differ by kind on purpose: an inactive
+  // filter draws a 1px seam ring, a button the 1.5px ink line that says
+  // "control", and a segmented item sits in its track.
+  const controls = await toolbar.locator("button").evaluateAll((buttons) => buttons.map((button) => ({
+    slot: button.getAttribute("data-slot"),
+    height: button.getBoundingClientRect().height,
+    borderWidth: parseFloat(getComputedStyle(button).borderTopWidth),
+    boxShadow: getComputedStyle(button).boxShadow,
+  })));
+  expect(controls.length).toBeGreaterThanOrEqual(5);
+  expect(new Set(controls.map((control) => control.height)).size).toBe(1);
+  const filters = controls.filter((control) => control.slot === "picker-trigger-button");
+  expect(filters.length).toBeGreaterThanOrEqual(2);
+  for (const filter of filters) expect(filter.boxShadow).toMatch(/0px 0px 0px 1px inset/);
+  const buttons = controls.filter((control) => control.slot === "button");
+  expect(buttons.length).toBeGreaterThanOrEqual(1);
+  for (const button of buttons) expect(button.borderWidth).toBeGreaterThan(0);
+  await page.getByRole("tab", { name: "Chat", exact: true }).click();
+
   await page.setViewportSize({ width: 1100, height: 820 });
 
   await expect

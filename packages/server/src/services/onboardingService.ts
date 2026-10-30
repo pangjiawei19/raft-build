@@ -1,26 +1,27 @@
-import { publishChannelUpdate } from "./channelRealtimeEvents.js";
-import { socketUserServerRoom } from "../socket/platformScope.js";
-import { ALL_CHANNEL_TEAM_THRESHOLD, currentDate, referralSourceLabel, signupRoleLabel } from "@botiverse/raft-shared";
+import { publishChannelUpdate } from "./channelRealtimeEvents";
+import { socketUserServerRoom } from "../socket/platformScope";
+import { ALL_CHANNEL_TEAM_THRESHOLD, currentDate, isExternalAgentRuntime, referralSourceLabel, signupRoleLabel } from "@botiverse/raft-shared";
 import type { Server as SocketServer } from "socket.io";
 import { createHash } from "node:crypto";
-import type { AgentOrchestrator } from "./agentOrchestrator.js";
-import { getDb } from "../db/index.js";
-import * as agentService from "./agentService.js";
-import * as channelService from "./channelService.js";
-import * as featureFlagService from "./featureFlagService.js";
-import * as messageService from "./messageService.js";
-import * as serverService from "./serverService.js";
-import { getStorage } from "./storageService.js";
-import * as userService from "./userService.js";
-import { createAppReminder } from "../apps/reminder/crud.js";
-import { computeNextFire, type Recurrence } from "./recurrence.js";
-import { OWNER_OPENER_TEAM_MODE_HTML } from "./ownerOpenerArtifactHtml.js";
-import { createIdempotentPendingAttachmentProjectionWithExecutor } from "./attachmentProjectionWriterService.js";
+import type { AgentOrchestrator } from "./agentOrchestrator";
+import { getDb } from "../db/index";
+import * as agentService from "./agentService";
+import * as channelService from "./channelService";
+import * as featureFlagService from "./featureFlagService";
+import * as messageService from "./messageService";
+import * as serverService from "./serverService";
+import { getStorage } from "./storageService";
+import * as userService from "./userService";
+import { createAppReminder } from "../apps/reminder/crud";
+import { getHostedOnboardingAgentState } from "./hostedCindyService";
+import { computeNextFire, type Recurrence } from "./recurrence";
+import { OWNER_OPENER_TEAM_MODE_HTML } from "./ownerOpenerArtifactHtml";
+import { createIdempotentPendingAttachmentProjectionWithExecutor } from "./attachmentProjectionWriterService";
 import {
   buildAttachmentTransferArtifactPlan,
   createAttachmentTransferIntent,
-} from "./attachmentTransferIntentService.js";
-import { ATTACHMENT_TRANSFER_INTENT_TTL_MS } from "./attachmentUploadWriterService.js";
+} from "./attachmentTransferIntentService";
+import { ATTACHMENT_TRANSFER_INTENT_TTL_MS } from "./attachmentUploadWriterService";
 
 type OnboardingKind = "owner" | "member";
 
@@ -122,6 +123,9 @@ type OnboardingServiceDeps = {
   tryClaimAllChannelUnlockInstruction: typeof serverService.tryClaimAllChannelUnlockInstruction;
   clearAllChannelUnlockInstructionClaim: typeof serverService.clearAllChannelUnlockInstructionClaim;
   getUser: typeof userService.getUser;
+  getHostedOnboardingAgentState: typeof getHostedOnboardingAgentState;
+  claimOwnerOpener: typeof serverService.claimOwnerOpener;
+  releaseOwnerOpenerClaim: typeof serverService.releaseOwnerOpenerClaim;
   createSchedule: typeof createAppReminder;
 };
 
@@ -150,6 +154,9 @@ const defaultOnboardingServiceDeps: OnboardingServiceDeps = {
   tryClaimAllChannelUnlockInstruction: serverService.tryClaimAllChannelUnlockInstruction,
   clearAllChannelUnlockInstructionClaim: serverService.clearAllChannelUnlockInstructionClaim,
   getUser: userService.getUser,
+  getHostedOnboardingAgentState,
+  claimOwnerOpener: serverService.claimOwnerOpener,
+  releaseOwnerOpenerClaim: serverService.releaseOwnerOpenerClaim,
   createSchedule: createAppReminder,
 };
 
@@ -453,7 +460,7 @@ async function isOwnerOpenerV2Enabled(serverId: string, ownerUserId: string) {
   return evaluation.enabled;
 }
 
-function buildOwnerOpenerV2Messages(userName: string) {
+export function buildOwnerOpenerV2Messages(userName: string, opts: { hosted?: boolean } = {}) {
   const displayName = userName.trim() || "there";
   return [
     {
@@ -471,7 +478,10 @@ function buildOwnerOpenerV2Messages(userName: string) {
     },
     {
       topic: OWNER_OPENER_V2_TOPICS[3],
-      content: "Would you want me to look at your current agents setup on this computer and propose you a starter team? Or just tell me what you're working on.",
+      // A hosted Cindy runs on Raft, not on the owner's computer, so she has no setup there to look at.
+      content: opts.hosted
+        ? "Tell me what you're working on and I'll propose a starter team for it."
+        : "Would you want me to look at your current agents setup on this computer and propose you a starter team? Or just tell me what you're working on.",
     },
   ];
 }
@@ -526,6 +536,7 @@ async function sendOwnerOpenerV2(
   serverId: string,
   targetUserId: string,
   onboardingAgentId: string,
+  opts: { hosted?: boolean } = {},
 ) {
   const deps = resolveOnboardingServiceDeps();
   const user = await deps.getUser(targetUserId);
@@ -541,7 +552,7 @@ async function sendOwnerOpenerV2(
   await deps.addHuman(targetChannel.id, targetUserId);
   await deps.addAgent(targetChannel.id, onboardingAgentId);
 
-  const messages = buildOwnerOpenerV2Messages(user.name);
+  const messages = buildOwnerOpenerV2Messages(user.name, { hosted: opts.hosted });
   const sentMessageIds: string[] = [];
   let artifactAttachmentId: string | null = null;
 
@@ -817,7 +828,16 @@ export async function triggerOwnerOnboardingOnAgentActivation(
   const server = await deps.getServer(serverId);
   if (!server) return false;
 
-  const openerV2Enabled = await isOwnerOpenerV2Enabled(serverId, server.ownerId);
+  // A hosted Cindy (antiproton_cindy) is never "started": she can receive once
+  // the provider accepted her AND her workspace import landed (`ready`). Only
+  // the server's onboarding agent, only under the flag; she always takes the
+  // opener-v2 path, the only one that briefs her with the owner's facts.
+  const activatedAgent = server.onboardingAgentId === activatedAgentId ? await deps.getAgent(activatedAgentId) : null;
+  const hostedState = activatedAgent && isExternalAgentRuntime(activatedAgent.runtime)
+    ? await deps.getHostedOnboardingAgentState(serverId, activatedAgentId)
+    : null;
+
+  const openerV2Enabled = hostedState !== null || await isOwnerOpenerV2Enabled(serverId, server.ownerId);
   if (!openerV2Enabled) {
     try {
       await triggerAgentIntroInAllChannel(io, agentOrchestrator, serverId, activatedAgentId);
@@ -872,7 +892,9 @@ export async function triggerOwnerOnboardingOnAgentActivation(
   //
   // Returning false claims nothing, so the next activation (which fires this same
   // trigger when the agent starts) delivers it for real.
-  if (onboardingAgent.status !== "active") return false;
+  // A hosted Cindy counts as able to receive once `ready` (see above); other
+  // external agents keep this rule.
+  if (onboardingAgent.status !== "active" && hostedState !== "ready") return false;
 
   if (openerV2Enabled) {
     if (ownerPrefs.onboardingOwnerOpenerV2SentAt) {
@@ -894,14 +916,35 @@ export async function triggerOwnerOnboardingOnAgentActivation(
       return false;
     }
 
-    const opener = await sendOwnerOpenerV2(
-      io,
-      agentOrchestrator,
-      serverId,
-      server.ownerId,
-      onboardingAgent.id,
-    );
-    if (!opener) return false;
+    // One sender at a time: the import hook, the survey save, agent start and the
+    // setup backstop can all arrive together. Only the trigger that claims the
+    // opener briefs and posts it; a failed send releases the claim for a retry.
+    const claim = await deps.claimOwnerOpener(serverId, server.ownerId);
+    if (!claim) return false;
+    let opener: Awaited<ReturnType<typeof sendOwnerOpenerV2>>;
+    try {
+      // A hosted Cindy has no computer coming online to hand her the owner's facts on
+      // every wake (onboardingBriefingOnActivation); she keeps her session, so they go
+      // once, here, under the claim and ahead of the opener.
+      if (hostedState === "ready") {
+        await deliverOwnerFactsContext(agentOrchestrator, serverId, onboardingAgent.id, deps);
+      }
+      opener = await sendOwnerOpenerV2(
+        io,
+        agentOrchestrator,
+        serverId,
+        server.ownerId,
+        onboardingAgent.id,
+        { hosted: hostedState !== null },
+      );
+    } catch (error) {
+      await deps.releaseOwnerOpenerClaim(serverId, server.ownerId, claim);
+      throw error;
+    }
+    if (!opener) {
+      await deps.releaseOwnerOpenerClaim(serverId, server.ownerId, claim);
+      return false;
+    }
 
     const sentAt = currentDate();
     await deps.updateMemberOnboardingPreferences(serverId, server.ownerId, {
@@ -1154,6 +1197,11 @@ export async function deliverOwnerFactsContext(
     timestamp: new Date().toISOString(),
     seq: 0,
     message_id: `onboarding-owner-facts-${serverId}`,
+  }, {
+    // Context about the agent's own server, not a channel's content: there is
+    // no target channel to check visibility of ("onboarding-context" is a
+    // label, not a channel id), and the agent cannot opt out of its own setup.
+    intrinsic: true,
   }).catch((err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     console.warn(`[Onboarding] Owner facts context failed for agent ${onboardingAgentId}: ${message}`);

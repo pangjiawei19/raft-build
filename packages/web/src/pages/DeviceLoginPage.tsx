@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
-import type { FormEvent } from "react";
+import { useCallback, useMemo, useState } from "react";
+import type { ChangeEvent, FormEvent } from "react";
 import { useIntl } from "react-intl";
+import { Button, Input } from "@botiverse/raft-ui";
 import api from "../api/client";
 import { useAuthStore } from "../store/authStore";
 import AuthPageFrame, { AuthPageIntro } from "../components/auth/AuthPageFrame";
@@ -26,6 +27,9 @@ export default function DeviceLoginPage() {
   const [approved, setApproved] = useState(false);
   const [closeAttempted, setCloseAttempted] = useState(false);
   const [error, setError] = useState("");
+  const handleUserCodeChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    setUserCode(event.target.value);
+  }, []);
 
   const normalizedCode = normalizeUserCode(userCode);
 
@@ -58,12 +62,13 @@ export default function DeviceLoginPage() {
     }
   }
 
-  if (approved) {
-    function closePage() {
-      setCloseAttempted(true);
-      window.close();
-    }
+  const closePage = useCallback(() => {
+    setCloseAttempted(true);
+    window.close();
+  }, []);
+  const handleUseAnotherAccount = useCallback(() => logout(), [logout]);
 
+  if (approved) {
     return (
       <AuthPageFrame>
         <div className="w-full">
@@ -71,15 +76,17 @@ export default function DeviceLoginPage() {
             title={formatMessage({ id: "pages.deviceLogin.approvedTitle" })}
             description={formatMessage({ id: "pages.deviceLogin.approvedDescription" })}
           />
-          <button
+          <Button
             type="button"
             onClick={closePage}
-            className="btn-brutal block w-full bg-brutal-pink px-3 py-2 text-center text-sm"
+            size="xl"
+            variant="accent"
+            className="w-full"
           >
             {formatMessage({ id: "pages.deviceLogin.closePage" })}
-          </button>
+          </Button>
           {closeAttempted ? (
-            <p className="mt-3 text-center text-xs font-bold text-brutal-gray-700">
+            <p className="mt-3 text-center text-caption text-foreground-hint">
               {formatMessage({ id: "pages.deviceLogin.closeManually" })}
             </p>
           ) : null}
@@ -101,38 +108,44 @@ export default function DeviceLoginPage() {
         />
 
         {error ? (
-          <Banner intent="warning" className="mb-4 font-bold">{error}</Banner>
+          <Banner intent="warning" className="mb-4">{error}</Banner>
         ) : null}
 
         <form onSubmit={approveDeviceLogin} className="space-y-4">
-          <FormField label={formatMessage({ id: "pages.deviceLogin.deviceCodeLabel" })} labelStyle="plain">
-            <input
+          <FormField label={formatMessage({ id: "pages.deviceLogin.deviceCodeLabel" })}>
+            {/* A device code is machine text: Space Mono, centred, in the
+                standard 44px ink-line field. */}
+            <Input
               type="text"
               value={userCode}
-              onChange={(event) => setUserCode(event.target.value)}
+              onChange={handleUserCodeChange}
               placeholder={formatMessage({ id: "pages.deviceLogin.codePlaceholder" })}
               autoCapitalize="characters"
               autoComplete="one-time-code"
-              className="w-full border-2 border-black p-2 text-center font-mono text-lg font-black tracking-widest shadow-brutal-sm focus:shadow-brutal focus:outline-none"
+              className="w-full text-center font-mono"
             />
           </FormField>
 
-          <button
+          <Button
             type="submit"
             disabled={submitting || !normalizedCode}
-            className="btn-brutal w-full bg-brutal-pink px-3 py-2 text-sm disabled:opacity-50"
+            size="xl"
+            variant="accent"
+            className="w-full"
           >
             {submitting ? formatMessage({ id: "pages.deviceLogin.approving" }) : formatMessage({ id: "pages.deviceLogin.approve" })}
-          </button>
+          </Button>
         </form>
 
-        <button
+        <Button
           type="button"
-          onClick={() => logout()}
-          className="mt-3 w-full border-2 border-black bg-white p-2 text-sm font-bold shadow-brutal-sm transition-all duration-100 hover:-translate-y-[1px] hover:shadow-brutal active:translate-x-[1px] active:translate-y-[1px] active:shadow-brutal-active"
+          onClick={handleUseAnotherAccount}
+          size="lg"
+          variant="outline"
+          className="mt-3 w-full"
         >
           {formatMessage({ id: "pages.deviceLogin.useAnotherAccount" })}
-        </button>
+        </Button>
       </div>
     </AuthPageFrame>
   );

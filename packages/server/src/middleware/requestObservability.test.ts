@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
 import { EventEmitter } from "node:events";
 import { BasicTracer, MemoryTraceSink, traceEventRowsForSpan, traceSpanFactRowForSpan } from "@botiverse/raft-shared";
-import { httpRequestDuration, httpRequestsTotal } from "../metrics.js";
-import { attachAuthTraceIdentity, bucketHttpStatus, inferHttpCallerKind, normalizeObservedRoutePattern, requestObservabilityMiddleware } from "./requestObservability.js";
+import { httpRequestDuration, httpRequestsTotal } from "../metrics";
+import { __traceUserIdForTests, rememberTraceUserId } from "../tracing/traceUserId";
+import { attachAuthTraceIdentity, bucketHttpStatus, inferHttpCallerKind, normalizeObservedRoutePattern, requestObservabilityMiddleware, setRequestTraceComputerTarget, setRequestTraceErrorCode } from "./requestObservability";
 
 const EXPECTED_LABELS = {
   route_pattern: "/api/servers/:id/members/:memberId/profile",
@@ -132,6 +132,8 @@ test("requestObservabilityMiddleware records an HTTP root span without sensitive
   assert.equal(spans[0].attrs?.agent_id_present, false);
   assert.equal(spans[0].attrs?.caller_kind, "human");
   assert.equal(Object.values(spans[0].attrs ?? {}).includes("user-1"), false);
+  // Not cached for "user-1" here, so no trace_user_id either (never the raw id).
+  assert.equal(spans[0].attrs?.trace_user_id, undefined);
 
   const [eventRow] = traceEventRowsForSpan(spans[0], TRACE_EVENT_ROW_TEST_RESOURCE);
   assert.equal(eventRow.row_kind, "event");
@@ -394,4 +396,259 @@ test("inferHttpCallerKind treats internal agent and machine routes as separate c
     inferHttpCallerKind({ machineId: "machine-1", header: () => undefined } as any, "/internal/machine/self"),
     "system",
   );
+});
+
+test("an authenticated request carries the user's cached trace_user_id, never the raw id", () => {
+  __traceUserIdForTests.reset();
+  __traceUserIdForTests.setLoader(async () => new Map());
+  try {
+    rememberTraceUserId("user-9", "9f8e7d6c-5b4a-4392-8180-7f6e5d4c3b2a");
+    const sink = new MemoryTraceSink();
+    const tracer = new BasicTracer({ sink });
+    const req: any = {
+      method: "GET",
+      originalUrl: "/api/channels/threads/followed",
+      url: "/api/channels/threads/followed",
+      baseUrl: "/api/channels",
+      route: { path: "/threads/followed" },
+      userId: "user-9",
+      app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+    };
+    const res: any = new EventEmitter();
+    res.statusCode = 200;
+    res.locals = {};
+    requestObservabilityMiddleware(req, res, () => {});
+    res.emit("finish");
+    const [span] = sink.getAllSpans();
+    assert.equal(span.attrs?.trace_user_id, "9f8e7d6c-5b4a-4392-8180-7f6e5d4c3b2a");
+    assert.equal(span.attrs?.user_id, undefined);
+    assert.equal(Object.values(span.attrs ?? {}).includes("user-9"), false);
+  } finally {
+    __traceUserIdForTests.setLoader(null);
+    __traceUserIdForTests.reset();
+  }
+});
+
+test("requestObservabilityMiddleware records a route's error_code on the root span, leaving reason as before", () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink, traceIdGenerator: () => "3".repeat(32), spanIdGenerator: () => "4".repeat(16) });
+  const makeReq = (): any => ({
+    method: "GET",
+    originalUrl: "/api/channels/inbox",
+    url: "/api/channels/inbox",
+    baseUrl: "/api/channels",
+    route: { path: "/inbox" },
+    app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+  });
+
+  const overloaded: any = new EventEmitter();
+  overloaded.statusCode = 503;
+  overloaded.locals = {};
+  requestObservabilityMiddleware(makeReq(), overloaded, () => {});
+  setRequestTraceErrorCode(overloaded, "rw_overloaded");
+  overloaded.emit("finish");
+
+  const plain: any = new EventEmitter();
+  plain.statusCode = 500;
+  plain.locals = {};
+  requestObservabilityMiddleware(makeReq(), plain, () => {});
+  plain.emit("finish");
+
+  const [overloadedSpan, plainSpan] = sink.getAllSpans();
+  assert.equal(overloadedSpan!.attrs?.error_code, "rw_overloaded");
+  assert.equal(overloadedSpan!.attrs?.reason, "http_5xx", "reason keeps its status-derived meaning");
+  assert.equal(overloadedSpan!.events.find((event) => event.name === "http.response.finished")?.attrs?.error_code, "rw_overloaded");
+  assert.equal(plainSpan!.attrs?.error_code, undefined);
+});
+
+test("a request waiting on a Computer names it on the root span and its finished event", () => {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink, traceIdGenerator: () => "5".repeat(32), spanIdGenerator: () => "6".repeat(16) });
+  const req: any = {
+    method: "GET",
+    originalUrl: "/api/servers/s1/machines/m1/runtime-models/codex",
+    url: "/api/servers/s1/machines/m1/runtime-models/codex",
+    baseUrl: "/api/servers",
+    route: { path: "/:id/machines/:machineId/runtime-models/:runtime" },
+    app: { get: (key: string) => (key === "serverTracer" ? tracer : undefined) },
+  };
+  const res: any = new EventEmitter();
+  res.statusCode = 504;
+  res.locals = {};
+  requestObservabilityMiddleware(req, res, () => {});
+  setRequestTraceComputerTarget(res, { machineId: "m1", computerVersion: "1.0.48", daemonVersion: "1.0.48", runtime: "codex", sourceId: "model" });
+  res.emit("finish");
+  const [span] = sink.getAllSpans();
+  const finished = span!.events.find((event) => event.name === "http.response.finished")?.attrs;
+  for (const attrs of [span!.attrs, finished]) {
+    // Hashed when the deployment has a trace identity key (JWT_SECRET); never the raw id.
+    assert.ok(!Object.values(attrs ?? {}).includes("m1"));
+    assert.equal(attrs?.target_computer_version, "1.0.48");
+    assert.equal(attrs?.target_daemon_version, "1.0.48");
+    assert.equal(attrs?.target_runtime, "codex");
+    assert.equal(attrs?.option_source_id, "model");
+  }
+});
+
+// #proj-o11y task #6: an outside client's traceparent is recorded, not
+// continued, so one reused client span cannot fold unrelated requests into
+// one trace. Internal sources (daemon proxy, web session) keep their parent.
+function runWithInboundHeaders(headers: Record<string, string>, afterAuth?: (req: any) => void) {
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({
+    sink,
+    traceIdGenerator: () => "d".repeat(32),
+    spanIdGenerator: () => "c".repeat(16),
+  });
+  const req: any = {
+    method: "GET",
+    originalUrl: "/internal/agent-api/events",
+    url: "/internal/agent-api/events",
+    baseUrl: "/internal/agent-api",
+    route: { path: "/events" },
+    header: (name: string) => headers[name.toLowerCase()],
+    app: {
+      get: (key: string) => (key === "serverTracer" ? tracer : undefined),
+    },
+  };
+  const res: any = new EventEmitter();
+  res.statusCode = 200;
+  res.locals = {};
+  requestObservabilityMiddleware(req, res, () => {});
+  afterAuth?.(req);
+  res.emit("finish");
+  const [span] = sink.getAllSpans();
+  return span!;
+}
+
+const CLIENT_TRACEPARENT = `00-${"a".repeat(32)}-${"b".repeat(16)}-01`;
+
+test("an external agent credential's traceparent is recorded, not continued", () => {
+  const span = runWithInboundHeaders({ authorization: "Bearer sk_agent_external", traceparent: CLIENT_TRACEPARENT });
+  assert.equal(span.context.traceId, "d".repeat(32));
+  assert.equal(span.context.parentSpanId, null);
+  assert.equal(span.attrs?.trace_parent_policy, "linked");
+  assert.equal(span.attrs?.client_trace_id, "a".repeat(32));
+  assert.equal(span.attrs?.client_parent_span_id, "b".repeat(16));
+});
+
+test("third-party app and share tokens start a new trace too", () => {
+  for (const token of ["slock_at_app", "raft_share_link"]) {
+    const span = runWithInboundHeaders({ authorization: `Bearer ${token}`, traceparent: CLIENT_TRACEPARENT });
+    assert.equal(span.context.parentSpanId, null, token);
+    assert.equal(span.attrs?.trace_parent_policy, "linked", token);
+  }
+});
+
+test("the daemon proxy and web sessions keep continuing their traceparent", () => {
+  const daemon = runWithInboundHeaders({
+    authorization: "Bearer sk_agent_hosted",
+    "x-slock-agent-active-capabilities": "read,send",
+    traceparent: CLIENT_TRACEPARENT,
+  });
+  assert.equal(daemon.context.traceId, "a".repeat(32));
+  assert.equal(daemon.context.parentSpanId, "b".repeat(16));
+  assert.equal(daemon.attrs?.trace_parent_policy, "continued");
+  assert.equal(daemon.attrs?.client_trace_id, undefined);
+
+  const web = runWithInboundHeaders({ authorization: "Bearer eyJhbGciOiJIUzI1NiJ9.e30.sig", traceparent: CLIENT_TRACEPARENT });
+  assert.equal(web.context.traceId, "a".repeat(32));
+  assert.equal(web.attrs?.trace_parent_policy, "continued");
+});
+
+test("an external client's malformed traceparent is never written raw", () => {
+  const span = runWithInboundHeaders({ authorization: "Bearer sk_agent_external", traceparent: "00-not-a-valid-parent" });
+  assert.equal(span.context.parentSpanId, null);
+  assert.equal(span.attrs?.trace_parent_policy, "absent");
+  assert.equal(span.attrs?.client_traceparent_invalid, true);
+  assert.equal(span.attrs?.client_trace_id, undefined);
+  assert.doesNotMatch(JSON.stringify(span.attrs), /not-a-valid-parent/);
+});
+
+test("a daemon claim from an agent that auth finds external is flagged", () => {
+  const span = runWithInboundHeaders(
+    { authorization: "Bearer sk_agent_external", "x-slock-agent-active-capabilities": "read", traceparent: CLIENT_TRACEPARENT },
+    (req) => { req.actingAgentIsExternal = true; },
+  );
+  assert.equal(span.attrs?.trace_parent_policy, "continued");
+  assert.equal(span.attrs?.trace_parent_claim_mismatch, true);
+});
+
+test("normalizeObservedRoutePattern drops a stale app-level route once the request is inside a mounted router (task #9)", () => {
+  // An app-level `app.post("/internal/machine/scope-attestation", ...)` that
+  // calls next() leaves req.route behind; inside `app.use("/internal", ...)`
+  // baseUrl is "/internal" before the inner router matches.
+  const req: any = {
+    originalUrl: "/internal/machine/scope-attestation",
+    url: "/machine/scope-attestation",
+    baseUrl: "/internal",
+    route: { path: "/internal/machine/scope-attestation" },
+  };
+  assert.equal(normalizeObservedRoutePattern(req), "/internal/machine/scope-attestation");
+
+  const unrelated: any = {
+    originalUrl: "/internal/agent/abc/upload",
+    url: "/agent/abc/upload",
+    baseUrl: "/internal",
+    route: { path: "/internal/machine/scope-attestation" },
+  };
+  assert.equal(normalizeObservedRoutePattern(unrelated), "unmatched");
+});
+
+test("normalizeObservedRoutePattern keeps templates whose params sit inside a segment or use wildcards", () => {
+  const dotted: any = {
+    originalUrl: "/api/files/report.xlsx",
+    url: "/files/report.xlsx",
+    baseUrl: "/api",
+    route: { path: "/files/:name.:ext" },
+  };
+  assert.equal(normalizeObservedRoutePattern(dotted), "/api/files/:name.:ext");
+
+  const wildcard: any = {
+    originalUrl: "/static/a/b/c.js",
+    url: "/a/b/c.js",
+    baseUrl: "/static",
+    route: { path: "/*splat" },
+  };
+  assert.equal(normalizeObservedRoutePattern(wildcard), "/static/*splat");
+});
+
+test("a real Express app labels the scope-attestation pre-parse route once, at every stage", async () => {
+  const { default: express } = await import("express");
+  const { createServer, request } = await import("node:http");
+  const seen: string[] = [];
+  const app = express();
+  app.post("/internal/machine/scope-attestation", (req, _res, next) => {
+    seen.push(`app:${normalizeObservedRoutePattern(req)}`);
+    next();
+  });
+  const internal = express.Router();
+  internal.post("/machine/scope-attestation", (req, res) => {
+    seen.push(`inner:${normalizeObservedRoutePattern(req)}`);
+    res.status(204).end();
+  });
+  app.use("/internal", (req, _res, next) => {
+    seen.push(`mount:${normalizeObservedRoutePattern(req)}`);
+    next();
+  }, internal);
+  const server = createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const { port } = server.address() as { port: number };
+    await new Promise<void>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port, method: "POST", path: "/internal/machine/scope-attestation" }, (res) => {
+        res.resume();
+        res.on("end", resolve);
+      });
+      req.on("error", reject);
+      req.end();
+    });
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+  assert.deepEqual(seen, [
+    "app:/internal/machine/scope-attestation",
+    "mount:/internal/machine/scope-attestation",
+    "inner:/internal/machine/scope-attestation",
+  ]);
 });

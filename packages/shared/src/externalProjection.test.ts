@@ -1,21 +1,20 @@
 import assert from "node:assert/strict";
-import test from "node:test";
 
 import {
   normalizeExternalHandle,
   resolveExternalMention,
   type ExternalAddressabilityContext,
   type ExternalAddressabilityProjection,
-} from "./externalProjection.js";
+} from "./externalProjection";
 import {
   AGENT_API_EXTERNAL_MESSAGE_FORBIDDEN_AUTHORITY_FIELDS,
   agentApiMessageEnvelopeSchema,
   isAgentApiExternalMessageForbiddenAuthorityField,
-} from "./agentApiContract.js";
+} from "./agentApiContract";
 
 const NOW = new Date("2026-07-24T00:00:00.000Z");
 
-test("Agent API envelope validates structured external provenance as a closed inert fact", () => {
+test("Agent API envelope validates structured external provenance as a closed authority-free fact", () => {
   const provenance = {
     schema: "external-message-provenance.v1",
     provider: "slack",
@@ -97,6 +96,25 @@ test("Agent API envelope validates structured external provenance as a closed in
   assert.equal(agentApiMessageEnvelopeSchema.safeParse({
     mentioned: false,
     external_message: provenance,
+  }).success, false);
+  // Slack-bridged messages carry the reader's mention fact like an ordinary
+  // message; the flag must still be an explicit boolean.
+  assert.equal(agentApiMessageEnvelopeSchema.safeParse({
+    ...inertEnvelope,
+    mentioned: true,
+  }).success, true);
+  const { mentioned: _omitted, ...withoutMentioned } = inertEnvelope;
+  assert.equal(agentApiMessageEnvelopeSchema.safeParse(withoutMentioned).success, false);
+  // Every other provider stays explicitly non-mentioned.
+  const otherProvider = { ...provenance, provider: "other-chat" };
+  assert.equal(agentApiMessageEnvelopeSchema.safeParse({
+    ...inertEnvelope,
+    external_message: otherProvider,
+  }).success, true);
+  assert.equal(agentApiMessageEnvelopeSchema.safeParse({
+    ...inertEnvelope,
+    mentioned: true,
+    external_message: otherProvider,
   }).success, false);
 });
 

@@ -24,20 +24,38 @@ import type { Dispatcher } from "undici";
 import {
   MANUAL_CONTEXT_CAPABILITY,
   RAFT_CLIENT_CAPABILITIES_HEADER,
-} from "@botiverse/raft-shared";
-import { buildAgentApiEventsPath } from "./agentApiPath.js";
-import type { AgentContext } from "./auth/env.js";
-import { apiFailureError } from "./core/apiFailure.js";
-import { buildFetchDispatcher } from "./proxy.js";
+} from "@botiverse/raft-shared/src/agentCliSurface";
+import { buildAgentApiEventsPath } from "./agentApiPath";
+import type { AgentContext } from "./auth/env";
+import { apiFailureError } from "./core/apiFailure";
+import { isHttpRedirect, requestJsonOverHttp, type JsonTransportInit, type TransportResponse } from "./httpTransport";
+import { buildFetchDispatcher } from "./proxy";
 import {
   boundedOriginalMessage,
   emitCliTransportNormalizedError,
   routeFamilyForPath,
   targetHostClassForUrl,
   upstreamLayerForFetchError,
-} from "./transportTrace.js";
+} from "./transportTrace";
 
 type ProxyAwareRequestInit = RequestInit & { dispatcher?: Dispatcher };
+
+type JsonTransport = (url: URL, init: JsonTransportInit) => Promise<TransportResponse>;
+let jsonTransport: JsonTransport = requestJsonOverHttp;
+
+/**
+ * Test-only seam: route plain JSON requests through `transport` instead of
+ * node:http (tests that stub `globalThis.fetch` pass a fetch adapter).
+ * Returns the previous transport.
+ */
+export function setJsonTransportForTests(transport: JsonTransport): JsonTransport {
+  const previous = jsonTransport;
+  jsonTransport = transport;
+  return previous;
+}
+
+/** A JsonTransport that sends through the current `globalThis.fetch`. */
+export const globalFetchJsonTransport: JsonTransport = (url, init) => fetch(url, init);
 
 export interface ApiResponse<T> {
   ok: boolean;
@@ -117,6 +135,7 @@ export class ApiClient {
     if (suffix === "/integrations" || suffix.startsWith("/integrations/")) return `/internal/agent-api${suffix}`;
     if (suffix === "/upload") return "/internal/agent-api/upload";
     if (suffix === "/resolve-channel") return "/internal/agent-api/resolve-channel";
+    if (suffix === "/threads") return "/internal/agent-api/threads";
     if (suffix === "/threads/unfollow") return "/internal/agent-api/threads/unfollow";
     if (suffix === "/prepare-action") return "/internal/agent-api/prepare-action";
     if (suffix === "/channels") return "/internal/agent-api/channels";
@@ -172,7 +191,7 @@ export class ApiClient {
     return headers;
   }
 
-  private async parseJsonResponse<T>(res: Response): Promise<ApiResponse<T>> {
+  private async parseJsonResponse<T>(res: TransportResponse): Promise<ApiResponse<T>> {
     let data: T | null = null;
     let error: string | null = null;
     let errorCode: string | null = null;
@@ -267,9 +286,25 @@ export class ApiClient {
     }
   }
 
-  private async fetchWithTransportTrace(url: URL, pathname: string, init: ProxyAwareRequestInit): Promise<Response> {
+  private fetchWithTransportTrace(url: URL, pathname: string, init: ProxyAwareRequestInit): Promise<Response> {
+    return this.sendWithTransportTrace(url, pathname, () => fetch(url, init));
+  }
+
+  // Plain JSON requests go over node:http (see httpTransport.ts). A redirect is
+  // re-sent through fetch, which follows it exactly as before.
+  private async requestJsonWithTransportTrace(url: URL, pathname: string, init: JsonTransportInit): Promise<TransportResponse> {
+    const res = await this.sendWithTransportTrace(url, pathname, () => jsonTransport(url, init));
+    if (!isHttpRedirect(res.status)) return res;
+    return this.fetchWithTransportTrace(url, pathname, init);
+  }
+
+  private async sendWithTransportTrace<R extends { status: number }>(
+    url: URL,
+    pathname: string,
+    send: () => Promise<R>,
+  ): Promise<R> {
     try {
-      const res = await fetch(url, init);
+      const res = await send();
       if (res.status >= 500) {
         this.emitTransportNormalizedError({
           url,
@@ -321,11 +356,15 @@ export class ApiClient {
     method: string,
     pathname: string,
     body?: unknown,
+    options?: { headers?: Record<string, string>; signal?: AbortSignal },
   ): Promise<ApiResponse<T>> {
     pathname = this.rewriteAgentCredentialPath(pathname);
     const url = new URL(pathname, this.ctx.serverUrl);
     const headers = this.buildAuthHeaders();
     headers["Content-Type"] = "application/json";
+    // Per-request capability declarations (task #178 events ack lease). Auth
+    // and capability headers below stay authoritative over these.
+    Object.assign(headers, options?.headers);
     // Rollout carrier: new CLIs hard-require Manual intent/reason locally and
     // advertise that contract explicitly. New servers may therefore enforce
     // it without breaking older published CLI/daemon fleets.
@@ -337,14 +376,17 @@ export class ApiClient {
     if (this.ctx.activeCapabilities && this.ctx.activeCapabilities.length > 0) {
       headers["X-Slock-Agent-Active-Capabilities"] = this.ctx.activeCapabilities.join(",");
     }
-    const dispatcher = buildFetchDispatcher(url.toString());
-    const init: ProxyAwareRequestInit = {
+    const dispatcher = await buildFetchDispatcher(url.toString());
+    const init: JsonTransportInit = {
       method,
       headers,
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal: options?.signal,
     };
-    if (dispatcher) init.dispatcher = dispatcher;
-    const res = await this.fetchWithTransportTrace(url, pathname, init);
+    // Through an HTTP proxy the request stays on fetch + the undici dispatcher.
+    const res = dispatcher
+      ? await this.fetchWithTransportTrace(url, pathname, { ...init, dispatcher })
+      : await this.requestJsonWithTransportTrace(url, pathname, init);
     const parsed = await this.parseJsonResponse<T>(res);
     this.throwProxyFailure(parsed);
     if (parsed.ok && parsed.data !== null) {
@@ -363,7 +405,7 @@ export class ApiClient {
   ): Promise<ApiResponse<T>> {
     pathname = this.rewriteAgentCredentialPath(pathname);
     const url = new URL(pathname, this.ctx.serverUrl);
-    const dispatcher = buildFetchDispatcher(url.toString());
+    const dispatcher = await buildFetchDispatcher(url.toString());
     const headers = this.buildAuthHeaders();
     if (this.ctx.activeCapabilities && this.ctx.activeCapabilities.length > 0) {
       headers["X-Slock-Agent-Active-Capabilities"] = this.ctx.activeCapabilities.join(",");
@@ -387,7 +429,7 @@ export class ApiClient {
   ): Promise<BodyResponse> {
     pathname = this.rewriteAgentCredentialPath(pathname);
     const url = new URL(pathname, this.ctx.serverUrl);
-    const dispatcher = buildFetchDispatcher(url.toString());
+    const dispatcher = await buildFetchDispatcher(url.toString());
     const headers = this.buildAuthHeaders();
     if (this.ctx.activeCapabilities && this.ctx.activeCapabilities.length > 0) {
       headers["X-Slock-Agent-Active-Capabilities"] = this.ctx.activeCapabilities.join(",");
@@ -440,7 +482,7 @@ export class ApiClient {
         };
       }
 
-      const dispatcher = buildFetchDispatcher(objectUrl.toString());
+      const dispatcher = await buildFetchDispatcher(objectUrl.toString());
       const init: ProxyAwareRequestInit = {
         method: "GET",
         redirect: "error",
@@ -520,7 +562,7 @@ function parseProxyDiagnostics(value: unknown): ApiProxyDiagnostics | null {
   };
 }
 
-function proxyDiagnosticsForResponseBodyFailure(res: Response): ApiProxyDiagnostics | null {
+function proxyDiagnosticsForResponseBodyFailure(res: Pick<TransportResponse, "headers">): ApiProxyDiagnostics | null {
   if (res.headers.get("x-raft-proxy-stream-carrier") !== "1") return null;
   const correlationId = res.headers.get("x-raft-correlation-id");
   if (!correlationId) return null;

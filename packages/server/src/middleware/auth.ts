@@ -1,22 +1,26 @@
 import type { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { eq, and, isNull, ne } from "drizzle-orm";
-import { getDb } from "../db/index.js";
-import { users, serverMembers, servers, sessionFamilies } from "../db/schema.js";
-import { findMachineByApiKey, getMachine } from "../services/machineService.js";
+import { getDb } from "../db/index";
+import { isPilotServer } from "../raftbench/contract";
+import { resolveProviderConfig } from "../services/agentRuntimeProviderService";
+import { UUID_RE } from "../lib/messageId";
+import { users, serverMembers, servers, sessionFamilies, agents, appBotBindings, oauthClientInstalls, raftbenchServiceAgents, agentRuntimeProvisions } from "../db/schema";
+import { findMachineByApiKey, getMachine } from "../services/machineService";
 import {
   findAgentCredentialByApiKey,
   isAgentApiKey,
-  recordAgentCredentialUse,
-} from "../services/agentCredentialService.js";
-import { addTraceEvent } from "../tracing/semanticTrace.js";
+} from "../services/agentCredentialService";
+import { recordAgentApiSeen } from "../services/externalAgentPresence";
+import { addTraceEvent, runWithTraceAttrs } from "../tracing/semanticTrace";
+import { agentIdHashAttrs, serverIdHashAttrs } from "../tracing/traceIdentity";
 import {
   findComputerByApiKey,
   isComputerApiKey,
   recordComputerUse,
-} from "../services/computerCredentialService.js";
-import { accountNeedsIdentitySetup, asServerId, asMachineId, isOwnerRole, type ServerId, type MachineId } from "@botiverse/raft-shared";
-import { agents } from "../db/schema.js";
+} from "../services/computerCredentialService";
+import { accountNeedsIdentitySetup, asServerId, isExternalAgentRuntime, asMachineId, isOwnerRole, type ServerId, type MachineId } from "@botiverse/raft-shared";
+import { rememberTraceUserId } from "../tracing/traceUserId";
 
 const JWT_SECRET = () => {
   const secret = process.env.JWT_SECRET;
@@ -47,6 +51,10 @@ declare global {
       actingAgentId?: string;
       agentCredentialId?: string;
       agentCredentialScopes?: readonly string[];
+      raftbenchServiceAgent?: boolean;
+      // True when the credential's bound agent runs on the `external` runtime
+      // (no daemon). Drives the `agent:seen` presence push.
+      actingAgentIsExternal?: boolean;
       // `rfcs/034-slock-credential-rfc.zh.html#section-credential-model` —
       // `sk_computer_*` auth.
       // Set ONLY by `requireComputerAuth`. Downstream handlers under
@@ -86,9 +94,11 @@ export async function verifyActiveAccessToken(token: string): Promise<JwtPayload
   }
   if (payload.type !== "access") return null;
   const db = getDb();
-  const [user] = await db.select({ id: users.id, retiredAt: users.retiredAt })
+  const [user] = await db.select({ id: users.id, retiredAt: users.retiredAt, traceUserId: users.traceUserId })
     .from(users).where(eq(users.id, payload.sub)).limit(1);
   if (!user || user.retiredAt) return null;
+  // Same row read, so this request's spans export the user as trace_user_id.
+  rememberTraceUserId(user.id, user.traceUserId);
   if (payload.familyId) {
     const [family] = await db.select({ revokedAt: sessionFamilies.revokedAt })
       .from(sessionFamilies).where(and(
@@ -234,7 +244,8 @@ export async function requireServer(req: Request, res: Response, next: NextFunct
   }
 
   req.serverId = asServerId(serverId);
-  next();
+  // Spans opened for the rest of the request carry the server's keyed hash.
+  runWithTraceAttrs(serverIdHashAttrs(req.serverId), next);
 }
 
 /**
@@ -380,7 +391,8 @@ export async function requireServerForFlex(req: Request, res: Response, next: Ne
   }
 
   req.serverId = asServerId(serverId);
-  next();
+  // Spans opened for the rest of the request carry the server's keyed hash.
+  runWithTraceAttrs(serverIdHashAttrs(req.serverId), next);
 }
 
 /**
@@ -411,6 +423,12 @@ export async function requireServerMatchesParam(
     // Route doesn't actually carry `:id` — nothing to match. This shouldn't
     // happen if the middleware is mounted correctly, but fail closed.
     res.status(400).json({ error: "Server id is required" });
+    return;
+  }
+  // A non-UUID :id names no server; let it reach the membership query and the
+  // uuid cast error comes back as a 500 (task #12). Uniform 404 instead.
+  if (typeof paramId !== "string" || !UUID_RE.test(paramId)) {
+    res.status(404).json({ error: "Server not found" });
     return;
   }
 
@@ -454,7 +472,8 @@ export async function requireServerMatchesParam(
   }
 
   req.serverId = asServerId(paramId);
-  next();
+  // Spans opened for the rest of the request carry the server's keyed hash.
+  runWithTraceAttrs(serverIdHashAttrs(req.serverId), next);
 }
 
 /**
@@ -612,7 +631,7 @@ async function authenticateAgentCredential(
   // but verify again so semantics stay correct if the JOIN is removed.
   const agentLivenessStart = Date.now();
   const [agentRow] = await db
-    .select({ id: agents.id })
+    .select({ id: agents.id, runtime: agents.runtime, managedByAppInstallId: agents.managedByAppInstallId })
     .from(agents)
     .where(and(eq(agents.id, credential.agentId), isNull(agents.deletedAt)));
   addTraceEvent("agent_credential_auth.agent_liveness.checked", {
@@ -623,22 +642,83 @@ async function authenticateAgentCredential(
     return { ok: false, status: 401, body: { error: "Agent no longer exists" } };
   }
 
+  // Managed app bot: verify the binding + install grant are still live.
+  // Without this, a revoked install's bot key would stay valid until the
+  // per-request binding check catches it — too late.
+  if (agentRow.managedByAppInstallId) {
+    const botCheckStart = Date.now();
+    const [bindingRow] = await db
+      .select({
+        state: appBotBindings.state,
+        installStatus: oauthClientInstalls.status,
+        botGrant: oauthClientInstalls.botGrant,
+      })
+      .from(appBotBindings)
+      .innerJoin(oauthClientInstalls, eq(appBotBindings.installId, oauthClientInstalls.id))
+      .where(and(
+        eq(appBotBindings.agentId, agentRow.id),
+        eq(appBotBindings.installId, agentRow.managedByAppInstallId),
+      ))
+      .limit(1);
+    addTraceEvent("agent_credential_auth.app_bot_binding.checked", {
+      duration_ms: Date.now() - botCheckStart,
+      outcome: bindingRow ? "found" : "missing",
+    });
+    const bindingLive = bindingRow
+      && bindingRow.state === "active"
+      && bindingRow.installStatus === "active"
+      && bindingRow.botGrant === "granted";
+    if (!bindingLive) {
+      return { ok: false, status: 401, body: { error: "App bot binding not active" } };
+    }
+  }
+
   req.principalKind = "agent_credential";
   req.agentCredentialId = credential.credentialId;
   req.agentCredentialScopes = credential.scopes;
   req.actingAgentId = credential.agentId;
   req.serverId = asServerId(credential.serverId);
 
-  // Best-effort observability triple — fire and forget. Failure does not
-  // affect the request path; see `recordAgentCredentialUse` notes.
-  void recordAgentCredentialUse({
-    credentialId: credential.credentialId,
-    ip: typeof req.ip === "string" ? req.ip : null,
-    userAgent:
-      typeof req.headers["user-agent"] === "string"
-        ? req.headers["user-agent"]
-        : null,
-  });
+  // Bind read-only service restrictions to identity, including alternate credentials.
+  const [raftbenchBinding] = await getDb().select({ agentId: raftbenchServiceAgents.agentId })
+    .from(raftbenchServiceAgents).where(and(eq(raftbenchServiceAgents.serverId, credential.serverId),
+      eq(raftbenchServiceAgents.agentId, credential.agentId))).limit(1);
+  if (raftbenchBinding || credential.scopes.includes("raftbench")) {
+    req.raftbenchServiceAgent = true;
+    if (!isPilotServer(credential.serverId, process.env.DEPLOYMENT_ENV)) {
+      return { ok: false, status: 403, body: { error: "RaftBench is unavailable on this server or deployment.", code: "raftbench_server_not_allowed", suggestedNextAction: "Use an enrolled staging server. Production is not enrolled." } };
+    }
+    const path = req.originalUrl.split("?")[0].replace(/\/$/, "");
+    const webhookPath = path === "/internal/agent-api/push-webhook";
+    let providerWebhook = false;
+    if (webhookPath && req.method === "PUT" && typeof req.body?.url === "string") {
+      try {
+        const endpoint = new URL(req.body.url);
+        const [provision] = await getDb().select({ provider: agentRuntimeProvisions.provider, target: agentRuntimeProvisions.providerTarget })
+          .from(agentRuntimeProvisions).where(and(eq(agentRuntimeProvisions.agentId, credential.agentId), eq(agentRuntimeProvisions.serverId, credential.serverId))).limit(1);
+        const provider = provision ? resolveProviderConfig(provision.provider, process.env, provision.target) : null;
+        providerWebhook = !!provider && endpoint.origin === new URL(provider.baseUrl).origin
+          && endpoint.pathname.startsWith("/hooks/") && endpoint.pathname.length > "/hooks/".length
+          && !endpoint.search && !endpoint.hash && !endpoint.username && !endpoint.password;
+      } catch { /* Malformed or non-provider destinations remain refused. */ }
+    }
+    if (webhookPath && req.method === "PUT" && !providerWebhook) {
+      return { ok: false, status: 403, body: { error: "Inbox delivery for this service agent must use the configured staging provider origin with a /hooks/<id> path and no query, fragment or credentials; this URL was refused.", code: "raftbench_read_only", suggestedNextAction: "Use the configured Antiproton provider hook URL. If provider configuration is unavailable, ask the deployment owner to restore it; do not try another destination." } };
+    }
+    const allowed = (req.method === "GET" && ["/internal/agent-api", "/internal/agent-api/events", "/internal/agent-api/context", "/internal/agent-api/raftbench/context"].includes(path)) ||
+      (webhookPath && ["GET", "DELETE"].includes(req.method)) || providerWebhook ||
+      (req.method === "POST" && path === "/internal/agent-api/raftbench/submit");
+    if (!allowed) {
+      return { ok: false, status: 403, body: { error: "This service agent can only check its identity, configure inbox delivery on its staging provider, receive run assignments, read its RaftBench context and submit its result.", code: "raftbench_read_only", suggestedNextAction: "Use the assigned RaftBench run to read context and submit a result. Do not send messages, edit tasks or try other operations; retrying will not help." } };
+    }
+  }
+
+  req.actingAgentIsExternal = isExternalAgentRuntime(agentRow.runtime);
+
+  // Best-effort observability triple + external-agent presence — fire and
+  // forget, throttled per credential. Failure does not affect the request
+  // path; see `recordAgentCredentialUse` notes.
+  recordAgentApiSeen(req);
 
   return { ok: true };
 }
@@ -679,7 +759,13 @@ export async function requireAgentCredentialAuth(
     res.status(result.status).json(result.body);
     return;
   }
-  next();
+  // Every span under this request carries the acting agent's hash (never the
+  // raw id); the request span stamps its own at end.
+  const agentHash = agentIdHashAttrs(req.actingAgentId);
+  runWithTraceAttrs({
+    ...(agentHash.agent_id_hash ? { ...agentHash, agent_id_present: true } : {}),
+    ...serverIdHashAttrs(req.serverId),
+  }, next);
 }
 
 // =============================================================================

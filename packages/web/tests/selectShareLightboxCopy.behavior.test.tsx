@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, test } from "node:test";
 import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import SelectShareLightbox from "../src/components/message/SelectShareLightbox";
 import { TestIntlProvider } from "./helpers/intl";
@@ -9,6 +8,14 @@ const render: typeof rtlRender = (ui, options) =>
 
 const DATA_IMAGE =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/wHwAF/gL+Av5NAAAAAElFTkSuQmCC";
+// What a validated capture hands the preview (task #1302), at the default 2x.
+const IMAGE = {
+  dataUrl: DATA_IMAGE,
+  blob: new Blob([Uint8Array.from(atob(DATA_IMAGE.split(",")[1]), (c) => c.charCodeAt(0))], { type: "image/png" }),
+  width: 1,
+  height: 1,
+  pixelRatio: 2,
+};
 
 type ClipboardPayload = Record<string, Blob | Promise<Blob>>;
 
@@ -87,7 +94,7 @@ test("Share preview copies the generated PNG without closing the modal", async (
 
   render(
     <SelectShareLightbox
-      dataUrl={DATA_IMAGE}
+      image={IMAGE}
       onClose={() => {
         closeCalls += 1;
       }}
@@ -107,12 +114,12 @@ test("Share preview copies the generated PNG without closing the modal", async (
   assert.equal(closeCalls, 0, "copy should preserve the preview and current selection");
 });
 
-test("Share preview renders every footer action as a compact raft-ui Button", async () => {
+test("Share preview renders every footer action as a default footer raft-ui Button", async () => {
   installClipboard(async () => undefined);
 
   render(
     <SelectShareLightbox
-      dataUrl={DATA_IMAGE}
+      image={IMAGE}
       onClose={() => undefined}
       onShareToX={async () => undefined}
     />,
@@ -127,9 +134,11 @@ test("Share preview renders every footer action as a compact raft-ui Button", as
   for (const testId of actionIds) {
     const action = await screen.findByTestId(testId);
     assert.equal(action.getAttribute("data-slot"), "button", `${testId} should be owned by raft-ui Button`);
-    assert.equal(action.classList.contains("h-7"), true, `${testId} should use the 28px shared-button height`);
-    assert.equal(action.classList.contains("text-xs"), true, `${testId} should use compact button text`);
-    assert.equal(action.classList.contains("h-11"), false, `${testId} must not restore the oversized footer action`);
+    // Raft DS › Dialog: footer actions are the default 44 button (`size="lg"`
+    // → h-11 / text-subhead), never the 32 row button (h-8).
+    assert.equal(action.classList.contains("h-11"), true, `${testId} should use the default footer-button height`);
+    assert.equal(action.classList.contains("text-subhead"), true, `${testId} should use the default button text`);
+    assert.equal(action.classList.contains("h-8"), false, `${testId} must not fall back to the small row button`);
   }
 });
 
@@ -140,7 +149,7 @@ test("Share preview does not render Copy when image clipboard is unsupported", a
     value: { write: undefined },
   });
 
-  render(<SelectShareLightbox dataUrl={DATA_IMAGE} onClose={() => undefined} />);
+  render(<SelectShareLightbox image={IMAGE} onClose={() => undefined} />);
   await waitFor(() => {
     assert.equal(screen.queryByTestId("select-share-lightbox-copy-image"), null);
   });
@@ -150,7 +159,7 @@ test("Share preview does not render Copy when image clipboard is unsupported", a
 test("Share preview does not render Copy when clipboard-write permission is denied", async () => {
   installClipboard(async () => undefined, "denied");
 
-  render(<SelectShareLightbox dataUrl={DATA_IMAGE} onClose={() => undefined} />);
+  render(<SelectShareLightbox image={IMAGE} onClose={() => undefined} />);
   await waitFor(() => {
     assert.equal(permissionQueryCalls, 1);
     assert.equal(screen.queryByTestId("select-share-lightbox-copy-image"), null);
@@ -159,7 +168,7 @@ test("Share preview does not render Copy when clipboard-write permission is deni
 });
 
 test("Share preview does not upscale the captured CSS width", () => {
-  render(<SelectShareLightbox dataUrl={DATA_IMAGE} onClose={() => undefined} />);
+  render(<SelectShareLightbox image={IMAGE} onClose={() => undefined} />);
   const image = screen.getByRole("img", { name: "Selected messages screenshot preview" });
   Object.defineProperty(image, "naturalWidth", { configurable: true, value: 1098 });
 
@@ -168,4 +177,18 @@ test("Share preview does not upscale the captured CSS width", () => {
   });
 
   assert.equal(image.getAttribute("style"), "width: 549px;");
+});
+
+test("Share preview sizes by the ratio the image was rendered at, not the screen's", () => {
+  // A long selection is rendered at a lower ratio to stay within the pixel
+  // budget; dividing by the screen's ratio would shrink its preview.
+  render(<SelectShareLightbox image={{ ...IMAGE, pixelRatio: 1 }} onClose={() => undefined} />);
+  const image = screen.getByRole("img", { name: "Selected messages screenshot preview" });
+  Object.defineProperty(image, "naturalWidth", { configurable: true, value: 400 });
+
+  act(() => {
+    fireEvent.load(image);
+  });
+
+  assert.equal(image.getAttribute("style"), "width: 400px;");
 });

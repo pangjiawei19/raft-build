@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
-import { Navigate } from "react-router-dom";
+import { Navigate, useLocation } from "react-router-dom";
+import { Button, Card } from "@botiverse/raft-ui";
 import { useMachineStore } from "../../store/machineStore";
 import { useComputerConnectionWatch } from "../../hooks/useComputerConnectionWatch";
 import Modal from "../Modal";
@@ -10,9 +11,11 @@ import ConfirmDialog from "../ConfirmDialog";
 import CreateAgentDialog from "../agent/CreateAgentDialog";
 import ServerSetupComputerRuntimeStep from "./ServerSetupComputerRuntimeStep";
 import type { ServerSetupComputer } from "./ServerSetupComputerRuntimeStep";
+import ServerSetupDisplayStyleStep from "./ServerSetupDisplayStyleStep";
 import ServerSetupHandoffStep from "./ServerSetupHandoffStep";
 import ServerSetupSurveyStep from "./ServerSetupSurveyStep";
-import { getComputerCommands, getDaemonConnectCommand } from "../../utils/computerSetupCommand";
+import { getComputerCommands } from "../../utils/computerSetupCommand";
+import { completeOnboardingDisplayStyle, useOnboardingDisplayStylePending } from "../../utils/onboardingDisplayStyle";
 import { getServerUrl } from "../../utils/server";
 import { emitHostEvent, hasRaftHostEventBridge, readRaftHostOnboardingContext } from "../../embed/hostBridge";
 import { NATIVE_ONBOARDING_CONTRACT_VERSION } from "../../embed/nativeOnboarding";
@@ -34,6 +37,19 @@ import type {
   ServerSetupProjection,
 } from "./serverSetupProjection";
 
+type RuntimeOptions = NonNullable<ServerSetupProjection["runtimeOptions"]>;
+type OfflineComputers = NonNullable<ServerSetupProjection["offlineComputers"]>;
+const NO_RUNTIME_OPTIONS: RuntimeOptions = [];
+const NO_OFFLINE_COMPUTERS: OfflineComputers = [];
+
+/** Onboarding steps are blocking: the modal shell has no dismiss path. */
+function ignoreModalClose() {}
+
+// Copying says so where the click happened: the button turns into a tick.
+function copyInstallCommand(_runtimeId: string, command: string) {
+  void navigator.clipboard.writeText(command).catch(() => undefined);
+}
+
 function StepContainer({ children }: { children: ReactNode }) {
   return (
     <div className="flex min-h-full w-full overflow-y-auto p-4">
@@ -42,6 +58,11 @@ function StepContainer({ children }: { children: ReactNode }) {
       </div>
     </div>
   );
+}
+
+export function isServerSettingsPath(pathname: string, serverSlug: string): boolean {
+  const base = `/s/${serverSlug}/settings`;
+  return pathname === base || pathname.startsWith(`${base}/`);
 }
 
 type ServerSetupProjectionGateProps = {
@@ -87,27 +108,12 @@ export default function ServerSetupProjectionGate({
   dedicatedSurface = false,
 }: ServerSetupProjectionGateProps) {
   const { formatMessage } = useIntl();
+  const displayStylePending = useOnboardingDisplayStylePending();
+  const { pathname } = useLocation();
   const machines = useMachineStore((state) => state.machines);
   const loadMachines = useMachineStore((state) => state.loadMachines);
-  const registerMachine = useMachineStore((state) => state.registerMachine);
-  // The Windows Computer path uses device authorization and must not mint a legacy
-  // machine row. A raw machine/key is created only after the user explicitly asks to
-  // reveal the retained Daemon / Legacy fallback.
-  const [windowsApiKey, setWindowsApiKey] = useState("");
-  const [windowsKeyPending, setWindowsKeyPending] = useState(false);
-
-  const ensureWindowsApiKey = useCallback(async () => {
-    if (windowsApiKey || windowsKeyPending) return;
-    setWindowsKeyPending(true);
-    try {
-      const { apiKey } = await registerMachine("Windows computer");
-      setWindowsApiKey(apiKey);
-    } catch {
-      setError(formatMessage({ id: "layout.onboarding.windowsCommandFailed" }));
-    } finally {
-      setWindowsKeyPending(false);
-    }
-  }, [formatMessage, registerMachine, windowsApiKey, windowsKeyPending]);
+  // Every platform connects through Raft Computer's device authorization; the
+  // retired standalone-daemon path (which minted a raw machine row + key) is gone.
   const [projection, setProjection] = useState<ServerSetupProjection | null>(null);
   // Whether the CURRENT projection state came back from the server, as opposed
   // to closeCompletedSetup's locally-synthesized completion (which spreads the
@@ -275,7 +281,7 @@ export default function ServerSetupProjectionGate({
   useEffect(() => {
     if (gateStep !== "computer_runtime") return;
     void refreshProjection(true);
-  }, [machineSignature, gateStep]); // oxlint-disable-line react-hooks/exhaustive-deps -- refreshProjection is stable per serverId; adding it would re-fire on every render.
+  }, [machineSignature, gateStep, refreshProjection]);
 
   // The computer this setup attempt is bringing online, resolved by the same
   // state machine the Add Computer dialog uses. The old code here just grabbed
@@ -295,66 +301,13 @@ export default function ServerSetupProjectionGate({
       : null;
   }, [connectionProgress.machine]);
 
-  if (!projectionResolved) {
-    if (!dedicatedSurface) return null;
-    return (
-      <div className="flex min-h-full w-full items-center justify-center p-6" data-testid="native-onboarding-loading">
-        <p className="text-sm font-bold text-black/60">{formatMessage({ id: "onboarding.native.loading" })}</p>
-      </div>
-    );
-  }
-  // No projection, or a server-declared null phase (e.g. non-owner
-  // insufficient_permission, or a first-load fetch failure) → render NOTHING.
-  // This used to fall back to the legacy onboarding wizard, whose
-  // still-live "enable-notifications" step was how a "Turn on notifications"
-  // modal could pop up on any gate-mounting page. The wizard is gone; the
-  // honest state when we don't know is to show nothing (task #164).
-  if (!projection || projection.phase === null) {
-    if (!dedicatedSurface) return null;
-    const messageId = projectionLoadFailed
-      ? "onboarding.native.loadFailed"
-      : "onboarding.native.unavailable";
-    return (
-      <div className="flex min-h-full w-full items-center justify-center p-6" data-testid="native-onboarding-unavailable">
-        <div className="w-full max-w-md border-2 border-black bg-white p-5 text-center shadow-brutal">
-          <p className="text-sm font-bold text-black">{formatMessage({ id: messageId })}</p>
-          <button
-            type="button"
-            className="mt-4 border-2 border-black bg-soft-signal px-4 py-2 text-sm font-bold shadow-brutal-sm active:translate-x-0.5 active:translate-y-0.5 active:shadow-none"
-            onClick={retryProjection}
-          >
-            {formatMessage({ id: "onboarding.native.retry" })}
-          </button>
-        </div>
-      </div>
-    );
-  }
-  // Both are checked ahead of the blocksChat guard on purpose: completing setup flips
-  // blocksChat to false, so neither would get a chance to render otherwise. They only
-  // apply once setup itself is done.
-  const setupComplete = projection.surface === "complete";
-  if (setupComplete && surveyPending) {
-    const step = <ServerSetupSurveyStep onDone={() => void refreshProjection()} />;
-    if (!dedicatedSurface) {
-      return <Modal onClose={() => undefined} layer={1} closeOnEscape={false}>{step}</Modal>;
-    }
-    return <StepContainer>{step}</StepContainer>;
-  }
-  if (setupComplete && handoffPending) {
-    const step = (
-      <ServerSetupHandoffStep
-        serverId={serverId}
-        onDone={() => void refreshProjection()}
-      />
-    );
-    if (!dedicatedSurface) {
-      return <Modal onClose={() => undefined} layer={1} closeOnEscape={false}>{step}</Modal>;
-    }
-    return <StepContainer>{step}</StepContainer>;
-  }
-  // Declared before the deferred branch below uses it: the early return means the later
-  // handler declarations never execute on that path.
-  const handleResume = async () => {
+  // Every handler is declared here, above the early returns below, so the hook order
+  // is the same on every render.
+  const refreshProjectionInBackground = useCallback(() => {
+    void refreshProjection();
+  }, [refreshProjection]);
+
+  const handleResume = useCallback(async () => {
     if (loading) return;
     setLoading(true);
     setError("");
@@ -365,8 +318,115 @@ export default function ServerSetupProjectionGate({
     } finally {
       setLoading(false);
     }
-  };
+  }, [formatMessage, loading, serverId]);
+  const handleResumeClick = useCallback(() => {
+    void handleResume();
+  }, [handleResume]);
 
+  // Read on every render now, including the completed-setup surfaces, which may omit
+  // `allowedExits` entirely.
+  const canResetSetup = projection?.allowedExits?.includes("reset") ?? false;
+  const handleStartOver = useCallback(async () => {
+    if (!canResetSetup || loading) return;
+    setLoading(true);
+    setError("");
+    try {
+      setProjection(await resetServerSetup(serverId));
+      setConfirmStartOver(false);
+    } catch (nextError) {
+      setError(responseErrorMessage(nextError, formatMessage));
+    } finally {
+      setLoading(false);
+    }
+  }, [canResetSetup, formatMessage, loading, serverId]);
+  const openStartOverConfirm = useCallback(() => setConfirmStartOver(true), []);
+  const closeStartOverConfirm = useCallback(() => setConfirmStartOver(false), []);
+
+  const handleComputerRuntimeNext = useCallback(() => {
+    if (pendingCreateAgentProjection) {
+      setProjection(pendingCreateAgentProjection);
+      setPendingCreateAgentProjection(null);
+      return;
+    }
+    void refreshProjection();
+  }, [pendingCreateAgentProjection, refreshProjection]);
+
+  // Settings is the setup flow's escape hatch (the footer links here; Delete lives
+  // here), so the blocking modal stays down on it. Every other route still gets
+  // the gate, so this does not reopen a way to skip setup (task #246).
+  if (!dedicatedSurface && isServerSettingsPath(pathname, serverSlug)) return null;
+
+  if (!projectionResolved) {
+    if (!dedicatedSurface) return null;
+    return (
+      <div className="flex min-h-full w-full items-center justify-center p-6" data-testid="native-onboarding-loading">
+        <p className="text-callout text-foreground-muted">{formatMessage({ id: "onboarding.native.loading" })}</p>
+      </div>
+    );
+  }
+  // No projection, or a server-declared null phase (e.g. non-owner
+  // insufficient_permission, or a first-load fetch failure) → render NOTHING.
+  // This used to fall back to the legacy onboarding wizard, whose
+  // still-live "enable-notifications" step was how a "Turn on notifications"
+  // modal could pop up on any gate-mounting page. The wizard is gone; the
+  // honest state when we don't know is to show nothing (task #164).
+  // Task #247: a new account that is not in a setup of its own (an invited
+  // member, or an owner whose setup is already behind them) picks its display
+  // style here, in the slot where this gate would otherwise render nothing, so
+  // it can never stack on a setup step.
+  // A post-setup step is a blocking Modal in the browser and page content on the
+  // dedicated (native) surface.
+  const presentStep = (step: ReactNode) => (dedicatedSurface
+    ? <StepContainer>{step}</StepContainer>
+    : <Modal onClose={ignoreModalClose} layer={1} closeOnEscape={false}>{step}</Modal>);
+  const memberDisplayStyle = displayStylePending && !dedicatedSurface
+    ? presentStep(<ServerSetupDisplayStyleStep variant="member" onDone={completeOnboardingDisplayStyle} />)
+    : null;
+  if (!projection || projection.phase === null) {
+    if (!dedicatedSurface) return memberDisplayStyle;
+    const messageId = projectionLoadFailed
+      ? "onboarding.native.loadFailed"
+      : "onboarding.native.unavailable";
+    return (
+      <div className="flex min-h-full w-full items-center justify-center p-6" data-testid="native-onboarding-unavailable">
+        <Card className="block w-full max-w-md p-5 text-center">
+          <p className="text-subhead font-bold text-foreground">{formatMessage({ id: messageId })}</p>
+          <Button
+            type="button"
+            size="lg"
+            variant="outline"
+            className="mt-4"
+            onClick={retryProjection}
+          >
+            {formatMessage({ id: "onboarding.native.retry" })}
+          </Button>
+        </Card>
+      </div>
+    );
+  }
+  // Both are checked ahead of the blocksChat guard on purpose: completing setup flips
+  // blocksChat to false, so neither would get a chance to render otherwise. They only
+  // apply once setup itself is done.
+  const setupComplete = projection.surface === "complete";
+  if (setupComplete && surveyPending) {
+    const step = <ServerSetupSurveyStep onDone={refreshProjectionInBackground} />;
+    return presentStep(step);
+  }
+  // Task #247: after the survey, before the handoff, so Cindy's first message
+  // arrives in the style the owner picked. Browser-local, like the theme.
+  if (setupComplete && handoffPending && displayStylePending) {
+    const step = <ServerSetupDisplayStyleStep onDone={completeOnboardingDisplayStyle} />;
+    return presentStep(step);
+  }
+  if (setupComplete && handoffPending) {
+    const step = (
+      <ServerSetupHandoffStep
+        serverId={serverId}
+        onDone={refreshProjectionInBackground}
+      />
+    );
+    return presentStep(step);
+  }
   if (!projection.blocksChat) {
     if (dedicatedSurface && !effectiveWakeGeneration) {
       return <Navigate to={`/s/${serverSlug}`} replace />;
@@ -382,32 +442,34 @@ export default function ServerSetupProjectionGate({
         // app shell inside the onboarding page.
         return (
           <div className="flex min-h-full w-full items-center justify-center p-6" data-testid="native-onboarding-complete">
-            <p className="text-sm font-bold text-black/60">{formatMessage({ id: "onboarding.native.complete" })}</p>
+            <p className="text-callout text-foreground-muted">{formatMessage({ id: "onboarding.native.complete" })}</p>
           </div>
         );
       }
-      return null;
+      return memberDisplayStyle;
     }
     return (
       <div
         className="pointer-events-none fixed inset-x-0 bottom-0 z-40 flex justify-center px-4 pb-4"
         data-testid="server-setup-resume-bar"
       >
-        <div className="pointer-events-auto flex w-full max-w-[560px] flex-wrap items-center justify-between gap-3 border-2 border-black bg-soft-signal px-4 py-3 shadow-brutal">
-          <p className="min-w-0 text-sm font-bold">
+        <div className="pointer-events-auto flex w-full max-w-[560px] flex-wrap items-center justify-between gap-3 rounded-container bg-layer-popover px-4 py-3 text-foreground shadow-float ring-1 ring-line-seam">
+          <p className="min-w-0 text-callout font-bold">
             {formatMessage({ id: "layout.onboarding.notSetUpYet" })}
           </p>
-          <button
+          <Button
             type="button"
-            onClick={() => void handleResume()}
+            onClick={handleResumeClick}
             disabled={loading}
-            className="btn-brutal shrink-0 bg-white px-4 py-2 text-sm disabled:opacity-50"
+            size="sm"
+            variant="outline"
+            className="shrink-0"
             data-testid="server-setup-resume"
           >
             {loading
               ? formatMessage({ id: "layout.onboarding.opening" })
               : formatMessage({ id: "layout.onboarding.resumeSetup" })}
-          </button>
+          </Button>
         </div>
       </div>
     );
@@ -432,37 +494,11 @@ export default function ServerSetupProjectionGate({
   // omit the Computer credential revocation it is about to perform. Keep the larger known
   // count so a stale local projection cannot weaken the destructive-action warning.
   const startOverMachineCount = Math.max(machines.length, projection.offlineComputers?.length ?? 0);
-  const handleStartOver = async () => {
-    if (!projection.allowedExits.includes("reset") || loading) return;
-    setLoading(true);
-    setError("");
-    try {
-      setProjection(await resetServerSetup(serverId));
-      setConfirmStartOver(false);
-    } catch (nextError) {
-      setError(responseErrorMessage(nextError, formatMessage));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  // Copying says so where the click happened: the button turns into a tick.
-  const handleCopyInstallCommand = async (_runtimeId: string, command: string) => {
-    await navigator.clipboard.writeText(command).catch(() => undefined);
-  };
-
   const serverUrl = getServerUrl();
   const deploymentEnv = import.meta.env?.VITE_DEPLOYMENT_ENV;
   const computerCommands = getComputerCommands(serverSlug, deploymentEnv, serverUrl);
   const windowsComputerCommands = getComputerCommands(serverSlug, deploymentEnv, serverUrl, {
     platform: "windows",
-  });
-  const daemonDistTag = deploymentEnv === "staging" ? "staging" : "latest";
-  const daemonCommandFor = (platform: "mac-linux" | "windows") => getDaemonConnectCommand({
-    apiKey: windowsApiKey,
-    distTag: daemonDistTag,
-    platform,
-    serverUrl,
   });
 
   // The confirm dialog. Rendered ALONGSIDE whichever surface is up (Meet Cindy or Screen B),
@@ -483,7 +519,7 @@ export default function ServerSetupProjectionGate({
           )
         : formatMessage({ id: "layout.onboarding.startOverMessageEmpty" })}
       onConfirm={handleStartOver}
-      onClose={() => setConfirmStartOver(false)}
+      onClose={closeStartOverConfirm}
     />
   ) : null;
 
@@ -495,9 +531,9 @@ export default function ServerSetupProjectionGate({
       <CreateAgentDialog
         onboarding
         onboardingShell={dedicatedSurface ? "page" : "step"}
-        onClose={() => void refreshProjection()}
+        onClose={refreshProjectionInBackground}
         onOnboardingComplete={closeCompletedSetup}
-        onOnboardingStartOver={projection.allowedExits.includes("reset") ? () => setConfirmStartOver(true) : undefined}
+        onOnboardingStartOver={canResetSetup ? openStartOverConfirm : undefined}
       />
     );
     return (
@@ -505,7 +541,7 @@ export default function ServerSetupProjectionGate({
       {startOverConfirm}
       {dedicatedSurface
         ? <StepContainer>{createAgentStep}</StepContainer>
-        : <Modal onClose={() => undefined} layer={1} closeOnEscape={false}>{createAgentStep}</Modal>}
+        : <Modal onClose={ignoreModalClose} layer={1} closeOnEscape={false}>{createAgentStep}</Modal>}
       </>
     );
   }
@@ -525,32 +561,22 @@ export default function ServerSetupProjectionGate({
       <ServerSetupComputerRuntimeStep
         computer={computer}
         runtimeStatus={runtimeStatusFromProjection}
-        runtimeOptions={authoritative.runtimeOptions ?? []}
+        runtimeOptions={authoritative.runtimeOptions ?? NO_RUNTIME_OPTIONS}
         hasConnectedComputer={authoritative.hasConnectedComputer ?? false}
-        offlineComputers={authoritative.offlineComputers ?? []}
+        offlineComputers={authoritative.offlineComputers ?? NO_OFFLINE_COMPUTERS}
         serverSlug={serverSlug}
         showOwnApiKey={false}
         loading={loading}
         error={error || gateMessage(projection.gateReason, formatMessage)}
         setupCommand={computerCommands?.setup ?? null}
         computerInstallCommand={computerCommands?.install}
+        computerInstallAndSetupCommand={computerCommands?.installAndSetup ?? null}
         windowsComputerSetupCommand={windowsComputerCommands?.setup ?? null}
         windowsComputerInstallCommand={windowsComputerCommands?.install}
-        macLinuxDaemonCommand={daemonCommandFor("mac-linux")}
-        windowsDaemonCommand={windowsApiKey ? daemonCommandFor("windows") : ""}
-        onRequestWindowsDaemonCommand={() => void ensureWindowsApiKey()}
-        windowsDaemonCommandPending={windowsKeyPending}
-        onCopyInstallCommand={(runtimeId, command) => void handleCopyInstallCommand(runtimeId, command)}
-        canReset={projection.allowedExits.includes("reset")}
-        onStartOver={() => setConfirmStartOver(true)}
-        onNext={() => {
-          if (pendingCreateAgentProjection) {
-            setProjection(pendingCreateAgentProjection);
-            setPendingCreateAgentProjection(null);
-            return;
-          }
-          void refreshProjection();
-        }}
+        onCopyInstallCommand={copyInstallCommand}
+        canReset={canResetSetup}
+        onStartOver={openStartOverConfirm}
+        onNext={handleComputerRuntimeNext}
       />
   );
 
@@ -559,7 +585,7 @@ export default function ServerSetupProjectionGate({
     {startOverConfirm}
     {dedicatedSurface
       ? <StepContainer>{computerRuntimeStep}</StepContainer>
-      : <Modal onClose={() => undefined} layer={1} closeOnEscape={false}>{computerRuntimeStep}</Modal>}
+      : <Modal onClose={ignoreModalClose} layer={1} closeOnEscape={false}>{computerRuntimeStep}</Modal>}
     </>
   );
 }

@@ -1,6 +1,9 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { TSchema } from "typebox";
 import {
+  MCP_OUTCOME_UNKNOWN_TEXT,
+  flattenManagedMcpPromptText,
+  formatManagedMcpPromptName,
   type ManagedMcpCallResult,
   type ManagedMcpRuntimeSnapshot,
   type ManagedMcpRuntimeTool,
@@ -53,12 +56,17 @@ function isRuntimeSnapshot(value: unknown): value is ManagedMcpRuntimeSnapshot {
     && Array.isArray((value as { tools?: unknown }).tools);
 }
 
-function resultText(result: ManagedMcpCallResult): string {
-  return result.content
+/** A remote tool error's text, capped; a cut is marked so the model doesn't take it as the whole answer. */
+export const MANAGED_MCP_ERROR_TEXT_LIMIT = 4_000;
+
+function resultText(result: ManagedMcpCallResult, tool: Pick<ManagedMcpRuntimeTool, "runtimeName">): string {
+  const text = result.content
     .filter((block): block is Extract<ManagedMcpCallResult["content"][number], { type: "text" }> => block.type === "text")
     .map((block) => block.text)
-    .join("\n")
-    .slice(0, 4_000) || "Managed MCP tool failed";
+    .join("\n");
+  // Same words as raft-sdk: name the tool.
+  if (!text) return `${tool.runtimeName} failed`;
+  return text.length > MANAGED_MCP_ERROR_TEXT_LIMIT ? `${text.slice(0, MANAGED_MCP_ERROR_TEXT_LIMIT)}…[truncated]` : text;
 }
 
 function buildTool(input: {
@@ -69,25 +77,37 @@ function buildTool(input: {
   const { tool } = input;
   return {
     name: tool.runtimeName,
-    label: tool.title || `${tool.serverName}: ${tool.toolName}`,
-    description: tool.description || `Call ${tool.toolName} on the managed MCP server ${tool.serverName}.`,
-    promptSnippet: `${tool.runtimeName}: ${tool.description || `Call ${tool.toolName} on ${tool.serverName}`}`,
+    // Names, title and description come from the remote server (or the connector's setup):
+    // names quoted on one line so they cannot break out of the text they sit in.
+    label: tool.title ? flattenManagedMcpPromptText(tool.title) : `${formatManagedMcpPromptName(tool.serverName)}: ${formatManagedMcpPromptName(tool.toolName)}`,
+    description: tool.description || `Call ${formatManagedMcpPromptName(tool.toolName)} on the managed MCP server ${formatManagedMcpPromptName(tool.serverName)}.`,
+    promptSnippet: `${tool.runtimeName}: ${tool.description ? flattenManagedMcpPromptText(tool.description) : `Call ${formatManagedMcpPromptName(tool.toolName)} on ${formatManagedMcpPromptName(tool.serverName)}`}`,
     parameters: tool.inputSchema as TSchema,
     async execute(_toolCallId, params, signal) {
-      const result = await requestJson<ManagedMcpCallResult>({
-        url: new URL("/internal/agent-api/mcp/call", input.serverUrl),
-        token: input.token,
-        method: "POST",
-        body: {
-          mcpServerId: tool.mcpServerId,
-          toolName: tool.toolName,
-          arguments: params as Record<string, unknown>,
-          expectedConfigVersion: tool.configVersion,
-          expectedAssignmentVersion: tool.assignmentVersion,
-        },
-        signal,
-      });
-      if (result.isError) throw new Error(resultText(result));
+      let result: ManagedMcpCallResult;
+      try {
+        result = await requestJson<ManagedMcpCallResult>({
+          url: new URL("/internal/agent-api/mcp/call", input.serverUrl),
+          token: input.token,
+          method: "POST",
+          body: {
+            mcpServerId: tool.mcpServerId,
+            toolName: tool.toolName,
+            arguments: params as Record<string, unknown>,
+            expectedConfigVersion: tool.configVersion,
+            expectedAssignmentVersion: tool.assignmentVersion,
+          },
+          signal,
+        });
+      } catch (error) {
+        // An HTTP answer with Raft's JSON `code` is Raft's own (its agent-facing
+        // text). A transport failure mid-call, or a 5xx from something in between
+        // (no Raft code), has an unknown outcome: same words as raft-sdk.
+        if (error instanceof ManagedMcpHttpError && !(error.status >= 500 && error.code === null)) throw error;
+        if (signal?.aborted) throw error;
+        throw new Error(MCP_OUTCOME_UNKNOWN_TEXT);
+      }
+      if (result.isError) throw new Error(resultText(result, tool));
       return {
         content: result.content.map((block) => block.type === "text"
           ? { type: "text" as const, text: block.text }

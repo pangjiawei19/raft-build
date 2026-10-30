@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
-import { GrokEventNormalizer, type GrokJsonRpcMessage } from "./grokEventNormalizer.js";
+import { GrokEventNormalizer, grokToolEndOutcome, type GrokJsonRpcMessage } from "./grokEventNormalizer";
 
 function notification(sessionId: string, update: Record<string, unknown>): GrokJsonRpcMessage {
   return {
@@ -58,6 +57,7 @@ test("grok normalizer joins tool deltas and emits each call and output once", ()
     kind: "tool_call",
     name: "shell",
     input: { command: "pwd" },
+    callId: "tool-1",
   }]);
   assert.equal(normalizer.normalizeNotification(call)[0]?.kind, "internal_progress");
 
@@ -67,7 +67,7 @@ test("grok normalizer joins tool deltas and emits each call and output once", ()
     status: "completed",
     rawOutput: { stdout: "/tmp" },
   });
-  assert.deepEqual(normalizer.normalizeNotification(completed), [{ kind: "tool_output", name: "shell" }]);
+  assert.deepEqual(normalizer.normalizeNotification(completed), [{ kind: "tool_output", name: "shell", callId: "tool-1", ok: true }]);
   assert.equal(normalizer.normalizeNotification(completed)[0]?.kind, "internal_progress");
 });
 
@@ -144,6 +144,48 @@ test("grok normalizer does not let a late terminal notification complete the nex
     promptId: "prompt-2",
   }), [{ kind: "turn_end", sessionId: "session-1" }]);
   assert.equal(normalizer.canSteerBusy, false);
+});
+
+test("grok normalizer keeps a tool completion that outlives its turn from becoming a tool event", () => {
+  const normalizer = new GrokEventNormalizer();
+  normalizer.adoptSession("session-1");
+  const generation = normalizer.beginPrompt();
+  assert.equal(normalizer.normalizeNotification(notification("session-1", {
+    sessionUpdate: "tool_call",
+    toolCallId: "tool-bg",
+    _meta: { "x.ai/tool": { name: "shell" } },
+  }))[0]?.kind, "tool_call");
+  assert.deepEqual(normalizer.finishPrompt(generation, { stopReason: "end_turn", promptId: "prompt-1" }), [
+    { kind: "turn_end", sessionId: "session-1" },
+  ]);
+
+  const late = normalizer.normalizeNotification(notification("session-1", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tool-bg",
+    status: "completed",
+  }));
+  assert.equal(late.length, 1);
+  assert.equal(late[0]?.kind, "internal_progress", "late completion is progress, not a tool event that marks the agent busy");
+
+  // A self-started successor turn announces its call before completing it.
+  assert.equal(normalizer.normalizeNotification(notification("session-1", {
+    sessionUpdate: "tool_call",
+    toolCallId: "tool-successor",
+    _meta: { "x.ai/tool": { name: "shell" } },
+  }))[0]?.kind, "tool_call");
+  assert.deepEqual(normalizer.normalizeNotification(notification("session-1", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tool-successor",
+    status: "completed",
+  })), [{ kind: "tool_output", name: "shell", callId: "tool-successor", ok: true }]);
+
+  // Inside a daemon turn an unannounced completion still surfaces.
+  normalizer.beginPrompt();
+  assert.equal(normalizer.normalizeNotification(notification("session-1", {
+    sessionUpdate: "tool_call_update",
+    toolCallId: "tool-unannounced",
+    status: "failed",
+  }))[0]?.kind, "tool_output");
 });
 
 test("grok normalizer completes an autonomous successor turn with its own prompt id", () => {
@@ -316,4 +358,11 @@ test("grok normalizer keeps interaction lifecycle internal and bounds unknown ex
     payloadBytes: undefined,
   });
   assert.ok((unknown[0].payloadBytes ?? 0) > 0);
+});
+
+test("task #17: a failed or cancelled Grok tool is not ok, unless it reports the exit code of a command that ran", () => {
+  assert.deepEqual(grokToolEndOutcome("completed", { stdout: "" }), { ok: true });
+  assert.deepEqual(grokToolEndOutcome("failed", { error: "denied" }), { ok: false });
+  assert.deepEqual(grokToolEndOutcome("cancelled", undefined), { ok: false });
+  assert.deepEqual(grokToolEndOutcome("failed", { exit_code: 2, stdout: "" }), { ok: true, exitCode: 2 });
 });

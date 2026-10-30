@@ -1,10 +1,9 @@
+import { useCallback } from "react";
 import { GitBranch, Hash, Lock, LogIn, UserPlus } from "lucide-react";
 import { useIntl } from "react-intl";
-import { Checkbox } from "raft-ui";
+import { Checkbox, Button, Spinner, IconTile } from "@botiverse/raft-ui";
 import type { Channel } from "../../store/channelStore";
 import AvatarSlot from "../ui/AvatarSlot";
-import Button from "../ui/Button";
-import Spinner from "../ui/Spinner";
 import {
   MAX_FORWARD_DESTINATIONS,
   localSelectionKey,
@@ -14,6 +13,13 @@ import {
   targetPickerLabel,
 } from "./forwardComposerModel";
 import type { ForwardSearchTarget, SelectedDestination } from "./forwardComposerModel";
+
+// DS ListRow in a picker: no frame, the row presses like any list row; the
+// chosen value is the check (and a bolder name), never a colour wash.
+const FORWARD_TARGET_ROW_CLASS = "flex min-h-11 w-full min-w-0 items-center gap-3 rounded-control px-2 py-1.5 text-left text-subhead text-foreground outline-none transition-colors focus-visible:shadow-focus";
+// A channel is a place, not a face: the neutral DS channel tile (raft-ui
+// IconTile at the 27px step, the compact-row avatars' size beside it).
+const FORWARD_TARGET_HINT_CLASS = "flex shrink-0 items-center gap-1 text-caption text-foreground-hint";
 
 type Props = {
   currentServerId: string;
@@ -54,6 +60,7 @@ export default function ForwardComposerTargetList({
 }: Props) {
   const { formatMessage } = useIntl();
   const showCheckbox = !isMobile || mobileMultiSelect;
+  const handleRetrySearch = useCallback(() => retrySearch(lowerQuery), [retrySearch, lowerQuery]);
 
   const renderSearchTarget = (target: ForwardSearchTarget) => {
     const key = searchSelectionKey(currentServerId, target);
@@ -84,38 +91,41 @@ export default function ForwardComposerTargetList({
           event.preventDefault();
           toggle();
         }}
-        className={`flex w-full min-w-0 items-center gap-2 border-2 border-black px-2 py-2 text-left text-sm font-bold transition-colors ${
-          unavailable ? "cursor-not-allowed bg-black/5 opacity-50" : selected ? "bg-soft-signal" : "bg-white hover:bg-brutal-cyan/15"
+        className={`${FORWARD_TARGET_ROW_CLASS} ${
+          unavailable ? "cursor-not-allowed text-foreground-disabled" : `hover:bg-fill-pressed ${selected ? "font-bold" : "font-medium"}`
         }`}
         data-testid={`forward-search-target-${target.type}-${target.id}`}
       >
         {showCheckbox && <Checkbox checked={selected} disabled={disabled} tabIndex={-1} aria-hidden className="pointer-events-none" />}
-        <span className="shrink-0">
-          {target.type === "channel" && target.channelType === "joint" && <GitBranch size={14} />}
-          {target.type === "channel" && target.channelType === "private" && <Lock size={14} />}
-          {target.type === "channel" && target.channelType !== "joint" && target.channelType !== "private" && <Hash size={14} />}
-          {target.type === "dm" && (
-            <AvatarSlot
-              context="compact-list"
-              type={target.subtitle === "agent" ? "agent" : "human"}
-              agentAvatarUrl={target.subtitle === "agent" ? target.avatarUrl : null}
-              humanAvatarUrl={target.subtitle !== "agent" ? target.avatarUrl : null}
-              humanPlaceholder={target.subtitle !== "agent" && !target.avatarUrl}
-            />
-          )}
-          {target.type === "agent" && <AvatarSlot context="compact-list" type="agent" agentAvatarUrl={target.avatarUrl} />}
-          {target.type === "human" && <AvatarSlot context="compact-list" type="human" humanAvatarUrl={target.avatarUrl} humanPlaceholder={!target.avatarUrl} />}
-        </span>
+        {target.type === "channel" ? (
+          <IconTile size="sm">
+            {target.channelType === "joint" ? <GitBranch /> : target.channelType === "private" ? <Lock /> : <Hash />}
+          </IconTile>
+        ) : (
+          <span className="shrink-0">
+            {target.type === "dm" && (
+              <AvatarSlot
+                context="compact-row"
+                type={target.subtitle === "agent" ? "agent" : "human"}
+                agentAvatarUrl={target.subtitle === "agent" ? target.avatarUrl : null}
+                humanAvatarUrl={target.subtitle !== "agent" ? target.avatarUrl : null}
+                humanPlaceholder={target.subtitle !== "agent" && !target.avatarUrl}
+              />
+            )}
+            {target.type === "agent" && <AvatarSlot context="compact-row" type="agent" agentAvatarUrl={target.avatarUrl} />}
+            {target.type === "human" && <AvatarSlot context="compact-row" type="human" humanAvatarUrl={target.avatarUrl} humanPlaceholder={!target.avatarUrl} />}
+          </span>
+        )}
         <span className="min-w-0 flex-1 truncate">{target.title}</span>
         {target.requiredAction === "join_channel" && !resolvedChannelId && (
-          <span className="flex shrink-0 items-center gap-1 text-[10px] font-bold uppercase text-black/45">
-            <LogIn size={10} />
+          <span className={FORWARD_TARGET_HINT_CLASS}>
+            <LogIn size={12} />
             {formatMessage({ id: "message.forwardComposer.notJoined" })}
           </span>
         )}
         {target.requiredAction === "create_dm" && !resolvedChannelId && (
-          <span className="flex shrink-0 items-center gap-1 text-[10px] font-bold uppercase text-black/45">
-            <UserPlus size={10} />
+          <span className={FORWARD_TARGET_HINT_CLASS}>
+            <UserPlus size={12} />
             {formatMessage({ id: "message.forwardComposer.newDm" })}
           </span>
         )}
@@ -142,28 +152,32 @@ export default function ForwardComposerTargetList({
           event.preventDefault();
           toggle();
         }}
-        className={`flex w-full min-w-0 items-center gap-2 border-2 border-black px-2 py-2 text-left text-sm font-bold transition-colors ${selected ? "bg-soft-signal" : "bg-white hover:bg-brutal-cyan/15"}`}
+        className={`${FORWARD_TARGET_ROW_CLASS} hover:bg-fill-pressed ${selected ? "font-bold" : "font-medium"}`}
         data-testid={`forward-target-${target.id}`}
       >
         {showCheckbox && <Checkbox checked={selected} disabled={disabled} tabIndex={-1} aria-hidden className="pointer-events-none" />}
-        <span className="shrink-0">{targetIcon(target)}</span>
+        {target.type === "dm" ? (
+          <span className="shrink-0">{targetIcon(target)}</span>
+        ) : (
+          <IconTile size="sm">{targetIcon(target)}</IconTile>
+        )}
         <span className="min-w-0 flex-1 truncate">{targetPickerLabel(target)}</span>
       </div>
     );
   };
 
   if (!isSearchMode) return <>{filteredTargets.map(renderTarget)}</>;
-  if (searchLoading) return <div className="flex items-center justify-center py-4"><Spinner size="sm" /></div>;
+  if (searchLoading) return <div className="flex items-center justify-center py-4"><Spinner size="sm"  aria-label={formatMessage({ id: "common.loadingLabel" })} /></div>;
   if (searchFailed) {
     return (
       <div className="flex flex-col items-center gap-2 py-4 text-center">
-        <p className="text-xs font-bold text-black/55">{formatMessage({ id: "message.forwardComposer.searchFailed" })}</p>
-        <Button type="button" size="xs" tone="white" onClick={() => retrySearch(lowerQuery)}>{formatMessage({ id: "message.forwardComposer.tryAgain" })}</Button>
+        <p className="text-callout text-foreground-muted">{formatMessage({ id: "message.forwardComposer.searchFailed" })}</p>
+        <Button type="button" size="sm" variant="outline" onClick={handleRetrySearch}>{formatMessage({ id: "message.forwardComposer.tryAgain" })}</Button>
       </div>
     );
   }
   if (searchResults.length === 0) {
-    return <p className="py-4 text-center text-xs font-bold text-black/35">{formatMessage({ id: "message.forwardComposer.noMatchingDestinations" })}</p>;
+    return <p className="py-4 text-center text-callout text-foreground-hint">{formatMessage({ id: "message.forwardComposer.noMatchingDestinations" })}</p>;
   }
   return <>{searchResults.map(renderSearchTarget)}</>;
 }

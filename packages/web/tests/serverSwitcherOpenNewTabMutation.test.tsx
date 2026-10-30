@@ -1,8 +1,8 @@
-import test from "node:test";
+import "./helpers/installResizeObserver";
 import assert from "node:assert/strict";
-import { afterEach } from "node:test";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter, useLocation, useNavigationType } from "react-router-dom";
+import { Popover } from "@botiverse/raft-ui";
 import ServerSwitcherMenu from "../src/components/ui/ServerSwitcherMenu";
 import { TestIntlProvider } from "./helpers/intl";
 import { useServerStore } from "../src/store/serverStore";
@@ -64,18 +64,19 @@ function renderMenu(options: { muted?: boolean; navigationMode?: "replace-with-h
     <MemoryRouter initialEntries={["/s/alpha"]}>
       <TestIntlProvider>
         <LocationProbe />
-        <ServerSwitcherMenu
-          open
-          onClose={() => {}}
-          navigationMode={options.navigationMode}
-          serverUnreadCounts={{
-            "550e8400-e29b-41d4-a716-446655440001": {
-              unreadCount: 3,
-              activityUnreadCount: 5,
-              serverPushMuted: options.muted === true,
-            },
-          }}
-        />
+        <Popover open>
+          <ServerSwitcherMenu
+            onClose={() => {}}
+            navigationMode={options.navigationMode}
+            serverUnreadCounts={{
+              "550e8400-e29b-41d4-a716-446655440001": {
+                unreadCount: 3,
+                activityUnreadCount: 5,
+                serverPushMuted: options.muted === true,
+              },
+            }}
+          />
+        </Popover>
       </TestIntlProvider>
     </MemoryRouter>,
   );
@@ -299,14 +300,12 @@ test("server switcher renders the known Activity count, not the broader legacy c
 
   assert.equal(unreadCount.getAttribute("data-slot"), "badge");
   assert.equal(unreadCount.getAttribute("data-variant"), "accent");
-  assert.equal(unreadCount.classList.contains("bg-accent-400"), true);
-  assert.equal(unreadCount.classList.contains("rounded"), true);
-  assert.equal(unreadCount.classList.contains("h-auto"), true);
-  assert.equal(unreadCount.classList.contains("min-w-0"), true);
-  assert.equal(unreadCount.classList.contains("px-1.5"), true);
-  assert.equal(unreadCount.classList.contains("py-0.5"), true);
-  assert.equal(unreadCount.classList.contains("text-white"), true);
-  assert.equal(unreadCount.classList.contains("text-black/50"), false);
+  assert.equal(unreadCount.classList.contains("text-white"), false);
+  // Raft Design System › Badge: raft-ui owns the count sticker's geometry
+  // (20px, min 20 wide); the switcher must not squash it.
+  for (const override of ["h-auto", "py-0.5"]) {
+    assert.equal(unreadCount.classList.contains(override), false, `no badge geometry override: ${override}`);
+  }
   assert.equal(unreadCount.classList.contains("ml-auto"), true);
   assert.equal(unreadCount.classList.contains("justify-center"), true);
   const reorder = screen.getByRole("button", { name: "Reorder Beta" });
@@ -317,11 +316,13 @@ test("server switcher renders muted Activity counts as quiet right-aligned numbe
   renderMenu({ muted: true });
   const unreadCount = screen.getByText("5");
 
-  assert.equal(unreadCount.classList.contains("bg-brutal-pink"), false);
+  assert.equal(unreadCount.classList.contains("bg-attention"), false);
+  assert.notEqual(unreadCount.getAttribute("data-slot"), "badge");
   assert.equal(unreadCount.classList.contains("font-mono"), true);
-  assert.equal(unreadCount.classList.contains("text-black/50"), true);
+  assert.equal(unreadCount.classList.contains("text-foreground-hint"), true);
   assert.equal(unreadCount.classList.contains("ml-auto"), true);
-  assert.equal(unreadCount.getAttribute("title"), "Notifications muted");
+  assert.equal(unreadCount.getAttribute("title"), null);
+  assert.ok(unreadCount.hasAttribute("data-base-ui-tooltip-trigger"), "muted count uses the RUI tooltip instead of native title");
 });
 
 test("server switcher target helpers preserve remembered surfaces and ignore left clicks", () => {

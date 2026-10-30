@@ -1,5 +1,5 @@
 export interface ApmFreshnessDecisionProducerInput {
-  action: "send" | "task_claim" | "task_update";
+  action: "send" | "task_claim" | "task_update" | "task_amend";
   decision: "local_hold" | "syncing_hold" | "forward" | "bypass";
   freshnessContextMode?: "inline" | "withheld";
   target?: string;
@@ -171,7 +171,9 @@ export function projectApmHeldFreshnessActivity(input: {
     ? "Send held by freshness check"
     : input.action === "task_claim"
       ? "Task claim held by freshness check"
-      : "Task update held by freshness check";
+      : input.action === "task_amend"
+        ? "Task amendment held by freshness check"
+        : "Task update held by freshness check";
   const countLine = input.decision === "syncing_hold"
     ? `unreviewed synced context for this target: ${input.messageCount} ${messageNoun}`
     : `new messages: ${input.messageCount} newer ${messageNoun}`;

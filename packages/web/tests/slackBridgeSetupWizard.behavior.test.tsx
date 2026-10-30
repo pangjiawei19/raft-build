@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
 
@@ -192,6 +191,8 @@ test("channel mapping uses Raft selectors and blocks Slack channels the app has 
     [0, 1, 2, 3],
     "mobile DOM order must be Raft selector, Slack selector, membership hint, then actions",
   );
+  // Section-level actions are the raft DS small 32 button (`size="sm"` → h-8),
+  // not the 44 form/footer button.
   assert.ok(addButton.className.split(" ").includes("h-8"));
   assert.ok(refreshButton.className.split(" ").includes("h-8"));
 
@@ -455,6 +456,46 @@ test("read-only viewers see health but cannot mutate provisioning", async () => 
   assert.equal(screen.queryByRole("button", { name: "Disconnect Slack workspace" }), null);
 });
 
+test("read-only viewers get no provisioning action at any setup stage", async () => {
+  const stages: SlackBridgeSetupSnapshot["stage"][] = ["connect", "oauth", "channels", "preflight", "enable", "health"];
+  for (const stage of stages) {
+    const calls: string[] = [];
+    const record = (name: string) => async () => {
+      calls.push(name);
+      return ready(stage);
+    };
+    const provider: SlackBridgeProvisioningProvider = {
+      load: async () => ready(stage),
+      connect: record("connect"),
+      beginOAuth: async () => {
+        calls.push("beginOAuth");
+        return { kind: "view", view: ready(stage) };
+      },
+      beginReauthorization: async () => {
+        calls.push("beginReauthorization");
+        return { kind: "view", view: ready(stage) };
+      },
+      saveChannelPairs: record("saveChannelPairs"),
+      removeChannelPair: record("removeChannelPair"),
+      disconnect: record("disconnect"),
+      runPreflight: record("runPreflight"),
+      enable: record("enable"),
+    };
+
+    renderWithIntl(<SlackBridgeSetupWizard canManage={false} provider={provider} />);
+
+    await screen.findByText("View only");
+    assert.deepEqual(
+      screen.queryAllByRole("button").map((button) => button.textContent),
+      [],
+      `${stage}: a viewer who cannot manage gets no action buttons`,
+    );
+    assert.ok(screen.queryByRole("combobox") === null, `${stage}: no channel pickers`);
+    assert.deepEqual(calls, [], `${stage}: rendering read-only never calls a mutation`);
+    cleanup();
+  }
+});
+
 test("connected managers confirm the exact connection epoch before disconnecting the workspace", async () => {
   const current = ready("health");
   if (current.kind !== "ready" || !current.snapshot.rawHealth.install) throw new Error("health fixture required");
@@ -695,4 +736,87 @@ test("a failed replacement after exact teardown reports partial success instead 
     "Some channel mappings were removed, but the remaining bridge changes did not finish. Reload the current mappings before retrying.",
   );
   assert.equal(screen.queryByText("The Slack bridge operation failed. No setup state was assumed."), null);
+});
+
+test("connected managers can update Slack authorization without disconnecting", async () => {
+  const current = ready("health");
+  if (current.kind !== "ready" || !current.snapshot.rawHealth.install) throw new Error("health fixture required");
+  current.snapshot.rawHealth.install.epochs.connection = "11";
+  const redirects: string[] = [];
+  let disconnects = 0;
+  const provider: SlackBridgeProvisioningProvider = {
+    load: async () => current,
+    connect: async () => ready("oauth"),
+    beginOAuth: async () => ({ kind: "view", view: ready("channels") }),
+    beginReauthorization: async () => ({ kind: "redirect", url: "https://slack.com/oauth/v2/authorize?state=reauth" }),
+    saveChannelPairs: async () => ready("preflight"),
+    runPreflight: async () => ready("enable"),
+    enable: async () => ready("health"),
+    disconnect: async () => {
+      disconnects += 1;
+      return ready("connect");
+    },
+  };
+
+  renderWithIntl(<SlackBridgeSetupWizard canManage provider={provider} onOAuthRedirect={(url) => redirects.push(url)} />);
+
+  const reauthorize = await screen.findByRole("button", { name: "Update Slack authorization" });
+  // Both labels are long; on a phone-width card the row must wrap instead of
+  // pushing the buttons past the card edges (yezizp, 10-11).
+  const actions = screen.getByTestId("slack-bridge-connection-actions");
+  assert.ok(actions.contains(reauthorize));
+  assert.ok(actions.contains(screen.getByRole("button", { name: "Disconnect Slack workspace" })));
+  assert.ok(actions.classList.contains("flex-wrap"));
+
+  fireEvent.click(reauthorize);
+  await waitFor(() => assert.deepEqual(redirects, ["https://slack.com/oauth/v2/authorize?state=reauth"]));
+  assert.equal(disconnects, 0);
+});
+
+test("mention sync only asks for action an admin can take; free plans and transient failures stay quiet", async () => {
+  const cases: Array<{ slackError: string | null; expected: RegExp | null }> = [
+    { slackError: null, expected: null },
+    { slackError: "paid_only", expected: null },
+    { slackError: "restricted_action", expected: /Permissions → User groups/ },
+    { slackError: "missing_scope", expected: /Update Slack authorization/ },
+    { slackError: "name_taken", expected: /2 members couldn't get an entry/ },
+    { slackError: "some_new_error", expected: /\(some_new_error\); Raft keeps retrying/ },
+  ];
+  for (const { slackError, expected } of cases) {
+    const view: SlackBridgeProvisioningView = {
+      kind: "ready",
+      snapshot: {
+        ...snapshot("health"),
+        rawHealth: {
+          ...rawHealth,
+          agentMentionSync: {
+            state: "degraded",
+            slackError,
+            expected: 10,
+            actual: 8,
+            observedAt: "2032-01-02T03:04:05.000Z",
+          },
+        },
+      },
+    };
+    const provider: SlackBridgeProvisioningProvider = {
+      load: async () => view,
+      connect: async () => view,
+      beginOAuth: async () => ({ kind: "view", view }),
+      saveChannelPairs: async () => view,
+      runPreflight: async () => view,
+      enable: async () => view,
+    };
+    renderWithIntl(<SlackBridgeSetupWizard canManage provider={provider} />);
+    await screen.findByText("Connected");
+    const hint = screen.queryByTestId("slack-mention-sync-hint");
+    if (expected === null) {
+      assert.ok(hint === null, `${slackError ?? "transient"}: no mention-sync banner`);
+    } else {
+      assert.ok(hint !== null, `${slackError}: banner shown`);
+      assert.match(hint.textContent ?? "", expected);
+      assert.match(hint.textContent ?? "", /still reaches them when no one else in the channel has that name/);
+    }
+    cleanup();
+  }
 });

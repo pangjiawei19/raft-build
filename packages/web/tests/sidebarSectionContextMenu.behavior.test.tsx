@@ -1,23 +1,20 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import api from "../src/api/client";
 import Sidebar, {
   getSidebarDropIndicatorEdge,
-  getWorkspaceSidebarReorderScope,
   isSidebarCollisionCandidate,
-  reorderSidebarSubset,
 } from "../src/components/layout/Sidebar";
 import { TestIntlProvider } from "./helpers/intl";
 import { sidebarJoinedChannelsOnlyStorageKey } from "../src/components/layout/sidebarChannelVisibility";
+import { useAppearanceStore } from "../src/store/appearanceStore";
 import { useAgentStore } from "../src/store/agentStore";
 import { useAuthStore } from "../src/store/authStore";
 import { useChannelStore } from "../src/store/channelStore";
 import { useMachineStore } from "../src/store/machineStore";
 import { useMessageStore } from "../src/store/messageStore";
 import { useServerStore } from "../src/store/serverStore";
-import { useWorkspaceGridNavigationStore } from "../src/components/workspace/workspaceGridNavigationStore";
 
 const originalApiGet = api.get;
 const originalApiPatch = api.patch;
@@ -30,6 +27,7 @@ globalThis.IntersectionObserver = globalThis.IntersectionObserver ?? class {
 } as typeof IntersectionObserver;
 
 afterEach(() => {
+  useAppearanceStore.setState({ hideEmptySidebarSections: false });
   api.get = originalApiGet;
   api.patch = originalApiPatch;
   cleanup();
@@ -40,7 +38,6 @@ afterEach(() => {
   useMachineStore.setState({ machines: [], loading: true });
   useServerStore.setState({ current: null, servers: [], members: [] });
   useAuthStore.setState({ user: null, loading: false, initialized: true });
-  useWorkspaceGridNavigationStore.setState({ active: false, enabled: false, railMode: null });
 });
 
 function installApiStub() {
@@ -147,14 +144,11 @@ function seedSidebar() {
   useAgentStore.setState({ agents: [], loading: false } as never);
 }
 
-function renderSidebar(
-  initialEntry = "/s/server/channel/joined-channel",
-  workspaceRailMode?: "humans",
-) {
+function renderSidebar(initialEntry = "/s/server/channel/joined-channel") {
   render(
     <MemoryRouter initialEntries={[initialEntry]}>
       <TestIntlProvider>
-        <Sidebar mobileInline workspaceRailMode={workspaceRailMode} />
+        <Sidebar mobileInline />
       </TestIntlProvider>
     </MemoryRouter>,
   );
@@ -163,9 +157,11 @@ function renderSidebar(
 function assertSectionDescriptionTypography(text: string) {
   const description = screen.getByText(text).closest<HTMLElement>("[data-sidebar-section-description]");
   assert.ok(description, `${text} must use the Sidebar section-description primitive`);
-  assert.match(description.className, /(?:^|\s)text-xs(?:\s|$)/);
-  assert.match(description.className, /(?:^|\s)font-mono(?:\s|$)/);
-  assert.match(description.className, /(?:^|\s)leading-snug(?:\s|$)/);
+  // Raft Design System › Sidebar section empty/help copy: Grotesk 13/18, one
+  // family for every rail (no per-theme typography).
+  assert.match(description.className, /(?:^|\s)text-footnote(?:\s|$)/);
+  assert.match(description.className, /(?:^|\s)font-sans(?:\s|$)/);
+  assert.doesNotMatch(description.className, /theme-brutal:|font-mono|uppercase/);
 }
 
 test("sidebar empty and help descriptions share one typography contract across rails", () => {
@@ -180,12 +176,6 @@ test("sidebar empty and help descriptions share one typography contract across r
   renderSidebar("/s/server/members");
 
   assertSectionDescriptionTypography("No agents yet");
-
-  cleanup();
-  seedSidebar();
-  useWorkspaceGridNavigationStore.setState({ active: true, enabled: true, railMode: "humans" });
-  renderSidebar("/s/server", "humans");
-
   assertSectionDescriptionTypography("No humans");
 
   cleanup();
@@ -193,6 +183,22 @@ test("sidebar empty and help descriptions share one typography contract across r
   renderSidebar("/s/server/computers");
 
   assertSectionDescriptionTypography("No computers yet");
+});
+
+test("Pinned and Joint channels retain independent disclosure choices after remount", () => {
+  seedSidebar();
+  renderSidebar();
+  fireEvent.click(screen.getByTestId("sidebar-section-toggle-pinned"));
+  fireEvent.click(screen.getByTestId("sidebar-section-toggle-joint-channels"));
+  cleanup();
+  renderSidebar();
+  assert.equal(screen.getByTestId("sidebar-section-toggle-pinned").getAttribute("aria-expanded"), "false");
+  assert.equal(screen.getByTestId("sidebar-section-toggle-joint-channels").getAttribute("aria-expanded"), "false");
+  fireEvent.click(screen.getByTestId("sidebar-section-toggle-pinned"));
+  cleanup();
+  renderSidebar();
+  assert.equal(screen.getByTestId("sidebar-section-toggle-pinned").getAttribute("aria-expanded"), "true");
+  assert.equal(screen.getByTestId("sidebar-section-toggle-joint-channels").getAttribute("aria-expanded"), "false");
 });
 
 test("sidebar sections own their create actions and joint channels remain visible while empty", () => {
@@ -310,9 +316,9 @@ test("custom sections render mixed placement chrome and expose direct management
   const menu = screen.getByRole("menu", { name: "Project options" });
   assert.ok(menu.textContent?.includes("New section…"));
   assert.equal(menu.textContent?.includes("Manage sections…"), false);
-  assert.ok(menu.textContent?.includes("Rename / change icon…"));
+  assert.ok(menu.textContent?.includes("Edit section…"));
   assert.ok(menu.textContent?.includes("Delete section"));
-  assert.ok((menu.textContent?.indexOf("Rename / change icon…") ?? -1) < (menu.textContent?.indexOf("New section…") ?? -1));
+  assert.ok((menu.textContent?.indexOf("Edit section…") ?? -1) < (menu.textContent?.indexOf("New section…") ?? -1));
   assert.ok((menu.textContent?.indexOf("New section…") ?? -1) < (menu.textContent?.indexOf("Delete section") ?? -1));
 });
 
@@ -419,7 +425,9 @@ test("custom sections accept direct-message channel placements", () => {
 
   const customSection = screen.getByTestId("sidebar-custom-section-project");
   assert.ok(customSection.textContent?.includes("Alice"));
-  assert.equal(customSection.textContent?.includes("Alice profile description"), false);
+  // A row looks the same in every section: the custom section shows the
+  // description exactly as Direct Messages does.
+  assert.equal(customSection.textContent?.includes("Alice profile description"), true);
   const dmRow = customSection.querySelector('button[data-sidebar-channel-id="dm-alice"]');
   assert.ok(dmRow);
   assert.ok(dmRow.classList.contains("items-center"));
@@ -465,7 +473,7 @@ test("blank chat sidebar space opens only target-free creation and section actio
   assert.equal(within(menu).queryByRole("menuitem", { name: "Manage sections…" }), null);
   assert.equal(within(menu).queryByText("Sort"), null);
   assert.equal(within(menu).queryByRole("menuitem", { name: "Move to section" }), null);
-  assert.equal(within(menu).queryByRole("menuitem", { name: "Rename / change icon…" }), null);
+  assert.equal(within(menu).queryByRole("menuitem", { name: "Edit section…" }), null);
 });
 
 test("section headers are direct drag activators in persisted visual order", () => {
@@ -512,45 +520,6 @@ test("sidebar insertion edge follows the dragged row center around the target mi
   assert.equal(getSidebarDropIndicatorEdge(100, 100), "after");
 });
 
-test("native Workspace reorder preserves non-sortable channel and DM positions", () => {
-  assert.deepEqual(
-    reorderSidebarSubset(
-      ["all", "one", "joint", "two"],
-      ["one", "two"],
-      "two",
-      "one",
-    ),
-    ["all", "two", "joint", "one"],
-  );
-  assert.deepEqual(
-    reorderSidebarSubset(
-      ["visible-one", "hidden", "custom", "visible-two"],
-      ["visible-one", "visible-two"],
-      "visible-two",
-      "visible-one",
-    ),
-    ["visible-two", "hidden", "custom", "visible-one"],
-  );
-  assert.equal(reorderSidebarSubset(["one", "two"], ["one", "two"], "missing", "one"), null);
-});
-
-test("Workspace DM reorder is owned only by the visible default-DMs surface", () => {
-  const options = {
-    channelManualSort: true,
-    jointChannelManualSort: true,
-    dmManualSort: true,
-    sortableChannelIds: ["channel-one", "channel-two"],
-    sortableJointChannelIds: ["joint-one", "joint-two"],
-    sortableDmIds: ["default-one", "default-two"],
-  };
-
-  assert.equal(getWorkspaceSidebarReorderScope("dm:default-one", "dm:default-two", options), "dms");
-  assert.equal(getWorkspaceSidebarReorderScope("dm:pinned", "dm:default-two", options), null);
-  assert.equal(getWorkspaceSidebarReorderScope("dm:custom", "dm:default-two", options), null);
-  assert.equal(getWorkspaceSidebarReorderScope("dm:hidden", "dm:default-two", options), null);
-  assert.equal(getWorkspaceSidebarReorderScope("dm:default-one", "dm:pinned", options), null);
-});
-
 test("channel empty states distinguish the all-channel and joined-only views", () => {
   seedSidebar();
   useChannelStore.setState({ channels: [] } as never);
@@ -568,6 +537,79 @@ test("channel empty states distinguish the all-channel and joined-only views", (
   assert.ok(screen.getByText("No joined channels"));
   assertSectionDescriptionTypography("No joined channels");
   assert.equal(screen.queryByText("No channels yet"), null);
+});
+
+test("hide-empty-sections drops empty system blocks while keeping the populated Channels section", () => {
+  seedSidebar();
+  useAppearanceStore.getState().setHideEmptySidebarSections(true);
+  renderSidebar();
+
+  // Pinned / Joint Channels / DMs are all empty in the seed → gone entirely.
+  assert.equal(screen.queryByTestId("sidebar-section-block-pinned"), null);
+  assert.equal(screen.queryByTestId("sidebar-section-block-joint"), null);
+  assert.equal(screen.queryByTestId("sidebar-section-block-dms"), null);
+  assert.equal(screen.queryByText("No joint channels yet"), null);
+  assert.equal(screen.queryByText("Drag channels or DMs here to pin"), null);
+
+  // Channels has rows → it stays, and its onboarding-bearing empty state is
+  // never auto-hidden even when it is empty.
+  assert.ok(screen.getByTestId("sidebar-section-block-channels"));
+  assert.ok(screen.getByText("joined-channel"));
+});
+
+test("a non-empty section is never hidden by hide-empty-sections", () => {
+  seedSidebar();
+  useChannelStore.setState((state) => ({
+    channels: [
+      ...state.channels,
+      {
+        id: "joint-channel",
+        serverId: "server-1",
+        name: "joint-channel",
+        type: "joint",
+        joined: true,
+        archivedAt: null,
+        createdAt: "2026-07-12T00:00:00.000Z",
+      },
+    ],
+  } as never));
+  useAppearanceStore.getState().setHideEmptySidebarSections(true);
+  renderSidebar();
+
+  assert.ok(screen.getByTestId("sidebar-section-block-joint"));
+  assert.ok(screen.getByText("joint-channel"));
+});
+
+test("the Hide empty sections menu toggle restores hidden empty sections", async () => {
+  seedSidebar();
+  useAppearanceStore.getState().setHideEmptySidebarSections(true);
+  renderSidebar();
+
+  assert.equal(screen.queryByTestId("sidebar-section-block-pinned"), null);
+
+  // The toggle lives on every section's menu, so a visible section (Channels)
+  // can re-show the ones hidden for being empty.
+  fireEvent.contextMenu(screen.getByRole("button", { name: "Create Channel" }));
+  const toggle = screen.getByRole("menuitemcheckbox", { name: "Hide empty sections" });
+  assert.equal(toggle.getAttribute("aria-checked"), "true");
+  fireEvent.click(toggle);
+
+  await waitFor(() => assert.ok(screen.getByTestId("sidebar-section-block-pinned")));
+  assert.ok(screen.getByTestId("sidebar-section-block-joint"));
+  assert.ok(screen.getByTestId("sidebar-section-block-dms"));
+});
+
+test("the context-menu toggle writes the shared appearance store (Settings ⇄ sidebar sync)", () => {
+  seedSidebar();
+  useAppearanceStore.getState().setHideEmptySidebarSections(false);
+  renderSidebar();
+
+  fireEvent.contextMenu(screen.getByRole("button", { name: "Create Channel" }));
+  fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Hide empty sections" }));
+
+  // The sidebar toggle and the Settings → Appearance toggle read/write the same
+  // appearanceStore field, so flipping one is immediately observable to the other.
+  assert.equal(useAppearanceStore.getState().hideEmptySidebarSections, true);
 });
 
 test("direct-message section right-click keeps sorting but omits channel creation", () => {

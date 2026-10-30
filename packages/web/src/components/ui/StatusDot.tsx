@@ -1,6 +1,9 @@
 import type { HTMLAttributes } from "react";
+import { Status } from "@botiverse/raft-ui";
+import type { Presence } from "@botiverse/raft-ui";
 import type { AgentActivity } from "@botiverse/raft-shared";
-import { getActivityDotClass } from "../../utils/activity";
+import Tooltip from "./Tooltip";
+import { activityPresence } from "../../utils/activity";
 
 // React's `HTMLAttributes` doesn't expose `data-*` keys in TS, so widen
 // passthrough prop types with a string-key index signature so callsites
@@ -8,73 +11,78 @@ import { getActivityDotClass } from "../../utils/activity";
 type SpanPassthroughProps = HTMLAttributes<HTMLSpanElement> &
   Record<`data-${string}`, string | undefined>;
 
+/** Raft Design System presence lights: fixed meanings, never animated
+ *  (raft-ui's `Presence`, drawn by raft-ui `Status presence`). */
+export type StatusDotPresence = Presence;
+
 /**
- * Canonical status-dot primitive — covers every inline "colored circle with
- * black border" that signals presence / activity / binary state across the
- * app (~20 callsites: Sidebar, ChatPanel, AgentDetailPanel, MachineDetailPanel,
- * ProfilePreviewCardContent, AgentListRow, AgentActivityLog, MessageItem avatar
- * overlay, ChannelMembers, etc.).
+ * Canonical status-dot primitive — every presence / activity / binary-state
+ * light across the app (Sidebar, ChatPanel, AgentDetailPanel,
+ * MachineDetailPanel, ProfilePreviewCardContent, AgentListRow,
+ * AgentActivityLog, MessageItem avatar overlay, ChannelMembers, …).
  *
- * stdrc 2026-05-10 #wg-theme:f5a597b3 ("@Duoyu 来做 StatusDot") — Tier 1
- * theme-componentization audit candidate, same primitive, different prop
- * combinations for each surface.
+ * Raft Design System › StatusChip / Avatar: every dot is a square pixel —
+ * radius 2, a 1.5px ink edge, a fixed presence colour (online lime, busy
+ * yellow, error orange, offline stone, external cyan). It never animates.
+ * The pixel and its presence colours are raft-ui's `Status`; this wrapper
+ * only maps agent activity onto a presence and routes `title` through the
+ * app Tooltip.
  *
  * **API design** (follows PanelHeader conventions — Joy 2026-05-10 design API note):
- * - `activity` drives the color via `getActivityDotClass()`. For non-activity
- *   binary states (machine online/offline, waiting pulse, etc.) pass `tone`
- *   with a Tailwind color token like `"bg-brutal-lime"` — `activity` wins
- *   if both are provided.
- * - `size` is the canonical variant axis. `md` = `size-2.5` (headers,
- *   sidebar, ChannelMembers, machine detail — the standard size from
- *   CLAUDE.md). `sm` = `size-2` (inline text contexts — profile preview cards,
- *   AgentActivityLog, AgentDetailPanel machine info). `lg` = `h-[11px]
- *   w-[11px]` (MessageItem avatar overlay).
- * - `pulse` adds `animate-pulse` — used for "waiting for input" / "thinking"
- *   affordances where the activity mapping does not already encode pulse.
- * - `className` passes through for positioning overrides (e.g. `absolute
- *   -bottom-0.5 -right-0.5`, `inline-block`, `shrink-0`, etc.).
+ * - `presence` names the DS presence light directly. Prefer it for new code.
+ * - `activity` maps an agent activity onto its presence light
+ *   (thinking / working → busy).
+ * - `tone` is the escape hatch for non-presence binary states (an upgrade's
+ *   pink, a task status): a Tailwind bg token that replaces the pixel's
+ *   colour. `presence` wins over `activity`, which wins over `tone`.
+ * - `external` forces the external (cyan) light regardless of the rest
+ *   (SHA-V0-014: no managed liveness for external agents).
+ * - `size` is the physical-fit axis. `md` (default) = the 9px DS pixel
+ *   (headers, sidebar, members, machine detail). `sm` = 8px for inline text
+ *   (profile preview cards, activity log). `lg` = 11px for avatar overlays.
+ * - No `pulse`: status dots mark AMBIENT states and never animate (task #136 —
+ *   an infinite pulse keeps the page rendering at display refresh rate).
+ * - `className` passes through for positioning (e.g. `absolute -bottom-0.5
+ *   -right-0.5`, `shrink-0`).
  */
 export interface StatusDotProps extends Omit<SpanPassthroughProps, "children"> {
-  /** Agent activity state; drives the color via `getActivityDotClass()`. */
+  /** DS presence light. Wins over `activity` and `tone`. */
+  presence?: StatusDotPresence;
+  /** Agent activity state; mapped onto its presence light. */
   activity?: AgentActivity;
-  /** Explicit Tailwind bg token for non-activity uses (e.g.
-   *  `"bg-brutal-lime"`, `"bg-brutal-orange"`, `"bg-gray-400"`). Ignored
-   *  when `activity` is provided (unless `external` is true). */
+  /** Explicit Tailwind bg token for non-presence uses. Ignored when
+   *  `presence` or `activity` is provided (or `external` is true). */
   tone?: string;
-  /** When true, renders neutral `bg-brutal-cyan` tone regardless of `activity`.
-   *  For external agents (SHA-V0-014) — no managed liveness green/red. */
+  /** When true, renders the external (cyan) presence light regardless of
+   *  `activity`. For external agents (SHA-V0-014) — no managed liveness. */
   external?: boolean;
-  /** Size variant. `md` (default) = `size-2.5`. `sm` = `size-2` for
-   *  inline text. `lg` = `size-[11px]` for avatar overlays. */
+  /** Size variant. `md` (default) = 9px DS pixel. `sm` = 8px for inline
+   *  text. `lg` = 11px for avatar overlays. */
   size?: "sm" | "md" | "lg";
-  /** Adds `animate-pulse` on top of the chosen color. The color util
-   *  already pulses for `thinking`/`working`; only use this prop when the
-   *  pulse is orthogonal to activity mapping. */
-  pulse?: boolean;
 }
 
-const SIZE_CLASS: Record<NonNullable<StatusDotProps["size"]>, string> = {
-  sm: "size-2",
-  md: "size-2.5",
-  lg: "size-[11px]",
-};
-
 export default function StatusDot({
+  presence,
   activity,
   tone,
   external = false,
   size = "md",
-  pulse = false,
   className,
+  title,
   ...rest
 }: StatusDotProps) {
-  const colorClass = external
-    ? "bg-brutal-cyan"
-    : activity ? getActivityDotClass(activity) : tone ?? "bg-gray-400";
-  return (
-    <span
+  const resolvedPresence: StatusDotPresence | undefined = external
+    ? "external"
+    : presence ?? (activity ? activityPresence(activity) : undefined);
+  const dot = (
+    <Status
       {...rest}
-      className={`inline-block shrink-0 rounded-full border border-black ${SIZE_CLASS[size]} ${colorClass} ${pulse ? "animate-pulse" : ""} ${className ?? ""}`}
+      size={size}
+      presence={resolvedPresence ?? (tone ? undefined : "offline")}
+      className={[resolvedPresence ? "" : tone ?? "", className ?? ""].join(" ").trim() || undefined}
     />
   );
+  // Native title= on a span is only a hover tooltip; route it through the RUI
+  // Tooltip so it follows the theme recipe (migration wave for title=, task #595).
+  return title ? <Tooltip content={title}>{dot}</Tooltip> : dot;
 }

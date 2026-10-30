@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -31,7 +30,7 @@ test("the Worker is routed for /.well-known/*, or it never sees the request", ()
 });
 
 test("both association paths are answered before static assets are consulted", async () => {
-  const { default: handler } = await import("../public/_worker.js");
+  const { default: handler } = await import("../public/_worker");
   // If ASSETS were reached, we would get the SPA shell — so this stub throws to
   // prove the association paths never fall through.
   const env = {
@@ -68,15 +67,30 @@ test("both association paths are answered before static assets are consulted", a
       ]);
     }],
     ["/.well-known/apple-app-site-association", (body: unknown) => {
-      // Scope is exactly /download — claiming more would change behaviour for
-      // every other Raft URL on a device that has the app installed, so the
-      // components array is pinned whole rather than by its "/" key alone.
+      // Pin the complete scope: keep download and add only channel/DM families.
+      // A broad catch-all would divert unrelated website URLs to the app.
       assert.deepEqual(body, {
         applinks: {
           details: [
             {
               appIDs: ["XDAPXFY8FZ.build.raft.app"],
-              components: [{ "/": "/download", comment: "mobile download entry only" }],
+              components: [
+                { "/": "/download", comment: "mobile download entry only" },
+                { "/": "/s/*/channel/", exclude: true, comment: "no channel id" },
+                { "/": "/s/*/*/channel/*", exclude: true, comment: "nested route, not a channel permalink" },
+                { "/": "/s/*/channel/*/*", exclude: true, comment: "extra segment after the channel id" },
+                { "/": "/s/*/dm/", exclude: true, comment: "no dm id" },
+                { "/": "/s/*/*/dm/*", exclude: true, comment: "nested route, not a dm permalink" },
+                { "/": "/s/*/dm/*/*", exclude: true, comment: "extra segment after the dm id" },
+                {
+                  "/": "/s/*/channel/*",
+                  comment: "channel and reply permalinks; native validates identity and query anchors",
+                },
+                {
+                  "/": "/s/*/dm/*",
+                  comment: "direct-message permalinks; native validates identity and query anchors",
+                },
+              ],
             },
           ],
         },
@@ -91,12 +105,13 @@ test("both association paths are answered before static assets are consulted", a
       "application/json",
       `${path} must be JSON — 200 + text/html is the silent failure mode`,
     );
+    assert.equal(response.headers.get("location"), null, `${path} must not redirect`);
     check(await response.json());
   }
 });
 
 test("change-password redirects temporarily before static assets are consulted", async () => {
-  const { default: handler } = await import("../public/_worker.js");
+  const { default: handler } = await import("../public/_worker");
   const env = {
     ASSETS: {
       fetch: () => {
@@ -116,7 +131,7 @@ test("change-password redirects temporarily before static assets are consulted",
 });
 
 test("unknown well-known paths are real empty 404s instead of the SPA shell", async () => {
-  const { default: handler } = await import("../public/_worker.js");
+  const { default: handler } = await import("../public/_worker");
   let reachedAssets = 0;
   const env = {
     ASSETS: {
@@ -143,4 +158,62 @@ test("unknown well-known paths are real empty 404s instead of the SPA shell", as
   // And the two we do own must still not touch assets.
   await handler.fetch(new Request("https://app.raft.build/.well-known/assetlinks.json"), env);
   assert.equal(reachedAssets, 0, "our own paths must not fall through");
+});
+
+// This test models the path-only, case-sensitive '*' patterns used above, not
+// Apple's device/CDN verification or the native identity/anchor parser.
+// https://developer.apple.com/documentation/bundleresources/applinks/details-swift.dictionary/components-swift.dictionary
+// '*' matches zero or more characters (including '/'); query/fragment are not
+// constrained because these components specify neither '?' nor '#'.
+test("AASA covers conversation and message links without claiming unrelated web routes", async () => {
+  const { default: handler } = await import("../public/_worker");
+  const response = await handler.fetch(
+    new Request("https://app.raft.build/.well-known/apple-app-site-association"),
+    { ASSETS: { fetch: () => { throw new Error("AASA must bypass assets"); } } },
+  );
+  const body = await response.json();
+  const components = body.applinks.details[0].components as Array<Record<string, unknown>>;
+  // The first matching component decides; an `exclude` match keeps the URL on web.
+  const rules = components.map((component) => {
+    const keys = Object.keys(component).sort();
+    assert.ok(
+      keys.join() === "/,comment" || keys.join() === "/,comment,exclude",
+      `unexpected component keys ${keys.join()}`,
+    );
+    if ("exclude" in component) assert.equal(component.exclude, true);
+    const pattern = component["/"] as string;
+    return {
+      exclude: component.exclude === true,
+      regex: new RegExp(`^${pattern.split("*").map((part) =>
+        part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      ).join(".*")}$`),
+    };
+  });
+  const matches = (path: string) => {
+    const pathname = new URL(path, "https://app.raft.build").pathname;
+    const rule = rules.find(({ regex }) => regex.test(pathname));
+    return rule !== undefined && !rule.exclude;
+  };
+  for (const path of [
+    "/download",
+    "/download?source=qr",
+    "/s/qa-workspace/channel/channel-id",
+    "/s/qa-workspace/channel/channel-id?thread=channel-id%3Aparent-id&msg=message-id",
+    "/s/other-workspace/dm/dm-id",
+    "/s/other-workspace/dm/dm-id?msg=message-id",
+  ]) assert.equal(matches(path), true, `must associate ${path}`);
+  for (const path of [
+    "/", "/join", "/join/invite-token", "/download/extra", "/downloads",
+    "/login", "/change-password", "/s/qa-workspace", "/s/qa-workspace/members",
+    "/s/qa-workspace/settings", "/s/qa-workspace/channels/id",
+    "/s/qa-workspace/Channel/id", "/s/qa-workspace/DM/id",
+    "/channel/id", "/dm/id", "/other/s/qa-workspace/channel/id",
+    "/?next=/s/qa-workspace/channel/id", "/#s/qa-workspace/dm/id",
+    // `*` spans `/`, so these reach the include patterns unless excluded first;
+    // the native parser accepts only `/s/<slug>/(channel|dm)/<id>`.
+    "/s/qa-workspace/channel/", "/s/qa-workspace/dm/",
+    "/s/qa-workspace/settings/channel/id", "/s/qa-workspace/settings/dm/id",
+    "/s/qa-workspace/channel/id/extra", "/s/qa-workspace/dm/id/extra",
+    "/s/qa-workspace/channel/id/", "/s/a/b/channel/id",
+  ]) assert.equal(matches(path), false, `must stay on web ${path}`);
 });

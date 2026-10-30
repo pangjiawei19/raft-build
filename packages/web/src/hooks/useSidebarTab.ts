@@ -2,6 +2,8 @@ import { useCallback, useMemo } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useServerStore } from "../store/serverStore";
 import { readTabMemory } from "./useTabRouteMemory";
+import { useLiveLocation } from "./useLiveLocation";
+import { resolveSearchOverlayBackground, searchEntryState } from "../components/search/searchOverlayLocation";
 
 // The left navigation rail surfaces a fixed set of modes; the entire left
 // column (rail button highlight + sidebar content + sidebar header text)
@@ -15,7 +17,7 @@ import { readTabMemory } from "./useTabRouteMemory";
 // visible) — same shape as `tasks`. Per stdrc #proj-uiux:c2313b1d task #311
 // 2026-05-25: Search entry promoted to the Rail's first button + opens a
 // fullscreen search page.
-export type RailMode = "search" | "activity" | "chat" | "wiki" | "members" | "computers" | "tasks" | "settings";
+export type RailMode = "search" | "activity" | "chat" | "members" | "computers" | "tasks" | "settings";
 
 // Back-compat alias for callers that only care about the chat/members
 // distinction inside the chat-or-members surface (e.g. existing tests).
@@ -28,7 +30,7 @@ function deriveRailModeFromPath(pathname: string, pathBase: string): RailMode {
   // Legacy /inbox still maps to the activity rail mode so the rail button stays
   // highlighted during the /inbox→/activity redirect tick.
   if (pathname === `${pathBase}/inbox` || pathname.startsWith(`${pathBase}/inbox/`)) return "activity";
-  if (pathname === `${pathBase}/wiki` || pathname.startsWith(`${pathBase}/wiki/`)) return "wiki";
+  if (pathname.replace(/\/$/, "") === `${pathBase}/raftbench`) return "settings";
   if (pathname.startsWith(`${pathBase}/settings`)) return "settings";
   if (pathname.startsWith(`${pathBase}/release-notes`)) return "settings";
   if (pathname === `${pathBase}/tasks` || pathname.startsWith(`${pathBase}/tasks/`)) return "tasks";
@@ -46,8 +48,21 @@ export function useRailMode() {
   const navigate = useNavigate();
   const serverSlug = useServerStore((s) => s.current?.slug ?? null);
   const pathBase = serverSlug ? `/s/${serverSlug}` : "";
+  const liveLocation = useLiveLocation();
 
+  // While the ⌘K search overlay floats over a page, the URL is /search but the
+  // page behind it (and its sidebar) is the overlay's background: settings stays
+  // settings, members stays members. Deriving from /search here made the
+  // sidebar fall back to the Chat channel list behind the overlay.
+  const overlayBackgroundPath = resolveSearchOverlayBackground(location)?.pathname ?? null;
   const railMode = useMemo<RailMode>(
+    () => deriveRailModeFromPath(overlayBackgroundPath ?? location.pathname, pathBase),
+    [overlayBackgroundPath, location.pathname, pathBase],
+  );
+  // Where the user actually is: `search` while the overlay floats over a page,
+  // where railMode names the page behind it. Telemetry reads it to tell a
+  // click on the current surface (nav_entry_selected `was_active`).
+  const currentMode = useMemo<RailMode>(
     () => deriveRailModeFromPath(location.pathname, pathBase),
     [location.pathname, pathBase],
   );
@@ -65,7 +80,9 @@ export function useRailMode() {
     // where the user was.
     if (mode === "search") {
       navigate(`${base}/search`, {
-        state: { searchEntry: "rail", searchFrom: `${location.pathname}${location.search}` },
+        // Desktop: the rail entry is the ⌘K overlay too (task #96); web keeps full page.
+        // The page at click time, not the rendered one (useLiveLocation).
+        state: searchEntryState(liveLocation(), { searchEntry: "rail" }),
       });
       return;
     }
@@ -75,15 +92,14 @@ export function useRailMode() {
     }
     const remembered = readTabMemory(serverSlug, mode);
     const fallback = mode === "chat" ? base
-      : mode === "wiki" ? `${base}/wiki`
       : mode === "members" ? `${base}/members`
       : mode === "computers" ? `${base}/computers`
       : mode === "tasks" ? `${base}/tasks`
       : `${base}/settings/account`;
     navigate(remembered ?? fallback);
-  }, [location.pathname, location.search, serverSlug, navigate]);
+  }, [liveLocation, serverSlug, navigate]);
 
-  return { railMode, selectRailMode };
+  return { railMode, currentMode, selectRailMode };
 }
 
 // Back-compat shim for callers that only need chat-vs-members. New code

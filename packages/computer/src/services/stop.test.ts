@@ -7,12 +7,11 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "vitest";
 
-import { ComputerServiceError } from "./errors.js";
-import { stop } from "./stop.js";
-import type { ComputerApiEvent } from "../lib/events.js";
-import { servicePidPath } from "../paths.js";
+import { ComputerServiceError } from "./errors";
+import { stop } from "./stop";
+import type { ComputerApiEvent } from "../lib/events";
+import { servicePidPath } from "../paths";
 
 async function withHome<T>(fn: (home: string) => Promise<T>): Promise<T> {
   const home = await mkdtemp(join(tmpdir(), "raft-computer-stop-svc-"));
@@ -117,25 +116,22 @@ test("stop service: missing pidfile → status='not_running' + emits not_running
   });
 });
 
-test("stop service: successful no-process stop durably disables the macOS CLI carrier", async () => {
+test("stop service: successful no-process stop records the disabled macOS CLI host lifecycle", async () => {
   await withHome(async (home) => {
     const order: string[] = [];
     const result = await stop(
       { slockHome: home, hostLifecycleOwner: "cli" },
       {
-        hostLifecycleDeps: {
-          platform: "darwin",
-          dispatcherPath: "/usr/local/bin/raft-computer",
-        },
+        hostLifecycleDeps: { platform: "darwin" },
         convergeHostLifecycle: async (_actualHome, desired) => {
-          order.push(`carrier:${desired}`);
+          order.push(`lifecycle:${desired}`);
           return {
             owner: "cli",
             enabled: false,
-            status: "converged",
-            label: "build.raft.computer.login.test",
-            definitionPath: "/tmp/test.plist",
-            definition: "plist",
+            status: "not-applicable",
+            label: null,
+            definitionPath: null,
+            definition: null,
           };
         },
         readPidfile: async () => {
@@ -146,8 +142,80 @@ test("stop service: successful no-process stop durably disables the macOS CLI ca
       },
     );
     assert.equal(result.status, "not_running");
-    assert.equal(order.at(-1), "carrier:disabled");
+    assert.equal(order.at(-1), "lifecycle:disabled");
     assert.ok(order.slice(0, -1).every((entry) => entry === "pid-read"));
+  });
+});
+
+test("stop service: a host-lifecycle failure never blocks the stop", async () => {
+  await withHome(async (home) => {
+    await writePidfile(home, 12345);
+    let alive = true;
+    const order: string[] = [];
+    const events: ComputerApiEvent[] = [];
+
+    const result = await stop(
+      { slockHome: home, hostLifecycleOwner: "cli" },
+      {
+        hostLifecycleDeps: { platform: "darwin" },
+        convergeHostLifecycle: async (_actualHome, desired) => {
+          order.push(`lifecycle:${desired}`);
+          throw new ComputerServiceError("HOST_LIFECYCLE_OWNER_UNREADABLE", "owner record unreadable");
+        },
+        isProcessAlive: () => alive,
+        killService: () => {
+          order.push("kill");
+          alive = false;
+        },
+        sleep: async () => undefined,
+        onEvent: (event) => events.push(event),
+      },
+    );
+
+    assert.equal(result.status, "stopped");
+    assert.deepEqual(order, ["lifecycle:disabled", "kill"]);
+    const skipped = events.find((event) => event.kind === "host_lifecycle.skipped");
+    assert.deepEqual(skipped, {
+      kind: "host_lifecycle.skipped",
+      operation: "stop",
+      code: "HOST_LIFECYCLE_OWNER_UNREADABLE",
+      message: "owner record unreadable",
+    });
+  });
+});
+
+test("stop service: live macOS CLI service records the disabled host lifecycle before SIGTERM", async () => {
+  await withHome(async (home) => {
+    await writePidfile(home, 12345);
+    let alive = true;
+    const order: string[] = [];
+
+    const result = await stop(
+      { slockHome: home, hostLifecycleOwner: "cli" },
+      {
+        hostLifecycleDeps: { platform: "darwin" },
+        convergeHostLifecycle: async (_actualHome, desired) => {
+          order.push(`lifecycle:${desired}`);
+          return {
+            owner: "cli",
+            enabled: false,
+            status: "not-applicable",
+            label: null,
+            definitionPath: null,
+            definition: null,
+          };
+        },
+        isProcessAlive: () => alive,
+        killService: () => {
+          order.push("kill");
+          alive = false;
+        },
+        sleep: async () => undefined,
+      },
+    );
+
+    assert.equal(result.status, "stopped");
+    assert.deepEqual(order, ["lifecycle:disabled", "kill"]);
   });
 });
 
@@ -181,6 +249,84 @@ test("stop service: stale pidfile → clears pidfile + status='stale_pidfile_cle
     assert.ok(cleared && cleared.kind === "stop.stale_pidfile_cleared");
     assert.equal(cleared.pid, 99999);
     assert.equal(events.find((e) => e.kind === "stop.signaled"), undefined);
+  });
+});
+
+// --- task #912: stale pidfile but a service still answers on the IPC endpoint ---
+test("stop service: stale pidfile + IPC answers with a live pid → that service is stopped, not reported stale", async () => {
+  await withHome(async (home) => {
+    await writePidfile(home, 99999); // the killed replacement from a failed self-restart
+    const pidfilePath = servicePidPath(home);
+    const LIVE = 4242;
+    let alive = true;
+    const killed: number[] = [];
+    const events: ComputerApiEvent[] = [];
+    const result = await stop(
+      { slockHome: home },
+      {
+        readPidfile: async () => 99999,
+        isProcessAlive: (pid) => pid === LIVE && alive,
+        probeLiveServicePid: async () => LIVE,
+        killService: (pid) => {
+          killed.push(pid);
+          alive = false;
+        },
+        sleep: async () => {},
+        onEvent: (e) => events.push(e),
+      },
+    );
+    assert.equal(result.status, "stopped");
+    assert.equal(result.pid, LIVE);
+    assert.deepEqual(killed, [LIVE]);
+    const stopping = events.find((e) => e.kind === "stop.stopping");
+    assert.ok(stopping && stopping.kind === "stop.stopping" && stopping.pid === LIVE);
+    assert.equal(events.find((e) => e.kind === "stop.stale_pidfile_cleared"), undefined);
+    // The incumbent exited on SIGTERM; its pidfile is gone.
+    await assert.rejects(
+      () => readFile(pidfilePath, "utf8"),
+      (e) => (e as NodeJS.ErrnoException).code === "ENOENT",
+    );
+  });
+});
+
+test("stop service: stale pidfile + nothing answers on IPC → still stale_pidfile_cleared, no kill", async () => {
+  await withHome(async (home) => {
+    await writePidfile(home, 99999);
+    let killCount = 0;
+    const result = await stop(
+      { slockHome: home },
+      {
+        readPidfile: async () => 99999,
+        isProcessAlive: () => false,
+        probeLiveServicePid: async () => null,
+        killService: () => {
+          killCount += 1;
+        },
+      },
+    );
+    assert.equal(result.status, "stale_pidfile_cleared");
+    assert.equal(result.pid, 99999);
+    assert.equal(killCount, 0);
+  });
+});
+
+test("stop service: an IPC answer naming a dead pid is ignored", async () => {
+  await withHome(async (home) => {
+    await writePidfile(home, 99999);
+    let killCount = 0;
+    const result = await stop(
+      { slockHome: home },
+      {
+        readPidfile: async () => 99999,
+        isProcessAlive: () => false,
+        probeLiveServicePid: async () => 31337,
+        killService: () => {
+          killCount += 1;
+        },
+      },
+    );
+    assert.equal(result.status, "stale_pidfile_cleared");
+    assert.equal(killCount, 0);
   });
 });
 
@@ -362,4 +508,79 @@ test("stop service: source has exactly one graceful process.kill(SIGTERM) author
   assert.equal(src.match(/process\.kill\s*\(/g)?.length, 1);
   assert.match(src, /process\.kill\s*\([^)]*,\s*["']SIGTERM["']\s*\)/);
   assert.equal(src.match(/\b(?:process\.)?kill\s*\([^)]*,\s*(?:9|["']SIGKILL["'])/g), null);
+});
+
+
+// --- task #917: a systemd unit that owns the live pid is stopped through systemd ---
+test("task #917: stop delegates to `systemctl stop` when the unit's MainPID is the live service", async () => {
+  await withHome(async (home) => {
+    let alive = true;
+    let killed = 0;
+    const calls: string[] = [];
+    const result = await stop(
+      { slockHome: home },
+      {
+        readPidfile: async () => 777,
+        isProcessAlive: () => alive,
+        killService: () => { killed += 1; },
+        sleep: async () => undefined,
+        pollIntervalMs: 1,
+        timeoutMs: 50,
+        inspectSupervisor: async () => ({
+          record: { kind: "systemd", scope: "user", unit: "raft-computer.service", invocationId: "x", pid: 777, recordedAt: "t" },
+          unitLoaded: true, enabledState: "enabled", activeState: "active", mainPid: 777, killMode: "process", reachable: true,
+        }),
+        systemctl: async (scope, args) => { calls.push(`${scope}:${args.join(" ")}`); alive = false; return { code: 0, stdout: "", stderr: "" }; },
+      },
+    );
+    assert.equal(result.status, "stopped");
+    assert.deepEqual(calls, ["user:stop raft-computer.service"]);
+    assert.equal(killed, 0, "no SIGTERM from here: the unit's Restart= policy would answer it with a relaunch");
+  });
+});
+
+test("task #917: stop never acts beside an unreachable manager, and reports a failing systemctl", async () => {
+  await withHome(async (home) => {
+    const record = { kind: "systemd" as const, scope: "user" as const, unit: "raft-computer.service", invocationId: "x", pid: 777, recordedAt: "t" };
+    let killed = 0;
+    await assert.rejects(
+      () => stop({ slockHome: home }, {
+        readPidfile: async () => 777, isProcessAlive: () => true, killService: () => { killed += 1; },
+        inspectSupervisor: async () => ({ record, unitLoaded: false, enabledState: null, activeState: null, mainPid: null, killMode: null, reachable: false }),
+      }),
+      (err: unknown) => err instanceof ComputerServiceError && err.code === "STOP_SUPERVISOR_UNREACHABLE" && /XDG_RUNTIME_DIR/.test(err.message),
+    );
+    await assert.rejects(
+      () => stop({ slockHome: home }, {
+        readPidfile: async () => 777, isProcessAlive: () => true, killService: () => { killed += 1; },
+        inspectSupervisor: async () => ({ record, unitLoaded: true, enabledState: "enabled", activeState: "active", mainPid: 777, killMode: "process", reachable: true }),
+        systemctl: async () => ({ code: 1, stdout: "", stderr: "Failed to stop raft-computer.service: Access denied" }),
+      }),
+      (err: unknown) => err instanceof ComputerServiceError && err.code === "STOP_SUPERVISOR_FAILED" && /Access denied/.test(err.message),
+    );
+    assert.equal(killed, 0);
+  });
+});
+
+test("task #917: a unit that does not own the live pid leaves the SIGTERM path untouched", async () => {
+  await withHome(async (home) => {
+    let alive = true;
+    let killed = 0;
+    const result = await stop(
+      { slockHome: home },
+      {
+        readPidfile: async () => 777,
+        isProcessAlive: () => alive,
+        killService: () => { killed += 1; alive = false; },
+        sleep: async () => undefined, pollIntervalMs: 1, timeoutMs: 50,
+        inspectSupervisor: async () => ({
+          record: { kind: "systemd", scope: "user", unit: "raft-computer.service", invocationId: "x", pid: 1, recordedAt: "t" },
+          unitLoaded: true, enabledState: "enabled", activeState: "inactive", mainPid: 0, killMode: "process", reachable: true,
+        }),
+        systemctl: async () => { throw new Error("must not be called"); },
+      },
+    );
+    assert.equal(result.status, "stopped");
+    assert.equal(killed, 1);
+  });
 });

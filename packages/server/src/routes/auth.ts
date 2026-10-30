@@ -1,17 +1,20 @@
-import { serializeErrorForLog } from "../tracing/safeErrorLog.js";
+import { serializeErrorForLog } from "../tracing/safeErrorLog";
+import { kickAppNotificationDelivery } from "../services/appNotificationDeliveryService";
 import { Router, urlencoded, type NextFunction, type Request, type Response, type Router as RouterType } from "express";
 import type { Server as SocketServer } from "socket.io";
 import multer from "multer";
 import { z } from "zod";
-import * as userService from "../services/userService.js";
-import * as sessionService from "../services/sessionService.js";
-import * as inviteService from "../services/inviteService.js";
-import * as onboardingService from "../services/onboardingService.js";
-import * as serverService from "../services/serverService.js";
-import * as featureFlagService from "../services/featureFlagService.js";
-import * as legalAcceptanceService from "../services/legalAcceptanceService.js";
-import * as serverAgreementService from "../services/serverAgreementService.js";
-import type { AgentOrchestrator } from "../services/agentOrchestrator.js";
+import * as userService from "../services/userService";
+import { getDb, type DatabaseExecutor } from "../db/index";
+import { setProductAnalyticsOptOut } from "../services/productAnalyticsGate";
+import * as sessionService from "../services/sessionService";
+import * as inviteService from "../services/inviteService";
+import * as onboardingService from "../services/onboardingService";
+import * as serverService from "../services/serverService";
+import * as featureFlagService from "../services/featureFlagService";
+import * as legalAcceptanceService from "../services/legalAcceptanceService";
+import * as serverAgreementService from "../services/serverAgreementService";
+import type { AgentOrchestrator } from "../services/agentOrchestrator";
 import {
   getBearerAccessUserId,
   signAccessToken,
@@ -19,15 +22,16 @@ import {
   requireRetirementAuth,
   requireProfileSetupComplete,
   respondInvalidOrExpiredToken,
-} from "../middleware/auth.js";
-import { attachAuthTraceIdentity } from "../middleware/requestObservability.js";
-import { recordEmailLoginRejectedTrace } from "./authLoginTrace.js";
+} from "../middleware/auth";
+import { attachAuthTraceIdentity } from "../middleware/requestObservability";
+import { recordEmailLoginRejectedTrace } from "./authLoginTrace";
 import {
   authRefreshAttemptIdFromHeader,
   authRefreshInstallationIdFromHeader,
   recordAuthRefreshTrace,
   recordAuthSessionIssuedTrace,
-} from "./authRefreshTrace.js";
+} from "./authRefreshTrace";
+import { sendJsonServerError } from "./errorResponse";
 import {
   isReservedAgentName,
   isSignupRoleId,
@@ -39,7 +43,7 @@ import {
   validateName,
   type TimeFormatPreference,
 } from "@botiverse/raft-shared";
-import { getRegistrationBlockedReason } from "../services/registrationPolicy.js";
+import { getRegistrationBlockedReason } from "../services/registrationPolicy";
 import {
   createAvatarUpload,
   MAX_PROFILE_AVATAR_BYTES,
@@ -47,7 +51,7 @@ import {
   PROFILE_AVATAR_TOO_LARGE_MESSAGE,
   runSingleAvatarUpload,
   storeUserAvatar,
-} from "../services/avatarService.js";
+} from "../services/avatarService";
 import {
   assertVerifiedSocialAuthProfile,
   buildAuthorizationUrl,
@@ -66,6 +70,13 @@ import {
   getMobileOAuthCompletion,
   getSocialAuthCompletion,
   getSocialAuthProvider,
+  assertPendingSocialLinkFor,
+  cancelPendingSocialLink,
+  claimPendingSocialLink,
+  exchangeMobileConflictCompletionForPendingLink,
+  exchangeWebConflictCompletionForPendingLink,
+  PendingSocialLinkError,
+  type PendingSocialLink,
   isNativeAppleSignInConfigured,
   isSocialAuthProviderConfigured,
   markMobileOAuthCompletionConsumed,
@@ -74,12 +85,12 @@ import {
   signSocialAuthState,
   validateSocialAuthCallbackState,
   verifySocialAuthState,
-} from "../services/socialAuthService.js";
-import type { SocialAuthMode, SocialAuthProfile, SocialAuthProvider } from "../services/socialAuthService.js";
+} from "../services/socialAuthService";
+import type { SocialAuthMode, SocialAuthProfile, SocialAuthProvider } from "../services/socialAuthService";
+import { parseCanonicalBrowserTimezone, parseIanaTimezone } from "../lib/ianaTimezone";
 
 export const authRouter: RouterType = Router();
 const MAX_USER_DESCRIPTION_LENGTH = 3000;
-const MAX_PREFERRED_TIMEZONE_LENGTH = 128;
 const userAvatarUpload = createAvatarUpload();
 // Write-side validation accepts retired ids too (`hn_reddit`, before Hacker News and
 // Reddit were split apart): an older client is still entitled to be understood.
@@ -154,6 +165,76 @@ function getSocialAuthCallbackParam(req: Request, key: "code" | "error" | "state
   return typeof value === "string" ? value : "";
 }
 
+/** `undefined` = not sent; `null` = invalid, and a 400 was sent. */
+function parsePendingLinkToken(body: unknown, res: Response): string | undefined | null {
+  const value = (body as { pendingLinkToken?: unknown } | undefined)?.pendingLinkToken;
+  if (value === undefined || value === null || value === "") return undefined;
+  if (typeof value !== "string" || value.length > 256) {
+    res.status(400).json({ code: "pending_link_token_invalid", error: "pendingLinkToken must be a string" });
+    return null;
+  }
+  return value;
+}
+
+async function sendAccountLinkRequired(res: Response, pending: PendingSocialLink, extra: { returnTo?: string; returnUri?: string }) {
+  const methods = await userService.getUserAuthMethods(pending.userId);
+  res.status(409).json({
+    code: "account_link_required",
+    error: "An account with this email already exists. Sign in to it to connect this provider.",
+    pendingLinkToken: pending.token,
+    provider: pending.provider,
+    email: pending.email,
+    expiresAt: pending.expiresAt.toISOString(),
+    signInMethods: {
+      // "Known to be set": a few legacy accounts with a provider have a working
+      // password but no recorded credential; they can use `providers`.
+      password: methods?.passwordConfigured ?? false,
+      providers: (methods?.identities ?? []).map((identity) => identity.provider),
+    },
+    ...extra,
+  });
+}
+
+/** Link the pending identity to the account that just signed in. No session exists yet. */
+async function completePendingSocialLink(token: string, userId: string): Promise<SocialAuthProvider> {
+  const profile = await claimPendingSocialLink(token, userId);
+  await userService.linkSocialIdentity(userId, profile);
+  return profile.provider;
+}
+
+/**
+ * Password sign-in: check the token and fetch the avatar now, then claim and
+ * link inside the locked login transaction, so a password rejected by the
+ * locked revalidation never links the provider or spends the token.
+ */
+async function preparePendingSocialLinkInLock(
+  token: string,
+  userId: string,
+  onLinked: (provider: SocialAuthProvider) => void,
+) {
+  const profile = await assertPendingSocialLinkFor(token, userId);
+  const prepared = await userService.prepareSocialLink(userId, profile);
+  return async (tx: DatabaseExecutor) => {
+    const claimed = await claimPendingSocialLink(token, userId, tx);
+    const { afterCommit } = await userService.linkSocialIdentityTx(tx, userId, claimed, prepared);
+    onLinked(claimed.provider);
+    return afterCommit;
+  };
+}
+
+function pendingSocialLinkErrorResponse(res: Response, err: unknown): boolean {
+  if (err instanceof PendingSocialLinkError) {
+    res.status(err.code === "pending_link_expired" ? 410 : 403).json({ code: err.code, error: err.message });
+    return true;
+  }
+  const message = errorMessage(err);
+  if (message.includes("already linked to another") || message.includes("belongs to another")) {
+    res.status(409).json({ code: "provider_conflict", error: message });
+    return true;
+  }
+  return false;
+}
+
 function errorMessage(err: unknown, fallback = ""): string {
   return err instanceof Error ? err.message : fallback;
 }
@@ -171,35 +252,6 @@ function parsePreferredLanguage(raw: unknown): string | null | undefined {
     throw new Error("preferredLanguage must be a supported language tag");
   }
   return normalized;
-}
-
-function parseIanaTimezone(raw: string, fieldName: string): string {
-  const value = raw.trim();
-  if (!value) {
-    throw new Error(`${fieldName} must be a non-empty IANA timezone`);
-  }
-  if (value.length > MAX_PREFERRED_TIMEZONE_LENGTH) {
-    throw new Error(`${fieldName} must be at most 128 characters`);
-  }
-  try {
-    new Intl.DateTimeFormat("en-US", { timeZone: value }).format(new Date());
-  } catch {
-    throw new Error(`${fieldName} must be an IANA timezone`);
-  }
-  return value;
-}
-
-function parseCanonicalBrowserTimezone(raw: string): string {
-  const timezone = parseIanaTimezone(raw, "timezone");
-  if (timezone !== "UTC" && !timezone.includes("/")) {
-    throw new Error("timezone must be a canonical IANA timezone");
-  }
-  const canonical = new Intl.DateTimeFormat("en-US", { timeZone: timezone })
-    .resolvedOptions().timeZone;
-  if (canonical !== "UTC" && !canonical.includes("/")) {
-    throw new Error("timezone must be a canonical IANA timezone");
-  }
-  return canonical;
 }
 
 // UI display language (app-chrome i18n). Validated against the DISPLAY locale
@@ -237,6 +289,16 @@ function parseAutoTranslationEnabled(raw: unknown): boolean | undefined {
   if (raw === undefined) return undefined;
   if (typeof raw !== "boolean") {
     throw new Error("autoTranslationEnabled must be a boolean");
+  }
+  return raw;
+}
+
+// RFC-067 "Share usage data": true / false, or null to go back to "not chosen"
+// (the regional default, productAnalyticsGate.SHARE_USAGE_DATA_DEFAULT).
+function parseShareUsageData(raw: unknown): boolean | null | undefined {
+  if (raw === undefined) return undefined;
+  if (raw !== null && typeof raw !== "boolean") {
+    throw new Error("shareUsageData must be a boolean or null");
   }
   return raw;
 }
@@ -371,6 +433,7 @@ async function startMobileOAuthResponse(req: Request, res: Response, params: {
   returnUri: unknown;
   codeChallenge: unknown;
   authenticatedUserId?: string;
+  linkOnConflict?: boolean;
 }) {
   const provider = getSocialAuthProvider(params.providerId);
   if (!provider) {
@@ -396,6 +459,7 @@ async function startMobileOAuthResponse(req: Request, res: Response, params: {
     returnUri: params.returnUri,
     codeChallenge: params.codeChallenge,
     userId: userId ?? undefined,
+    linkOnConflict: params.linkOnConflict,
   });
   res.status(201).json({
     requestId: started.requestId,
@@ -484,6 +548,7 @@ async function completeMobileOAuthResponse(req: Request, res: Response, params: 
   code: string;
   codeVerifier: string;
   authenticatedUserId?: string;
+  pendingLinkToken?: string;
 }) {
   const completion = await getMobileOAuthCompletion(params.code, params.codeVerifier);
   if (params.providerId && completion.provider !== params.providerId) {
@@ -493,6 +558,16 @@ async function completeMobileOAuthResponse(req: Request, res: Response, params: 
   if (params.expectedMode && completion.mode !== params.expectedMode) {
     res.status(400).json({ code: "mode_mismatch", error: "Mobile OAuth code does not match the requested mode" });
     return;
+  }
+
+  if (completion.mode === "login" && completion.intendedAction === "link") {
+    const pending = await exchangeMobileConflictCompletionForPendingLink(completion.requestId);
+    await sendAccountLinkRequired(res, pending, { returnUri: completion.returnUri });
+    return;
+  }
+  // Refuse a wrong account before anything one-time is spent.
+  if (completion.mode === "login" && params.pendingLinkToken) {
+    await assertPendingSocialLinkFor(params.pendingLinkToken, completion.userId);
   }
 
   if (completion.mode === "link") {
@@ -534,6 +609,9 @@ async function completeMobileOAuthResponse(req: Request, res: Response, params: 
     );
   }
 
+  const linkedProvider = params.pendingLinkToken
+    ? await completePendingSocialLink(params.pendingLinkToken, user.id)
+    : undefined;
   const { sessionId, familyId, refreshToken } = await sessionService.createSession(user.id);
   const accessToken = signAccessToken(user.id, familyId);
   attachAuthTraceIdentity(req, { userId: user.id, sessionId, source: "mobile_oauth" });
@@ -546,6 +624,7 @@ async function completeMobileOAuthResponse(req: Request, res: Response, params: 
     returnUri: completion.returnUri,
     accessToken,
     refreshToken,
+    ...(linkedProvider ? { linkedProvider } : {}),
   });
 }
 
@@ -570,6 +649,10 @@ authRouter.post("/register", async (req, res) => {
       const nameError = validateName(name, "Name", 5);
       if (nameError) {
         res.status(400).json({ error: nameError });
+        return;
+      }
+      if (isReservedAgentName(name)) {
+        res.status(400).json({ error: "This username is reserved. Choose another name." });
         return;
       }
     }
@@ -613,8 +696,11 @@ authRouter.post("/register", async (req, res) => {
     } else if (msg.includes("already registered") || msg.includes("already taken")) {
       res.status(409).json({ error: msg });
     } else {
-      console.error("Register error:", serializeErrorForLog(err));
-      res.status(500).json({ error: "Registration failed" });
+      sendJsonServerError(req, res, {
+        error: "Registration failed",
+        logPrefix: "Register error:",
+        err,
+      });
     }
   }
 });
@@ -652,8 +738,11 @@ authRouter.get("/identities", requireAuth, async (req, res) => {
     }
     res.json(methods);
   } catch (err) {
-    console.error("List auth identities error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to load linked accounts" });
+    sendJsonServerError(req, res, {
+      error: "Failed to load linked accounts",
+      logPrefix: "List auth identities error:",
+      err,
+    });
   }
 });
 
@@ -676,8 +765,11 @@ authRouter.delete("/identities/:provider", requireAuth, async (req, res) => {
       respondInvalidOrExpiredToken(res);
       return;
     }
-    console.error("Unlink auth identity error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to disconnect linked account" });
+    sendJsonServerError(req, res, {
+      error: "Failed to disconnect linked account",
+      logPrefix: "Unlink auth identity error:",
+      err,
+    });
   }
 });
 
@@ -711,8 +803,12 @@ authRouter.post("/mobile/oauth/apple/native/start", async (req, res) => {
     });
   } catch (err: unknown) {
     if (nativeAppleOAuthErrorResponse(res, err) || mobileOAuthErrorResponse(res, err, "start")) return;
-    console.error("Native Apple OAuth start error:", serializeErrorForLog(err));
-    res.status(500).json({ code: "native_apple_start_failed", error: "Failed to start Apple sign-in" });
+    sendJsonServerError(req, res, {
+      error: "Failed to start Apple sign-in",
+      code: "native_apple_start_failed",
+      logPrefix: "Native Apple OAuth start error:",
+      err,
+    });
   }
 });
 
@@ -749,11 +845,16 @@ authRouter.post("/mobile/oauth/start", async (req, res) => {
       mode: req.body?.mode,
       returnUri: req.body?.returnUri,
       codeChallenge: req.body?.codeChallenge,
+      linkOnConflict: req.body?.linkOnConflict === true,
     });
   } catch (err: unknown) {
     if (mobileOAuthErrorResponse(res, err, "start")) return;
-    console.error("Mobile OAuth start error:", serializeErrorForLog(err));
-    res.status(500).json({ code: "mobile_oauth_start_failed", error: "Failed to start mobile OAuth" });
+    sendJsonServerError(req, res, {
+      error: "Failed to start mobile OAuth",
+      code: "mobile_oauth_start_failed",
+      logPrefix: "Mobile OAuth start error:",
+      err,
+    });
   }
 });
 
@@ -774,16 +875,23 @@ authRouter.post("/mobile/oauth/:provider/link/start", requireAuth, async (req, r
     });
   } catch (err: unknown) {
     if (mobileOAuthErrorResponse(res, err, "start")) return;
-    console.error("Mobile OAuth link start error:", serializeErrorForLog(err));
-    res.status(500).json({ code: "mobile_oauth_link_start_failed", error: "Failed to start mobile OAuth link" });
+    sendJsonServerError(req, res, {
+      error: "Failed to start mobile OAuth link",
+      code: "mobile_oauth_link_start_failed",
+      logPrefix: "Mobile OAuth link start error:",
+      err,
+    });
   }
 });
 
 authRouter.post("/mobile/oauth/complete", async (req, res) => {
+  const pendingLinkToken = parsePendingLinkToken(req.body, res);
+  if (pendingLinkToken === null) return;
   try {
     await completeMobileOAuthResponse(req, res, {
       code: req.body?.code,
       codeVerifier: req.body?.codeVerifier,
+      pendingLinkToken,
     });
   } catch (err: unknown) {
     const legalResponse = legalAcceptanceService.legalAcceptanceErrorResponse(err);
@@ -791,9 +899,14 @@ authRouter.post("/mobile/oauth/complete", async (req, res) => {
       res.status(legalResponse.status).json(legalResponse.body);
       return;
     }
+    if (pendingSocialLinkErrorResponse(res, err)) return;
     if (mobileOAuthErrorResponse(res, err, "complete")) return;
-    console.error("Mobile OAuth completion error:", serializeErrorForLog(err));
-    res.status(500).json({ code: "mobile_oauth_complete_failed", error: "Failed to complete mobile OAuth" });
+    sendJsonServerError(req, res, {
+      error: "Failed to complete mobile OAuth",
+      code: "mobile_oauth_complete_failed",
+      logPrefix: "Mobile OAuth completion error:",
+      err,
+    });
   }
 });
 
@@ -814,8 +927,12 @@ authRouter.post("/mobile/oauth/:provider/link/complete", requireAuth, async (req
     });
   } catch (err: unknown) {
     if (mobileOAuthErrorResponse(res, err, "complete")) return;
-    console.error("Mobile OAuth link completion error:", serializeErrorForLog(err));
-    res.status(500).json({ code: "mobile_oauth_link_complete_failed", error: "Failed to complete mobile OAuth link" });
+    sendJsonServerError(req, res, {
+      error: "Failed to complete mobile OAuth link",
+      code: "mobile_oauth_link_complete_failed",
+      logPrefix: "Mobile OAuth link completion error:",
+      err,
+    });
   }
 });
 
@@ -838,6 +955,7 @@ authRouter.get("/:provider/start", async (req, res, next) => {
     mode: "login",
     nonce,
     returnTo,
+    ...(req.query.linkOnConflict === "1" ? { linkOnConflict: true } : {}),
   });
 
   res.setHeader("Set-Cookie", buildStateCookie(provider.id, nonce));
@@ -956,11 +1074,20 @@ async function handleSocialAuthCallback(req: Request, res: Response, next: NextF
       return;
     }
 
-    const user = await userService.findExistingSocialLoginUser(profile);
+    let user: Awaited<ReturnType<typeof userService.findExistingSocialLoginUser>> = null;
+    let emailConflict = false;
+    try {
+      user = await userService.findExistingSocialLoginUser(profile);
+    } catch (err) {
+      if (!(err instanceof userService.SocialEmailConflictError) || !state.linkOnConflict) throw err;
+      emailConflict = true;
+    }
     const completionCode = await createSocialAuthCompletion({
       provider: provider.id,
       mode: "login",
-      intendedAction: "login",
+      // A conflict completion carries no userId, so a server that predates
+      // pending links cannot read it as "sign in to the existing account".
+      intendedAction: emailConflict ? "link" : "login",
       userId: user?.id,
       providerUserId: profile.providerUserId,
       providerEmail: profile.email,
@@ -1008,7 +1135,19 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
       return;
     }
 
+    const pendingLinkToken = parsePendingLinkToken(req.body, res);
+    if (pendingLinkToken === null) return;
+
     const pendingCompletion = await getSocialAuthCompletion(provider.id, code);
+    if (pendingCompletion.mode === "login" && pendingCompletion.intendedAction === "link") {
+      const pending = await exchangeWebConflictCompletionForPendingLink(provider.id, code);
+      await sendAccountLinkRequired(res, pending, { returnTo: pendingCompletion.returnTo });
+      return;
+    }
+    // Refuse a wrong account before the one-time completion code is spent.
+    if (pendingCompletion.mode === "login" && pendingLinkToken) {
+      await assertPendingSocialLinkFor(pendingLinkToken, pendingCompletion.userId);
+    }
     if (pendingCompletion.mode === "login" && !pendingCompletion.userId) {
       legalAcceptanceService.requireCurrentLegalAcceptance(parseLegalAcceptance(req.body));
     }
@@ -1066,6 +1205,9 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
       return;
     }
 
+    const linkedProvider = pendingLinkToken
+      ? await completePendingSocialLink(pendingLinkToken, completion.userId)
+      : undefined;
     const { sessionId, familyId, refreshToken } = await sessionService.createSession(completion.userId);
     const accessToken = signAccessToken(completion.userId, familyId);
     attachAuthTraceIdentity(req, { userId: completion.userId, sessionId, source: "social_oauth" });
@@ -1076,6 +1218,7 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
       returnTo: completion.returnTo,
       accessToken,
       refreshToken,
+      ...(linkedProvider ? { linkedProvider } : {}),
     });
   } catch (err: any) {
     const legalResponse = legalAcceptanceService.legalAcceptanceErrorResponse(err);
@@ -1083,13 +1226,17 @@ authRouter.post("/:provider/complete", async (req, res, next) => {
       res.status(legalResponse.status).json(legalResponse.body);
       return;
     }
+    if (pendingSocialLinkErrorResponse(res, err)) return;
     const message = err?.message || "";
     if (message.includes("Invalid") || message.includes("expired") || message.includes("mismatch")) {
       res.status(400).json({ error: message });
       return;
     }
-    console.error(`${provider.label} auth completion error:`, serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to complete sign-in" });
+    sendJsonServerError(req, res, {
+      error: "Failed to complete sign-in",
+      logPrefix: `${provider.label} auth completion error:`,
+      err,
+    });
   }
 });
 
@@ -1099,17 +1246,24 @@ authRouter.post("/login", async (req, res) => {
   if (!body) return;
   req.body = body;
 
+  const pendingLinkToken = parsePendingLinkToken(body, res);
+  if (pendingLinkToken === null) return;
+
   try {
     const { email, password } = body;
 
-    const { user, session } = await userService.authenticateUser(email, password);
+    let linkedProvider: SocialAuthProvider | undefined;
+    const { user, session } = await userService.authenticateUser(email, password, pendingLinkToken
+      ? { prepareLink: (userId) => preparePendingSocialLinkInLock(pendingLinkToken, userId, (provider) => { linkedProvider = provider; }) }
+      : {});
     const { sessionId, familyId, refreshToken } = session;
     const accessToken = signAccessToken(user.id, familyId);
     attachAuthTraceIdentity(req, { userId: user.id, sessionId, source: "email_login" });
     recordAuthSessionIssuedTrace({ flow: "email_login", userId: user.id, sessionId });
 
-    res.json({ user, accessToken, refreshToken });
+    res.json({ user, accessToken, refreshToken, ...(linkedProvider ? { linkedProvider } : {}) });
   } catch (err: any) {
+    if (pendingSocialLinkErrorResponse(res, err)) return;
     if (err instanceof userService.EmailLoginRejectedError) {
       attachAuthTraceIdentity(req, { source: "email_login", reason: err.reason });
       const traceId = recordEmailLoginRejectedTrace(err.reason);
@@ -1118,9 +1272,32 @@ authRouter.post("/login", async (req, res) => {
       }
       res.status(401).json({ code: "AUTH_INVALID_CREDENTIALS", error: err.message });
     } else {
-      console.error("Login error:", serializeErrorForLog(err));
-      res.status(500).json({ error: "Login failed" });
+      sendJsonServerError(req, res, {
+        error: "Login failed",
+        logPrefix: "Login error:",
+        err,
+      });
     }
+  }
+});
+
+// Drop a pending social link (the person chose not to connect the provider).
+authRouter.post("/pending-link/cancel", async (req, res) => {
+  const pendingLinkToken = parsePendingLinkToken(req.body, res);
+  if (pendingLinkToken === null) return;
+  if (!pendingLinkToken) {
+    res.status(400).json({ code: "pending_link_token_invalid", error: "pendingLinkToken is required" });
+    return;
+  }
+  try {
+    await cancelPendingSocialLink(pendingLinkToken);
+    res.status(204).end();
+  } catch (err) {
+    sendJsonServerError(req, res, {
+      error: "Failed to cancel the pending link",
+      logPrefix: "Pending social link cancel error:",
+      err,
+    });
   }
 });
 
@@ -1217,8 +1394,11 @@ authRouter.post("/me/timezone-observation", requireAuth, async (req, res) => {
     }
     res.json(observation);
   } catch (err) {
-    console.error("Record timezone observation error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to record timezone observation" });
+    sendJsonServerError(req, res, {
+      error: "Failed to record timezone observation",
+      logPrefix: "Record timezone observation error:",
+      err,
+    });
   }
 });
 
@@ -1266,8 +1446,11 @@ authRouter.post("/me/complete-profile", requireAuth, async (req, res) => {
       res.status(status).json({ error: err.message, code: err.code });
       return;
     }
-    console.error("Complete profile error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to complete profile setup" });
+    sendJsonServerError(req, res, {
+      error: "Failed to complete profile setup",
+      logPrefix: "Complete profile error:",
+      err,
+    });
   }
 });
 
@@ -1337,6 +1520,7 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       preferredTranslationDisplay?: PreferredTranslationDisplay;
       preferredTimeFormat?: TimeFormatPreference | null;
       preferredMessageBodyFontSize?: MessageBodyFontSizePreference | null;
+      shareUsageData?: boolean | null;
       referralSource?: string | null;
       referralSourceOther?: string | null;
       referralSourceSkippedAt?: Date | null;
@@ -1375,6 +1559,8 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       if (preferredTimeFormat !== undefined) profileFields.preferredTimeFormat = preferredTimeFormat;
       const preferredMessageBodyFontSize = parsePreferredMessageBodyFontSize(req.body?.preferredMessageBodyFontSize);
       if (preferredMessageBodyFontSize !== undefined) profileFields.preferredMessageBodyFontSize = preferredMessageBodyFontSize;
+      const shareUsageData = parseShareUsageData(req.body?.shareUsageData);
+      if (shareUsageData !== undefined) profileFields.shareUsageData = shareUsageData;
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : "Invalid account preference" });
       return;
@@ -1421,6 +1607,12 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
       }
     }
 
+    // RFC-067: turning "Share usage data" off unlinks everything recorded so
+    // far (deletes the analytics-id mapping); turning it on mints a fresh id.
+    if (profileFields.shareUsageData === false || profileFields.shareUsageData === true) {
+      await setProductAnalyticsOptOut(getDb(), req.userId!, !profileFields.shareUsageData);
+    }
+
     let user;
     if (Object.keys(profileFields).length > 0) {
       user = await userService.updateUser(req.userId!, profileFields);
@@ -1457,8 +1649,11 @@ authRouter.patch("/me", requireAuth, async (req, res) => {
     if (msg.includes("Current password is incorrect")) {
       res.status(401).json({ code: "AUTH_CURRENT_PASSWORD_INCORRECT", error: msg });
     } else {
-      console.error("Update profile error:", serializeErrorForLog(err));
-      res.status(500).json({ error: "Failed to update profile" });
+      sendJsonServerError(req, res, {
+        error: "Failed to update profile",
+        logPrefix: "Update profile error:",
+        err,
+      });
     }
   }
 });
@@ -1502,8 +1697,11 @@ authRouter.post("/me/avatar", requireAuth, async (req, res) => {
       });
       return;
     }
-    console.error("User avatar upload error:", serializeErrorForLog(err));
-    res.status(500).json({ error: "Failed to upload avatar" });
+    sendJsonServerError(req, res, {
+      error: "Failed to upload avatar",
+      logPrefix: "User avatar upload error:",
+      err,
+    });
   }
 });
 
@@ -1540,8 +1738,11 @@ authRouter.post("/resend-verification", requireAuth, async (req, res) => {
     } else if (msg.includes("Too many") || msg.includes("Please wait")) {
       res.status(429).json({ error: msg });
     } else {
-      console.error("Resend verification error:", serializeErrorForLog(err));
-      res.status(500).json({ error: "Failed to resend verification email" });
+      sendJsonServerError(req, res, {
+        error: "Failed to resend verification email",
+        logPrefix: "Resend verification error:",
+        err,
+      });
     }
   }
 });
@@ -1603,6 +1804,8 @@ authRouter.post("/accept-invite", requireAuth, requireProfileSetupComplete, asyn
       agreementId: typeof agreementId === "string" ? agreementId : null,
       ...getAgreementRequestMetadata(req),
     });
+    // Committed: deliver the server.member_added App Notification now.
+    kickAppNotificationDelivery();
     const io = req.app.get("io") as SocketServer | undefined;
     const agentOrchestrator = req.app.get("agentOrchestrator") as AgentOrchestrator | undefined;
     if (io) {
@@ -1642,8 +1845,11 @@ authRouter.post("/accept-invite", requireAuth, requireProfileSetupComplete, asyn
     ) {
       res.status(400).json({ error: msg });
     } else {
-      console.error("Accept invite error:", serializeErrorForLog(err));
-      res.status(500).json({ error: "Failed to accept invite" });
+      sendJsonServerError(req, res, {
+        error: "Failed to accept invite",
+        logPrefix: "Accept invite error:",
+        err,
+      });
     }
   }
 });

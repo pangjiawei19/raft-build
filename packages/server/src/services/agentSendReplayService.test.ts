@@ -1,15 +1,15 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
-import { closeTestDatabase } from "../test/integration/database.js";
+import { dbTest as test } from "../test/integration/dbTest";
+import { closeTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
-import { afterEach } from "vitest";
 import { eq } from "drizzle-orm";
 import {
   __resetAgentSendReplayDbForTests,
   __setAgentSendReplayDbForTests,
   createOrReplayAgentSend,
-} from "./agentSendReplayService.js";
-import { getDb, type DatabaseExecutor } from "../db/index.js";
-import { agents, attachments, channels, messages, servers, users } from "../db/schema.js";
+} from "./agentSendReplayService";
+import { getDb, type DatabaseExecutor } from "../db/index";
+import { agents, attachments, channels, messages, servers, users } from "../db/schema";
+import { __setChannelWriterFenceTransactionTestAdapterForTests } from "./channelConversionFenceService";
 
 
 type InsertCapture = {
@@ -135,8 +135,16 @@ function makeDb(options: {
 }
 
 afterEach(async () => {
+  __setChannelWriterFenceTransactionTestAdapterForTests(null);
   __resetAgentSendReplayDbForTests();
   await closeTestDatabase();
+});
+
+beforeEach(() => {
+  // The in-memory replay adapter intentionally has no SQL executor. Install
+  // the explicit test transaction contract rather than making production
+  // fence code branch on the runtime shape of a fake.
+  __setChannelWriterFenceTransactionTestAdapterForTests(async () => undefined);
 });
 
 test("createOrReplayAgentSend persists a new agent message on first send", async () => {
@@ -166,7 +174,7 @@ test("createOrReplayAgentSend persists a new agent message on first send", async
       updatedAt: createdAt,
     }]],
     updateResults: [[{
-      id: "att-1",
+      id: "a0000000-0000-4000-8000-000000000001",
       filename: "report.png",
       mimeType: "image/png",
       sizeBytes: 1234,
@@ -177,12 +185,12 @@ test("createOrReplayAgentSend persists a new agent message on first send", async
     selectResults: [
       [],
       [{
-        id: "att-1",
+        id: "a0000000-0000-4000-8000-000000000001",
         uploaderId: "agent-1",
         messageId: null,
       }],
       [{
-        id: "att-1",
+        id: "a0000000-0000-4000-8000-000000000001",
         messageId: "msg-1",
         messagePosition: 0,
         channelId: "channel-1",
@@ -209,7 +217,7 @@ test("createOrReplayAgentSend persists a new agent message on first send", async
     senderId: "agent-1",
     content: "hello",
     agentSendKey: "send-1",
-    attachmentIds: ["att-1"],
+    attachmentIds: ["a0000000-0000-4000-8000-000000000001"],
   });
 
   assert.equal(result.replayed, false);
@@ -250,7 +258,7 @@ test("createOrReplayAgentSend rejects attachment IDs already linked to another m
     selectResults: [
       [],
       [{
-        id: "att-1",
+        id: "a0000000-0000-4000-8000-000000000001",
         uploaderId: "agent-1",
         messageId: "msg-already-linked",
       }],
@@ -264,7 +272,7 @@ test("createOrReplayAgentSend rejects attachment IDs already linked to another m
       senderId: "agent-1",
       content: "hello",
       agentSendKey: "send-1",
-      attachmentIds: ["att-1"],
+      attachmentIds: ["a0000000-0000-4000-8000-000000000001"],
     }),
     /already attached to another message/,
   );
@@ -299,7 +307,7 @@ test("createOrReplayAgentSend replays the original successful send instead of in
         updatedAt: createdAt,
       }],
       [{
-        id: "att-1",
+        id: "a0000000-0000-4000-8000-000000000001",
         messageId: "msg-1",
         messagePosition: 0,
         channelId: "channel-1",
@@ -325,7 +333,7 @@ test("createOrReplayAgentSend replays the original successful send instead of in
     senderId: "agent-1",
     content: "hello",
     agentSendKey: "send-1",
-    attachmentIds: ["att-1"],
+    attachmentIds: ["a0000000-0000-4000-8000-000000000001"],
   });
 
   assert.equal(result.replayed, true);
@@ -360,7 +368,7 @@ test("createOrReplayAgentSend rejects a reordered attachment replay without writ
   };
   const linked = [
     {
-      id: "att-1",
+      id: "a0000000-0000-4000-8000-000000000001",
       messageId: "msg-1",
       messagePosition: 0,
       channelId: "channel-1",
@@ -377,7 +385,7 @@ test("createOrReplayAgentSend rejects a reordered attachment replay without writ
       createdAt,
     },
     {
-      id: "att-2",
+      id: "a0000000-0000-4000-8000-000000000002",
       messageId: "msg-1",
       messagePosition: 1,
       channelId: "channel-1",
@@ -407,7 +415,7 @@ test("createOrReplayAgentSend rejects a reordered attachment replay without writ
       senderId: "agent-1",
       content: "hello",
       agentSendKey: "send-1",
-      attachmentIds: ["att-2", "att-1"],
+      attachmentIds: ["a0000000-0000-4000-8000-000000000002", "a0000000-0000-4000-8000-000000000001"],
     }),
     /different ordered attachment set/,
   );

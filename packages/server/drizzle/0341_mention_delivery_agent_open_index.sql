@@ -1,0 +1,12 @@
+-- listRecoverableMentionDeliveriesForAgent filters mention_delivery_occurrences
+-- (13 GB with TOAST, ~1.8M rows) by agent_id over unacked, non-terminal rows
+-- with a delivery payload; without this index it scans the whole
+-- (message_id, agent_id) index (~13 s cold). The partial index holds ~85k rows:
+-- open rows without a payload (~78k, recovery skips them) are left out so they
+-- cost no heap rechecks. Staging/prod build it first with
+--   pnpm --filter @botiverse/raft-server db:create-mention-delivery-agent-open-index
+-- (CREATE INDEX CONCURRENTLY IF NOT EXISTS, then checks indisvalid), so this
+-- statement is a no-op there and never holds a write lock. That script also
+-- drops the earlier hand-built idx_mention_delivery_occurrences_agent_open
+-- CONCURRENTLY once the new index is valid; no migration ever created it.
+CREATE INDEX IF NOT EXISTS "idx_mention_delivery_occurrences_agent_payload_open" ON "mention_delivery_occurrences" USING btree ("agent_id","state") WHERE "mention_delivery_occurrences"."acked_at" IS NULL AND "mention_delivery_occurrences"."terminal_error_at" IS NULL AND "mention_delivery_occurrences"."delivery_payload" IS NOT NULL;

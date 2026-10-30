@@ -2,17 +2,23 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
 
-import { ApiClient, type ApiResponse } from "../../client.js";
-import type { AgentContext } from "../../auth/env.js";
-import { createCommandContext } from "../../core/context.js";
-import { CliError } from "../../core/errors.js";
-import type { CliIo } from "../../core/io.js";
+import { ApiClient, type ApiResponse } from "../../client";
+import type { AgentContext } from "../../auth/env";
+import { createCommandContext } from "../../core/context";
+import { CliError } from "../../core/errors";
+import type { CliIo } from "../../core/io";
 import {
   formatServerUpdateResult,
   serverUpdateCommand,
-} from "./update.js";
+} from "./update";
+import { globalFetchJsonTransport, setJsonTransportForTests } from "../../client";
+import { afterEach, beforeEach } from "vitest";
+// These tests stub globalThis.fetch; route the client's JSON transport (node:http
+// in production) through it.
+let previousJsonTransport: ReturnType<typeof setJsonTransportForTests>;
+beforeEach(() => { previousJsonTransport = setJsonTransportForTests(globalFetchJsonTransport); });
+afterEach(() => { setJsonTransportForTests(previousJsonTransport); });
 
 function memoryIo(): { io: CliIo; stdout: string[]; stderr: string[] } {
   const stdout: string[] = [];

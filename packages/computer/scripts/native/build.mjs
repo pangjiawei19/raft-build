@@ -32,14 +32,33 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, readFileSync } from "node:fs";
-import { chmod, copyFile, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import vm from "node:vm";
 import { createGzip } from "node:zlib";
 
 import { assertBuildOutputFresh } from "./dependency-freshness.mjs";
+import {
+  SEA_ASSET_CLI,
+  SEA_ASSET_CLI_UNDICI,
+  SEA_ASSET_FULL,
+  SEA_ASSET_KIMI,
+  SEA_ASSET_LITE,
+  SEA_CLI_LAZY_ASSETS,
+  SEA_LAZY_ASSETS,
+  SEA_LITE_EXTERNAL,
+  seaLoaderSource,
+} from "./seaEntries.mjs";
+import {
+  assertLatin1Source,
+  countNonLatin1,
+  escapeNonLatin1,
+  insideRanges,
+  regexLiteralRanges,
+} from "./latin1Source.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const COMPUTER_ROOT = resolve(HERE, "..", "..");
@@ -178,19 +197,194 @@ async function downloadOfficialNode({ platform, arch, nodeVersion, workDir }) {
   return extractedBinary;
 }
 
-async function bundleCjs({ version, daemonVersion, cliVersion, workDir }) {
+// The agent CLI as its own CJS bundle (task #11). Same define/banner contract
+// as bundleCjs; the SEA loader evaluates it alone for `__cli`, so an agent
+// `raft` call skips the 38 MB Computer bundle (~550 → ~150 MiB per call).
+// The CLI is first built by tsdown with its own config, as its dist is (tsdown
+// drops far more unused zod than esbuild does), but with undici left external:
+// esbuild then points undici at the shim that loads cli-undici.cjs on first use
+// (seaEntries.mjs SEA_CLI_LAZY_ASSETS). The CLI dist itself keeps undici
+// inlined for the npm package and the desktop sidecar.
+async function bundleSeaCliCjs({ cliVersion, workDir }) {
+  const { build: tsdown } = await import("tsdown");
   const { build } = await import("esbuild");
-  const outfile = join(workDir, "computer-bundle.cjs");
-  await build({
-    entryPoints: [join(COMPUTER_ROOT, "src", "index.ts")],
+  const cliDir = join(workDir, "cli-sea-dist");
+  const cliPkg = JSON.parse(await readFile(join(CLI_ROOT, "package.json"), "utf8"));
+  const lazy = new Set(Object.keys(SEA_CLI_LAZY_ASSETS));
+  const subpaths = (name) => new RegExp(`^${name.replace(/[^a-zA-Z0-9]/g, "\\$&")}(\\/|$)`);
+  await tsdown({
+    config: join(CLI_ROOT, "tsdown.config.ts"),
+    cwd: CLI_ROOT,
+    outDir: cliDir,
+    clean: true,
+    deps: {
+      alwaysBundle: Object.keys(cliPkg.dependencies).filter((name) => !lazy.has(name)).map(subpaths),
+      neverBundle: [...lazy].map(subpaths),
+    },
+    logLevel: "warn",
+  });
+  const outfile = join(workDir, "cli-bundle.cjs");
+  const result = await build({
+    entryPoints: [join(COMPUTER_ROOT, "src", "seaCliEntry.ts")],
     bundle: true,
     platform: "node",
     format: "cjs",
     target: "node20",
     outfile,
-    // SEA has no node_modules — inline EVERYTHING including @botiverse/raft-daemon.
-    // Leave node: builtins external (the runtime provides them).
-    packages: undefined,
+    metafile: true,
+    define: {
+      __RAFT_CLI_VERSION__: JSON.stringify(cliVersion),
+      "import.meta.url": "__slockImportMetaUrl",
+    },
+    banner: {
+      js: `const __slockImportMetaUrl = require("node:url").pathToFileURL(process.execPath).href;`,
+    },
+    alias: {
+      "@botiverse/raft-daemon/bundled-cli": SEA_SOURCE_ALIASES["@botiverse/raft-daemon/bundled-cli"],
+      "@botiverse/raft/dist/index.js": join(cliDir, "index.js"),
+      ...SEA_CLI_LAZY_ASSET_SHIMS,
+    },
+    // See finalizeSeaBundleSource: no comments or layout whitespace in the
+    // resident source.
+    minifyWhitespace: true,
+    logLevel: "info",
+  });
+  const inlined = bundledInputs(result).filter((input) =>
+    [...lazy].some((name) => `/${input}`.includes(`/node_modules/${name}/`)) || /^packages\/[^/]+\/dist\//.test(input),
+  );
+  if (inlined.length > 0) {
+    throw new Error(`Agent CLI SEA bundle inlined ${inlined[0]}; lazy packages load from their own asset (SEA_CLI_LAZY_ASSETS) and the CLI from the tsdown build above`);
+  }
+  assertLazyShimsDynamicOnly(result, SEA_CLI_LAZY_ASSET_SHIMS, "every agent `raft` call");
+  await finalizeSeaBundleSource(outfile, SEA_ASSET_CLI);
+  return outfile;
+}
+
+// undici on its own (asset cli-undici.cjs), evaluated by the SEA loader the
+// first time a `raft` call opens a direct or proxied server connection. Built
+// from the CLI's own undici so it is the version the CLI was tested with.
+async function bundleCliUndiciCjs({ workDir }) {
+  const { build } = await import("esbuild");
+  const outfile = join(workDir, "cli-undici-bundle.cjs");
+  const specifier = Object.keys(SEA_CLI_LAZY_ASSETS).find((id) => SEA_CLI_LAZY_ASSETS[id] === SEA_ASSET_CLI_UNDICI);
+  await build({
+    stdin: { contents: `module.exports = require(${JSON.stringify(specifier)});`, resolveDir: CLI_ROOT, sourcefile: "cli-undici-entry.cjs" },
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    target: "node20",
+    outfile,
+    minifyWhitespace: true,
+    logLevel: "info",
+  });
+  const check = spawnSync(
+    process.execPath,
+    [
+      "-e",
+      `const bundled = Object.keys(require(${JSON.stringify(outfile)})).sort();
+       const pkg = Object.keys(require(${JSON.stringify(specifier)})).sort();
+       if (JSON.stringify(bundled) !== JSON.stringify(pkg)) { console.error(JSON.stringify({ bundled, pkg })); process.exit(1); }`,
+    ],
+    { cwd: CLI_ROOT, encoding: "utf8" },
+  );
+  if (check.status !== 0) {
+    throw new Error(`${SEA_ASSET_CLI_UNDICI} does not expose undici's exports: ${check.stderr.slice(0, 2000)}`);
+  }
+  await finalizeSeaBundleSource(outfile, SEA_ASSET_CLI_UNDICI);
+  return outfile;
+}
+
+// Every SEA bundle stays resident as one V8 source string. Make it Latin-1 so
+// V8 stores it one byte per character (latin1Source.mjs), and fail the build
+// if anything above U+00FF is left. The compile check runs the escaped source
+// through the same wrapper the SEA loader uses, so a bad rewrite fails here.
+async function finalizeSeaBundleSource(outfile, label) {
+  const original = await readFile(outfile, "utf8");
+  // Locating regex literals takes a full parse (~30 s, ~1 GB on a small arm64
+  // host), so only when there is something to rewrite.
+  const mayRewrite =
+    countNonLatin1(original) === 0
+      ? () => false
+      : insideRanges(regexLiteralRanges(original, createRequire(join(COMPUTER_ROOT, "package.json"))("typescript")));
+  const { source, escaped } = escapeNonLatin1(original, label, mayRewrite);
+  assertLatin1Source(source, label);
+  vm.compileFunction(source, ["exports", "require", "module", "__filename", "__dirname"], { filename: label });
+  if (escaped > 0) await writeFile(outfile, source);
+  console.log(`[build] ${label}: ${source.length} chars, Latin-1 (${escaped} escaped)`);
+}
+
+// The loader names each asset's code cache by the asset's digest, so a cache
+// written by one build is never read by another.
+async function writeSeaLoader({ workDir, assets }) {
+  const loaderPath = join(workDir, "sea-loader.cjs");
+  const digests = {};
+  for (const [asset, file] of Object.entries(assets)) digests[asset] = (await sha256(file)).slice(0, 16);
+  await writeFile(loaderPath, seaLoaderSource(digests));
+  return loaderPath;
+}
+
+// The Computer bundle inlines the daemon and the agent CLI from their sources,
+// not from their tsdown dists. Each dist stays self-contained for native Node
+// (it inlines raft-shared, raft-trace-client and, for the CLI, zod, undici,
+// ajv and commander), so bundling a dist here embedded a second copy of code
+// the Computer already imports from source, and V8 keeps the whole script
+// source on the heap. Every daemon/CLI specifier the Computer graph imports
+// needs an entry; bundleCjs fails if a dist still gets bundled.
+const SEA_SOURCE_ALIASES = {
+  "@botiverse/raft-daemon/core": join(DAEMON_ROOT, "src", "core.ts"),
+  "@botiverse/raft-daemon/bundled-cli": join(DAEMON_ROOT, "src", "bundledRaftCli.ts"),
+  "@botiverse/raft-daemon/runtime-detection-child": join(DAEMON_ROOT, "src", "runtimeDetectionChild.ts"),
+  "@botiverse/raft/dist/index.js": join(CLI_ROOT, "src", "index.ts"),
+};
+
+// Modules no runner path reaches, replaced by an empty module so their source
+// is not resident. highlight.js/lib/index.js (all ~190 grammars, 1.3M chars)
+// is only imported by pi's interactive terminal UI (loadAllHighlightLanguages),
+// which the daemon never runs; pi treats a failed or empty load as "eager
+// languages only".
+const SEA_UNREACHABLE_ALIASES = {
+  "highlight.js/lib/index.js": join(HERE, "sea-empty-module.cjs"),
+};
+
+// Each lazily loaded package (seaEntries.mjs SEA_LAZY_ASSETS) is replaced in
+// computer.cjs by a shim that fetches it from its own asset on first use. A
+// plain `external` would not do: esbuild keeps an external dynamic import as a
+// real `import()`, which the SEA resolves through Node's ESM loader, and that
+// cannot find a bare package name in a single binary.
+const SEA_LAZY_ASSET_SHIMS = {
+  "@botiverse/kimi-code-sdk": join(HERE, "sea-lazy-kimi.cjs"),
+};
+// The same for cli.cjs (seaEntries.mjs SEA_CLI_LAZY_ASSETS).
+const SEA_CLI_LAZY_ASSET_SHIMS = {
+  undici: join(HERE, "sea-lazy-undici.cjs"),
+};
+
+// The alias catches every import of a lazy package, so a static one would
+// quietly require the shim at startup and load the asset in every process of
+// that bundle. Only dynamic imports may reach a shim.
+function assertLazyShimsDynamicOnly(result, shims, where) {
+  const shimPaths = new Set(Object.values(shims).map((shim) => relative(REPO_ROOT, shim).replaceAll("\\", "/")));
+  const eagerShimImports = Object.entries(result.metafile.inputs).flatMap(([importer, input]) =>
+    input.imports
+      .filter((record) => shimPaths.has(relative(REPO_ROOT, resolve(record.path)).replaceAll("\\", "/")) && record.kind !== "dynamic-import")
+      .map((record) => `${importer} (${record.kind} of ${record.original ?? record.path})`),
+  );
+  if (eagerShimImports.length > 0) {
+    throw new Error(
+      `a lazily loaded SEA package is imported eagerly, which would load its asset in ${where}: ${eagerShimImports.join(", ")}; use a dynamic import()`,
+    );
+  }
+}
+
+// esbuild options both Computer bundles share. Each bundle function spells out
+// its entry, `bundle` and `packages` itself: carrier-version-closure-gate reads
+// them from bundleCjs's own body.
+function computerBundleOptions({ version, daemonVersion, cliVersion, minify }) {
+  return {
+    platform: "node",
+    format: "cjs",
+    target: "node20",
+    metafile: true,
     define: {
       __RAFT_COMPUTER_VERSION__: JSON.stringify(version),
       __RAFT_DAEMON_VERSION__: JSON.stringify(daemonVersion),
@@ -213,23 +407,110 @@ async function bundleCjs({ version, daemonVersion, cliVersion, workDir }) {
         `/* raft-computer SEA bundle v${version} */\n` +
         `const __slockImportMetaUrl = require("node:url").pathToFileURL(process.execPath).href;`,
     },
+    // Drops comments and layout whitespace from the resident source (40M → 29M
+    // characters measured), which also removes almost all non-Latin-1 text.
+    // Names are kept, so stack traces still name functions.
+    minifyWhitespace: minify,
     logLevel: "info",
+  };
+}
+
+function bundledInputs(result) {
+  return Object.keys(result.metafile.inputs).map((input) => relative(REPO_ROOT, resolve(input)).replaceAll("\\", "/"));
+}
+
+// The lite bundle: `__service` and every `raft-computer <command>`. Same entry
+// with the daemon and the agent CLI left external, so none of their source is
+// resident in those processes; the SEA loader turns a stray daemon import into
+// a routing error.
+async function bundleLiteCjs({ version, daemonVersion, cliVersion, workDir, minify = true }) {
+  const { build } = await import("esbuild");
+  const outfile = join(workDir, "computer-lite-bundle.cjs");
+  const result = await build({
+    ...computerBundleOptions({ version, daemonVersion, cliVersion, minify }),
+    entryPoints: [join(COMPUTER_ROOT, "src", "index.ts")],
+    bundle: true,
+    packages: undefined,
+    outfile,
+    external: SEA_LITE_EXTERNAL,
   });
+  const runnerInputs = bundledInputs(result).filter((input) =>
+    /^packages\/(daemon|cli)\//.test(input) || input.includes("node_modules/@botiverse/kimi-code-sdk/"),
+  );
+  if (runnerInputs.length > 0) {
+    throw new Error(`Computer lite bundle pulled in runner code: ${runnerInputs.slice(0, 5).join(", ")}`);
+  }
+  if (minify) await finalizeSeaBundleSource(outfile, SEA_ASSET_LITE);
   return outfile;
 }
 
-async function assertBundledDaemonReleaseContracts(bundlePath) {
-  const bundle = await readFile(bundlePath, "utf8");
-  for (const requiredText of [
-    "wiki-workspace-pack:v1",
-    "Configured Wiki Agent has no valid installed workspace pack",
-  ]) {
-    if (!bundle.includes(requiredText)) {
-      throw new Error(
-        `bundled daemon release contract missing from Computer SEA input: ${requiredText}`,
-      );
-    }
+// The kimi SDK on its own (asset kimi.cjs), evaluated by the SEA loader the
+// first time a runner requires it. It must expose exactly the package's
+// exports, or a Kimi launch would fail only once a user starts one.
+async function bundleKimiCjs({ workDir, minify = true }) {
+  const { build } = await import("esbuild");
+  const outfile = join(workDir, "kimi-bundle.cjs");
+  const specifier = Object.keys(SEA_LAZY_ASSETS).find((id) => SEA_LAZY_ASSETS[id] === SEA_ASSET_KIMI);
+  await build({
+    stdin: { contents: `export * from ${JSON.stringify(specifier)};`, resolveDir: DAEMON_ROOT, sourcefile: "kimi-entry.mjs" },
+    bundle: true,
+    platform: "node",
+    format: "cjs",
+    target: "node20",
+    outfile,
+    define: { "import.meta.url": "__slockImportMetaUrl" },
+    banner: { js: `const __slockImportMetaUrl = require("node:url").pathToFileURL(process.execPath).href;` },
+    minifyWhitespace: minify,
+    logLevel: "info",
+  });
+  const check = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "-e",
+      `import { createRequire } from "node:module";
+       const bundled = Object.keys(createRequire(import.meta.url)(${JSON.stringify(outfile)})).filter((k) => k !== "__esModule").sort();
+       const pkg = Object.keys(await import(${JSON.stringify(specifier)})).filter((k) => k !== "default").sort();
+       if (JSON.stringify(bundled) !== JSON.stringify(pkg)) { console.error(JSON.stringify({ bundled, pkg })); process.exit(1); }`,
+    ],
+    { cwd: DAEMON_ROOT, encoding: "utf8" },
+  );
+  if (check.status !== 0) {
+    throw new Error(`${SEA_ASSET_KIMI} does not expose the kimi SDK's exports: ${check.stderr.slice(0, 2000)}`);
   }
+  if (minify) await finalizeSeaBundleSource(outfile, SEA_ASSET_KIMI);
+  return outfile;
+}
+
+// The full bundle: the runner (`__run`) and the other hidden entries that run
+// daemon code (seaEntries.mjs SEA_RUNNER_ENTRIES).
+async function bundleCjs({ version, daemonVersion, cliVersion, workDir, minify = true }) {
+  const { build } = await import("esbuild");
+  const outfile = join(workDir, "computer-bundle.cjs");
+  const result = await build({
+    ...computerBundleOptions({ version, daemonVersion, cliVersion, minify }),
+    entryPoints: [join(COMPUTER_ROOT, "src", "index.ts")],
+    bundle: true,
+    // SEA has no node_modules — inline EVERYTHING including @botiverse/raft-daemon.
+    // Leave node: builtins external (the runtime provides them).
+    packages: undefined,
+    outfile,
+    alias: { ...SEA_SOURCE_ALIASES, ...SEA_UNREACHABLE_ALIASES, ...SEA_LAZY_ASSET_SHIMS },
+  });
+  const lazyInputs = bundledInputs(result).filter((input) => input.includes("node_modules/@botiverse/kimi-code-sdk/"));
+  if (lazyInputs.length > 0) {
+    throw new Error(`Computer SEA bundle inlined the kimi SDK, which must load from ${SEA_ASSET_KIMI}: ${lazyInputs[0]}`);
+  }
+  assertLazyShimsDynamicOnly(result, SEA_LAZY_ASSET_SHIMS, "every runner");
+  const distInputs = bundledInputs(result).filter((input) => /^packages\/[^/]+\/dist\//.test(input));
+  if (distInputs.length > 0) {
+    throw new Error(
+      `Computer SEA bundle inlined prebuilt workspace dists (duplicating shared/zod code): ` +
+        `${distInputs.join(", ")}; add their source entries to SEA_SOURCE_ALIASES`,
+    );
+  }
+  if (minify) await finalizeSeaBundleSource(outfile, SEA_ASSET_FULL);
+  return outfile;
 }
 
 async function resolvePhotonWasmPath() {
@@ -269,7 +550,7 @@ async function copyPhotonWasmSidecar(outDir) {
   console.log(`[build] photon wasm: ${outWasm} (${digest})`);
 }
 
-async function makeBlob({ bundlePath, workDir, nodeVersion }) {
+async function makeBlob({ loaderPath, bundlePath, liteBundlePath, kimiBundlePath, cliBundlePath, cliUndiciBundlePath, workDir, nodeVersion }) {
   const hostMajor = process.versions.node.split(".")[0];
   const targetMajor = String(nodeVersion).split(".")[0];
   if (hostMajor !== targetMajor) {
@@ -284,7 +565,18 @@ async function makeBlob({ bundlePath, workDir, nodeVersion }) {
   await writeFile(
     configPath,
     JSON.stringify(
-      { main: bundlePath, output: blobPath, disableExperimentalSEAWarning: true },
+      {
+        main: loaderPath,
+        output: blobPath,
+        disableExperimentalSEAWarning: true,
+        assets: {
+          [SEA_ASSET_FULL]: bundlePath,
+          [SEA_ASSET_LITE]: liteBundlePath,
+          [SEA_ASSET_KIMI]: kimiBundlePath,
+          [SEA_ASSET_CLI]: cliBundlePath,
+          [SEA_ASSET_CLI_UNDICI]: cliUndiciBundlePath,
+        },
+      },
       null,
       2,
     ),
@@ -330,11 +622,19 @@ async function injectAndSign({ officialNode, blobPath, platform, outBinary }) {
   await chmod(outBinary, 0o755);
 }
 
-function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, cliVersion }) {
+function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, cliVersion, smokeHome }) {
   if (platform !== process.platform || arch !== process.arch) return;
+  // Prevent K dispatch from testing an installed resident instead of these
+  // newly injected bytes, and keep host account credentials out of all probes.
+  const smokeEnv = {
+    ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot } : {}),
+    RAFT_HOME: smokeHome,
+    SLOCK_HOME: smokeHome,
+  };
   const result = spawnSync(outBinary, ["--version"], {
     encoding: "utf8",
     windowsHide: true,
+    env: smokeEnv,
   });
   if (result.status !== 0) {
     throw new Error(
@@ -351,6 +651,7 @@ function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, 
   const versionsResult = spawnSync(outBinary, ["__build-versions"], {
     encoding: "utf8",
     windowsHide: true,
+    env: smokeEnv,
   });
   if (versionsResult.status !== 0) {
     throw new Error(
@@ -402,6 +703,87 @@ function smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, 
     }
   }
   console.log(`[verify] ${outBinary} __build-versions → ${JSON.stringify(reported)}`);
+
+  const oauthResult = spawnSync(outBinary, ["__verify-bundled-oauth"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 15_000,
+    env: smokeEnv,
+  });
+  if (oauthResult.status !== 0 || oauthResult.stdout.trim() !== "oauth-bundle-ok") {
+    throw new Error(
+      `native OAuth bundle smoke failed with ${oauthResult.status ?? oauthResult.signal}: ` +
+        `${oauthResult.stderr || oauthResult.stdout || oauthResult.error}`,
+    );
+  }
+  console.log(`[verify] ${outBinary} bundled OAuth derivation passed`);
+
+  // The kimi SDK is its own asset, compiled on the first Kimi launch; load it
+  // here so a broken asset fails the build, not a user's first Kimi agent.
+  const kimiResult = spawnSync(outBinary, ["__verify-bundled-kimi"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 30_000,
+    env: smokeEnv,
+  });
+  if (kimiResult.status !== 0 || kimiResult.stdout.trim() !== "kimi-bundle-ok") {
+    throw new Error(
+      `native kimi asset smoke failed with ${kimiResult.status ?? kimiResult.signal}: ` +
+        `${kimiResult.stderr || kimiResult.stdout || kimiResult.error}`,
+    );
+  }
+  console.log(`[verify] ${outBinary} kimi SDK asset loaded`);
+
+  // The agent CLI path runs from its own embedded asset (seaCliEntry.ts).
+  const cliResult = spawnSync(outBinary, ["__cli", "--version"], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 30_000,
+    env: smokeEnv,
+  });
+  const cliReported = String(cliResult.stdout ?? "").trim();
+  if (cliResult.status !== 0 || !cliReported.endsWith(cliVersion)) {
+    throw new Error(
+      `native agent CLI smoke failed with ${cliResult.status ?? cliResult.signal}: ` +
+        `${cliResult.stderr || cliResult.stdout || cliResult.error}`,
+    );
+  }
+  console.log(`[verify] ${outBinary} __cli --version → ${cliReported}`);
+  assertAgentCliFootprint({ outBinary, smokeEnv });
+}
+
+// Peak memory budget for one agent `raft` call (task #11). 1.0.47 measured
+// ~580 MiB. With the CLI-only asset, lazy shared schemas and the node:http
+// transport it measures 74 MiB on linux-arm64 and 85 MiB on macOS (which
+// reports more for the same build); the budget leaves ~30% headroom over macOS.
+const AGENT_CLI_MAX_RSS_MIB = 110;
+
+// POSIX only: reads the child's peak RSS via python's getrusage(RUSAGE_CHILDREN)
+// (Node has no API for a child's rusage). Skipped where python3 is missing.
+function assertAgentCliFootprint({ outBinary, smokeEnv }) {
+  if (process.platform === "win32") return;
+  const probe = [
+    "import resource, subprocess, sys, time",
+    "t = time.time()",
+    "r = subprocess.run([sys.argv[1], '__cli', '--version'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+    "u = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss",
+    "kib = u / 1024 if sys.platform == 'darwin' else u",
+    "print(r.returncode, int(kib / 1024), round(time.time() - t, 2))",
+  ].join("\n");
+  const result = spawnSync("python3", ["-c", probe, outBinary], { encoding: "utf8", env: { ...smokeEnv, PATH: process.env.PATH } });
+  if (result.error || result.status !== 0) {
+    console.log(`[verify] agent CLI footprint not measured (python3 unavailable: ${result.error?.message ?? result.stderr})`);
+    return;
+  }
+  const [code, rssMiB, seconds] = String(result.stdout).trim().split(/\s+/).map(Number);
+  console.log(`[verify] agent CLI footprint: ${rssMiB} MiB peak RSS, ${seconds}s (budget ${AGENT_CLI_MAX_RSS_MIB} MiB)`);
+  if (code !== 0) throw new Error(`agent CLI footprint probe: __cli --version exited ${code}`);
+  if (!(rssMiB <= AGENT_CLI_MAX_RSS_MIB)) {
+    throw new Error(
+      `agent CLI footprint ${rssMiB} MiB exceeds the ${AGENT_CLI_MAX_RSS_MIB} MiB budget: ` +
+        "an agent `raft` call must load only the CLI asset (see seaCliEntry.ts) and build shared schemas lazily (packages/shared/src/lazySchema.ts)",
+    );
+  }
 }
 
 async function sha256(file) {
@@ -422,6 +804,10 @@ async function main() {
   const arch = args.arch || process.arch;
   const nodeVersion = args["node-version"] || process.versions.node;
   const bundleOnly = args["bundle-only"] === true;
+  // Measurement only (measure-load-heap attributes objects by the bundle's
+  // module comments and source layout): keeps them, skips the Latin-1 gate.
+  const noMinify = args["no-minify"] === true;
+  if (noMinify && !bundleOnly) throw new Error("--no-minify is only for --bundle-only measurement bundles");
   const outDir = resolve(args["out-dir"] || join(COMPUTER_ROOT, "dist-native"));
   const workDir = resolve(args["work-dir"] || join(tmpdir(), "raft-computer-sea", `${platform}-${arch}`));
 
@@ -431,11 +817,11 @@ async function main() {
       join(DAEMON_ROOT, "src"),
       join(DAEMON_ROOT, "package.json"),
       join(DAEMON_ROOT, "tsconfig.json"),
-      join(DAEMON_ROOT, "tsup.config.ts"),
+      join(DAEMON_ROOT, "tsdown.config.ts"),
       join(COMPUTER_ROOT, "..", "cli", "src"),
       join(COMPUTER_ROOT, "..", "cli", "package.json"),
       join(COMPUTER_ROOT, "..", "cli", "tsconfig.json"),
-      join(COMPUTER_ROOT, "..", "cli", "tsup.config.ts"),
+      join(COMPUTER_ROOT, "..", "cli", "tsdown.config.ts"),
       join(COMPUTER_ROOT, "..", "shared", "src"),
       join(COMPUTER_ROOT, "..", "shared", "package.json"),
       join(COMPUTER_ROOT, "..", "shared", "tsconfig.json"),
@@ -453,15 +839,39 @@ async function main() {
   await mkdir(outDir, { recursive: true });
   await mkdir(workDir, { recursive: true });
 
-  const bundlePath = await bundleCjs({ version, daemonVersion, cliVersion, workDir });
-  await assertBundledDaemonReleaseContracts(bundlePath);
+  const bundlePath = await bundleCjs({ version, daemonVersion, cliVersion, workDir, minify: !noMinify });
+  const liteBundlePath = await bundleLiteCjs({ version, daemonVersion, cliVersion, workDir, minify: !noMinify });
+  const kimiBundlePath = await bundleKimiCjs({ workDir, minify: !noMinify });
   if (bundleOnly) {
-    console.log(`[build] bundle-only contract passed: ${bundlePath}`);
+    console.log(
+      `[build] bundle-only contract passed: ${bundlePath}, ${liteBundlePath}, ${kimiBundlePath}${noMinify ? " (unminified, not shippable)" : ""}`,
+    );
     return;
   }
 
+  const cliBundlePath = await bundleSeaCliCjs({ cliVersion, workDir });
+  const cliUndiciBundlePath = await bundleCliUndiciCjs({ workDir });
+  const loaderPath = await writeSeaLoader({
+    workDir,
+    assets: {
+      [SEA_ASSET_FULL]: bundlePath,
+      [SEA_ASSET_LITE]: liteBundlePath,
+      [SEA_ASSET_KIMI]: kimiBundlePath,
+      [SEA_ASSET_CLI]: cliBundlePath,
+      [SEA_ASSET_CLI_UNDICI]: cliUndiciBundlePath,
+    },
+  });
   const officialNode = await downloadOfficialNode({ platform, arch, nodeVersion, workDir });
-  const blobPath = await makeBlob({ bundlePath, workDir, nodeVersion });
+  const blobPath = await makeBlob({
+    loaderPath,
+    bundlePath,
+    liteBundlePath,
+    kimiBundlePath,
+    cliBundlePath,
+    cliUndiciBundlePath,
+    workDir,
+    nodeVersion,
+  });
 
   const ext = platform === "win32" ? ".exe" : "";
   const binaryName = `raft-computer-${platform}-${arch}${ext}`;
@@ -469,7 +879,12 @@ async function main() {
   await rm(outBinary, { force: true });
 
   await injectAndSign({ officialNode, blobPath, platform, outBinary });
-  smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, cliVersion });
+  const smokeHome = await mkdtemp(join(workDir, "smoke-home-"));
+  try {
+    smokeNativeBinary({ outBinary, platform, arch, version, daemonVersion, cliVersion, smokeHome });
+  } finally {
+    await rm(smokeHome, { recursive: true, force: true });
+  }
 
   const digest = await sha256(outBinary);
   await writeFile(`${outBinary}.sha256`, `${digest}  ${binaryName}\n`);

@@ -1,0 +1,1 @@
+ALTER TABLE "server_members" ADD COLUMN "onboarding_owner_opener_claimed_at" timestamp with time zone;

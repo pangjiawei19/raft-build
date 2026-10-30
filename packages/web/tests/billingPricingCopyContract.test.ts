@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 
@@ -11,7 +10,12 @@ function read(path: string) {
 
 test("settings billing pricing copy matches current landing pricing copy", () => {
   const shared = read("../shared/src/index.ts");
-  const settings = read("src/components/settings/SettingsPanel.tsx");
+  // PlanSectionContent was split out of SettingsPanel into its own file; read
+  // both so the billing copy surface is the same text as before the move.
+  const settings = [
+    read("src/components/settings/SettingsPanel.tsx"),
+    read("src/components/settings/PlanSectionContent.tsx"),
+  ].join("\n");
   const billingCopy = `${shared}\n${settings}`;
   // PRE-EXISTING BUG, found while re-anchoring: this slice looked for
   // `const freeIncludedFeatures` in SettingsPanel, but those constants live in
@@ -48,6 +52,7 @@ test("settings billing pricing copy matches current landing pricing copy", () =>
   // output is pinned in tests/billingTrialAndCheckout.i18n.test.ts.
   assert.match(billingCopy, /id: "billing\.seatCoverageHelp"/);
   assert.match(billingCopy, /Everything in Free/);
+  assert.match(publicPlanBlocks, /billing\.agentMigration/);
   assert.match(billingCopy, /Unlimited message history/);
   assert.match(billingCopy, /Higher file upload limits/);
   assert.match(billingCopy, /Joint channels/);

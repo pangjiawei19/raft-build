@@ -1,0 +1,44 @@
+import { type TraceUploadRuntimeEnv, type TraceUploadWorkerEnv } from "./env";
+import { S3TraceStorage } from "./nodeStorage";
+
+export function requiredEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`Missing required env ${name}`);
+  return value;
+}
+
+export function createNodeTraceUploadEnv(): TraceUploadWorkerEnv {
+  return {
+    SCOPE_ATTESTATION_SECRET: requiredEnv("SCOPE_ATTESTATION_SECRET"),
+    TRACE_UPLOAD_WORKER_SECRET: process.env.TRACE_UPLOAD_WORKER_SECRET,
+    TRACE_UPLOAD_MAX_BYTES: process.env.TRACE_UPLOAD_MAX_BYTES,
+    TRACE_INGEST_OTLP_ENDPOINT: process.env.TRACE_INGEST_OTLP_ENDPOINT,
+    TRACE_INGEST_OTLP_AUTHORIZATION: process.env.TRACE_INGEST_OTLP_AUTHORIZATION,
+    TRACE_INGEST_SERVICE_NAME: process.env.TRACE_INGEST_SERVICE_NAME,
+    TRACE_INGEST_BATCH_SIZE: process.env.TRACE_INGEST_BATCH_SIZE,
+    TRACE_INGEST_MAX_DECOMPRESSED_BYTES: process.env.TRACE_INGEST_MAX_DECOMPRESSED_BYTES,
+    TRACE_INGEST_PER_MINUTE_CAP: process.env.TRACE_INGEST_PER_MINUTE_CAP,
+    TRACE_INGEST_EVENT_PER_MINUTE_CAP: process.env.TRACE_INGEST_EVENT_PER_MINUTE_CAP,
+    TRACE_INGEST_OTLP_TIMEOUT_MS: process.env.TRACE_INGEST_OTLP_TIMEOUT_MS,
+    TRACE_INGEST_BUNDLE_OTLP_TIMEOUT_MS: process.env.TRACE_INGEST_BUNDLE_OTLP_TIMEOUT_MS,
+    RAFT_TRACE_SCOPEDB_PROJECTOR: process.env.RAFT_TRACE_SCOPEDB_PROJECTOR,
+    SCOPEDB_TRACE_EVENTS_ENDPOINT: process.env.SCOPEDB_TRACE_EVENTS_ENDPOINT,
+    SCOPEDB_TRACE_EVENTS_WRITE_KEY: process.env.SCOPEDB_TRACE_EVENTS_WRITE_KEY,
+    EXTERNAL_GITHUB_REFRESH_TOKEN: process.env.EXTERNAL_GITHUB_REFRESH_TOKEN,
+    DEPLOYMENT_ENV: process.env.DEPLOYMENT_ENV,
+    SLOCK_RELEASE_SHA: process.env.SLOCK_RELEASE_SHA,
+    TRACE_WEB_CORS_ORIGIN: process.env.TRACE_WEB_CORS_ORIGIN,
+    FEEDBACK_REPORT_MAX_BYTES: process.env.FEEDBACK_REPORT_MAX_BYTES,
+    FEEDBACK_REPORT_HOURLY_LIMIT: process.env.FEEDBACK_REPORT_HOURLY_LIMIT,
+    TRACE_UPLOAD_HOURLY_LIMIT: process.env.TRACE_UPLOAD_HOURLY_LIMIT,
+    TRACE_UPLOAD_HOURLY_BYTES_LIMIT: process.env.TRACE_UPLOAD_HOURLY_BYTES_LIMIT,
+    TRACE_UPLOAD_RATE_LIMIT_MODE: process.env.TRACE_UPLOAD_RATE_LIMIT_MODE,
+    TRACE_BUNDLES: new S3TraceStorage({
+      endpoint: requiredEnv("R2_ENDPOINT"),
+      bucket: requiredEnv("R2_BUCKET"),
+      accessKeyId: requiredEnv("R2_ACCESS_KEY_ID"),
+      secretAccessKey: requiredEnv("R2_SECRET_ACCESS_KEY"),
+      region: process.env.R2_REGION,
+    }),
+  } satisfies TraceUploadRuntimeEnv & TraceUploadWorkerEnv;
+}

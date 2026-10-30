@@ -1,15 +1,14 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
-import { closeTestDatabase, openTestDatabase } from "../test/integration/database.js";
+import { dbTest as test } from "../test/integration/dbTest";
+import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { afterEach, beforeEach } from "vitest";
 import { eq } from "drizzle-orm";
 import type { ManagedMcpCallRequest } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
-import { integrationAuditEvents, managedMcpCredentials, managedMcpServers, users } from "../db/schema.js";
-import { createAgent } from "./agentService.js";
-import { createServer } from "./serverService.js";
-import { decryptManagedMcpHeaders } from "./managedMcpCredentialService.js";
+import { getDb } from "../db/index";
+import { integrationAuditEvents, managedMcpCredentials, managedMcpServers, users } from "../db/schema";
+import { createAgent } from "./agentService";
+import { createServer } from "./serverService";
+import { decryptManagedMcpHeaders } from "./managedMcpCredentialService";
 import {
   applyManagedMcpAssignments,
   createManagedMcpServer,
@@ -21,7 +20,7 @@ import {
   setManagedMcpAssignment,
   testManagedMcpConfiguration,
   updateManagedMcpServer,
-} from "./managedMcpService.js";
+} from "./managedMcpService";
 
 
 const originalCredentialKey = process.env.SLOCK_MCP_CREDENTIAL_KEY;
@@ -439,6 +438,34 @@ test("managed MCP assignments reject tools outside the current catalog", async (
     enabled: true,
     allowedTools: ["not-present"],
   }), /outside the current catalog/u);
+});
+
+test("a not-connected OAuth connector is listed as unavailable (reconnect_required), with no tools, unless the agent's assignment is off", async () => {
+  const { user, server, agent } = await seed();
+  const notion = await createManagedMcpServer({
+    serverId: server.id,
+    userId: user.id,
+    name: "Notion",
+    provider: "notion",
+    authMode: "oauth",
+    endpointUrl: "https://mcp.notion.com/mcp",
+  });
+  const toolCatalog = [{ name: "search", inputSchema: { type: "object" as const, properties: {} } }];
+  await getDb().update(managedMcpServers).set({ toolCatalog, catalogVersion: 1, oauthStatus: "error" }).where(eq(managedMcpServers.id, notion.id));
+
+  const broken = await getManagedMcpRuntimeSnapshot(server.id, agent.id);
+  assert.deepEqual(broken.tools, [], "an unusable connector contributes no tools");
+  assert.deepEqual(broken.unavailable, [{ mcpServerId: notion.id, serverName: "Notion", status: "reconnect_required" }]);
+
+  await getDb().update(managedMcpServers).set({ oauthStatus: "connected" }).where(eq(managedMcpServers.id, notion.id));
+  const connected = await getManagedMcpRuntimeSnapshot(server.id, agent.id);
+  assert.deepEqual(connected.tools.map((t) => t.toolName), ["search"]);
+  assert.equal("unavailable" in connected, false, "absent when nothing is unavailable");
+
+  // An agent whose assignment turned this connector off is not told about it.
+  await setManagedMcpAssignment({ serverId: server.id, userId: user.id, agentId: agent.id, mcpServerId: notion.id, enabled: false, allowedTools: null });
+  await getDb().update(managedMcpServers).set({ oauthStatus: "disconnected" }).where(eq(managedMcpServers.id, notion.id));
+  assert.equal("unavailable" in await getManagedMcpRuntimeSnapshot(server.id, agent.id), false);
 });
 
 test("managed MCP assignments reject disconnected OAuth connections", async () => {

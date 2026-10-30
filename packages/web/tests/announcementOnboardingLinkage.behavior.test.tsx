@@ -1,3 +1,4 @@
+import { MemoryRouter } from "react-router-dom";
 /**
  * Onboarding ⇄ announcement exclusivity (task #4, items ② and ③).
  *
@@ -14,7 +15,6 @@
  * (Cindy, 2026-08-07); after a reload the user is by definition on a new entry.
  */
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { readFileSync } from "node:fs";
 import "./helpers/domSetup";
 import { cleanup, render, screen } from "@testing-library/react";
@@ -51,9 +51,9 @@ function suppressionForServer(): boolean {
 function renderAsMainLayoutDoes() {
   const suppressed = suppressionForServer();
   return render(
-    <TestIntlProvider>
+    <MemoryRouter><TestIntlProvider>
       <AnnouncementModal suppressed={suppressed} />
-    </TestIntlProvider>,
+    </TestIntlProvider></MemoryRouter>,
   );
 }
 
@@ -80,8 +80,8 @@ test("an unresolved gate suppresses announcements rather than flashing them", ()
   assert.equal(suppressionForServer(), true);
 });
 
-test("a settled user with no onboarding this session sees announcements", (t) => {
-  t.mock.method(api, "post", async () => ({ data: {} }));
+test("a settled user with no onboarding this session sees announcements", () => {
+  vi.spyOn(api, "post").mockImplementation(async () => ({ data: {} }));
   useAnnouncementStore.setState({ pending: [announcement], loaded: true });
   useOnboardingAnnouncementGateStore.getState().setForServer(SERVER, "ready");
 
@@ -115,8 +115,8 @@ test("switching away and back does not launder away the next-entry rule", () => 
   assert.equal(suppressionForServer(), true);
 });
 
-test("a server that never blocked is not marked, so other servers stay unaffected", (t) => {
-  t.mock.method(api, "post", async () => ({ data: {} }));
+test("a server that never blocked is not marked, so other servers stay unaffected", () => {
+  vi.spyOn(api, "post").mockImplementation(async () => ({ data: {} }));
   const gate = useOnboardingAnnouncementGateStore.getState();
   gate.setForServer("other-server", "blocked");
   gate.setForServer(SERVER, "pending");
@@ -130,8 +130,8 @@ test("a server that never blocked is not marked, so other servers stay unaffecte
   assert.equal(shouldSuppressAnnouncements("ready", false), false);
 });
 
-test("MainLayout derives suppression from the shared helper, not a local comparison", (t) => {
-  t.mock.method(api, "post", async () => ({ data: {} }));
+test("MainLayout derives suppression from the shared helper, not a local comparison", () => {
+  vi.spyOn(api, "post").mockImplementation(async () => ({ data: {} }));
   // Source pin, and named as one. The harness above mirrors MainLayout's
   // binding; without this, someone could rewrite MainLayout to
   // `suppressed={gateState !== "ready"}` — dropping the next-entry rule — and

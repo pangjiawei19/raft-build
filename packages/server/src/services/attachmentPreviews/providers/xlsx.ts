@@ -1,16 +1,16 @@
 import { crc32, inflateRawSync } from "node:zlib";
 import * as XLSX from "xlsx";
 import { XLSX_PREVIEW_MAX_FILE_SIZE_BYTES, type XlsxAttachmentPreviewData, type XlsxSheetPreviewData } from "@botiverse/raft-shared";
-import type { AttachmentPreviewProvider } from "../types.js";
+import type { AttachmentPreviewProvider } from "../types";
 
 export const XLSX_PREVIEW_BYTE_LIMIT = XLSX_PREVIEW_MAX_FILE_SIZE_BYTES;
 export const XLSX_PREVIEW_PAYLOAD_BYTE_LIMIT = 64 * 1024;
-export const XLSX_PREVIEW_MAX_SHEETS = 20;
+export const XLSX_PREVIEW_MAX_SHEETS = 5;
 export const XLSX_PREVIEW_MAX_ROWS = 200;
 export const XLSX_PREVIEW_MAX_COLUMNS = 20;
 export const XLSX_PREVIEW_MAX_CELLS = 10_000;
 const XLSX_MAX_ZIP_ENTRIES = 512;
-const XLSX_MAX_UNCOMPRESSED_BYTES = 64 * 1024 * 1024;
+const XLSX_MAX_UNCOMPRESSED_BYTES = 32 * 1024 * 1024;
 const XLSX_MAX_ENTRY_UNCOMPRESSED_BYTES = 16 * 1024 * 1024;
 
 const XLSX_MIME_TYPES = new Set([
@@ -235,6 +235,8 @@ export function buildXlsxPreview(buffer: Buffer): XlsxAttachmentPreviewData | nu
       bookSheets: false,
       bookVBA: false,
       sheetRows: XLSX_PREVIEW_MAX_ROWS + 1,
+      // Only the sheets that are shown are parsed; SheetNames still lists all.
+      sheets: Array.from({ length: XLSX_PREVIEW_MAX_SHEETS }, (_, index) => index),
     });
     const allNames = workbook.SheetNames;
     const names = allNames.slice(0, XLSX_PREVIEW_MAX_SHEETS);
@@ -245,17 +247,35 @@ export function buildXlsxPreview(buffer: Buffer): XlsxAttachmentPreviewData | nu
       sheetCount: allNames.length,
       truncated: allNames.length > XLSX_PREVIEW_MAX_SHEETS || sheets.some((sheet) => sheet.truncated),
     };
-    while (Buffer.byteLength(JSON.stringify(preview), "utf8") > XLSX_PREVIEW_PAYLOAD_BYTE_LIMIT) {
-      const target = [...preview.sheets].reverse().find((sheet) => sheet.rows.length > 0);
-      if (!target) return null;
-      target.rows.pop();
-      target.truncated = true;
-      preview.truncated = true;
-    }
-    return preview;
+    return fitXlsxPreviewToPayloadCap(preview, XLSX_PREVIEW_PAYLOAD_BYTE_LIMIT);
   } catch {
     return null;
   }
+}
+
+/**
+ * Drop trailing rows (last sheet first) until the serialized preview fits.
+ * Each row's size is measured once and subtracted, so this is linear in the
+ * preview size; re-serializing the whole preview per dropped row was quadratic
+ * and took ~1 s for a 0.26 MB workbook (task #19). The estimate never
+ * undercounts (flipping a `truncated` flag to true only shortens the JSON),
+ * and the result is verified with one final serialization.
+ */
+export function fitXlsxPreviewToPayloadCap(preview: XlsxAttachmentPreviewData, cap: number): XlsxAttachmentPreviewData | null {
+  let size = Buffer.byteLength(JSON.stringify(preview), "utf8");
+  if (size <= cap) return preview;
+  for (let index = preview.sheets.length - 1; index >= 0 && size > cap; index -= 1) {
+    const sheet = preview.sheets[index];
+    while (sheet.rows.length > 0 && size > cap) {
+      const row = sheet.rows.pop()!;
+      // The row's JSON plus the comma that separated it from its neighbour.
+      size -= Buffer.byteLength(JSON.stringify(row), "utf8") + (sheet.rows.length > 0 ? 1 : 0);
+      sheet.truncated = true;
+      preview.truncated = true;
+    }
+  }
+  if (size > cap) return null;
+  return Buffer.byteLength(JSON.stringify(preview), "utf8") <= cap ? preview : null;
 }
 
 export const xlsxPreviewProvider: AttachmentPreviewProvider<XlsxAttachmentPreviewData> = {

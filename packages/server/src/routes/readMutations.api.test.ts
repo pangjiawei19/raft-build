@@ -1,13 +1,14 @@
-import { fixturePasswordHash } from "../test/integration/credentials.js";
-import { createApiTest } from "../test/integration/apiTest.js";
+import { fixturePasswordHash } from "../test/integration/credentials";
+import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
 import { and, eq } from "drizzle-orm";
 
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   channelHumans,
+  featureFlags,
   channels,
   inboxSuppressionStates,
   messages,
@@ -17,18 +18,18 @@ import {
   userChannelInboxStates,
   userChannelReadCursors,
   users,
-} from "../db/schema.js";
-import { createServer } from "../services/serverService.js";
+} from "../db/schema";
+import { createServer } from "../services/serverService";
 import {
   admitReadMutation,
   claimNextReadMutation,
   executeReadMutationClaim,
   getReadMutationFrontier,
   READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV,
-} from "../services/readMutationSequencer.js";
-import { openTestApp } from "../test/integration/app.js";
+} from "../services/readMutationSequencer";
+import { openTestApp } from "../test/integration/app";
 
-const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const test = createApiTest({ sidebarMarkAllReadFlagDefaultEnabled: true, humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 
 async function login(baseUrl: string, email: string): Promise<string> {
   const response = await fetch(`${baseUrl}/api/auth/login`, {
@@ -762,4 +763,44 @@ test("post-persist thread reply stays successful and exact when its read receipt
     else process.env[READ_MUTATION_COMPATIBILITY_WAIT_MS_ENV] = previousWait;
     await app.close();
   }
+});
+
+test("sidebar conversation read-all derives the receiver and server from auth and returns every bounded scope", async ({ app }) => {
+  const db = getDb();
+  const [owner, other] = await db.insert(users).values([
+    { email: `conversation-owner-${randomUUID()}@test.invalid`, name: `conversation-owner-${randomUUID()}`, passwordHash: await fixturePasswordHash("password123"), emailVerified: true, profileSetupCompletedAt: new Date() },
+    { email: `conversation-other-${randomUUID()}@test.invalid`, name: `conversation-other-${randomUUID()}`, passwordHash: "x", emailVerified: true },
+  ]).returning();
+  const server = await createServer("Conversation reads", `conversation-${randomUUID()}`, owner.id);
+  const foreignServer = await createServer("Other conversation server", `conversation-other-${randomUUID()}`, owner.id);
+  const [parent] = await db.select().from(channels).where(eq(channels.serverId, server.id)).limit(1);
+  await db.insert(channelHumans).values({ channelId: parent.id, userId: owner.id }).onConflictDoNothing();
+  const [message] = await db.insert(messages).values({ channelId: parent.id, senderType: "user", senderId: other.id, content: "parent", seq: 1 }).returning();
+  const [thread] = await db.insert(channels).values({ serverId: server.id, name: "followed", type: "thread", parentMessageId: message.id }).returning();
+  await db.insert(messages).values({ channelId: thread.id, senderType: "user", senderId: other.id, content: "reply", seq: 2 });
+  await db.insert(threadFollows).values({ followerType: "user", followerId: owner.id, threadChannelId: thread.id, parentMessageId: message.id, reason: "manual" });
+  const token = await login(app.baseUrl, owner.email);
+  const endpoint = `${app.baseUrl}/api/channels/${parent.id}/conversation-read-all`;
+  await db.update(featureFlags).set({ defaultEnabled: false }).where(eq(featureFlags.key, "sidebar_mark_all_read_v0"));
+  const disabled = await fetch(endpoint, { method: "POST", headers: authHeaders(token, server.id) });
+  assert.equal(disabled.status, 404);
+  const generic = await fetch(`${app.baseUrl}/api/read-mutations`, {
+    method: "POST", headers: authHeaders(token, server.id),
+    body: JSON.stringify({ mutationId: randomUUID(), kind: "conversation_read_all", scopeId: parent.id }),
+  });
+  assert.equal(generic.status, 400, "generic admission must not bypass the conversation rollout gate");
+  assert.equal((await db.select().from(readMutations)).length, 0, "disabled gate must not admit a new kind");
+  await db.update(featureFlags).set({ defaultEnabled: true }).where(eq(featureFlags.key, "sidebar_mark_all_read_v0"));
+  const crossServer = await fetch(endpoint, { method: "POST", headers: authHeaders(token, foreignServer.id) });
+  assert.equal(crossServer.status, 404, await crossServer.clone().text());
+  const response = await fetch(endpoint, {
+    method: "POST", headers: authHeaders(token, server.id),
+    body: JSON.stringify({ receiver: { kind: "human", id: other.id } }),
+  });
+  assert.equal(response.status, 200, await response.clone().text());
+  const body = await response.json() as { serverId: string; scopes: Array<{ scopeId: string; maxReadSeq: number; readStateVersion: number }> };
+  assert.equal(body.serverId, server.id);
+  assert.deepEqual(body.scopes.map((scope) => [scope.scopeId, scope.maxReadSeq]).sort(), [[parent.id, 1], [thread.id, 2]].sort());
+  assert.ok(body.scopes.every((scope) => scope.readStateVersion > 0));
+  assert.equal((await db.select().from(userChannelReadCursors).where(eq(userChannelReadCursors.userId, other.id))).length, 0);
 });

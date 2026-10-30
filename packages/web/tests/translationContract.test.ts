@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { createElement } from "react";
 import { act, cleanup, render, waitFor } from "@testing-library/react";
 
@@ -20,9 +19,11 @@ import {
   normalizeTranslationLanguageCode,
   useTranslationStore,
 } from "../src/store/translationStore";
-import { shouldHideTranslationIndicator } from "../src/utils/translationContract.js";
+import { getPublicPersonalSettingsTabIds, shouldHideTranslationIndicator } from "../src/utils/translationContract";
 
 const originalGet = api.get;
+const originalPost = api.post;
+const originalPatch = api.patch;
 
 class MemoryStorage {
   private readonly map = new Map<string, string>();
@@ -43,6 +44,8 @@ class MemoryStorage {
 afterEach(() => {
   cleanup();
   api.get = originalGet;
+  api.post = originalPost;
+  api.patch = originalPatch;
   useAuthStore.setState(useAuthStore.getInitialState(), true);
   useServerStore.setState(useServerStore.getInitialState(), true);
   useTranslationStore.setState(useTranslationStore.getInitialState(), true);
@@ -63,6 +66,13 @@ test("quota and provider failures remain visible translation states", () => {
   assert.equal(shouldHideTranslationIndicator("failed", "provider_timeout"), false);
   assert.equal(shouldHideTranslationIndicator("failed", "placeholder"), false);
   assert.equal(shouldHideTranslationIndicator("translated", null), false);
+});
+
+test("public settings always expose Appearance and expose Languages only when translation is enabled", () => {
+  assert.deepEqual(getPublicPersonalSettingsTabIds({ authenticated: false, translationEnabled: false }), ["appearance"]);
+  assert.deepEqual(getPublicPersonalSettingsTabIds({ authenticated: true, translationEnabled: false }), ["account", "appearance"]);
+  assert.deepEqual(getPublicPersonalSettingsTabIds({ authenticated: false, translationEnabled: true }), ["language-region", "appearance"]);
+  assert.deepEqual(getPublicPersonalSettingsTabIds({ authenticated: true, translationEnabled: true }), ["account", "language-region", "appearance"]);
 });
 
 test("translation language and timezone options execute the normalized API contract", () => {
@@ -176,6 +186,7 @@ test("new users default off while the settings loader preserves the legacy auto 
   assert.equal(useTranslationStore.getInitialState().settings.preferredTranslationMode, "off");
   assert.equal(useTranslationStore.getInitialState().settings.autoTranslationEnabled, false);
 
+  useAuthStore.setState({ user: null } as never); // no signed-in user yet: the loader fetches it
   api.get = (async (url: string) => {
     if (url === "/auth/me") {
       return { data: { id: "legacy-user", preferredTranslationMode: null, autoTranslationEnabled: true } };
@@ -189,4 +200,103 @@ test("new users default off while the settings loader preserves the legacy auto 
   await useTranslationStore.getState().loadSettings("server-1");
   assert.equal(useTranslationStore.getState().settings.preferredTranslationMode, "auto");
   assert.equal(useTranslationStore.getState().settings.autoTranslationEnabled, true);
+});
+
+test("settings reuse the signed-in user from the auth store instead of re-fetching /auth/me (task #17)", async () => {
+  useTranslationStore.setState(useTranslationStore.getInitialState(), true);
+  useAuthStore.setState({
+    user: { id: "viewer-1", preferredLanguage: "ja", preferredTranslationMode: "auto", autoTranslationEnabled: true },
+  } as never);
+  const gets: string[] = [];
+  api.get = (async (url: string) => {
+    gets.push(url);
+    if (url === "/servers/server-1/translation-settings") {
+      return { data: { translationEnabled: true, translationAvailable: true } };
+    }
+    throw new Error(`Unexpected GET ${url}`);
+  }) as typeof api.get;
+
+  await useTranslationStore.getState().loadSettings("server-1");
+  assert.deepEqual(gets, ["/servers/server-1/translation-settings"], "no second /auth/me while the user is known");
+  assert.equal(useTranslationStore.getState().settings.preferredTranslationMode, "auto");
+  assert.equal(useTranslationStore.getState().settings.preferredLanguage, "ja");
+});
+
+test("settings fetch the user when the auth store has none and publish it there", async () => {
+  useTranslationStore.setState(useTranslationStore.getInitialState(), true);
+  useAuthStore.setState({ user: null } as never);
+  api.get = (async (url: string) => {
+    if (url === "/auth/me") return { data: { id: "viewer-2", preferredLanguage: "fr" } };
+    if (url === "/servers/server-1/translation-settings") return { data: { translationEnabled: false } };
+    throw new Error(`Unexpected GET ${url}`);
+  }) as typeof api.get;
+
+  await useTranslationStore.getState().loadSettings("server-1");
+  assert.equal(useTranslationStore.getState().settings.preferredLanguage, "fr");
+  assert.equal(useAuthStore.getState().user?.id, "viewer-2");
+});
+
+test("anonymous public translation preferences stay browser-local and requests use the public endpoint", async () => {
+  const storage = new MemoryStorage();
+  Object.defineProperty(globalThis, "localStorage", { value: storage, configurable: true });
+  useTranslationStore.setState(useTranslationStore.getInitialState(), true);
+  useAuthStore.setState({ user: null } as never);
+  const writes: string[] = [];
+  api.get = (async (url: string) => { throw new Error(`Unexpected GET ${url}`); }) as typeof api.get;
+  api.patch = (async (url: string) => { throw new Error(`Unexpected PATCH ${url}`); }) as typeof api.patch;
+  api.post = (async (url: string) => {
+    writes.push(url);
+    return { data: { results: [{ messageId: "m-public", status: "not_found", targetLanguage: "en" }] } };
+  }) as typeof api.post;
+
+  await useTranslationStore.getState().loadSettings("server-public", {
+    serverSlug: "public-slug",
+    translationEnabled: true,
+    translationAvailable: true,
+    browserLocalPreferences: true,
+  });
+  await useTranslationStore.getState().updatePreferredTranslationMode("manual");
+  await useTranslationStore.getState().updatePreferredLanguage("en");
+  assert.match(storage.getItem("raft:public-translation-preferences:v1") ?? "", /"preferredTranslationMode":"manual"/);
+
+  await useTranslationStore.getState().requestTranslations([{
+    id: "m-public",
+    channelId: "c-public",
+    senderType: "agent",
+    senderId: "public-agent",
+    messageType: "chat",
+    content: "你好",
+    createdAt: new Date().toISOString(),
+  } as Message], { targetLanguage: "en", force: true });
+  assert.deepEqual(writes, ["/public/servers/public-slug/message-translations:batch"]);
+});
+
+test("leaving a public page for the same member server clears public translation routing and persistence", async () => {
+  Object.defineProperty(globalThis, "localStorage", { value: new MemoryStorage(), configurable: true });
+  useTranslationStore.setState(useTranslationStore.getInitialState(), true);
+  useAuthStore.setState({ user: null } as never);
+  await useTranslationStore.getState().loadSettings("same-server", {
+    serverSlug: "same-slug",
+    translationEnabled: true,
+    translationAvailable: true,
+    browserLocalPreferences: true,
+  });
+  assert.equal(useTranslationStore.getState().publicTranslationSlug, "same-slug");
+  assert.equal(useTranslationStore.getState().browserLocalPreferences, true);
+
+  useAuthStore.setState({ user: { id: "member", preferredLanguage: "ja", preferredTranslationMode: "manual" } } as never);
+  const gets: string[] = [];
+  api.get = (async (url: string) => {
+    gets.push(url);
+    if (url === "/servers/same-server/translation-settings") {
+      return { data: { translationEnabled: true, translationAvailable: true } };
+    }
+    throw new Error(`Unexpected GET ${url}`);
+  }) as typeof api.get;
+
+  await useTranslationStore.getState().loadSettings("same-server");
+  assert.deepEqual(gets, ["/servers/same-server/translation-settings"]);
+  assert.equal(useTranslationStore.getState().publicTranslationSlug, null);
+  assert.equal(useTranslationStore.getState().browserLocalPreferences, false);
+  assert.equal(useTranslationStore.getState().settings.preferredLanguage, "ja");
 });

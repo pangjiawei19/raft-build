@@ -1,4 +1,4 @@
-import { createApiTest } from "./test/integration/apiTest.js";
+import { createApiTest } from "./test/integration/apiTest";
 import assert from "node:assert/strict";
 
 
@@ -34,6 +34,12 @@ test("unmatched app routes return a noindex JSON 404", async ({ app }) => {
     code: "not_found",
     path: "/api/not-a-real-path",
   });
+});
+
+test("livez answers without a database probe running and stays separate from /health", async ({ app }) => {
+  const livez = await fetch(`${app.baseUrl}/livez`);
+  assert.equal(livez.status, 200);
+  assert.deepEqual(await livez.json(), { status: "ok", ok: true, db: "unmonitored", msSinceDbSuccess: null });
 });
 
 test("health keeps its JSON body and carries the API noindex header", async ({ app }) => {

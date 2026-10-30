@@ -9,6 +9,7 @@ import {
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readContractRevision } from "./contract-revision.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, "..");
@@ -122,11 +123,19 @@ const unions = [...namespace.unions.values()]
   .filter((type) => !isTemplateDeclaration(type))
   .sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
 
+const { contract, revision } = await readContractRevision();
+
 const blocks = [
   "// Generated directly from activity-sync.tsp via the TypeSpec compiler semantic graph.",
   "// DO NOT EDIT. JSON Schema and OpenAPI are parallel outputs, not inputs.",
   "// Runtime raw-byte validation remains mandatory; TypeScript types are erased.",
   "",
+  [
+    "/** Wire contract identity, compared with the server-reported contract (X-Raft-Contract header, follow-up to task #3). */",
+    `export const ACTIVITY_SYNC_CONTRACT = "${contract}" as const;`,
+    "/** Contract revision from revisions.json; enable the sync engine only when the server reports exactly this revision. */",
+    `export const ACTIVITY_SYNC_CONTRACT_REVISION = ${revision} as const;`,
+  ].join("\n"),
   ...scalars.map(renderScalar),
   ...enums.map(renderEnum),
   ...models.map(renderModel),

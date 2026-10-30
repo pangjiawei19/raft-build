@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 
-import { and, desc, eq, gt, lte, not, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, lte, not, sql } from "drizzle-orm";
 
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   agents,
   attestedSendEvents,
@@ -11,8 +11,8 @@ import {
   messageMentions,
   messages,
   users,
-} from "../db/schema.js";
-import { addTraceEvent } from "../tracing/semanticTrace.js";
+} from "../db/schema";
+import { addTraceEvent } from "../tracing/semanticTrace";
 
 export type AttestedSendEventType = "gate_triggered" | "continue" | "silence" | "e1_exempt";
 export type AttestedSendTargetType = "channel" | "dm" | "thread";
@@ -33,14 +33,59 @@ type EventMetadata = Record<string, unknown>;
 const targetFreshnessGates = new Map<string, Promise<void>>();
 
 export type FreshnessMessageAnchorOptions = {
+  /**
+   * The sending actor. Its own messages are excluded, and so are system
+   * notices the server recorded as caused by it (`causal_actor_*`) whose kind
+   * is in SELF_CAUSED_FRESHNESS_EXEMPT_SUBTYPES. Everything else still counts:
+   * notices by anyone else, with no recorded causal actor, or of any other kind.
+   */
   excludeSender?: {
     senderType: "user" | "agent";
     senderId: string;
   };
 };
 
+/**
+ * System notice kinds that do not hold their own causal actor's send. A kind is
+ * listed only when every field of its text is either in the actor's request,
+ * in the successful response to that request, or the actor's own name
+ * (#proj-runtime task #1255). This is not proof the actor read the response.
+ * Not listed, so they keep holding: `task.lifecycle_thread` (its text carries
+ * the task title; the status-update response does not) and `channel.rename`
+ * (its "from" name is read outside the update lock and is not returned). A new
+ * kind holds until someone checks it and adds it here.
+ */
+export const SELF_CAUSED_FRESHNESS_EXEMPT_SUBTYPES = [
+  "agent.join_channel",
+  "channel.agent_membership",
+  "channel.human_membership",
+  "channel.archive",
+  "channel.unarchive",
+  "task.created_summary",
+  "task.assignment_receipt",
+  "task.converted_summary",
+] as const;
+
+function excludeSenderConditions(excludeSender: NonNullable<FreshnessMessageAnchorOptions["excludeSender"]>) {
+  return [
+    not(and(
+      eq(messages.senderType, excludeSender.senderType),
+      eq(messages.senderId, excludeSender.senderId),
+    )!),
+    // COALESCE: a NULL causal actor must keep the row, not drop it.
+    sql`NOT COALESCE(
+      ${messages.messageType} = 'system'
+      AND ${messages.causalActorType} = ${excludeSender.senderType}
+      AND ${messages.causalActorId} = ${excludeSender.senderId}
+      AND ${messages.systemSubtype} IN (${sql.join(SELF_CAUSED_FRESHNESS_EXEMPT_SUBTYPES.map((subtype) => sql`${subtype}`), sql`, `)}),
+      false
+    )`,
+  ];
+}
+
 export type FreshnessMessageRangeOptions = FreshnessMessageAnchorOptions & {
   latestSeq?: number;
+  excludeExactSeqs?: number[];
 };
 
 export type FreshnessMessageAnchor = {
@@ -59,12 +104,17 @@ export type AgentAttentionMessageOptions = FreshnessMessageRangeOptions;
 function messageAnchorConditions(channelId: string, options?: FreshnessMessageAnchorOptions) {
   const conditions = [eq(messages.channelId, channelId)];
   if (options?.excludeSender) {
-    conditions.push(not(and(
-      eq(messages.senderType, options.excludeSender.senderType),
-      eq(messages.senderId, options.excludeSender.senderId),
-    )!));
+    conditions.push(...excludeSenderConditions(options.excludeSender));
   }
   return conditions;
+}
+
+function normalizedExactSeqs(seqs: number[] | undefined, afterSeq = 0): number[] {
+  if (!seqs) return [];
+  return [...new Set(seqs
+    .map((seq) => Math.floor(Number(seq)))
+    .filter((seq) => Number.isInteger(seq) && seq > afterSeq))]
+    .slice(0, 2_500);
 }
 
 export async function withTargetFreshnessGate<T>(channelId: string, work: () => Promise<T>): Promise<T> {
@@ -142,6 +192,12 @@ export async function recordGateTriggered(
     boundarySource?: string;
     boundarySeq?: number;
     latestSeq?: number;
+    /** The held write (`send`, `task_claim`, ...); older rows have none and are sends. */
+    action?: string;
+    /** The conversation's channel id: a task write's rerun finds its hold by it. */
+    channelId?: string;
+    /** Which write was held (action and task): only its own rerun is covered by the hold. */
+    writeKey?: string;
   },
 ): Promise<void> {
   await recordEvent(
@@ -155,6 +211,9 @@ export async function recordGateTriggered(
       boundary_source: metadata.boundarySource,
       boundary_seq: metadata.boundarySeq,
       latest_seq: metadata.latestSeq,
+      ...(metadata.action ? { action: metadata.action } : {}),
+      ...(metadata.channelId ? { channel_id: metadata.channelId } : {}),
+      ...(metadata.writeKey ? { write_key: metadata.writeKey } : {}),
       copy_variant: ATTESTED_SEND_HOLD_COPY_VARIANT,
       available_actions: [...ATTESTED_SEND_HOLD_AVAILABLE_ACTIONS],
     },
@@ -256,6 +315,8 @@ export async function countMessagesAfterSeq(
   const db = getDb();
   const conditions = messageAnchorConditions(channelId, options);
   conditions.push(gt(messages.seq, seq));
+  const excludedSeqs = normalizedExactSeqs(options?.excludeExactSeqs, seq);
+  if (excludedSeqs.length > 0) conditions.push(not(inArray(messages.seq, excludedSeqs)));
   if (typeof options?.latestSeq === "number" && Number.isFinite(options.latestSeq)) {
     conditions.push(lte(messages.seq, Math.max(0, Math.floor(options.latestSeq))));
   }
@@ -276,6 +337,8 @@ export async function listRecentMessagesAfterSeq(
   const db = getDb();
   const conditions = messageAnchorConditions(channelId, options);
   conditions.push(gt(messages.seq, seq));
+  const excludedSeqs = normalizedExactSeqs(options?.excludeExactSeqs, seq);
+  if (excludedSeqs.length > 0) conditions.push(not(inArray(messages.seq, excludedSeqs)));
   if (typeof options?.latestSeq === "number" && Number.isFinite(options.latestSeq)) {
     conditions.push(lte(messages.seq, Math.max(0, Math.floor(options.latestSeq))));
   }
@@ -306,11 +369,12 @@ function agentAttentionConditions(
   if (typeof options?.latestSeq === "number" && Number.isFinite(options.latestSeq)) {
     conditions.push(lte(inboxNotificationFacts.messageSeq, Math.max(0, Math.floor(options.latestSeq))));
   }
+  const excludedSeqs = normalizedExactSeqs(options?.excludeExactSeqs, seq);
+  if (excludedSeqs.length > 0) {
+    conditions.push(not(inArray(inboxNotificationFacts.messageSeq, excludedSeqs)));
+  }
   if (options?.excludeSender) {
-    conditions.push(not(and(
-      eq(messages.senderType, options.excludeSender.senderType),
-      eq(messages.senderId, options.excludeSender.senderId),
-    )!));
+    conditions.push(...excludeSenderConditions(options.excludeSender));
   }
   return conditions;
 }
@@ -437,7 +501,13 @@ export async function getThreadParentMessage(channelId: string): Promise<{
   };
 }
 
-export async function getFormalMentionFacts(agentId: string, channelId: string, lastSeenSeq: number, latestSeq: number): Promise<{
+export async function getFormalMentionFacts(
+  agentId: string,
+  channelId: string,
+  lastSeenSeq: number,
+  latestSeq: number,
+  excludeExactSeqs?: number[],
+): Promise<{
   count: number;
   firstMessageId: string | null;
   firstHandle: string | null;
@@ -446,20 +516,23 @@ export async function getFormalMentionFacts(agentId: string, channelId: string, 
     return { count: 0, firstMessageId: null, firstHandle: null };
   }
   const db = getDb();
+  const conditions = [
+    eq(messageMentions.targetType, "agent"),
+    eq(messageMentions.targetId, agentId),
+    eq(messageMentions.channelId, channelId),
+    sql`(${messageMentions.notifiableAtSend} OR ${messageMentions.notifiedAt} IS NOT NULL)`,
+    gt(messageMentions.messageSeq, lastSeenSeq),
+    lte(messageMentions.messageSeq, latestSeq),
+  ];
+  const excludedSeqs = normalizedExactSeqs(excludeExactSeqs, lastSeenSeq);
+  if (excludedSeqs.length > 0) conditions.push(not(inArray(messageMentions.messageSeq, excludedSeqs)));
   const rows = await db
     .select({
       messageId: messageMentions.messageId,
       handleAtSendTime: messageMentions.handleAtSendTime,
     })
     .from(messageMentions)
-    .where(and(
-      eq(messageMentions.targetType, "agent"),
-      eq(messageMentions.targetId, agentId),
-      eq(messageMentions.channelId, channelId),
-      sql`(${messageMentions.notifiableAtSend} OR ${messageMentions.notifiedAt} IS NOT NULL)`,
-      gt(messageMentions.messageSeq, lastSeenSeq),
-      lte(messageMentions.messageSeq, latestSeq),
-    ))
+    .where(and(...conditions))
     .orderBy(messageMentions.messageSeq);
 
   return {
@@ -467,6 +540,39 @@ export async function getFormalMentionFacts(agentId: string, channelId: string, 
     firstMessageId: rows[0]?.messageId ?? null,
     firstHandle: rows[0]?.handleAtSendTime ?? null,
   };
+}
+
+/** How long a task write's hold covers its rerun: one hold per catch-up (glimpse G2). */
+export const TASK_WRITE_REHOLD_WINDOW_MS = 10 * 60_000;
+
+/**
+ * This agent's newest hold of one write (`writeKey`: the action and its task)
+ * on a conversation within `withinMs`, or null. Matched by the channel id and
+ * write key recorded with the hold, so another write on the same board is
+ * never covered by it. The hold is a row, so a rerun on another replica finds
+ * it; the query reads only this agent's recent rows (agent_id, created_at).
+ */
+export async function getRecentGateTriggered(
+  agentId: string,
+  channelId: string,
+  writeKey: string,
+  withinMs: number,
+): Promise<{ latestSeq: number } | null> {
+  const db = getDb();
+  const [row] = await db
+    .select({ metadata: attestedSendEvents.metadata })
+    .from(attestedSendEvents)
+    .where(and(
+      eq(attestedSendEvents.agentId, agentId),
+      eq(attestedSendEvents.eventType, "gate_triggered"),
+      gt(attestedSendEvents.createdAt, new Date(Date.now() - withinMs)),
+      sql`${attestedSendEvents.metadata}->>'channel_id' = ${channelId}`,
+      sql`${attestedSendEvents.metadata}->>'write_key' = ${writeKey}`,
+    ))
+    .orderBy(desc(attestedSendEvents.createdAt))
+    .limit(1);
+  const latestSeq = Number((row?.metadata as { latest_seq?: unknown } | undefined)?.latest_seq);
+  return row && Number.isFinite(latestSeq) ? { latestSeq } : null;
 }
 
 export function __resetAttestedSendStateForTest(): void {

@@ -1,13 +1,13 @@
-import { useState } from "react";
-import type { FormEvent } from "react";
+import { useCallback, useState } from "react";
+import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useIntl } from "react-intl";
-import type { ReactNode } from "react";
+import { Button, Input, TextSans } from "@botiverse/raft-ui";
 import { useAuthStore } from "../../store/authStore";
 import { ArrowLeft } from "lucide-react";
 import AuthPageFrame, { AuthPageIntro } from "./AuthPageFrame";
-import Button from "../ui/Button";
 import Banner from "../ui/Banner";
 import FormField from "../ui/FormField";
+import TextLink from "../ui/TextLink";
 
 interface ForgotPasswordPageProps {
   onBack: () => void;
@@ -20,6 +20,10 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
   const [loading, setLoading] = useState(false);
   const [sent, setSent] = useState(false);
   const [error, setError] = useState("");
+
+  const handleEmailChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    setEmail(e.target.value);
+  }, []);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -40,7 +44,7 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
       <AuthPageFrame>
         <div className="w-full">
           <AuthPageIntro title={formatMessage({ id: "pages.forgotPassword.checkEmailTitle" })}>
-            <p className="mt-2 text-sm text-black/60">
+            <p className="mt-2 text-callout text-foreground-muted">
               {formatMessage(
                 { id: "pages.forgotPassword.sentTo" },
                 {
@@ -49,7 +53,7 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
                   // collide with the {email} VALUE above and silently win,
                   // rendering the function instead of the address.
                   addr: (c: ReactNode) => (
-                    <strong key="addr" className="font-mono text-sm">
+                    <strong key="addr" className="font-mono font-bold text-foreground">
                       {c}
                     </strong>
                   ),
@@ -60,9 +64,8 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
           <div className="mb-6" />
           <Button
             onClick={onBack}
-            size="lg"
-            shape="iconText"
-            tone="pink"
+            size="xl"
+            variant="accent"
             className="w-full"
           >
             <ArrowLeft size={16} />
@@ -82,24 +85,23 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
         />
 
         {error && (
-          <Banner intent="warning" className="mb-4 font-bold">{error}</Banner>
+          <Banner intent="warning" className="mb-4">{error}</Banner>
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4">
-          <FormField label={formatMessage({ id: "pages.forgotPassword.emailLabel" })} labelStyle="plain">
-            <input
+          <FormField label={formatMessage({ id: "pages.forgotPassword.emailLabel" })}>
+            <Input
               type="email"
               value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="w-full border-2 border-black p-2 text-base shadow-brutal-sm focus:shadow-brutal focus:outline-none"
+              onChange={handleEmailChange}
               required
             />
           </FormField>
           <Button
             type="submit"
             disabled={loading}
-            size="lg"
-            tone="pink"
+            size="xl"
+            variant="accent"
             className="w-full"
           >
             {loading
@@ -108,11 +110,11 @@ export default function ForgotPasswordPage({ onBack }: ForgotPasswordPageProps) 
           </Button>
         </form>
 
-        <p className="mt-4 text-center text-sm">
-          <button onClick={onBack} className="font-bold text-brutal-pink underline">
+        <TextSans size="small" className="mt-4 text-center">
+          <TextLink variant="primary" onClick={onBack}>
             {formatMessage({ id: "auth.backToSignIn.link" })}
-          </button>
-        </p>
+          </TextLink>
+        </TextSans>
       </div>
     </AuthPageFrame>
   );

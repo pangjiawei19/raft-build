@@ -1,5 +1,5 @@
-import type { AgentMessage } from "@botiverse/raft-shared";
-import type { AgentProxyVisibleMessage } from "./agentCredentialProxy.js";
+import { agentApiHistoryConsumptionScopeSchema, type AgentApiHistoryConsumptionScope, type AgentMessage } from "@botiverse/raft-shared";
+import type { AgentProxyVisibleMessage } from "./agentCredentialProxy";
 
 export type AgentVisibleDeliveryConsumeSource =
   | "spawn_wake_message"
@@ -27,8 +27,49 @@ export type AgentVisibleDeliveryConsumption = {
   shouldSuppress(message: AgentMessage): boolean;
 };
 
+type SeenMessage = { seq?: number; message_id?: string; id?: string };
+
+/**
+ * Model-seen facts as a freshness decision may use them: what the model has in
+ * front of it now, as evidence for a send's `seenUpToSeq` / `seenExactSeqs`
+ * and the task-claim preflight. Delivery suppression keeps using the
+ * process-wide queries; this view only narrows what counts as evidence.
+ */
+export type AgentVisibleFreshnessView = {
+  getBoundary(target: string): number | undefined;
+  isModelSeen(target: string, message: SeenMessage): boolean;
+  getExactSeenSeqs(target: string): number[];
+};
+
+/** Facts recorded while one RFC 072 context id was current. */
+type ContextScope = {
+  contextId: string;
+  boundaries: Map<string, number>;
+  ids: Map<string, Set<string>>;
+  exactSeqs: Map<string, Set<number>>;
+};
+
+const NO_FRESHNESS_EVIDENCE: AgentVisibleFreshnessView = {
+  getBoundary: () => undefined,
+  isModelSeen: () => false,
+  getExactSeenSeqs: () => [],
+};
+
 function getMessageShortId(messageId: string): string {
   return messageId.startsWith("thread-") ? messageId.slice(7) : messageId.slice(0, 8);
+}
+
+// History accepts short or full event IDs, including uppercase hex. Keep the
+// existing visible key, but validate a full address against the full event ID
+// before collapsing it; two different UUIDs may share the same short prefix.
+function eventIdFromTarget(target: string): string | undefined {
+  return /^agent-event:([0-9a-f]{8}(?:-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?)$/i
+    .exec(target)?.[1].toLowerCase();
+}
+
+function canonicalVisibleTarget(target: string): string {
+  const eventId = eventIdFromTarget(target);
+  return eventId ? `agent-event:${getMessageShortId(eventId)}` : target;
 }
 
 // Single source for the agent-visible target key (project-from-single-source, FM2
@@ -54,17 +95,20 @@ function computeTarget(
 }
 
 export function formatAgentMessageVisibleTarget(message: AgentMessage): string {
+  return formatProxyVisibleMessageTarget(message);
+}
+
+export function formatProxyVisibleMessageTarget(message: AgentProxyVisibleMessage): string {
+  // Third-party events retain synthetic DM metadata for transport, but their
+  // visible scope is the event. Use the same key for consumption and suppression.
   if (message.third_party_event) {
-    return `agent-event:${getMessageShortId(message.third_party_event.id)}`;
+    return `agent-event:${getMessageShortId(message.third_party_event.id.toLowerCase())}`;
   }
   return computeTarget(message.channel_type, message.channel_name, message.parent_channel_name, message.parent_channel_type);
 }
 
-export function formatProxyVisibleMessageTarget(message: AgentProxyVisibleMessage): string {
-  return computeTarget(message.channel_type, message.channel_name, message.parent_channel_name, message.parent_channel_type);
-}
-
 function hasTargetMetadata(message: AgentProxyVisibleMessage): boolean {
+  if (message.third_party_event) return true;
   if (message.channel_type === "thread") return Boolean(message.parent_channel_name && message.channel_name);
   return Boolean(message.channel_type && message.channel_name);
 }
@@ -73,6 +117,30 @@ function visibleMessageId(message: AgentProxyVisibleMessage | AgentMessage): str
   if (typeof (message as AgentProxyVisibleMessage).message_id === "string") return String((message as AgentProxyVisibleMessage).message_id);
   if (typeof (message as AgentProxyVisibleMessage).id === "string") return String((message as AgentProxyVisibleMessage).id);
   return "";
+}
+
+function isSeenIn(boundary: number | undefined, ids: ReadonlySet<string> | undefined, message: SeenMessage): boolean {
+  const seq = Number(message.seq ?? 0);
+  if (Number.isFinite(seq) && seq > 0 && typeof boundary === "number" && boundary >= Math.floor(seq)) return true;
+  const id = visibleMessageId(message);
+  return id.length > 0 && ids?.has(id) === true;
+}
+
+function sortedSeqs(seqs: ReadonlySet<number> | undefined): number[] {
+  return seqs ? [...seqs].sort((a, b) => a - b) : [];
+}
+
+function addCappedExactSeqs(map: Map<string, Set<number>>, target: string, seqs: Iterable<number>): void {
+  let targetSeqs = map.get(target);
+  if (!targetSeqs) {
+    targetSeqs = new Set<number>();
+    map.set(target, targetSeqs);
+  }
+  for (const seq of seqs) targetSeqs.add(seq);
+  if (targetSeqs.size > MAX_EXACT_SEEN_SEQS_PER_TARGET) {
+    const kept = [...targetSeqs].sort((a, b) => a - b).slice(-MAX_EXACT_SEEN_SEQS_PER_TARGET);
+    map.set(target, new Set(kept));
+  }
 }
 
 function canAdvanceBoundaryForTarget(source: string, target: string): boolean {
@@ -118,13 +186,63 @@ function canAdvanceBoundaryForTarget(source: string, target: string): boolean {
  * - No raw mutable state leak: callers get read-only boundary/id-set queries
  *   and must route every write through recordConsumed().
  */
+/**
+ * Cap on exact model-seen seqs kept per target (task #360). Matches the Server's
+ * per-send cap on `seenExactSeqs`; the newest seqs are kept.
+ */
+export const MAX_EXACT_SEEN_SEQS_PER_TARGET = 2_500;
+
 export class AgentVisibleDeliveryLedger {
   private readonly boundaryByAgent = new Map<string, Map<string, number>>();
   private readonly messageIdsByAgent = new Map<string, Map<string, Set<string>>>();
+  private readonly exactSeqsByAgent = new Map<string, Map<string, Set<number>>>();
+  private readonly contextScopeByAgent = new Map<string, ContextScope>();
 
   clearAgent(agentId: string): void {
     this.boundaryByAgent.delete(agentId);
     this.messageIdsByAgent.delete(agentId);
+    this.exactSeqsByAgent.delete(agentId);
+    this.contextScopeByAgent.delete(agentId);
+  }
+
+  /**
+   * Freshness evidence for `agentId` (glimpse G0). `context` is the RFC 072
+   * context signal the CLI honours (present when the launch has passive AX
+   * on), so the daemon and the CLI scope evidence identically. With a signal,
+   * only facts recorded under its id count — none when the id is unknown — so
+   * after a compaction what the model saw before it no longer vouches for a
+   * send or a claim. Without one, the facts stay process-wide, as before.
+   * Delivery suppression never reads this view: those facts must outlive a
+   * compaction.
+   */
+  freshnessView(agentId: string, context: { contextId: string | null } | undefined): AgentVisibleFreshnessView {
+    if (!context) {
+      return {
+        getBoundary: (target) => this.getBoundary(agentId, target),
+        isModelSeen: (target, message) => this.isModelSeen(agentId, target, message),
+        getExactSeenSeqs: (target) => this.getExactSeenSeqs(agentId, target),
+      };
+    }
+    const scope = this.contextScopeByAgent.get(agentId);
+    if (!context.contextId || scope?.contextId !== context.contextId) return NO_FRESHNESS_EVIDENCE;
+    return {
+      getBoundary: (target) => scope.boundaries.get(canonicalVisibleTarget(target)),
+      isModelSeen: (target, message) => {
+        const key = canonicalVisibleTarget(target);
+        return isSeenIn(scope.boundaries.get(key), scope.ids.get(key), message);
+      },
+      getExactSeenSeqs: (target) => sortedSeqs(scope.exactSeqs.get(canonicalVisibleTarget(target))),
+    };
+  }
+
+  /**
+   * Exact seqs this target's model has seen (task #360), ascending. They never
+   * advance the boundary; the send preflight hands the ones above the boundary
+   * to the Server as `seenExactSeqs`, which excludes exactly those rows from
+   * the unread count without assuming the gaps were read.
+   */
+  getExactSeenSeqs(agentId: string, target: string): number[] {
+    return sortedSeqs(this.exactSeqsByAgent.get(agentId)?.get(canonicalVisibleTarget(target)));
   }
 
   hasAgentState(agentId: string): boolean {
@@ -132,26 +250,43 @@ export class AgentVisibleDeliveryLedger {
   }
 
   getBoundary(agentId: string, target: string): number | undefined {
-    return this.boundaryByAgent.get(agentId)?.get(target);
+    return this.boundaryByAgent.get(agentId)?.get(canonicalVisibleTarget(target));
   }
 
   getMessageIdSet(agentId: string, target: string): Set<string> | undefined {
-    return this.messageIdsByAgent.get(agentId)?.get(target);
+    return this.messageIdsByAgent.get(agentId)?.get(canonicalVisibleTarget(target));
   }
 
-  isModelSeen(agentId: string, target: string, message: { seq?: number; message_id?: string; id?: string }): boolean {
-    const seq = Number(message.seq ?? 0);
-    const boundary = this.getBoundary(agentId, target);
-    if (Number.isFinite(seq) && seq > 0 && typeof boundary === "number" && boundary >= Math.floor(seq)) return true;
-    const id = visibleMessageId(message);
-    return id.length > 0 && this.getMessageIdSet(agentId, target)?.has(id) === true;
+  isModelSeen(agentId: string, target: string, message: SeenMessage): boolean {
+    return isSeenIn(this.getBoundary(agentId, target), this.getMessageIdSet(agentId, target), message);
   }
 
+  /**
+   * `contextId` is the RFC 072 context id current when the content reached the
+   * model under passive AX (see freshnessView); without one the facts are
+   * process-wide only.
+   */
   recordConsumed(
     agentId: string,
-    input: { target?: string; messages: AgentProxyVisibleMessage[]; boundarySeq?: number; source: AgentVisibleDeliveryConsumeSource },
+    input: { historyScope?: AgentApiHistoryConsumptionScope; target?: string; messages: AgentProxyVisibleMessage[]; boundarySeq?: number; source: AgentVisibleDeliveryConsumeSource; contextId?: string | null },
   ): AgentVisibleDeliveryConsumption | null {
     if (input.messages.length === 0 && (!input.target || typeof input.boundarySeq !== "number")) return null;
+    const explicitTarget = input.target ? canonicalVisibleTarget(input.target) : undefined;
+    const explicitEventId = input.target ? eventIdFromTarget(input.target) : undefined;
+    const scopeResult = agentApiHistoryConsumptionScopeSchema.safeParse(input.historyScope);
+    const historyScope = input.source === "agent_api_history" && scopeResult.success
+      && scopeResult.data.agent_id === agentId && scopeResult.data.target === input.target
+      ? scopeResult.data : undefined;
+    const legacyDmIds = new Set<string>();
+    if (historyScope) {
+      for (const message of input.messages) {
+        // The scope alone is insufficient: each returned body must belong to
+        // the authorized channel. No sequence-based fallback across targets.
+        if (message.channel_id === historyScope.channel_id && visibleMessageId(message)) {
+          legacyDmIds.add(visibleMessageId(message));
+        }
+      }
+    }
     const byTarget = new Map<string, VisibleBucket>();
     const ensureBucket = (target: string): VisibleBucket => {
       let bucket = byTarget.get(target);
@@ -164,10 +299,12 @@ export class AgentVisibleDeliveryLedger {
 
     for (const message of input.messages) {
       const messageTarget = formatProxyVisibleMessageTarget(message);
-      if (input.target && hasTargetMetadata(message) && messageTarget !== input.target) {
+      const fullEventMismatch = explicitEventId?.length === 36
+        && message.third_party_event?.id.toLowerCase() !== explicitEventId;
+      if (input.target && hasTargetMetadata(message) && (messageTarget !== explicitTarget || fullEventMismatch)) {
         throw new Error(`AgentVisibleDeliveryLedger target mismatch: explicit target ${input.target} does not match visible message target ${messageTarget}`);
       }
-      const target = input.target ?? messageTarget;
+      const target = explicitTarget ?? messageTarget;
       if (!target) continue;
       const bucket = ensureBucket(target);
       const seq = Number(message.seq ?? 0);
@@ -180,8 +317,8 @@ export class AgentVisibleDeliveryLedger {
       if (id.length > 0) bucket.ids.add(id);
     }
 
-    if (input.target && typeof input.boundarySeq === "number" && Number.isFinite(input.boundarySeq) && input.boundarySeq > 0) {
-      const bucket = ensureBucket(input.target);
+    if (explicitTarget && typeof input.boundarySeq === "number" && Number.isFinite(input.boundarySeq) && input.boundarySeq > 0) {
+      const bucket = ensureBucket(explicitTarget);
       bucket.boundarySeq = Math.max(bucket.boundarySeq, Math.floor(input.boundarySeq));
     }
     if (byTarget.size === 0) return null;
@@ -200,11 +337,13 @@ export class AgentVisibleDeliveryLedger {
         const targetIds = this.messageIdSet(agentId, target);
         for (const id of bucket.ids) targetIds.add(id);
       }
+      if (bucket.seqs.size > 0) this.recordExactSeqs(agentId, target, bucket.seqs);
       this.assertConsumedInvariants("recordConsumed", agentId, target, bucket, {
         advancesBoundary,
         previousBoundary,
       });
     }
+    if (input.contextId) this.recordContextScope(agentId, input.contextId, byTarget, boundaryAdvancingTargets);
 
     return {
       targets: [...byTarget.keys()],
@@ -212,6 +351,13 @@ export class AgentVisibleDeliveryLedger {
       shouldSuppress(message: AgentMessage): boolean {
         const target = formatAgentMessageVisibleTarget(message);
         const bucket = byTarget.get(target);
+        if (historyScope) {
+          return Boolean(!message.third_party_event
+            && message.channel_id === historyScope.channel_id
+            && message.channel_type === historyScope.channel_type
+            && (message.channel_type === "dm" || message.parent_channel_type === "dm")
+            && legacyDmIds.has(visibleMessageId(message)));
+        }
         if (!bucket) return false;
         const seq = typeof message.seq === "number" ? Math.floor(message.seq) : 0;
         const id = visibleMessageId(message);
@@ -230,6 +376,43 @@ export class AgentVisibleDeliveryLedger {
       this.boundaryByAgent.set(agentId, map);
     }
     return map;
+  }
+
+  private recordExactSeqs(agentId: string, target: string, seqs: Iterable<number>): void {
+    let map = this.exactSeqsByAgent.get(agentId);
+    if (!map) {
+      map = new Map<string, Set<number>>();
+      this.exactSeqsByAgent.set(agentId, map);
+    }
+    addCappedExactSeqs(map, target, seqs);
+  }
+
+  /** A new context id starts an empty scope: the previous context's facts are gone from the model. */
+  private recordContextScope(
+    agentId: string,
+    contextId: string,
+    byTarget: ReadonlyMap<string, VisibleBucket>,
+    boundaryAdvancingTargets: ReadonlySet<string>,
+  ): void {
+    let scope = this.contextScopeByAgent.get(agentId);
+    if (scope?.contextId !== contextId) {
+      scope = { contextId, boundaries: new Map(), ids: new Map(), exactSeqs: new Map() };
+      this.contextScopeByAgent.set(agentId, scope);
+    }
+    for (const [target, bucket] of byTarget) {
+      if (boundaryAdvancingTargets.has(target)) {
+        scope.boundaries.set(target, Math.max(scope.boundaries.get(target) ?? 0, bucket.maxSeq, bucket.boundarySeq));
+      }
+      if (bucket.ids.size > 0) {
+        let ids = scope.ids.get(target);
+        if (!ids) {
+          ids = new Set<string>();
+          scope.ids.set(target, ids);
+        }
+        for (const id of bucket.ids) ids.add(id);
+      }
+      if (bucket.seqs.size > 0) addCappedExactSeqs(scope.exactSeqs, target, bucket.seqs);
+    }
   }
 
   private messageIdMap(agentId: string): Map<string, Set<string>> {

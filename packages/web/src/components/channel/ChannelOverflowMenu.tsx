@@ -1,20 +1,21 @@
 import type { ReactElement } from "react";
-import { useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useIntl } from "react-intl";
-import { ChevronRight, CircleStop, Search, Settings } from "lucide-react";
-import { TooltipProvider } from "raft-ui";
+import { ChevronRight, CircleStop, Plus, Search, Settings } from "lucide-react";
+import { Badge, TooltipProvider, Button, DialogSurface, Skeleton } from "@botiverse/raft-ui";
 import EditChannelDialog from "./EditChannelDialog";
+import { ChannelPreferencesSection } from "./ChannelPreferencesSection";
 import Modal from "../Modal";
 import ChannelMembers, { agentStatusFallbackActivity } from "../agent/ChannelMembers";
 import AgentActivityDot from "../agent/AgentActivityDot";
 import type { ChannelAgent, ChannelExternalMember, ChannelHuman } from "../../hooks/useChannelMembers";
+import { useAgentStore } from "../../store/agentStore";
 import { useAuthStore } from "../../store/authStore";
 import { useChannelStore } from "../../store/channelStore";
 import { useServerStore } from "../../store/serverStore";
 import { canUseChannelMemberAction } from "../../utils/channelMemberPermissions";
 import AvatarSlot from "../ui/AvatarSlot";
-import Button from "../ui/Button";
-import Skeleton from "../ui/Skeleton";
+import SectionEyebrow from "../ui/SectionEyebrow";
 import {
   OverflowActionRow,
   OverflowMenuTrigger,
@@ -31,11 +32,18 @@ import Tooltip from "../ui/Tooltip";
  *  into the add flow (one hop fewer). Artea 2026-08-10: the preview may
  *  wrap to at most three rows; overflow and add always keep their slots. */
 const STRIP_MAX_ROWS = 3;
-const STRIP_TILE_SIZE_PX = 36;
+// DS md identity: 35px (8n + two 1.5px edges).
+const STRIP_TILE_SIZE_PX = 35;
 const STRIP_TILE_GAP_PX = 8;
 const STRIP_FALLBACK_COLUMNS = 7;
+// Every strip tile is a square identity button: sticker radius and the shared
+// keyboard focus ring; the avatar inside draws its own frame.
+const STRIP_TILE_BUTTON_CLASS = "shrink-0 rounded-sticker outline-none focus-visible:shadow-focus";
 const STRIP_PRELOAD_LIMIT = STRIP_MAX_ROWS * STRIP_FALLBACK_COLUMNS;
 export const MEMBERS_STRIP_TOOLTIP_DELAY_MS = 250;
+const NO_CHANNEL_AGENTS: ChannelAgent[] = [];
+const NO_CHANNEL_HUMANS: ChannelHuman[] = [];
+const NO_CHANNEL_EXTERNAL_MEMBERS: ChannelExternalMember[] = [];
 
 function MemberStripTooltip({
   children,
@@ -47,7 +55,6 @@ function MemberStripTooltip({
   return (
     <Tooltip
       content={label}
-      contentProps={{ className: "bg-white" }}
     >
       {children}
     </Tooltip>
@@ -107,12 +114,15 @@ function createStripColumnStore() {
 function MembersStrip({
   channelAgents,
   channelHumans,
+  channelExternalMembers = NO_CHANNEL_EXTERNAL_MEMBERS,
   loading,
   onOpen,
   onAdd,
 }: {
   channelAgents: ChannelAgent[];
   channelHumans: ChannelHuman[];
+  /** Slack participants of a bridged channel (display-only, never Raft members). */
+  channelExternalMembers?: ChannelExternalMember[];
   loading: boolean;
   onOpen: () => void;
   onAdd?: () => void;
@@ -124,36 +134,53 @@ function MembersStrip({
     columnStore.getSnapshot,
     columnStore.getServerSnapshot,
   );
-  const totalMembers = channelHumans.length + channelAgents.length;
+  const totalMembers = channelHumans.length + channelAgents.length + channelExternalMembers.length;
   const visibleMemberLimit = getVisibleMemberLimit(totalMembers, columnCount);
   const humans = channelHumans.slice(0, visibleMemberLimit);
   const agents = channelAgents.slice(0, Math.max(0, visibleMemberLimit - humans.length));
-  const overflow = channelHumans.length + channelAgents.length - humans.length - agents.length;
+  const externalMembers = channelExternalMembers.slice(
+    0,
+    Math.max(0, visibleMemberLimit - humans.length - agents.length),
+  );
+  const overflow = totalMembers - humans.length - agents.length - externalMembers.length;
+  // Machine text (the remaining count), kept out of JSX as a protocol literal.
+  const overflowLabel = `+${overflow}`;
 
   return (
     <div className="px-4 pb-3 pt-3" data-testid="channel-overflow-members-strip">
+      {/* DS drawer section: a 13/18 700 ink-2 heading; the entry into the
+          full member page is the whole heading row, with its count in ink-3. */}
       <button
         type="button"
         onClick={onOpen}
-        className="flex w-full items-center justify-between gap-2 text-left"
+        className="-mx-2 flex w-[calc(100%+1rem)] items-center justify-between gap-2 rounded-control px-2 py-1 text-left outline-none hover:bg-fill-pressed focus-visible:shadow-focus"
         data-testid="channel-overflow-members-entry"
       >
-        <span
+        <SectionEyebrow
+          tone="muted"
           role="heading"
           aria-level={3}
-          className="text-base font-bold text-black"
           data-testid="channel-overflow-members-heading"
         >
           {formatMessage({ id: "message.chatPanel.overflow.members" })}
-        </span>
-        <span className="inline-flex min-w-0 items-center gap-1 text-xs font-bold text-black">
+        </SectionEyebrow>
+        <span className="inline-flex min-w-0 items-center gap-1 text-caption text-foreground-hint">
           {loading
             ? formatMessage({ id: "message.chatPanel.overflow.membersLoading" })
-            : formatMessage(
+            : channelExternalMembers.length > 0
+              ? formatMessage(
+                { id: "message.chatPanel.overflow.membersSummaryWithSlack" },
+                {
+                  humans: channelHumans.length,
+                  agents: channelAgents.length,
+                  slack: channelExternalMembers.length,
+                },
+              )
+              : formatMessage(
                 { id: "message.chatPanel.overflow.membersSummary" },
                 { humans: channelHumans.length, agents: channelAgents.length },
               )}
-          <ChevronRight size={14} />
+          <ChevronRight size={16} aria-hidden="true" />
         </span>
       </button>
       <TooltipProvider delay={MEMBERS_STRIP_TOOLTIP_DELAY_MS}>
@@ -168,8 +195,8 @@ function MembersStrip({
           {loading && Array.from({ length: 3 }, (_, index) => (
             <Skeleton
               key={index}
-              variant="circle"
-              className="size-9 shrink-0"
+              variant="block"
+              className="size-[35px] shrink-0"
               data-testid="channel-overflow-member-skeleton"
             />
           ))}
@@ -182,7 +209,7 @@ function MembersStrip({
                   onClick={onOpen}
                   aria-label={label}
                   data-kind="human"
-                  className="shrink-0 transition-colors hover:brightness-90"
+                  className={STRIP_TILE_BUTTON_CLASS}
                 >
                   <AvatarSlot
                     context="panel-header"
@@ -203,7 +230,7 @@ function MembersStrip({
                   onClick={onOpen}
                   aria-label={label}
                   data-kind="agent"
-                  className="shrink-0 transition-colors hover:brightness-90"
+                  className={STRIP_TILE_BUTTON_CLASS}
                 >
                   <AvatarSlot
                     context="panel-header"
@@ -220,28 +247,52 @@ function MembersStrip({
               </MemberStripTooltip>
             );
           })}
+          {!loading && externalMembers.map((member) => {
+            const label = formatMessage(
+              { id: "message.chatPanel.overflow.slackMemberLabel" },
+              { name: member.displayName },
+            );
+            return (
+              <MemberStripTooltip key={member.id} label={label}>
+                <button
+                  type="button"
+                  onClick={onOpen}
+                  aria-label={label}
+                  data-kind="external"
+                  className={STRIP_TILE_BUTTON_CLASS}
+                >
+                  <AvatarSlot context="panel-header" type="human" humanAvatarUrl={member.avatarUrl} />
+                </button>
+              </MemberStripTooltip>
+            );
+          })}
           {!loading && overflow > 0 && (
+            /* DS avatar stack overflow (`rf-avatars__more`): a sunken tile
+               with the remaining count in machine type. */
             <button
               type="button"
               onClick={onOpen}
-              className="flex h-9 w-9 shrink-0 items-center justify-center border-2 border-black text-xs font-bold"
+              className={`${STRIP_TILE_BUTTON_CLASS} flex h-[35px] min-w-[35px] items-center justify-center bg-fill-muted px-1 font-mono text-mono-meta font-bold text-foreground-muted hover:press-overlay`}
               data-testid="channel-overflow-members-more"
             >
-              +{overflow}
+              {overflowLabel}
             </button>
           )}
           {onAdd && (
-            <button
-              type="button"
-              onClick={onAdd}
-              disabled={loading}
-              title={formatMessage({ id: "agent.channelMembers.addMember" })}
-              aria-label={formatMessage({ id: "agent.channelMembers.addMember" })}
-              className="flex h-9 w-9 shrink-0 items-center justify-center border-2 border-dashed border-black/40 text-lg font-bold text-black/45 transition-colors hover:border-black hover:text-black disabled:cursor-wait disabled:opacity-40"
-              data-testid="channel-overflow-members-add-tile"
-            >
-              +
-            </button>
+            <Tooltip content={formatMessage({ id: "agent.channelMembers.addMember" })}>
+              {/* DS empty identity (`rf-avatar--empty`): a dashed ink-3 square
+                  with a plus — the place a new member would take. */}
+              <button
+                type="button"
+                onClick={onAdd}
+                disabled={loading}
+                aria-label={formatMessage({ id: "agent.channelMembers.addMember" })}
+                className={`${STRIP_TILE_BUTTON_CLASS} flex size-[35px] items-center justify-center border-[1.5px] border-dashed border-foreground-hint text-foreground-hint hover:bg-fill-pressed disabled:cursor-wait disabled:border-line-hairline disabled:text-foreground-disabled`}
+                data-testid="channel-overflow-members-add-tile"
+              >
+                <Plus size={20} aria-hidden="true" />
+              </button>
+            </Tooltip>
           )}
         </div>
       </TooltipProvider>
@@ -296,8 +347,7 @@ function MemberAvatarPreloader({
 }
 
 /**
- * Channel topbar details and settings surface (task #187, gated by
- * `topbar_overflow_v0`).
+ * Channel topbar details and settings surface.
  *
  * Collects the channel-header settings actions (members / channel settings
  * incl. activity mute / stop-all-agents) into a drawer. Search remains a
@@ -361,8 +411,8 @@ export interface ChannelOverflowMenuProps {
     changeMemberRole: (targetType: "user" | "agent", memberId: string, role: "member" | "admin") => Promise<void>;
     roleChangeFailed: boolean;
   };
-  /** Channel settings section. Omit when the user can neither manage
-   *  channels nor leave (mirrors `showChannelOptionsButton`). */
+  /** Settings entry follows the existing management/leave policy.
+   *  Individual actions retain their own capability checks. */
   settings?: {
     initialName: string;
     initialDescription: string;
@@ -403,8 +453,12 @@ export default function ChannelOverflowMenu({
   const [view, setView] = useState<"root" | "members">("root");
   const [membersInitialView, setMembersInitialView] = useState<"add" | undefined>(undefined);
   const open = controlledOpen ?? internalOpen;
-  // v2 identity header: visibility badge reads the live channel.
-  const channel = useChannelStore((s) => s.channels.find((c) => c.id === channelId));
+  // v2 identity header: visibility badge reads the live channel. DMs live in
+  // the store's dmChannels list, so look there too (task #703: this sheet IS
+  // the DM settings surface as well — same component as channels).
+  const channel = useChannelStore((s) =>
+    s.channels.find((c) => c.id === channelId) ?? s.dmChannels.find((c) => c.id === channelId));
+  const isDmChannel = channel?.type === "dm";
   const currentUserId = useAuthStore((s) => s.user?.id);
   const currentServerId = useServerStore((s) => s.current?.id);
   const serverMembers = useServerStore((s) => s.members);
@@ -427,7 +481,7 @@ export default function ChannelOverflowMenu({
   const settingsSaveAndCloseAvailableRef = useRef(true);
   const settingsSaveRef = useRef<(() => Promise<boolean>) | null>(null);
   const postCloseActionRef = useRef<(() => void) | null>(null);
-  const setOpen = (next: boolean) => {
+  const setOpen = useCallback((next: boolean) => {
     if (!next) {
       settingsDirtyRef.current = false;
       settingsSaveAndCloseAvailableRef.current = true;
@@ -437,12 +491,13 @@ export default function ChannelOverflowMenu({
     }
     if (onOpenChange) onOpenChange(next);
     else setInternalOpen(next);
-  };
-  const close = () => setOpen(false);
+  }, [onOpenChange]);
+  const close = useCallback(() => setOpen(false), [setOpen]);
+  const handleOpen = useCallback(() => setOpen(true), [setOpen]);
   // The members page ✕ rides the same draft guard as every other close
   // affordance; row → profile keeps the historical unguarded close (the
   // old drawer panel behavior).
-  const guardedClose = (postCloseAction?: () => void) => {
+  const guardedClose = useCallback((postCloseAction?: () => void) => {
     if (settingsDirtyRef.current) {
       postCloseActionRef.current = postCloseAction ?? null;
       setUnsavedCanSave(settingsSaveAndCloseAvailableRef.current);
@@ -451,8 +506,54 @@ export default function ChannelOverflowMenu({
     }
     close();
     postCloseAction?.();
-  };
-  const handleSaveAndClose = async () => {
+  }, [close]);
+  const handleSearch = useCallback(() => guardedClose(onSearch), [guardedClose, onSearch]);
+  const handleCloseGuarded = useCallback(() => {
+    postCloseActionRef.current = null;
+    setUnsavedCanSave(settingsSaveAndCloseAvailableRef.current);
+    setShowUnsavedPrompt(true);
+  }, []);
+  const handleOpenMembers = useCallback(() => {
+    setMembersInitialView(undefined);
+    setView("members");
+  }, []);
+  const handleAddMembers = useCallback(() => {
+    if (!canAddMembers) return;
+    setMembersInitialView("add");
+    // The add picker opens straight away: fetch the agent roster it lists.
+    void useAgentStore.getState().loadAgents();
+    setView("members");
+  }, [canAddMembers]);
+  const handleBackToRoot = useCallback(() => setView("root"), []);
+  const prefetchedMembers = useMemo(() => members ? {
+    channelAgents: members.agents,
+    channelHumans: members.humans,
+    channelExternalMembers: members.externalMembers,
+    loading: members.loading,
+    addMembers: members.addMembers,
+    addAgent: members.addAgent,
+    removeAgent: members.removeAgent,
+    addHuman: members.addHuman,
+    removeHuman: members.removeHuman,
+    changeMemberRole: members.changeMemberRole,
+    roleChangeFailed: members.roleChangeFailed,
+  } : undefined, [members]);
+  const handleKeepEditing = useCallback(() => {
+    postCloseActionRef.current = null;
+    setShowUnsavedPrompt(false);
+  }, []);
+  const handleUnsavedPromptClose = useCallback(() => {
+    if (unsavedBusy) return;
+    handleKeepEditing();
+  }, [unsavedBusy, handleKeepEditing]);
+  const handleDiscardAndClose = useCallback(() => {
+    const postCloseAction = postCloseActionRef.current;
+    postCloseActionRef.current = null;
+    setShowUnsavedPrompt(false);
+    close();
+    postCloseAction?.();
+  }, [close]);
+  const handleSaveAndClose = useCallback(async () => {
     setUnsavedBusy(true);
     try {
       const saved = (await settingsSaveRef.current?.()) ?? true;
@@ -466,20 +567,20 @@ export default function ChannelOverflowMenu({
     } finally {
       setUnsavedBusy(false);
     }
-  };
+  }, [close]);
 
   return (
     <>
       <OverflowMenuTrigger
         labelId="message.chatPanel.searchChannel"
-        onClick={() => guardedClose(onSearch)}
-        icon={<Search size={14} />}
+        onClick={handleSearch}
+        icon={<Search size={22} />}
         testId="channel-topbar-search"
       />
       <OverflowMenuTrigger
         labelId="message.chatPanel.overflow.open"
-        onClick={() => setOpen(true)}
-        icon={<Settings size={14} />}
+        onClick={handleOpen}
+        icon={<Settings size={22} />}
         testId="channel-overflow-trigger"
       />
       {showMembers && members && (
@@ -499,24 +600,32 @@ export default function ChannelOverflowMenu({
              header instead of body rows. */
           <span className="flex min-w-0 items-center gap-2">
             <span className="truncate" data-testid="channel-overflow-title-text">
-              {formatMessage({ id: "message.chatPanel.overflow.channelName" }, { name: channelName })}
+              {/* A DM has no "#" name — the title is the peer's plain name. */}
+              {isDmChannel
+                ? channelName
+                : formatMessage({ id: "message.chatPanel.overflow.channelName" }, { name: channelName })}
             </span>
             {channel && (
-              <span
-                className="shrink-0 border-[1.5px] border-black bg-brutal-lime px-2 py-px text-[11px] font-bold"
+              /* Visibility is a fact about the place, not a status: a neutral
+                 machine label (DS `rf-tag`), never a colour. */
+              <Badge
+                appearance="outline"
+                className="shrink-0"
                 data-testid="channel-overflow-visibility-badge"
               >
-                {channel.type === "private"
+                {isDmChannel
+                  ? formatMessage({ id: "message.chatPanel.dmOverflow.dmBadge" })
+                  : channel.type === "private"
                   ? formatMessage({ id: "message.chatPanel.overflow.visibilityPrivate" })
                   : channel.type === "joint"
                     ? formatMessage({ id: "channel.edit.jointChannelBadge" })
-                  : formatMessage({ id: "message.chatPanel.overflow.visibilityPublic" })}
-              </span>
+                    : formatMessage({ id: "message.chatPanel.overflow.visibilityPublic" })}
+              </Badge>
             )}
           </span>
         )}
         subtitle={settings?.initialDescription ? (
-          <p className="truncate font-mono text-xs text-black/50" data-testid="channel-overflow-identity-desc">
+          <p className="truncate text-caption text-foreground-hint" data-testid="channel-overflow-identity-desc">
             {settings.initialDescription}
           </p>
         ) : undefined}
@@ -524,11 +633,7 @@ export default function ChannelOverflowMenu({
         closeLabelId="message.chatPanel.overflow.close"
         hideDesktopClose
         closeGuardRef={settingsDirtyRef}
-        onCloseGuarded={() => {
-          postCloseActionRef.current = null;
-          setUnsavedCanSave(settingsSaveAndCloseAvailableRef.current);
-          setShowUnsavedPrompt(true);
-        }}
+        onCloseGuarded={handleCloseGuarded}
         bare={view === "members"}
         testId="channel-overflow-sheet"
       >
@@ -537,18 +642,12 @@ export default function ChannelOverflowMenu({
         <div className={view === "members" ? "hidden" : undefined}>
           {showMembers && (
             <MembersStrip
-              channelAgents={members?.agents ?? []}
-              channelHumans={members?.humans ?? []}
+              channelAgents={members?.agents ?? NO_CHANNEL_AGENTS}
+              channelHumans={members?.humans ?? NO_CHANNEL_HUMANS}
+              channelExternalMembers={members?.externalMembers ?? NO_CHANNEL_EXTERNAL_MEMBERS}
               loading={members?.loading ?? true}
-              onOpen={() => {
-                setMembersInitialView(undefined);
-                setView("members");
-              }}
-              onAdd={canAddMembers ? () => {
-                if (!canAddMembers) return;
-                setMembersInitialView("add");
-                setView("members");
-              } : undefined}
+              onOpen={handleOpenMembers}
+              onAdd={canAddMembers ? handleAddMembers : undefined}
             />
           )}
 
@@ -570,7 +669,7 @@ export default function ChannelOverflowMenu({
                    plain row (reversible — agents can be restarted), NOT
                    a danger-red separate group. */
                 <OverflowActionRow
-                  icon={<CircleStop size={14} />}
+                  icon={<CircleStop size={16} />}
                   label={formatMessage({ id: "message.chatPanel.overflow.stopAgents" })}
                   ariaLabel={formatMessage({ id: "message.chatPanel.stopAllAgents" })}
                   onClick={onStopAllAgents}
@@ -579,6 +678,21 @@ export default function ChannelOverflowMenu({
               ) : undefined}
             />
           )}
+
+          {/* task #703: a DM shares THIS sheet (same component, same
+              language) but has no name/description form — its root view is
+              the two-participant strip plus the shared preferences block.
+              Per-DM mute stays out (documented non-feature). */}
+          {isDmChannel && (
+            <div className="px-4 pb-2">
+              <ChannelPreferencesSection
+                channelId={channelId}
+                isPanel
+                activityMute={activityMute}
+                collapseLongMessages={collapseLongMessages}
+              />
+            </div>
+          )}
         </div>
 
         {view === "members" && (
@@ -586,20 +700,8 @@ export default function ChannelOverflowMenu({
             presentation="page"
             channelId={channelId}
             initialView={membersInitialView}
-            prefetchedMembers={members ? {
-              channelAgents: members.agents,
-              channelHumans: members.humans,
-              channelExternalMembers: members.externalMembers,
-              loading: members.loading,
-              addMembers: members.addMembers,
-              addAgent: members.addAgent,
-              removeAgent: members.removeAgent,
-              addHuman: members.addHuman,
-              removeHuman: members.removeHuman,
-              changeMemberRole: members.changeMemberRole,
-              roleChangeFailed: members.roleChangeFailed,
-            } : undefined}
-            onBack={() => setView("root")}
+            prefetchedMembers={prefetchedMembers}
+            onBack={handleBackToRoot}
             onClose={guardedClose}
             onRequestClose={close}
           />
@@ -612,65 +714,52 @@ export default function ChannelOverflowMenu({
            must be sent from its own form or explicitly discarded. Three
            actions, so a plain Modal instead of the two-action ConfirmDialog. */
         <Modal
-          onClose={() => {
-            if (unsavedBusy) return;
-            postCloseActionRef.current = null;
-            setShowUnsavedPrompt(false);
-          }}
+          onClose={handleUnsavedPromptClose}
           layer={1}
         >
-          <div
-            className="w-full max-w-sm card-brutal p-6"
+          {/* DS Dialog surface (raft-ui's DialogSurface draws the frame), 20
+              padding; title 17/22 700, body 15/20 ink-2; Keep is ghost,
+              Discard (loses the draft, reversible) orange, Save pink. */}
+          <DialogSurface
+            className="w-full max-w-[400px] p-5"
             role="dialog"
             aria-modal="true"
             data-testid="channel-overflow-unsaved-prompt"
           >
-            <h2 className="mb-4 text-lg font-bold">
+            <h2 className="text-headline">
               {formatMessage({ id: "message.chatPanel.overflow.unsavedTitle" })}
             </h2>
-            <p className="mb-5 text-sm text-black/70">
+            <p className="mt-1.5 text-subhead text-foreground-muted">
               {formatMessage({
                 id: unsavedCanSave
                   ? "message.chatPanel.overflow.unsavedMessage"
                   : "message.chatPanel.overflow.unsavedInvitationMessage",
               })}
             </p>
-            <div className="flex justify-end gap-3">
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
               <Button
-                onClick={() => {
-                  postCloseActionRef.current = null;
-                  setShowUnsavedPrompt(false);
-                }}
+                onClick={handleKeepEditing}
                 disabled={unsavedBusy}
-                size="sm"
-                tone="white"
-                className="disabled:opacity-50"
+                size="lg"
+                variant="ghost"
               >
                 {formatMessage({ id: "message.chatPanel.overflow.keepEditing" })}
               </Button>
               <Button
-                onClick={() => {
-                  const postCloseAction = postCloseActionRef.current;
-                  postCloseActionRef.current = null;
-                  setShowUnsavedPrompt(false);
-                  close();
-                  postCloseAction?.();
-                }}
+                onClick={handleDiscardAndClose}
                 disabled={unsavedBusy}
-                size="sm"
-                tone="orange"
-                className="disabled:opacity-50"
+                size="lg"
+                variant="warning"
                 data-testid="channel-overflow-unsaved-discard"
               >
                 {formatMessage({ id: "message.chatPanel.overflow.discardChanges" })}
               </Button>
               {unsavedCanSave && (
                 <Button
-                  onClick={() => void handleSaveAndClose()}
+                  onClick={handleSaveAndClose}
                   disabled={unsavedBusy}
-                  size="sm"
-                  tone="pink"
-                  className="disabled:opacity-50"
+                  size="lg"
+                  variant="accent"
                   data-testid="channel-overflow-unsaved-save"
                 >
                   {unsavedBusy
@@ -679,7 +768,7 @@ export default function ChannelOverflowMenu({
                 </Button>
               )}
             </div>
-          </div>
+          </DialogSurface>
         </Modal>
       )}
     </>

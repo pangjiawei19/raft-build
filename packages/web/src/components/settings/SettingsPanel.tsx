@@ -1,8 +1,48 @@
-import { useState, useEffect, useMemo, useReducer, useRef } from "react";
+import { AppSetupFields, AppSetupPanel, AppSetupRequirement } from "../integrations/AppSetup";
+import { AppWhenToUseField } from "./AppWhenToUseField";
+import {
+  ToggleGroup,
+  ToggleGroupItem,
+  Checkbox,
+  Textarea,
+  TextareaCounter,
+  Skeleton,
+  Badge,
+  Button,
+  Card,
+  Input,
+  Select,
+  SelectContent,
+  SelectIcon,
+  SelectItem,
+  SelectItemIndicator,
+  SelectItemText,
+  SelectList,
+  SelectTrigger,
+  SelectValue,
+  SegmentedControl,
+  SegmentedControlItem,
+  SegmentedControlLabel,
+  Switch,
+  Panel,
+  Separator,
+  DialogSurface,
+  FormSection,
+  Popover,
+  PopoverTrigger,
+  IconTile,
+  ListRowGroup,
+  ListRow,
+  ListRowBody,
+  ListRowDescription,
+  ListRowTitle,
+} from "@botiverse/raft-ui";
+import CloseButton from "../ui/CloseButton";
+import Tooltip from "../ui/Tooltip";
+import { Fragment, useCallback, useState, useEffect, useEffectEvent, useMemo, useReducer, useRef } from "react";
 import type { ChangeEvent, FormEvent, ReactNode } from "react";
 import { useNavigate } from "react-router-dom";
 import {
-  Settings,
   ChevronRight,
   Check,
   Copy,
@@ -28,42 +68,37 @@ import {
   FileText,
   Tag,
   Type,
-  Pencil,
   FlaskConical,
   LayoutGrid,
   List,
   Smartphone,
-  Globe2,
+  Monitor,
+  Globe,
   Hash,
 } from "lucide-react";
 import MobileDownloadQr from "./MobileDownloadQr";
+import DesktopDownloadOptions from "./DesktopDownloadOptions";
 import { MOBILE_DOWNLOAD_CHOOSER_PATH, mobileDownloadUrl } from "../../utils/mobileDownloadUrl";
 import { getApiErrorResponse } from "../../utils/apiErrorResponse";
-import {
+import { normalizeAppSetupUrl,
   DEFAULT_BILLING_INTERVAL,
-  PLAN_CONFIG,
   DOWNGRADE_GRACE_PERIOD_DAYS,
-  FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES,
   OAUTH_CLIENT_CATEGORIES,
-  PRO_AGENT_SEAT_FRACTION,
-  PRO_AGENT_SEAT_BLOCK_SIZE,
-  PRO_SEAT_ANNUAL_USD,
-  PRO_SEAT_MONTHLY_USD,
   PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   PUBLIC_SERVER_FEATURE_FLAG_KEY,
+  SERVER_GUEST_FEATURE_FLAG_KEY,
   SERVER_LABS_UI_FEATURE_FLAG_KEY,
   SLACK_BRIDGE_FEATURE_FLAG_KEYS,
-  WIKI_FEATURE_FLAG_KEY,
-  formatProAgentSeatFraction,
   getEffectiveLimits,
   getFinitePlanLimitExcess,
-  isTrialActive,
   renderThirdPartyInertText,
+  buildIntegrationInviteUrl,
+  isAppWhenToUseTooLong,
+  APP_WHEN_TO_USE_MAX_CODE_POINTS,
 } from "@botiverse/raft-shared";
 import type {
   BillingInterval,
   OAuthClientCategory,
-  ServerPlan,
   ServerRole,
   TimeFormatPreference,
 } from "@botiverse/raft-shared";
@@ -83,7 +118,9 @@ import { useTimeFormatter } from "../../hooks/useTimeFormatter";
 import ConfirmDialog from "../ConfirmDialog";
 import Modal from "../Modal";
 import Banner from "../ui/Banner";
+import { FormDialog } from "../ui/FormDialog";
 import api from "../../api/client";
+import { isElectronDesktopShell, shareableWebOrigin } from "../../utils/desktopShell";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
 import type { MessageId } from "../../i18n/messages";
@@ -101,23 +138,25 @@ import {
   isPushSubscribed,
   sendTestPushNotification,
 } from "../../utils/pushNotifications";
-import Checkbox from "../ui/Checkbox";
-import Textarea from "../ui/Textarea";
+import { resolveNotificationChannel } from "../../utils/notificationChannel";
+import type { NotificationChannel, NotificationUnsupportedReason } from "../../utils/notificationChannel";
+import { isDesktopNativeNotificationsAvailable, showDesktopTestNotification } from "../../utils/desktopNativeNotifications";
 import { avatarUploadApiErrorMessage, isAvatarFileTooLarge, isAvatarTooLargeError, PROFILE_AVATAR_ACCEPT } from "../../utils/avatarUpload";
 import PanelHeader from "../ui/PanelHeader";
 import SectionEyebrow from "../ui/SectionEyebrow";
 import SectionHeader from "../ui/SectionHeader";
-import Button from "../ui/Button";
+import { UsageDataSettingsCard, WorkspaceProductAnalyticsSection } from "./UsageDataSettings";
 import CopyButton from "../ui/CopyButton";
 import FormField from "../ui/FormField";
 import AvatarSlot from "../ui/AvatarSlot";
-import AvatarListRow from "../ui/AvatarListRow";
+import AvatarEditVeil from "../ui/AvatarEditVeil";
 import SelectionPopover from "../ui/SelectionPopover";
 import SurfaceListItem from "../ui/SurfaceListItem";
 import SlugInput, { PrefixedInput } from "../ui/SlugInput";
-import Skeleton from "../ui/Skeleton";
+import DeleteServerConfirmDialog from "./DeleteServerConfirmDialog";
 import {
   AGENT_INBOUND_NEGATIVE_CAPABILITY_ID,
+  AGENT_DIRECTORY_OAUTH_SCOPES,
   AGENT_INBOUND_OAUTH_SCOPES,
   DEFAULT_DECLARED_OAUTH_SCOPES,
   IDENTITY_OAUTH_SCOPES,
@@ -135,23 +174,22 @@ import MessageItem from "../message/MessageItem";
 import type { MentionEntry } from "../message/MessageItem";
 import { PwaInstallSettingsCard } from "../pwa/PwaInstallPrompt";
 import ArchivedChannelsSection from "./ArchivedChannelsSection";
+import ArchivedAgentsSection from "./ArchivedAgentsSection";
 import IMBridgesSettingsSection from "./IMBridgesSettingsSection";
 import { isSlackBridgeSurfaceEnabled } from "./slackBridgeVisibility";
 import { useAuthProviders } from "../../hooks/useAuthProviders";
-import type { AuthProvider } from "../../hooks/useAuthProviders";
-import type { SocialAuthProviderId } from "../../hooks/useAuthProviders";
+import type { AuthProvider, SocialAuthProviderId } from "../../hooks/useAuthProviders";
 import type { Message } from "../../store/messageStore";
 import type { Agent } from "../../store/agentStore";
 import { useChannelStore } from "../../store/channelStore";
+import { hasChatSurfaces } from "../../embed";
 import type { Channel } from "../../store/channelStore";
 import {
-  canRemoveAdminPrincipal,
   getAdminCandidatePrincipals,
   getAdminPrincipalKey,
   getAdminPrincipalLabel,
   getAdminPrincipalRoleOptions,
   getAdminPrincipals,
-  getMemberLabel,
 } from "../../utils/serverAdminSettings";
 import type {
   ServerAdminSettingsPrincipal,
@@ -159,8 +197,6 @@ import type {
 import {
   createServerLabEnrollmentMutation,
   createServerLabMasterMutation,
-  getServerLabDescriptionMessageId,
-  getServerLabEnrollmentDisabledReasonMessageId,
   getServerLabSettingsAuthority,
   isServerLabEnrollmentEditable,
   normalizeServerLabSettingsReadback,
@@ -181,21 +217,6 @@ import {
 import type {
   ServerLabsStoreContext,
 } from "../../store/serverLabsSettingsStore";
-import { getBillingControlsState, getSettingsBillingPlanPresentation } from "../../utils/billingControls";
-import { formatGlobalTrialCutoffDate } from "../../utils/trialCutoff";
-import {
-  applyBillingSeatInputChange,
-  applyBillingSeatInputCommit,
-  getBillingSeatDraftState,
-  getBillingCurrentTotalLabel,
-  getBillingSeatCopyLabels,
-  getBillingSeatInputValue,
-  getBillingSelectedTotalLabels,
-  getBillingTotalSummaryLabels,
-} from "../../utils/billingSeatInput";
-import type {
-  BillingPricedTotal,
-} from "../../utils/billingSeatInput";
 import { getTimezoneOptions, getTranslationLanguageOptions, useTranslationStore } from "../../store/translationStore";
 import type { PreferredTranslationMode } from "../../store/translationStore";
 import AgreementBody from "../server/AgreementBody";
@@ -203,26 +224,7 @@ import { AppleLogo, GitHubLogo, GoogleLogo } from "../icons/ProviderLogos";
 import {
   useAppearanceStore,
 } from "../../store/appearanceStore";
-import { useWorkspaceGridAvailability } from "../workspace/workspaceGridAvailability";
-import { useWorkspaceGridNavigationStore } from "../workspace/workspaceGridNavigationStore";
 import {
-  Badge,
-  Select,
-  SelectContent,
-  SelectIcon,
-  SelectItem,
-  SelectItemIndicator,
-  SelectItemText,
-  SelectList,
-  SelectTrigger,
-  SelectValue,
-  SegmentedControl,
-  SegmentedControlItem,
-  SegmentedControlLabel,
-  Switch,
-} from "raft-ui";
-import {
-  BillingIntervalSegmentedControl,
   ConnectedAppsTabSegmentedControl,
   MessageBodyFontSizeSegmentedControl,
 } from "./SettingsSegmentedControls";
@@ -230,7 +232,6 @@ import type {
   ConnectedAppsTab,
 } from "./SettingsSegmentedControls";
 import {
-  SETTINGS_ICON_BY_ID,
   SETTINGS_TAB_TITLE_ID,
   canOpenSettingsTab,
   normalizeSettingsTab,
@@ -245,11 +246,22 @@ import {
 import SettingsProfileCard from "./SettingsProfileCard";
 import { LazyAboutFeedbackPanel } from "./LazyAboutFeedbackDialog";
 import { AgentMcpTab } from "../agent/AgentMcpTab";
+import AppearanceThemePicker from "./AppearanceThemePicker";
+import { useOptionalAppTheme } from "../../hooks/useAppTheme";
 import ProviderConnectionsSettings from "./ProviderConnectionsSettings";
-import WikiSettingsSection from "./WikiSettingsSection";
+import { ProviderAccountRow } from "./ProviderAccountRow";
+import { ServerLabRow } from "./ServerLabRow";
+import { AdminPrincipalRow } from "./AdminPrincipalRow";
+import { PendingInviteRow } from "./PendingInviteRow";
+import { JoinLinkRow } from "./JoinLinkRow";
+import { PlanSectionContent } from "./PlanSectionContent";
+import { DeclaredScopeToggle } from "./DeclaredScopeToggle";
+import { InstalledConnectedAppItem } from "./InstalledConnectedAppItem";
+import { RegisteredConnectedAppItem } from "./RegisteredConnectedAppItem";
 import {
   AppNotificationRequestSummary,
   DeveloperAppNotifications,
+  DeveloperAppPermissions,
   InstalledAppNotifications,
 } from "./AppNotificationsControls";
 import type {
@@ -321,6 +333,8 @@ const APPEARANCE_PREVIEW_CHANNEL: Channel = {
   createdAt: "2026-05-19T00:00:00.000Z",
 };
 
+const APPEARANCE_PREVIEW_CHANNELS: Channel[] = [APPEARANCE_PREVIEW_CHANNEL];
+
 const APPEARANCE_PREVIEW_MENTION_MAP = new Map<string, MentionEntry>([
   ["joy", { displayName: "Joy", type: "user", id: "appearance-preview-joy" }],
 ]);
@@ -331,7 +345,7 @@ const PRE_JOIN_AGREEMENT_BODY_MAX_LENGTH_LABEL = "5,000";
 // ── Account Section ──
 
 
-function SocialProviderIcon({ providerId }: { providerId: SocialAuthProviderId }) {
+export function SocialProviderIcon({ providerId }: { providerId: SocialAuthProviderId }) {
   if (providerId === "google") {
     return (
       <span className="inline-flex size-[18px] shrink-0 items-center justify-center">
@@ -341,21 +355,20 @@ function SocialProviderIcon({ providerId }: { providerId: SocialAuthProviderId }
   }
   if (providerId === "apple") {
     return (
-      <span className="inline-flex size-[18px] shrink-0 items-center justify-center text-black">
+      <span className="inline-flex size-[18px] shrink-0 items-center justify-center text-foreground">
         <AppleLogo className="size-4" />
       </span>
     );
   }
   return (
-    <span className="inline-flex size-[18px] shrink-0 items-center justify-center text-black">
+    <span className="inline-flex size-[18px] shrink-0 items-center justify-center text-foreground">
       <GitHubLogo className="size-4" />
     </span>
   );
 }
 
 // Exported for the sub-batch-A i18n DOM smoke test: renders the Account section
-// in isolation without SettingsPanel's account-tab WorkspaceModeSettingsCard,
-// which reads the Vite-only `import.meta.env` graph the node harness cannot shim.
+// in isolation.
 export function AccountSection({
   initialError,
   passwordChangeIntent = false,
@@ -451,7 +464,7 @@ export function AccountSection({
     && linkedIdentityCount === 1
     && passwordConfigured === false;
 
-  const applyAuthMethods = (data: {
+  const applyAuthMethods = useCallback((data: {
     identities?: Array<{ provider?: string; providerEmail?: string | null }>;
     passwordConfigured?: boolean;
   }) => {
@@ -463,9 +476,9 @@ export function AccountSection({
     }
     setLinkedIdentities(next);
     setPasswordConfigured(data.passwordConfigured === true);
-  };
+  }, []);
 
-  const handleConnectProvider = async (provider: AuthProvider) => {
+  const handleConnectProvider = useCallback(async (provider: AuthProvider) => {
     setError("");
     setLinkingProviderId(provider.id);
     try {
@@ -477,9 +490,15 @@ export function AccountSection({
       setError(err.response?.data?.error || formatMessage({ id: "settings.account.failedConnectProvider" }, { label: provider.label }));
       setLinkingProviderId(null);
     }
-  };
+  }, [formatMessage]);
 
-  const handleDisconnectProvider = async (provider: AuthProvider) => {
+  const handleRequestDisconnectProvider = useCallback((provider: AuthProvider) => {
+    setPasswordSetupError("");
+    setPasswordSetupSentForProvider(null);
+    setPendingDisconnectProvider(provider);
+  }, []);
+
+  const handleDisconnectProvider = useCallback(async (provider: AuthProvider) => {
     try {
       const { data } = await api.delete(`/auth/identities/${provider.id}`);
       applyAuthMethods(data);
@@ -496,13 +515,14 @@ export function AccountSection({
       }
       throw err;
     }
-  };
+  }, [applyAuthMethods]);
 
-  const handleSendPasswordSetup = async (provider?: AuthProvider) => {
+  const userEmail = user?.email;
+  const handleSendPasswordSetup = useCallback(async (provider?: AuthProvider) => {
     setPasswordSetupError("");
     setPasswordSetupLoading(true);
     try {
-      await api.post("/auth/forgot-password", { email: user?.email });
+      await api.post("/auth/forgot-password", { email: userEmail });
       setPasswordSetupEmailSent(true);
       setPasswordSetupSentForProvider(provider ?? null);
       setPendingDisconnectProvider(null);
@@ -513,7 +533,29 @@ export function AccountSection({
     } finally {
       setPasswordSetupLoading(false);
     }
-  };
+  }, [formatMessage, userEmail]);
+
+  const handleSetPasswordByEmail = useCallback(() => {
+    void handleSendPasswordSetup();
+  }, [handleSendPasswordSetup]);
+
+  const handleConfirmDisconnect = useCallback(() => {
+    if (!pendingDisconnectProvider) return;
+    return pendingDisconnectRequiresPassword
+      ? handleSendPasswordSetup(pendingDisconnectProvider)
+      : handleDisconnectProvider(pendingDisconnectProvider);
+  }, [handleDisconnectProvider, handleSendPasswordSetup, pendingDisconnectProvider, pendingDisconnectRequiresPassword]);
+
+  const handleCloseDisconnect = useCallback(() => setPendingDisconnectProvider(null), []);
+
+  const handleDisplayNameChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    setDisplayName(e.target.value);
+    setSaved(false);
+  }, []);
+
+  const handleCurrentPasswordChange = useCallback((e: ChangeEvent<HTMLInputElement>) => setCurrentPassword(e.target.value), []);
+  const handleNewPasswordChange = useCallback((e: ChangeEvent<HTMLInputElement>) => setNewPassword(e.target.value), []);
+  const handleConfirmPasswordChange = useCallback((e: ChangeEvent<HTMLInputElement>) => setConfirmPassword(e.target.value), []);
 
   const handleSaveProfile = async (e: FormEvent) => {
     e.preventDefault();
@@ -595,21 +637,15 @@ export function AccountSection({
           title={user?.displayName || user?.name || formatMessage({ id: "settings.account.sectionLabel" })}
           subtitle={user?.name ? `@${user.name}` : ""}
           avatar={
+            <Tooltip content={avatarSaving ? formatMessage({ id: "settings.common.uploadingAvatar" }) : formatMessage({ id: "settings.common.uploadImage" })}>
             <label
-              className={`group relative flex size-16 shrink-0 items-center justify-center ${
-                avatarSaving ? "cursor-not-allowed opacity-70" : ""
-              }`}
-              title={avatarSaving ? formatMessage({ id: "settings.common.uploadingAvatar" }) : formatMessage({ id: "settings.common.uploadImage" })}
-              aria-label={avatarSaving ? formatMessage({ id: "settings.common.uploadingAvatar" }) : formatMessage({ id: "settings.common.uploadImage" })}
+              className={`group/avatar-edit relative flex shrink-0 rounded-sticker has-[:focus-visible]:shadow-focus ${avatarSaving ? "cursor-not-allowed opacity-70" : ""}`}
             >
-              <AvatarSlot context="profile-tile" type="human" humanAvatarUrl={user?.avatarUrl} email={user?.email} />
-              <div className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">
-                <Upload size={18} className="text-white" />
-              </div>
               <input
                 type="file"
                 accept={PROFILE_AVATAR_ACCEPT}
-                className="hidden"
+                className="peer/avatar-edit sr-only"
+                aria-label={avatarSaving ? formatMessage({ id: "settings.common.uploadingAvatar" }) : formatMessage({ id: "settings.common.uploadImage" })}
                 disabled={avatarSaving}
                 onChange={(e) => {
                   const file = e.target.files?.[0];
@@ -617,127 +653,90 @@ export function AccountSection({
                   if (file) void handleUploadAvatar(file);
                 }}
               />
+              <AvatarSlot context="profile-tile" type="human" humanAvatarUrl={user?.avatarUrl} email={user?.email} />
+              <AvatarEditVeil busy={avatarSaving} />
             </label>
+            </Tooltip>
           }
         >
           {avatarError ? (
-            <p className="text-xs font-bold text-brutal-red" role="alert">{avatarError}</p>
+            <p className="text-caption text-danger-strong" role="alert">{avatarError}</p>
           ) : null}
           {/* Profile form */}
           <form onSubmit={handleSaveProfile} className="space-y-3">
-          <FormField label={formatMessage({ id: "settings.account.displayNameLabel" })} labelStyle="plain" size="compact">
-            <input
-              data-testid="account-profile-display-name-input"
-              type="text"
-              value={displayName}
-              onChange={(e) => {
-                setDisplayName(e.target.value);
-                setSaved(false);
-              }}
-              className="w-full border-2 border-black p-2 text-sm shadow-brutal-sm focus:shadow-brutal focus:outline-none"
-            />
-          </FormField>
-          <FormField label={formatMessage({ id: "settings.account.usernameLabel" })} labelStyle="plain" size="compact">
-            <PrefixedInput
-              data-testid="account-profile-username-input"
-              type="text"
-              value={user?.name ?? ""}
-              readOnly
-              aria-readonly="true"
-              tabIndex={-1}
-              prefix="@"
-              className="border-black/30 bg-gray-50 shadow-none focus-within:shadow-none"
-              inputClassName="cursor-default text-sm text-black/60"
-            />
-          </FormField>
-          <FormField label={formatMessage({ id: "settings.account.emailLabel" })} labelStyle="plain" size="compact">
-            <div className="flex items-center gap-2">
-              <span className="font-mono text-sm">{user?.email}</span>
-              {user?.emailVerified ? (
-                <span className="inline-flex items-center gap-1 border border-black bg-brutal-lime px-1.5 text-[10px] font-bold uppercase">
-                  <Shield size={10} /> {formatMessage({ id: "settings.account.verified" })}
-                </span>
-              ) : (
-                <span className="inline-flex items-center gap-1 border border-black bg-brutal-orange/30 px-1.5 text-[10px] font-bold uppercase">
-                  {formatMessage({ id: "settings.account.unverified" })}
-                </span>
-              )}
-            </div>
-          </FormField>
+            <FormField label={formatMessage({ id: "settings.account.displayNameLabel" })} size="compact">
+              <Input
+                data-testid="account-profile-display-name-input"
+                type="text"
+                value={displayName}
+                onChange={handleDisplayNameChange}
+              />
+            </FormField>
+            <FormField label={formatMessage({ id: "settings.account.usernameLabel" })} size="compact">
+              <PrefixedInput
+                data-testid="account-profile-username-input"
+                type="text"
+                value={user?.name ?? ""}
+                readOnly
+                aria-readonly="true"
+                tabIndex={-1}
+                prefix="@"
+                className="border-line-hairline bg-fill-muted shadow-none focus-within:shadow-none"
+                inputClassName="cursor-default text-foreground-muted"
+              />
+            </FormField>
+            <FormField label={formatMessage({ id: "settings.account.emailLabel" })} size="compact">
+              <div className="flex items-center gap-2">
+                <span className="min-w-0 truncate font-mono text-mono-code text-foreground">{user?.email}</span>
+                {user?.emailVerified ? (
+                  <Badge variant="success" appearance="soft">
+                    <Shield size={10} /> {formatMessage({ id: "settings.account.verified" })}
+                  </Badge>
+                ) : (
+                  <Badge variant="warning" appearance="soft">
+                    {formatMessage({ id: "settings.account.unverified" })}
+                  </Badge>
+                )}
+              </div>
+            </FormField>
 
           {error && (
-            <Banner intent="warning" density="sm" className="font-bold">{error}</Banner>
+            <Banner intent="warning" density="sm">{error}</Banner>
           )}
 
-          <button
-            type="submit"
-            disabled={!profileDirty || saving}
-            className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {saving ? formatMessage({ id: "settings.common.saving" }) : saved ? (
-              <><Check size={14} /> {formatMessage({ id: "settings.common.saved" })}</>
-            ) : formatMessage({ id: "settings.account.saveProfile" })}
-          </button>
+            <Button
+              type="submit"
+              disabled={!profileDirty || saving}
+              size="sm"
+              variant="accent"
+            >
+              {saving ? formatMessage({ id: "settings.common.saving" }) : saved ? (
+                <><Check size={14} /> {formatMessage({ id: "settings.common.saved" })}</>
+              ) : formatMessage({ id: "settings.account.saveProfile" })}
+            </Button>
           </form>
 
         {/* Divider */}
-        <div className="border-t-2 border-black" />
+        <Separator />
 
         {visibleProviders.length > 0 && (
           <>
             <div>
-              <div className="mb-2 text-sm font-bold">{formatMessage({ id: "settings.account.connectedAccounts" })}</div>
+              <div className="mb-2 text-subhead font-semibold">{formatMessage({ id: "settings.account.connectedAccounts" })}</div>
               <div className="space-y-2">
-                {visibleProviders.map((provider) => {
-                  const identity = linkedIdentities[provider.id];
-                  return (
-                    <div
-                      key={provider.id}
-                      role="group"
-                      aria-label={formatMessage({ id: "settings.account.providerAccountAria" }, { label: provider.label })}
-                      className="relative flex items-start justify-between gap-3 border-2 border-black/30 bg-white p-3 text-left transition-colors hover:border-black hover:shadow-brutal-sm"
-                    >
-                      <div className="min-w-0 flex-1">
-                        <div className="mb-1 flex items-center gap-2 text-xs">
-                          <SocialProviderIcon providerId={provider.id} />
-                          <span className="font-bold text-black">{provider.label}</span>
-                        </div>
-                        <div className="truncate text-xs text-black/50">
-                          {identity?.providerEmail
-                            ? formatMessage({ id: "settings.account.connectedAs" }, { email: identity.providerEmail })
-                            : formatMessage({ id: "settings.account.notConnected" })}
-                        </div>
-                      </div>
-                      {!identity && (
-                        <button
-                          type="button"
-                          onClick={() => handleConnectProvider(provider)}
-                          disabled={linkingProviderId === provider.id}
-                          className="btn-brutal-sm shrink-0 bg-white px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                          {linkingProviderId === provider.id ? formatMessage({ id: "settings.account.connecting" }) : formatMessage({ id: "settings.account.connect" })}
-                        </button>
-                      )}
-                      {identity && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setPasswordSetupError("");
-                            setPasswordSetupSentForProvider(null);
-                            setPendingDisconnectProvider(provider);
-                          }}
-                          aria-label={formatMessage({ id: "settings.account.disconnectAria" }, { label: provider.label })}
-                          className="btn-brutal-sm shrink-0 bg-white px-3 py-1.5 text-xs"
-                        >
-                          {formatMessage({ id: "settings.account.disconnect" })}
-                        </button>
-                      )}
-                    </div>
-                  );
-                })}
+                {visibleProviders.map((provider) => (
+                  <ProviderAccountRow
+                    key={provider.id}
+                    provider={provider}
+                    identity={linkedIdentities[provider.id]}
+                    linking={linkingProviderId === provider.id}
+                    onConnect={handleConnectProvider}
+                    onRequestDisconnect={handleRequestDisconnectProvider}
+                  />
+                ))}
               </div>
               {passwordSetupSentForProvider && (
-                <Banner intent="success" density="sm" className="mt-3 font-bold">
+                <Banner intent="success" density="sm" className="mt-3">
                   {formatMessage(
                     { id: "settings.account.passwordSetupSentForProvider" },
                     { label: passwordSetupSentForProvider.label },
@@ -746,22 +745,22 @@ export function AccountSection({
               )}
             </div>
 
-            <div className="border-t-2 border-black" />
+            <Separator />
           </>
         )}
 
         {/* Password credential */}
         <div>
           {passwordChangeIntent && passwordConfigured === null ? (
-            <p className="text-xs text-black/60" role="status">
+            <p className="text-footnote text-foreground-muted" role="status">
               {formatMessage({ id: "settings.account.loadingSignInMethods" })}
             </p>
           ) : passwordChangeIntent && passwordConfigured === false ? (
             <div className="space-y-2" data-testid="password-managed-by-provider">
-              <div className="text-sm font-bold">
+              <div className="text-subhead font-semibold">
                 {formatMessage({ id: "settings.account.passwordManagedTitle" })}
               </div>
-              <p className="text-xs text-black/60">
+              <p className="text-footnote text-foreground-muted">
                 {formatMessage(
                   { id: "settings.account.passwordManagedDescription" },
                   {
@@ -774,39 +773,39 @@ export function AccountSection({
           ) : passwordConfigured === false ? (
             <div className="space-y-3">
               <div>
-                <div className="text-sm font-bold">{formatMessage({ id: "settings.account.setPassword" })}</div>
-                <p className="mt-1 text-xs text-black/60">
+                <div className="text-subhead font-semibold">{formatMessage({ id: "settings.account.setPassword" })}</div>
+                <p className="mt-1 text-footnote text-foreground-muted">
                   {formatMessage({ id: "settings.account.setPasswordDescription" })}
                 </p>
               </div>
               {passwordSetupError && (
-                <Banner intent="warning" density="sm" className="font-bold">{passwordSetupError}</Banner>
+                <Banner intent="warning" density="sm">{passwordSetupError}</Banner>
               )}
               {passwordSetupEmailSent && !passwordSetupSentForProvider && (
-                <Banner intent="success" density="sm" className="font-bold">
+                <Banner intent="success" density="sm">
                   {formatMessage({ id: "settings.account.passwordSetupEmailSent" })}
                 </Banner>
               )}
-              <button
+              <Button
+                variant="accent" size="sm"
                 type="button"
-                onClick={() => void handleSendPasswordSetup()}
+                onClick={handleSetPasswordByEmail}
                 disabled={passwordSetupLoading}
-                className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {passwordSetupLoading
                   ? formatMessage({ id: "settings.account.sendingSetupEmail" })
                   : formatMessage({ id: "settings.account.setPasswordByEmail" })}
-              </button>
+              </Button>
             </div>
           ) : (
             <button
               type="button"
               onClick={() => setShowPasswordChange(!showPasswordChange)}
-              className="flex items-center gap-2 text-sm font-bold"
+              className="-mx-1 flex items-center gap-2 rounded-control px-1 text-subhead font-semibold text-foreground outline-none hover:bg-fill-pressed focus-visible:shadow-focus"
             >
               <ChevronRight
-                size={14}
-                className={`transition-transform ${passwordFormOpen ? "rotate-90" : ""}`}
+                size={16}
+                className={`text-foreground-hint transition-transform ${passwordFormOpen ? "rotate-90" : ""}`}
               />
               {formatMessage({ id: "settings.account.changePassword" })}
             </button>
@@ -814,59 +813,60 @@ export function AccountSection({
 
           {(!passwordChangeIntent || passwordConfigured === true) && passwordFormOpen && (
             <form onSubmit={handleChangePassword} className="mt-3 space-y-3">
-              <FormField label={formatMessage({ id: "settings.account.currentPassword" })} labelStyle="plain" size="compact">
-                <input
+              <FormField label={formatMessage({ id: "settings.account.currentPassword" })} size="compact">
+                <Input
                   type="password"
                   name="current-password"
                   autoComplete="current-password"
                   aria-label={formatMessage({ id: "settings.account.currentPassword" })}
                   value={currentPassword}
-                  onChange={(e) => setCurrentPassword(e.target.value)}
-                  className="w-full border-2 border-black p-2 text-sm shadow-brutal-sm focus:shadow-brutal focus:outline-none"
+                  onChange={handleCurrentPasswordChange}
+                  className="w-full"
                   required
                 />
               </FormField>
-              <FormField label={formatMessage({ id: "settings.account.newPassword" })} labelStyle="plain" size="compact">
-                <input
+              <FormField label={formatMessage({ id: "settings.account.newPassword" })} size="compact">
+                <Input
                   type="password"
                   name="new-password"
                   autoComplete="new-password"
                   aria-label={formatMessage({ id: "settings.account.newPassword" })}
                   value={newPassword}
-                  onChange={(e) => setNewPassword(e.target.value)}
-                  className="w-full border-2 border-black p-2 text-sm shadow-brutal-sm focus:shadow-brutal focus:outline-none"
+                  onChange={handleNewPasswordChange}
+                  className="w-full"
                   placeholder={formatMessage({ id: "settings.account.minCharsPlaceholder" })}
                   required
                 />
               </FormField>
-              <FormField label={formatMessage({ id: "settings.account.confirmPassword" })} labelStyle="plain" size="compact">
-                <input
+              <FormField label={formatMessage({ id: "settings.account.confirmPassword" })} size="compact">
+                <Input
                   type="password"
                   name="confirm-password"
                   autoComplete="new-password"
                   aria-label={formatMessage({ id: "settings.account.confirmPassword" })}
                   value={confirmPassword}
-                  onChange={(e) => setConfirmPassword(e.target.value)}
-                  className="w-full border-2 border-black p-2 text-sm shadow-brutal-sm focus:shadow-brutal focus:outline-none"
+                  onChange={handleConfirmPasswordChange}
+                  className="w-full"
                   required
                 />
               </FormField>
 
               {passwordError && (
-                <Banner intent="warning" density="sm" className="font-bold">{passwordError}</Banner>
+                <Banner intent="warning" density="sm">{passwordError}</Banner>
               )}
 
               {passwordSaved && (
-                <div className="border-2 border-black bg-brutal-lime/30 p-2 text-xs font-bold">{formatMessage({ id: "settings.account.passwordUpdated" })}</div>
+                <Banner intent="success" density="sm" role="status">{formatMessage({ id: "settings.account.passwordUpdated" })}</Banner>
               )}
 
-              <button
+              <Button
+
+                variant="accent" size="sm"
                 type="submit"
                 disabled={saving}
-                className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs"
               >
                 {saving ? formatMessage({ id: "settings.account.updating" }) : formatMessage({ id: "settings.account.changePassword" })}
-              </button>
+              </Button>
             </form>
           )}
         </div>
@@ -901,14 +901,12 @@ export function AccountSection({
               ? "settings.account.sendingSetupEmail"
               : "settings.account.disconnecting",
           })}
-          confirmColor={pendingDisconnectRequiresPassword
-            ? "bg-brutal-pink"
+          confirmVariant={pendingDisconnectRequiresPassword
+            ? "accent"
             : undefined}
           chromeLocale="active"
-          onConfirm={() => pendingDisconnectRequiresPassword
-            ? handleSendPasswordSetup(pendingDisconnectProvider)
-            : handleDisconnectProvider(pendingDisconnectProvider)}
-          onClose={() => setPendingDisconnectProvider(null)}
+          onConfirm={handleConfirmDisconnect}
+          onClose={handleCloseDisconnect}
         />
       )}
 
@@ -923,6 +921,9 @@ function AccountSignOutSection() {
   const { formatMessage } = useIntl();
   const logout = useAuthStore((s) => s.logout);
   const [showConfirm, setShowConfirm] = useState(false);
+  const handleOpenConfirm = useCallback(() => setShowConfirm(true), []);
+  const handleCloseConfirm = useCallback(() => setShowConfirm(false), []);
+  const handleConfirmLogout = useCallback(() => { logout(); }, [logout]);
 
   return (
     <div className="mb-6">
@@ -932,26 +933,27 @@ function AccountSignOutSection() {
         label={formatMessage({ id: "settings.session.sectionLabel" })}
       />
 
-      <div className="border-2 border-black bg-white shadow-brutal-sm p-4">
+      <Card className="p-4">
         <div className="flex items-center justify-between">
           <div>
-            <div className="text-sm font-bold text-black">
+            <div className="text-subhead font-semibold text-foreground">
               {formatMessage({ id: "settings.session.logOutTitle" })}
             </div>
-            <p className="text-xs text-black/60 mt-0.5">
+            <p className="text-footnote text-foreground-muted mt-0.5">
               {formatMessage({ id: "settings.session.logOutDescription" })}
             </p>
           </div>
-          <button
+          <Button
+            variant="warning" size="sm"
             type="button"
-            onClick={() => setShowConfirm(true)}
+            onClick={handleOpenConfirm}
             data-testid="account-logout"
-            className="btn-brutal bg-brutal-orange px-4 py-2 [@media(max-height:600px)]:py-1 text-sm font-bold flex items-center gap-1.5 shrink-0 ml-4"
+            className="ml-4 shrink-0"
           >
             {formatMessage({ id: "settings.session.logOutAction" })}
-          </button>
+          </Button>
         </div>
-      </div>
+      </Card>
 
       {showConfirm && (
         <ConfirmDialog
@@ -959,10 +961,10 @@ function AccountSignOutSection() {
           message={formatMessage({ id: "settings.session.confirmMessage" })}
           confirmLabel={formatMessage({ id: "settings.session.confirmLabel" })}
           loadingLabel={formatMessage({ id: "settings.session.confirmLoadingLabel" })}
-          confirmColor="bg-brutal-orange"
+          confirmVariant="warning"
           confirmTestId="account-logout-confirm-button"
-          onConfirm={() => { logout(); }}
-          onClose={() => setShowConfirm(false)}
+          onConfirm={handleConfirmLogout}
+          onClose={handleCloseConfirm}
         />
       )}
     </div>
@@ -978,8 +980,17 @@ function NotificationsTabContent() {
   );
 }
 
-function LanguageRegionSection() {
+interface PublicTranslationSettingsContext {
+  serverId: string;
+  serverSlug: string;
+  translationEnabled: boolean;
+  translationAvailable: boolean;
+  browserLocalPreferences: boolean;
+}
+
+function LanguageRegionSection({ publicContext }: { publicContext?: PublicTranslationSettingsContext }) {
   const currentServer = useServerStore((s) => s.current);
+  const translationServerId = publicContext?.serverId ?? currentServer?.id;
   const settings = useTranslationStore((s) => s.settings);
   const settingsLoading = useTranslationStore((s) => s.settingsLoading);
   const settingsError = useTranslationStore((s) => s.settingsError);
@@ -1019,8 +1030,8 @@ function LanguageRegionSection() {
   );
 
   useEffect(() => {
-    void loadSettings(currentServer?.id);
-  }, [currentServer?.id, loadSettings]);
+    void loadSettings(translationServerId, publicContext);
+  }, [loadSettings, publicContext, translationServerId]);
 
   // oxlint-disable-next-line react-doctor/no-derived-state-effect
   useEffect(() => {
@@ -1056,7 +1067,7 @@ function LanguageRegionSection() {
     setTranslationDisplay(settings.preferredTranslationDisplay);
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setLanguageRegionSaved(false);
-  }, [currentServer?.id, savedTranslationTarget, savedTranslationMode, settings.preferredTranslationDisplay]);
+  }, [translationServerId, savedTranslationTarget, savedTranslationMode, settings.preferredTranslationDisplay]);
 
   // oxlint-disable-next-line react-doctor/no-derived-state-effect, react-doctor/no-cascading-set-state
   useEffect(() => {
@@ -1066,7 +1077,7 @@ function LanguageRegionSection() {
     setTimeFormat(savedTimeFormat);
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setDateTimeSaved(false);
-  }, [currentServer?.id, savedTimezone, savedTimeFormat]);
+  }, [translationServerId, savedTimezone, savedTimeFormat]);
 
   const languageOptions = useMemo(
     () => getTranslationLanguageOptions(settings.effectiveLanguage, formatMessage),
@@ -1150,7 +1161,46 @@ function LanguageRegionSection() {
     }
   };
 
-  if (!currentServer) return null;
+  const handleDisplayLanguageChange = useCallback((next: string | null) => {
+    if (next == null) return;
+    setLanguageRegionSaved(false);
+    setLanguageError("");
+    setDisplayLanguage(next as Locale);
+  }, []);
+
+  const handleTranslationModeChange = useCallback((next: PreferredTranslationMode) => {
+    setLanguageRegionSaved(false);
+    setLanguageError("");
+    setTranslationMode(next);
+  }, []);
+
+  const handleTranslationTargetChange = useCallback((next: string | null) => {
+    if (next == null) return;
+    setLanguageRegionSaved(false);
+    setLanguageError("");
+    setTranslationTarget(next);
+  }, []);
+
+  const handleTranslationDisplayChange = useCallback((next: "translated" | "original" | "bilingual") => {
+    setLanguageRegionSaved(false);
+    setTranslationDisplayError("");
+    setTranslationDisplay(next);
+  }, []);
+
+  const handleTimezoneChange = useCallback((next: string | null) => {
+    if (next == null) return;
+    setDateTimeSaved(false);
+    setTimezoneError("");
+    setTimezone(next);
+  }, []);
+
+  const handleTimeFormatChange = useCallback((next: "12h" | "24h") => {
+    setDateTimeSaved(false);
+    setTimeFormatError("");
+    setTimeFormat(next);
+  }, []);
+
+  if (!translationServerId) return null;
 
   return (
     <>
@@ -1161,24 +1211,19 @@ function LanguageRegionSection() {
           label={formatMessage({ id: "settings.language.sectionLabel" })}
         />
 
-        <form onSubmit={handleSaveLanguageRegion} className="border-2 border-black bg-white shadow-brutal-sm p-4 space-y-4">
+        <Card render={<form onSubmit={handleSaveLanguageRegion} />} className="block space-y-4 p-4">
           <div className="space-y-3">
             <div>
-              <div className="text-sm font-bold text-black">
+              <div className="text-subhead font-semibold text-foreground">
                 {formatMessage({ id: "settings.language.displayLanguageTitle" })}
               </div>
-              <div className="text-xs text-black/60 mt-0.5">
+              <div className="text-footnote text-foreground-muted mt-0.5">
                 {formatMessage({ id: "settings.language.displayLanguageDescription" })}
               </div>
             </div>
             <Select
               value={displayLanguage}
-              onValueChange={(next) => {
-                if (next == null) return;
-                setLanguageRegionSaved(false);
-                setLanguageError("");
-                setDisplayLanguage(next as Locale);
-              }}
+              onValueChange={handleDisplayLanguageChange}
               disabled={savingLanguageRegion || settingsLoading}
               items={displayLanguageOptions}
             >
@@ -1196,26 +1241,38 @@ function LanguageRegionSection() {
                 some pages may still be English while zh-cn is active. en never
                 shows this. Removed once all namespaces are migrated. */}
             {locale === "zh-cn" ? (
-              <div className="text-xs text-black/60 mt-0.5" data-testid="zh-coverage-notice">
+              <div className="text-footnote text-foreground-muted mt-0.5" data-testid="zh-coverage-notice">
                 {formatMessage({ id: "settings.language.zhCoverageNotice" })}
               </div>
             ) : null}
           </div>
           <div className="space-y-3">
             <div>
-              <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.language.translationMode" })}</div>
-              <div className="text-xs text-black/60 mt-0.5">
+              <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.language.translationMode" })}</div>
+              <div className="text-footnote text-foreground-muted mt-0.5">
                 {formatMessage({ id: "settings.language.translationModeDesc" })}
               </div>
+              {/* The menu action needs the server gate AND a configured provider;
+                  without this line the mode control silently does nothing. */}
+              {!settingsLoading && !settings.available ? (
+                <div
+                  className="mt-1 text-caption font-bold text-warning-strong"
+                  data-testid="translation-unavailable-notice"
+                >
+                  {formatMessage({
+                    id: !settings.serverTranslationEnabled
+                      ? settings.canManageServerTranslation
+                        ? "settings.language.translationServerOffAdmin"
+                        : "settings.language.translationServerOff"
+                      : "settings.language.translationProviderMissing",
+                  })}
+                </div>
+              ) : null}
             </div>
             <SegmentedControl<PreferredTranslationMode>
               value={translationMode}
               aria-label={formatMessage({ id: "settings.language.translationModeAria" })}
-              onValueChange={(next) => {
-                setLanguageRegionSaved(false);
-                setLanguageError("");
-                setTranslationMode(next);
-              }}
+              onValueChange={handleTranslationModeChange}
               disabled={savingLanguageRegion || settingsLoading}
             >
               <SegmentedControlItem value="auto" data-testid="translation-mode-auto">
@@ -1233,19 +1290,14 @@ function LanguageRegionSection() {
           {translationMode !== "off" ? (
             <div className="space-y-3">
               <div>
-                <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.language.translationTarget" })}</div>
-                <div className="text-xs text-black/60 mt-0.5">
+                <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.language.translationTarget" })}</div>
+                <div className="text-footnote text-foreground-muted mt-0.5">
                   {formatMessage({ id: "settings.language.translationTargetDesc" }, { language: settings.effectiveLanguage?.toUpperCase() ?? "English" })}
                 </div>
               </div>
               <Select
                 value={translationTarget}
-                onValueChange={(next) => {
-                  if (next == null) return;
-                  setLanguageRegionSaved(false);
-                  setLanguageError("");
-                  setTranslationTarget(next);
-                }}
+                onValueChange={handleTranslationTargetChange}
                 disabled={savingLanguageRegion || settingsLoading}
                 items={languageOptions}
               >
@@ -1265,19 +1317,15 @@ function LanguageRegionSection() {
           {translationMode !== "off" ? (
             <div className="space-y-3">
               <div>
-                <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.language.defaultView" })}</div>
-                <div className="text-xs text-black/60 mt-0.5">
+                <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.language.defaultView" })}</div>
+                <div className="text-footnote text-foreground-muted mt-0.5">
                   {formatMessage({ id: "settings.language.defaultViewDesc" })}
                 </div>
               </div>
               <SegmentedControl<"translated" | "original" | "bilingual">
                 value={translationDisplay}
                 aria-label={formatMessage({ id: "settings.language.defaultViewAria" })}
-                onValueChange={(next) => {
-                  setLanguageRegionSaved(false);
-                  setTranslationDisplayError("");
-                  setTranslationDisplay(next);
-                }}
+                onValueChange={handleTranslationDisplayChange}
                 disabled={savingLanguageRegion || settingsLoading}
               >
                 <SegmentedControlItem value="translated" data-testid="translation-display-translated">
@@ -1294,20 +1342,21 @@ function LanguageRegionSection() {
           ) : null}
 
           {(settingsError || languageError || translationDisplayError) && (
-            <Banner intent="warning" density="sm" className="font-bold">
+            <Banner intent="warning" density="sm">
               {translationDisplayError || languageError || settingsError}
             </Banner>
           )}
-          <button
+          <Button
+            variant="accent" size="sm"
             type="submit"
             disabled={!languageRegionDirty || savingLanguageRegion || settingsLoading}
-            className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-1.5"
           >
             {savingLanguageRegion ? formatMessage({ id: "settings.common.saving" }) : languageRegionSaved ? (
               <><Check size={14} /> {formatMessage({ id: "settings.common.saved" })}</>
             ) : formatMessage({ id: "settings.common.save" })}
-          </button>
-        </form>
+          </Button>
+        </Card>
       </div>
 
       <div className="mb-6">
@@ -1317,22 +1366,17 @@ function LanguageRegionSection() {
           label={formatMessage({ id: "settings.dateTime.sectionLabel" })}
         />
 
-        <form onSubmit={handleSaveDateTime} className="border-2 border-black bg-white shadow-brutal-sm p-4 space-y-4">
+        <Card render={<form onSubmit={handleSaveDateTime} />} className="block space-y-4 p-4">
           <div className="space-y-3">
             <div>
-              <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.dateTime.timezone" })}</div>
-              <div className="text-xs text-black/60 mt-0.5">
+              <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.dateTime.timezone" })}</div>
+              <div className="text-footnote text-foreground-muted mt-0.5">
                 {formatMessage({ id: "settings.dateTime.timezoneDesc" })}
               </div>
             </div>
             <Select
               value={timezone}
-              onValueChange={(next) => {
-                if (next == null) return;
-                setDateTimeSaved(false);
-                setTimezoneError("");
-                setTimezone(next);
-              }}
+              onValueChange={handleTimezoneChange}
               disabled={savingDateTime || settingsLoading}
               items={timezoneOptions}
             >
@@ -1347,19 +1391,15 @@ function LanguageRegionSection() {
               </SelectContent>
             </Select>
             <div>
-              <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.dateTime.timeFormat" })}</div>
-              <div className="text-xs text-black/60 mt-0.5">
+              <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.dateTime.timeFormat" })}</div>
+              <div className="text-footnote text-foreground-muted mt-0.5">
                 {formatMessage({ id: "settings.dateTime.timeFormatDesc" })}
               </div>
             </div>
             <SegmentedControl<"12h" | "24h">
               value={timeFormat}
               aria-label={formatMessage({ id: "settings.dateTime.timeFormatAria" })}
-              onValueChange={(next) => {
-                setDateTimeSaved(false);
-                setTimeFormatError("");
-                setTimeFormat(next);
-              }}
+              onValueChange={handleTimeFormatChange}
               disabled={savingDateTime || settingsLoading}
             >
               <SegmentedControlItem value="12h" data-testid="time-format-12h">
@@ -1372,26 +1412,113 @@ function LanguageRegionSection() {
           </div>
 
           {(settingsError || timezoneError || timeFormatError) && (
-            <Banner intent="warning" density="sm" className="font-bold">
+            <Banner intent="warning" density="sm">
               {timezoneError || timeFormatError || settingsError}
             </Banner>
           )}
-          <button
+          <Button
+            variant="accent" size="sm"
             type="submit"
             disabled={!dateTimeDirty || savingDateTime || settingsLoading}
-            className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-1.5"
           >
             {savingDateTime ? formatMessage({ id: "settings.common.saving" }) : dateTimeSaved ? (
               <><Check size={14} /> {formatMessage({ id: "settings.common.saved" })}</>
             ) : formatMessage({ id: "settings.common.save" })}
-          </button>
-        </form>
+          </Button>
+        </Card>
       </div>
     </>
   );
 }
 
+// Which card the Notifications tab shows is a property of the RUNTIME, not of
+// the user: the desktop delivers OS notifications natively, a browser needs Web
+// Push, and some browsers can do neither. Deciding this once, synchronously, is
+// what keeps the tab from ever sitting on "Checking…" (task #93).
+const UNSUPPORTED_REASON_MESSAGE: Record<NotificationUnsupportedReason, MessageId> = {
+  "no-window": "settings.notifications.unsupportedHint",
+  "no-notification-api": "settings.notifications.unsupportedReason.noNotificationApi",
+  "insecure-context": "settings.notifications.unsupportedReason.insecureContext",
+  "no-service-worker": "settings.notifications.unsupportedReason.noServiceWorker",
+  "no-push-manager": "settings.notifications.unsupportedReason.noPushManager",
+};
+
 function NotificationsSection() {
+  const channel = useMemo(() => resolveNotificationChannel(), []);
+  if (channel.kind === "desktop-native") return <DesktopNativeNotificationsCard />;
+  return <WebPushNotificationsCard channel={channel} />;
+}
+
+function DesktopNativeNotificationsCard() {
+  const { formatMessage } = useIntl();
+  // The shell grants the Chromium notification permission outright, so there is
+  // no readable "enabled/blocked" state here (see desktopNativeNotifications.ts);
+  // the card reports that the OS owns the switch and offers the one real check.
+  const available = isDesktopNativeNotificationsAvailable();
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+
+  const handleTest = useCallback(() => {
+    setError("");
+    setMessage("");
+    const posted = showDesktopTestNotification({
+      title: formatMessage({ id: "settings.notifications.desktop.testTitle" }),
+      body: formatMessage({ id: "settings.notifications.desktop.testBody" }),
+    });
+    if (posted) setMessage(formatMessage({ id: "settings.notifications.desktop.testSent" }));
+    else setError(formatMessage({ id: "settings.notifications.desktop.errTestFailed" }));
+  }, [formatMessage]);
+
+  return (
+    <div>
+      <SectionHeader
+        className="mb-3"
+        icon={<Bell size={16} />}
+        label={formatMessage({ id: "settings.notifications.desktop.sectionLabel" })}
+      />
+
+      <Card className="space-y-3 p-4" data-testid="desktop-notifications-card">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.notifications.desktop.title" })}</div>
+            <div className="text-footnote text-foreground-muted mt-0.5">
+              {formatMessage({ id: "settings.notifications.desktop.description" })}
+            </div>
+          </div>
+          <Badge appearance="soft" variant={available ? "default" : "muted"}>
+            {formatMessage({ id: available ? "settings.notifications.desktop.statusSystemManaged" : "settings.notifications.desktop.statusUnavailable" })}
+          </Badge>
+        </div>
+
+        <div className="text-footnote text-foreground-muted">
+          {formatMessage({ id: available ? "settings.notifications.desktop.systemHint" : "settings.notifications.desktop.unavailableHint" })}
+        </div>
+
+        {error && (
+          <Banner intent="warning" density="sm">{error}</Banner>
+        )}
+        {message && (
+          <Banner intent="success" density="sm" role="status">{message}</Banner>
+        )}
+
+        <div className="flex gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            type="button"
+            onClick={handleTest}
+            disabled={!available}
+          >
+            {formatMessage({ id: "settings.notifications.desktop.sendTest" })}
+          </Button>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function WebPushNotificationsCard({ channel }: { channel: Exclude<NotificationChannel, { kind: "desktop-native" }> }) {
   const { formatMessage } = useIntl();
   const currentServer = useServerStore((s) => s.current);
   const currentServerId = currentServer?.id;
@@ -1409,17 +1536,26 @@ function NotificationsSection() {
   const [savedServerPushMuted, setSavedServerPushMuted] = useState(false);
   const serverPrefsVersionRef = useRef(currentServer?.notificationPrefsVersion ?? -1);
 
-  const refreshState = async () => {
+  const refreshState = useCallback(async () => {
     const serverId = currentServerId;
     setLoading(true);
     setPermission(getPushPermissionState());
-    const [configured, currentSubscribed, notificationSettings] = await Promise.all([
-      isPushServerConfigured(),
-      isPushSubscribed(),
-      serverId
-        ? api.get(`/servers/${serverId}/notification-settings`).then((res) => res.data as { serverPushMuted: boolean; prefsVersion?: number }).catch(() => null)
-        : Promise.resolve(null),
-    ]);
+    // Every probe must settle: if any of them threw, `loading` stayed true
+    // forever ("Checking…") and the enable button stayed disabled (task #93).
+    let configured = false;
+    let currentSubscribed = false;
+    let notificationSettings: { serverPushMuted: boolean; prefsVersion?: number } | null = null;
+    try {
+      [configured, currentSubscribed, notificationSettings] = await Promise.all([
+        isPushServerConfigured(),
+        isPushSubscribed(),
+        serverId
+          ? api.get(`/servers/${serverId}/notification-settings`).then((res) => res.data as { serverPushMuted: boolean; prefsVersion?: number }).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+    } catch (err) {
+      console.error("[Push] Failed to refresh notification state:", err);
+    }
     if (serverId !== useServerStore.getState().current?.id) return;
     setServerConfigured(configured);
     setSubscribed(currentSubscribed);
@@ -1444,14 +1580,15 @@ function NotificationsSection() {
       });
     }
     setLoading(false);
-  };
+  }, [applyServerPatch, currentServerId]);
 
-  // oxlint-disable react-hooks/exhaustive-deps -- refetch push/notification state only when the active server id changes; `refreshState` is recreated each render and closes over the current `currentServer`, so depending on it would loop every render.
+  // Refetch push/notification state only when the active server id changes:
+  // `refreshState` is keyed on `currentServerId`, and the prefs version is read
+  // from the store so later prefs-version bumps do not trigger a refetch.
   useEffect(() => {
-    serverPrefsVersionRef.current = currentServer?.notificationPrefsVersion ?? -1;
+    serverPrefsVersionRef.current = useServerStore.getState().current?.notificationPrefsVersion ?? -1;
     void refreshState();
-  }, [currentServerId]);
-  // oxlint-enable react-hooks/exhaustive-deps
+  }, [refreshState]);
 
   // oxlint-disable-next-line react-doctor/no-cascading-set-state -- Realtime server notification-pref updates must refresh the open settings form and clear stale save status together.
   useEffect(() => {
@@ -1471,7 +1608,7 @@ function NotificationsSection() {
     };
   }, [currentServerId]);
 
-  const handleEnable = async () => {
+  const handleEnable = useCallback(async () => {
     setBusy(true);
     setError("");
     setMessage("");
@@ -1485,9 +1622,9 @@ function NotificationsSection() {
     }
     await refreshState();
     setBusy(false);
-  };
+  }, [formatMessage, refreshState]);
 
-  const handleDisable = async () => {
+  const handleDisable = useCallback(async () => {
     setBusy(true);
     setError("");
     setMessage("");
@@ -1497,9 +1634,9 @@ function NotificationsSection() {
     }
     await refreshState();
     setBusy(false);
-  };
+  }, [formatMessage, refreshState]);
 
-  const handleSendTest = async () => {
+  const handleSendTest = useCallback(async () => {
     setTesting(true);
     setError("");
     setMessage("");
@@ -1515,7 +1652,13 @@ function NotificationsSection() {
     }
     await refreshState();
     setTesting(false);
-  };
+  }, [formatMessage, refreshState]);
+
+  const handleServerPushMutedChange = useCallback((checked: boolean) => {
+    setServerPushMuted(checked);
+    setMessage("");
+    setError("");
+  }, []);
 
   const handleSaveServerMute = async (event: FormEvent) => {
     event.preventDefault();
@@ -1565,6 +1708,15 @@ function NotificationsSection() {
             : permission === "denied"
               ? formatMessage({ id: "settings.notifications.statusDenied" })
               : formatMessage({ id: "settings.notifications.statusDisabled" });
+  // Fixed status meanings: on is lime, a blocked permission is a problem
+  // (orange), everything else is neutral stone.
+  const statusTone = loading
+    ? "muted"
+    : subscribed && serverConfigured && permission !== "unsupported"
+      ? "success"
+      : permission === "denied"
+        ? "warning"
+        : "muted";
 
   return (
     <div>
@@ -1574,122 +1726,119 @@ function NotificationsSection() {
         label={formatMessage({ id: "settings.notifications.sectionLabel" })}
       />
 
-      <div className="border-2 border-black bg-white shadow-brutal-sm p-4 space-y-3">
+      <Card className="space-y-3 p-4">
         <div className="flex items-center justify-between gap-3">
           <div>
-            <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.notifications.mainTitle" })}</div>
-            <div className="text-xs text-black/60 mt-0.5">
+            <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.notifications.mainTitle" })}</div>
+            <div className="text-footnote text-foreground-muted mt-0.5">
               {formatMessage({ id: "settings.notifications.mainDescription" })}
             </div>
           </div>
-          <span className="inline-flex shrink-0 border-2 border-black bg-soft-signal px-2 py-1 text-[10px] font-bold uppercase">
+          <Badge appearance="soft" variant={statusTone}>
             {statusLabel}
-          </span>
+          </Badge>
         </div>
 
         {permission === "unsupported" && (
-          <div className="text-xs text-black/60">
-            {formatMessage({ id: "settings.notifications.unsupportedHint" })}
+          <div className="text-footnote text-foreground-muted">
+            {formatMessage({ id: channel.kind === "unsupported" ? UNSUPPORTED_REASON_MESSAGE[channel.reason] : "settings.notifications.unsupportedHint" })}
           </div>
         )}
 
         {permission !== "unsupported" && !serverConfigured && !loading && (
-          <div className="text-xs text-black/60">
+          <div className="text-footnote text-foreground-muted">
             {formatMessage({ id: "settings.notifications.notConfiguredHint" })}
           </div>
         )}
 
         {permission === "denied" && (
-          <div className="text-xs text-black/60">
+          <div className="text-footnote text-foreground-muted">
             {formatMessage({ id: "settings.notifications.deniedHint" })}
           </div>
         )}
 
         {error && (
-          <Banner intent="warning" density="sm" className="font-bold">{error}</Banner>
+          <Banner intent="warning" density="sm">{error}</Banner>
         )}
 
         {message && (
-          <div className="border-2 border-black bg-brutal-lime/30 p-2 text-xs font-bold">{message}</div>
+          <Banner intent="success" density="sm" role="status">{message}</Banner>
         )}
 
         <div className="flex gap-2">
           {subscribed ? (
             <>
-              <button
+              <Button
+                variant="outline" size="sm" type="button"
                 onClick={handleDisable}
                 disabled={busy || testing}
-                className="btn-brutal bg-white px-3 py-1.5 text-xs"
               >
                 {busy ? formatMessage({ id: "settings.notifications.disabling" }) : formatMessage({ id: "settings.notifications.disable" })}
-              </button>
-              <button
+              </Button>
+              <Button
+                variant="outline" size="sm" type="button"
                 onClick={handleSendTest}
                 disabled={busy || testing || permission === "unsupported" || !serverConfigured}
-                className="btn-brutal bg-brutal-lime px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {testing ? formatMessage({ id: "settings.notifications.sending" }) : formatMessage({ id: "settings.notifications.sendTest" })}
-              </button>
+              </Button>
             </>
           ) : (
-            <button
+            <Button
+              variant="outline"
+              size="sm"
               onClick={handleEnable}
               disabled={busy || testing || permission === "unsupported" || !serverConfigured}
-              className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {busy ? formatMessage({ id: "settings.notifications.enabling" }) : formatMessage({ id: "settings.notifications.enable" })}
-            </button>
+            </Button>
           )}
         </div>
 
         {currentServer && (
-          <div className="border-t-2 border-black/20 pt-3">
+          <div>
+            <Separator className="mb-3" />
             <form onSubmit={handleSaveServerMute} className="space-y-3">
-              <label className={`flex items-start gap-3 ${loading || busy || testing || muting ? "opacity-60" : ""}`}>
+              <label className={`flex items-start gap-3 ${loading || busy || testing || muting ? "cursor-not-allowed" : ""}`}>
                 <Checkbox
-                  size="md"
                   checked={serverPushMuted}
                   disabled={loading || busy || testing || muting}
-                  onChange={(event) => {
-                    setServerPushMuted(event.currentTarget.checked);
-                    setMessage("");
-                    setError("");
-                  }}
+                  onCheckedChange={handleServerPushMutedChange}
                   className="mt-0.5"
                 />
                 <span className="min-w-0">
-                  <span className="block text-sm font-bold text-black">{formatMessage({ id: "settings.notifications.muteServerTitle" })}</span>
-                  <span className="block text-xs text-black/60 mt-0.5">
+                  <span className={`block text-subhead font-semibold ${loading || busy || testing || muting ? "text-foreground-disabled" : "text-foreground"}`}>{formatMessage({ id: "settings.notifications.muteServerTitle" })}</span>
+                  <span className="block text-footnote text-foreground-muted mt-0.5">
                     {formatMessage({ id: "settings.notifications.muteServerDescription" }, { serverName: currentServer.name })}
                   </span>
                 </span>
               </label>
               <div className="flex justify-end">
-                <button
+                <Button
+                  variant="accent" size="sm"
                   type="submit"
                   disabled={serverPushMuted === savedServerPushMuted || loading || busy || testing || muting}
-                  className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {muting ? formatMessage({ id: "settings.common.saving" }) : formatMessage({ id: "settings.common.save" })}
-                </button>
+                </Button>
               </div>
             </form>
           </div>
         )}
-      </div>
+      </Card>
     </div>
   );
 }
 
 // ── Invites Section ──
 
-interface PendingInvite {
+export interface PendingInvite {
   id: string;
   invitedEmail: string;
   createdAt: string;
 }
 
-interface JoinLinkRecord {
+export interface JoinLinkRecord {
   id: string;
   token: string;
   createdAt: string;
@@ -1699,17 +1848,20 @@ interface JoinLinkRecord {
   revokedAt: string | null;
 }
 
-interface OAuthClientRecord {
+export interface OAuthClientRecord {
+  setupUrl?: string | null;
+  setupDescription?: string | null;
   id: string;
   serverId: string;
   clientId: string;
-  appType: "server_local" | "slock_builtin" | "third_party_global";
+  appType: "server_local" | "third_party_global";
   publishStatus: "private" | "publish_requested" | "in_review" | "published" | "rejected" | "unpublish_requested";
   category: OAuthClientCategory;
   dataAccessSummary: string | null;
   publishRejectionReason: string | null;
   name: string;
   description: string | null;
+  whenToUse: string | null;
   homepageUrl: string | null;
   returnUrl: string | null;
   agentManifestUrl: string | null;
@@ -1721,21 +1873,9 @@ interface OAuthClientRecord {
   updatedAt: string;
 }
 
-interface BuiltInOAuthClientRecord {
-  id: string;
-  clientId: string;
-  appType: "slock_builtin";
-  name: string;
-  description: string | null;
-  homepageUrl: string | null;
-  agentManifestUrl: string | null;
-  allowedScopes: string[] | null;
-  humanMarketplaceVisible: boolean;
-  createdAt: string;
-  updatedAt: string;
-}
-
 interface MarketplaceOAuthClientRecord extends OAuthClientRecord {
+  official: boolean;
+  purpose: string;
   installedAt: string | null;
   marketplaceInstallBadge: MarketplaceInstallBadge;
   publisherName: string | null;
@@ -1744,6 +1884,10 @@ interface MarketplaceOAuthClientRecord extends OAuthClientRecord {
   appNotificationGroups: AppNotificationSelection["groups"];
   appNotificationEvents: AppNotificationSelection["events"];
   appNotificationReviewPending: boolean;
+  appNotificationPendingRevisionId: string | null;
+  appNotificationPendingGroups: AppNotificationSelection["groups"];
+  appNotificationPendingEvents: AppNotificationSelection["events"];
+  canReviewAppNotifications: boolean;
 }
 
 type MarketplaceInstallBadge =
@@ -1791,6 +1935,8 @@ function ProfileSection() {
   useEffect(() => {
     setName(server?.name ?? "");
   }, [server?.id, server?.name]);
+
+  const handleNameChange = useCallback((e: ChangeEvent<HTMLInputElement>) => setName(e.target.value), []);
 
   if (!server) return null;
 
@@ -1849,19 +1995,15 @@ function ProfileSection() {
         subtitle={`/${server.slug}`}
         avatar={
           canEdit ? (
+            <Tooltip content={avatarSaving ? formatMessage({ id: "settings.common.uploadingAvatar" }) : formatMessage({ id: "settings.common.uploadImage" })}>
             <label
-              className={`group relative flex size-16 shrink-0 items-center justify-center ${avatarSaving ? "cursor-not-allowed opacity-70" : ""}`}
-              title={avatarSaving ? formatMessage({ id: "settings.common.uploadingAvatar" }) : formatMessage({ id: "settings.common.uploadImage" })}
-              aria-label={avatarSaving ? formatMessage({ id: "settings.common.uploadingAvatar" }) : formatMessage({ id: "settings.common.uploadImage" })}
+              className={`group/avatar-edit relative flex shrink-0 rounded-sticker has-[:focus-visible]:shadow-focus ${avatarSaving ? "cursor-not-allowed opacity-70" : ""}`}
             >
-              <AvatarSlot context="profile-tile" type="server" serverAvatarUrl={server.avatarUrl} serverInitial={serverInitial} />
-              <span className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity group-hover:opacity-100">
-                <Upload size={18} className="text-white" />
-              </span>
               <input
                 type="file"
                 accept={PROFILE_AVATAR_ACCEPT}
-                className="hidden"
+                className="peer/avatar-edit sr-only"
+                aria-label={avatarSaving ? formatMessage({ id: "settings.common.uploadingAvatar" }) : formatMessage({ id: "settings.common.uploadImage" })}
                 disabled={avatarSaving}
                 onChange={(e) => {
                   const file = e.target.files?.[0];
@@ -1869,64 +2011,68 @@ function ProfileSection() {
                   if (file) void handleUploadAvatar(file);
                 }}
               />
+              <AvatarSlot context="profile-tile" type="server" serverAvatarUrl={server.avatarUrl} serverInitial={serverInitial} />
+              <AvatarEditVeil busy={avatarSaving} />
             </label>
+            </Tooltip>
           ) : (
-            <AvatarSlot context="profile-tile" type="server" serverAvatarUrl={server.avatarUrl} serverInitial={serverInitial} className="border-black/30" />
+            <AvatarSlot context="profile-tile" type="server" serverAvatarUrl={server.avatarUrl} serverInitial={serverInitial} />
           )
         }
       >
         {avatarError ? (
-          <p className="text-xs font-bold text-brutal-red" role="alert">{avatarError}</p>
+          <p className="text-caption text-danger-strong" role="alert">{avatarError}</p>
         ) : null}
         <form onSubmit={handleSave} className="space-y-3">
-          <FormField label={formatMessage({ id: "settings.serverProfile.nameLabel" })} labelStyle="plain" size="compact">
+          <FormField label={formatMessage({ id: "settings.serverProfile.nameLabel" })} size="compact">
             {canEdit ? (
-              <input
+              <Input
                 data-testid="server-profile-name-input"
                 type="text"
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={handleNameChange}
                 maxLength={100}
-                className="w-full border-2 border-black p-2 text-sm shadow-brutal-sm focus:shadow-brutal focus:outline-none"
+                className="w-full"
               />
             ) : (
               <div
                 data-testid="server-profile-name-readonly"
-                className="w-full border-2 border-black/30 bg-gray-50 p-2 text-sm font-mono text-black/60"
+                className="flex min-h-11 w-full items-center rounded-control border border-line-hairline bg-fill-muted px-3 text-body text-foreground-muted"
               >
                 {server.name}
               </div>
             )}
           </FormField>
 
-          <FormField label={formatMessage({ id: "settings.serverProfile.slugLabel" })} labelStyle="plain" size="compact">
+          <FormField label={formatMessage({ id: "settings.serverProfile.slugLabel" })} size="compact">
             <SlugInput
               type="text"
               value={server.slug}
               readOnly
               aria-readonly="true"
               tabIndex={-1}
-              className="border-black/30 bg-gray-50 shadow-none focus-within:shadow-none"
-              inputClassName="cursor-default text-sm text-black/60"
+              className="border-line-hairline bg-fill-muted shadow-none focus-within:shadow-none"
+              inputClassName="cursor-default text-foreground-muted"
             />
           </FormField>
 
           {error && (
-            <Banner intent="warning" density="sm" className="font-bold">{error}</Banner>
+            <Banner intent="warning" density="sm">{error}</Banner>
           )}
 
           {canEdit && (
-            <button
+            <Button
+              variant="accent" size="sm"
               data-testid="server-profile-save-button"
               data-save-state={saving ? "saving" : saved ? "saved" : dirty ? "dirty" : "pristine"}
               type="submit"
               disabled={!dirty || saving}
-              className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+              className="flex items-center gap-1.5"
             >
               {saving ? formatMessage({ id: "settings.common.saving" }) : saved ? (
                 <><Check size={14} /> {formatMessage({ id: "settings.common.saved" })}</>
               ) : formatMessage({ id: "settings.serverProfile.saveProfile" })}
-            </button>
+            </Button>
           )}
         </form>
       </SettingsProfileCard>
@@ -1936,6 +2082,8 @@ function ProfileSection() {
 
 interface PublicVisibilityReadback {
   publiclyVisible: boolean;
+  publicGuestJoinEnabled: boolean;
+  publicSearchEnabled: boolean;
   slug: string;
   exposedChannels: Array<{ id: string; name: string; description: string | null }>;
 }
@@ -1953,7 +2101,9 @@ type PublicVisibilityUiAction =
   | { type: "loaded"; readback: PublicVisibilityReadback }
   | { type: "failed"; error: string }
   | { type: "saving" }
-  | { type: "saved"; publiclyVisible: boolean }
+  | { type: "saved"; publiclyVisible: boolean; publicGuestJoinEnabled: boolean }
+  | { type: "guestJoinSaved"; publicGuestJoinEnabled: boolean }
+  | { type: "searchSaved"; publicSearchEnabled: boolean }
   | { type: "confirm"; open: boolean };
 
 function publicVisibilityUiReducer(state: PublicVisibilityUiState, action: PublicVisibilityUiAction): PublicVisibilityUiState {
@@ -1965,11 +2115,27 @@ function publicVisibilityUiReducer(state: PublicVisibilityUiState, action: Publi
     case "saved": return {
       ...state,
       saving: false,
-      readback: state.readback ? { ...state.readback, publiclyVisible: action.publiclyVisible } : null,
+      readback: state.readback ? {
+        ...state.readback,
+        publiclyVisible: action.publiclyVisible,
+        publicGuestJoinEnabled: action.publicGuestJoinEnabled,
+      } : null,
+    };
+    case "guestJoinSaved": return {
+      ...state,
+      saving: false,
+      readback: state.readback ? { ...state.readback, publicGuestJoinEnabled: action.publicGuestJoinEnabled } : null,
+    };
+    case "searchSaved": return {
+      ...state,
+      saving: false,
+      readback: state.readback ? { ...state.readback, publicSearchEnabled: action.publicSearchEnabled } : null,
     };
     case "confirm": return { ...state, confirmOpen: action.open };
   }
 }
+
+const NO_PUBLIC_CHANNELS: PublicVisibilityReadback["exposedChannels"] = [];
 
 function PublicChannelList({ channels }: { channels: PublicVisibilityReadback["exposedChannels"] }) {
   const { formatMessage } = useIntl();
@@ -1980,22 +2146,25 @@ function PublicChannelList({ channels }: { channels: PublicVisibilityReadback["e
   const scrollFrameClass = "max-h-[7.5rem] overflow-y-scroll";
   if (channels.length === 0) {
     return (
-      <div className={`border-2 border-dashed border-black/25 bg-gray-50 px-3 py-4 text-center text-xs text-black/55 ${scrollFrameClass}`}>
+      <div className={`rounded-container border border-dashed border-line-hairline px-3 py-4 text-center text-footnote text-foreground-hint ${scrollFrameClass}`}>
         {formatMessage({ id: "settings.publicVisibility.emptyChannels" })}
       </div>
     );
   }
   return (
-    <ul className={`divide-y divide-black/10 border-2 border-black bg-white ${scrollFrameClass}`} data-testid="public-visibility-channel-list">
-      {channels.map((channel) => (
-        <li key={channel.id} className="flex h-[3.625rem] items-start gap-3 px-3 py-2.5">
-          <span className="mt-0.5 flex size-7 shrink-0 items-center justify-center border border-black bg-brutal-cream" aria-hidden="true">
-            <Hash size={14} strokeWidth={2.5} />
-          </span>
+    <ul className={`rounded-container border border-line-hairline bg-layer-card ${scrollFrameClass}`} data-testid="public-visibility-channel-list">
+      {channels.map((channel, index) => (
+        <li key={channel.id} className="flex h-[3.625rem] flex-col">
+          {index > 0 ? <Separator className="shrink-0" /> : null}
+          <div className="flex min-h-0 flex-1 items-start gap-3 px-3 py-2.5">
+          <IconTile size="sm" className="mt-0.5">
+            <Hash strokeWidth={2} />
+          </IconTile>
           <span className="min-w-0 flex-1">
-            <span className="block truncate text-sm font-bold text-black">{channel.name}</span>
-            {channel.description ? <span className="mt-0.5 block truncate text-xs text-black/55">{channel.description}</span> : null}
+            <span className="block truncate text-subhead font-semibold text-foreground">{channel.name}</span>
+            {channel.description ? <span className="mt-0.5 block truncate text-footnote text-foreground-muted">{channel.description}</span> : null}
           </span>
+          </div>
         </li>
       ))}
     </ul>
@@ -2007,6 +2176,7 @@ export function PublicVisibilitySection() {
   const server = useServerStore((s) => s.current);
   const { role } = useServerPermissions();
   const publicServerEnabled = useServerFeatureFlag(PUBLIC_SERVER_FEATURE_FLAG_KEY).enabled;
+  const serverGuestEnabled = useServerFeatureFlag(SERVER_GUEST_FEATURE_FLAG_KEY).enabled;
   const [ui, dispatch] = useReducer(publicVisibilityUiReducer, {
     readback: null,
     loading: false,
@@ -2035,52 +2205,116 @@ export function PublicVisibilitySection() {
     };
   }, [formatMessage, publicServerEnabled, role, server?.id]);
 
-  if (!server || role !== "owner" || !publicServerEnabled) return null;
-
-  const updateVisibility = async (publiclyVisible: boolean) => {
+  const serverId = server?.id;
+  const updateVisibility = useCallback(async (publiclyVisible: boolean) => {
+    if (!serverId) return;
     dispatch({ type: "saving" });
     try {
-      const { data } = await api.patch<{ publiclyVisible: boolean }>(`/servers/${server.id}/public-visibility`, { publiclyVisible });
-      if (useServerStore.getState().current?.id !== server.id) return;
-      dispatch({ type: "saved", publiclyVisible: data.publiclyVisible });
+      const { data } = await api.patch<{ publiclyVisible: boolean; publicGuestJoinEnabled: boolean }>(`/servers/${serverId}/public-visibility`, { publiclyVisible });
+      if (useServerStore.getState().current?.id !== serverId) return;
+      dispatch({ type: "saved", publiclyVisible: data.publiclyVisible, publicGuestJoinEnabled: data.publicGuestJoinEnabled });
+      // The server list carries publicPageLive (the globe on the server
+      // avatar and on public channels). Members pick the change up on their
+      // next list refresh; the owner who just flipped it should not wait.
+      void useServerStore.getState().loadServers({ fresh: true });
     } catch (err: unknown) {
-      if (useServerStore.getState().current?.id !== server.id) return;
+      if (useServerStore.getState().current?.id !== serverId) return;
       const response = getApiErrorResponse(err);
       dispatch({ type: "failed", error: response?.error || formatMessage({ id: "settings.publicVisibility.failedUpdate" }) });
       throw err;
     }
-  };
+  }, [formatMessage, serverId]);
 
-  const channels = readback?.exposedChannels ?? [];
+  const updateGuestJoin = useCallback(async (publicGuestJoinEnabled: boolean) => {
+    if (!serverId) return;
+    dispatch({ type: "saving" });
+    try {
+      const { data } = await api.patch<{ publicGuestJoinEnabled: boolean }>(
+        `/servers/${serverId}/public-guest-join`,
+        { publicGuestJoinEnabled },
+      );
+      if (useServerStore.getState().current?.id !== serverId) return;
+      dispatch({ type: "guestJoinSaved", publicGuestJoinEnabled: data.publicGuestJoinEnabled });
+    } catch (err: unknown) {
+      if (useServerStore.getState().current?.id !== serverId) return;
+      const response = getApiErrorResponse(err);
+      dispatch({ type: "failed", error: response?.error || formatMessage({ id: "settings.publicVisibility.failedGuestJoinUpdate" }) });
+      throw err;
+    }
+  }, [formatMessage, serverId]);
+
+  const updateSearch = useCallback(async (publicSearchEnabled: boolean) => {
+    if (!serverId) return;
+    dispatch({ type: "saving" });
+    try {
+      const { data } = await api.patch<{ publicSearchEnabled: boolean }>(
+        `/servers/${serverId}/public-search`,
+        { publicSearchEnabled },
+      );
+      if (useServerStore.getState().current?.id !== serverId) return;
+      dispatch({ type: "searchSaved", publicSearchEnabled: data.publicSearchEnabled });
+    } catch (err: unknown) {
+      if (useServerStore.getState().current?.id !== serverId) return;
+      const response = getApiErrorResponse(err);
+      dispatch({ type: "failed", error: response?.error || formatMessage({ id: "settings.publicVisibility.failedSearchUpdate" }) });
+      throw err;
+    }
+  }, [formatMessage, serverId]);
+
+  const handleSearchCheckedChange = useCallback((checked: boolean) => {
+    void updateSearch(checked).catch(() => {});
+  }, [updateSearch]);
+
+  const handleVisibilityCheckedChange = useCallback((checked: boolean) => {
+    if (checked) dispatch({ type: "confirm", open: true });
+    else void updateVisibility(false).catch(() => {});
+  }, [updateVisibility]);
+
+  const handleGuestJoinCheckedChange = useCallback((checked: boolean) => {
+    void updateGuestJoin(checked).catch(() => {});
+  }, [updateGuestJoin]);
+
+  const handleCopyUrlError = useCallback(() => dispatch({
+    type: "failed",
+    error: formatMessage({ id: "settings.publicVisibility.failedCopyUrl" }),
+  }), [formatMessage]);
+
+  const handleConfirmPublic = useCallback(() => updateVisibility(true), [updateVisibility]);
+  const handleCloseConfirm = useCallback(() => dispatch({ type: "confirm", open: false }), []);
+
+  if (!server || role !== "owner" || !publicServerEnabled) return null;
+
+  const channels = readback?.exposedChannels ?? NO_PUBLIC_CHANNELS;
   const publicUrl = readback?.publiclyVisible
-    ? `${window.location.origin}/s/${readback.slug}`
+    ? `${shareableWebOrigin()}/s/${readback.slug}`
     : "";
 
   return (
     <div className="mb-6" data-testid="public-visibility-section">
       <SectionHeader
         className="mb-3"
-        icon={<Globe2 size={16} />}
+        icon={<Globe size={16} />}
         label={formatMessage({ id: "settings.publicVisibility.sectionLabel" })}
       />
-      <div className="space-y-4 border-2 border-black bg-white p-4 shadow-brutal-sm">
+      {/* Two levels (cindyz, #wg-rbac task #127): "Make this server public"
+          with its link and, under it, the Guest-join setting, which only
+          applies to a public server; then, after a divider, the channel list,
+          which is about the whole public server and sits at the first level. */}
+      <Card className="space-y-4 p-4">
+        <div className="space-y-4" data-testid="public-visibility-primary">
         <div className="flex items-start justify-between gap-4">
           <div className="min-w-0">
-            <h3 id="public-visibility-label" className="text-sm font-bold text-black">
+            <h3 id="public-visibility-label" className="text-subhead font-semibold text-foreground">
               {formatMessage({ id: "settings.publicVisibility.title" })}
             </h3>
-            <p className="mt-1 text-xs leading-relaxed text-black/60">
+            <p className="mt-1 text-footnote text-foreground-muted">
               {formatMessage({ id: "settings.publicVisibility.description" })}
             </p>
           </div>
           <Switch
-            size="md"
             checked={readback?.publiclyVisible === true}
             disabled={loading || saving || !readback}
-            onCheckedChange={(checked) => {
-              if (checked) dispatch({ type: "confirm", open: true });
-              else void updateVisibility(false).catch(() => {});
-            }}
+            onCheckedChange={handleVisibilityCheckedChange}
             aria-labelledby="public-visibility-label"
             data-testid="public-visibility-switch"
           />
@@ -2090,14 +2324,14 @@ export function PublicVisibilitySection() {
           <div data-testid="public-visibility-url">
             <label
               htmlFor="public-visibility-url-input"
-              className="mb-1 block text-xs font-bold uppercase tracking-wide text-black/60"
+              className="mb-1.5 block text-footnote font-semibold text-foreground"
             >
               {formatMessage({ id: "settings.publicVisibility.publicUrl" })}
             </label>
             <div className="flex gap-2">
-              <input
+              <Input
                 id="public-visibility-url-input"
-                className="input-brutal h-10 min-w-0 flex-1 text-xs"
+                className="min-w-0 flex-1"
                 type="url"
                 value={publicUrl}
                 readOnly
@@ -2105,16 +2339,13 @@ export function PublicVisibilitySection() {
               <CopyButton
                 text={publicUrl}
                 resetKey={publicUrl}
-                onCopyError={() => dispatch({
-                  type: "failed",
-                  error: formatMessage({ id: "settings.publicVisibility.failedCopyUrl" }),
-                })}
+                onCopyError={handleCopyUrlError}
               >
                 {({ copied, disabled, onClick, onMouseDown }) => (
                   <Button
                     size="lg"
-                    shape="iconText"
-                    tone="white"
+                    
+                    variant="outline"
                     className="shrink-0"
                     disabled={disabled}
                     onMouseDown={onMouseDown}
@@ -2134,41 +2365,84 @@ export function PublicVisibilitySection() {
           </div>
         ) : null}
 
-        <div>
-          <p className="mb-2 text-xs font-bold uppercase tracking-wide text-black/60">
+        {serverGuestEnabled ? (
+          // Second level: indented under the setting it depends on, with a
+          // guide line instead of the divider that used to make it a sibling.
+          <div className="ml-1 flex items-start justify-between gap-4 border-l border-line-hairline pl-4" data-testid="public-guest-join-setting">
+            <div className="min-w-0">
+              <h3 id="public-guest-join-label" className="text-subhead font-semibold text-foreground">
+                {formatMessage({ id: "settings.publicVisibility.allowGuestJoin" })}
+              </h3>
+              <p className="mt-1 text-footnote text-foreground-muted">
+                {formatMessage({ id: "settings.publicVisibility.allowGuestJoinDescription" })}
+              </p>
+            </div>
+            <Switch
+              checked={readback?.publicGuestJoinEnabled === true}
+              disabled={loading || saving || !readback || !readback.publiclyVisible}
+              onCheckedChange={handleGuestJoinCheckedChange}
+              aria-labelledby="public-guest-join-label"
+              data-testid="public-guest-join-switch"
+            />
+          </div>
+        ) : null}
+
+        {/* Public server SEO: also second level. It never makes anything
+            readable; it only decides whether public content may be indexed. */}
+        <div className="ml-1 flex items-start justify-between gap-4 border-l border-line-hairline pl-4" data-testid="public-search-setting">
+          <div className="min-w-0">
+            <h3 id="public-search-label" className="text-subhead font-semibold text-foreground">
+              {formatMessage({ id: "settings.publicVisibility.allowSearch" })}
+            </h3>
+            <p className="mt-1 text-footnote text-foreground-muted">
+              {formatMessage({ id: "settings.publicVisibility.allowSearchDescription" })}
+            </p>
+          </div>
+          <Switch
+            checked={readback?.publiclyVisible === true && readback.publicSearchEnabled}
+            disabled={loading || saving || !readback || !readback.publiclyVisible}
+            onCheckedChange={handleSearchCheckedChange}
+            aria-labelledby="public-search-label"
+            data-testid="public-search-switch"
+          />
+        </div>
+        </div>
+
+        <div className="border-t border-line-hairline pt-4" data-testid="public-visibility-channels">
+          <h3 className="mb-2 text-subhead font-semibold text-foreground">
             {formatMessage({ id: "settings.publicVisibility.channelListLabel" })}
-          </p>
+          </h3>
           {loading ? (
-            <div className="h-16 animate-pulse border-2 border-black/15 bg-gray-100" data-testid="public-visibility-loading" />
+            <div className="h-16 animate-pulse rounded-container bg-fill-muted" data-testid="public-visibility-loading" />
           ) : <PublicChannelList channels={channels} />}
         </div>
 
-        {error ? <Banner intent="warning" density="sm" className="font-bold">{error}</Banner> : null}
-      </div>
+        {error ? <Banner intent="warning" density="sm">{error}</Banner> : null}
+      </Card>
 
       {confirmOpen ? (
         <ConfirmDialog
           title={formatMessage({ id: "settings.publicVisibility.confirmTitle" })}
           message={(
             <div className="space-y-4">
-              <p className="text-sm leading-relaxed text-black/75">
+              <p className="text-callout text-foreground">
                 {formatMessage({ id: "settings.publicVisibility.confirmDescription" })}
               </p>
               <PublicChannelList channels={channels} />
-              <p className="text-xs leading-relaxed text-black/60">
+              <p className="text-footnote text-foreground-muted">
                 {formatMessage({ id: "settings.publicVisibility.confirmAudienceChange" })}
               </p>
             </div>
           )}
           confirmLabel={formatMessage({ id: "settings.publicVisibility.confirmAction" })}
           loadingLabel={formatMessage({ id: "settings.publicVisibility.confirmSaving" })}
-          confirmColor="bg-brutal-pink"
+          confirmVariant="accent"
           confirmTestId="public-visibility-confirm-button"
           plainMessage
           maxWidthClass="max-w-lg"
           chromeLocale="active"
-          onConfirm={() => updateVisibility(true)}
-          onClose={() => dispatch({ type: "confirm", open: false })}
+          onConfirm={handleConfirmPublic}
+          onClose={handleCloseConfirm}
         />
       ) : null}
     </div>
@@ -2180,6 +2454,11 @@ interface ServerLabsSavingTarget {
   serverEpoch: number;
   token: number;
   target: string;
+}
+
+function isActiveServerLabsContext(context: ServerLabsStoreContext) {
+  const serverState = useServerStore.getState();
+  return serverState.current?.id === context.serverId && serverState.serverEpoch === context.serverEpoch;
 }
 
 function LabsSection() {
@@ -2199,20 +2478,13 @@ function LabsSection() {
     [activeReadback?.permissions, role],
   );
 
-  const isActiveServerLabsContext = (context: ServerLabsStoreContext) => {
-    const serverState = useServerStore.getState();
-    return serverState.current?.id === context.serverId && serverState.serverEpoch === context.serverEpoch;
-  };
-
   useEffect(() => {
     if (!current?.id) return;
     const requestContext = createServerLabsStoreContext(current.id, serverEpoch);
     loadServerLabsSettings(requestContext).catch(() => {});
   }, [current?.id, serverEpoch]);
 
-  if (!current) return null;
-
-  const applyReadbackMutation = async (
+  const applyReadbackMutation = useCallback(async (
     target: string,
     requestFactory: (serverId: string, snapshot: ServerLabSettingsReadback) => Promise<{ data: ServerLabSettingsReadback | CanonicalServerLabSettingsReadback | { data: ServerLabSettingsReadback | CanonicalServerLabSettingsReadback } }>,
   ) => {
@@ -2250,17 +2522,17 @@ function LabsSection() {
         ));
       }
     }
-  };
+  }, [activeReadback, activeServerId, serverEpoch]);
 
-  const handleMasterChange = (enabled: boolean) => {
+  const handleMasterChange = useCallback((enabled: boolean) => {
     if (!activeReadback || !authority.canSetMasterAccess) return;
     void applyReadbackMutation(
       "master",
       (serverId, snapshot) => api.patch(`/servers/${serverId}/labs/access`, createServerLabMasterMutation(snapshot, enabled)),
     );
-  };
+  }, [activeReadback, applyReadbackMutation, authority.canSetMasterAccess]);
 
-  const handleEnrollmentChange = (labKey: string, enabled: boolean) => {
+  const handleEnrollmentChange = useCallback((labKey: string, enabled: boolean) => {
     if (!activeReadback) return;
     const lab = activeReadback.labs.find((candidate) => candidate.key === labKey);
     if (!lab || !isServerLabEnrollmentEditable(lab, authority, activeReadback.masterEnabled)) return;
@@ -2268,7 +2540,9 @@ function LabsSection() {
       `lab:${labKey}`,
       (serverId, snapshot) => api.put(`/servers/${serverId}/labs/${encodeURIComponent(labKey)}`, createServerLabEnrollmentMutation(snapshot, enabled)),
     );
-  };
+  }, [activeReadback, applyReadbackMutation, authority]);
+
+  if (!current) return null;
 
   const error = errorId ? formatMessage({ id: errorId }) : "";
 
@@ -2281,7 +2555,7 @@ function LabsSection() {
         count={activeReadback?.labs.length}
       />
 
-      <div className="border-2 border-black bg-white p-4 shadow-brutal-sm">
+      <Card className="p-4">
         {loading ? (
           <div className="space-y-3">
             <Skeleton className="h-10 w-full" />
@@ -2289,94 +2563,91 @@ function LabsSection() {
             <Skeleton className="h-16 w-full" />
           </div>
         ) : unavailable ? (
-          <div className="flex items-start gap-3 text-sm text-black/60">
-            <AlertTriangle size={16} className="mt-0.5 shrink-0 text-black/50" />
+          <div className="flex items-start gap-3">
+            <AlertTriangle size={16} className="mt-0.5 shrink-0 text-foreground-muted" />
             <div>
-              <div className="font-bold text-black">{formatMessage({ id: "settings.labs.unavailableTitle" })}</div>
-              <div className="mt-1 text-xs leading-5">{formatMessage({ id: "settings.labs.unavailableDescription" })}</div>
+              <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.labs.unavailableTitle" })}</div>
+              <div className="mt-0.5 text-footnote text-foreground-muted">{formatMessage({ id: "settings.labs.unavailableDescription" })}</div>
             </div>
           </div>
         ) : activeReadback ? (
           <div className="space-y-4">
-            <div className="flex items-start justify-between gap-4 border-b-2 border-black pb-4">
-              <div className="min-w-0">
-                <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.labs.masterTitle" })}</div>
-                {!authority.canSetMasterAccess && (
-                  <div className="mt-1 text-xs font-mono text-black/45">
-                    {formatMessage({ id: "settings.labs.masterOwnerOnly" })}
-                  </div>
-                )}
+            <div>
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.labs.masterTitle" })}</div>
+                  {!authority.canSetMasterAccess && (
+                    <div className="mt-0.5 text-footnote text-foreground-muted">
+                      {formatMessage({ id: "settings.labs.masterOwnerOnly" })}
+                    </div>
+                  )}
+                </div>
+                <Switch
+                  checked={activeReadback.masterEnabled}
+                  disabled={!authority.canSetMasterAccess || activeSavingTarget != null}
+                  onCheckedChange={handleMasterChange}
+                  aria-label={formatMessage({ id: "settings.labs.masterTitle" })}
+                  className="mt-0.5 shrink-0"
+                />
               </div>
-              <Switch
-                size="md"
-                checked={activeReadback.masterEnabled}
-                disabled={!authority.canSetMasterAccess || activeSavingTarget != null}
-                onCheckedChange={handleMasterChange}
-                aria-label={formatMessage({ id: "settings.labs.masterTitle" })}
-                className="mt-0.5 shrink-0"
-              />
+              <Separator className="mt-4" />
             </div>
 
             {activeReadback.labs.length === 0 ? (
-              <div className="text-xs text-black/40 italic">{formatMessage({ id: "settings.labs.emptyState" })}</div>
+              <div className="text-footnote text-foreground-hint">{formatMessage({ id: "settings.labs.emptyState" })}</div>
             ) : (
-              <div className="divide-y-2 divide-black/10" data-testid="server-labs-list">
-                {activeReadback.labs.map((lab) => {
-                  const editable = isServerLabEnrollmentEditable(lab, authority, activeReadback.masterEnabled);
-                  const disabledReasonId = getServerLabEnrollmentDisabledReasonMessageId(lab, authority, activeReadback.masterEnabled);
-                  const disabledReason = disabledReasonId ? formatMessage({ id: disabledReasonId }) : "";
-                  const descriptionId = getServerLabDescriptionMessageId(lab.key);
-                  const description = descriptionId ? formatMessage({ id: descriptionId }) : lab.description;
-                  const checked = activeReadback.masterEnabled && lab.enrolled;
-                  const saving = activeSavingTarget?.target === `lab:${lab.key}`;
-                  return (
-                    <div
-                      key={lab.key}
-                      data-testid="server-lab-row"
-                      className={`grid grid-cols-[minmax(0,1fr)_44px] items-start gap-4 py-3 first:pt-0 last:pb-0 ${!editable ? "opacity-60" : ""}`}
-                    >
-                      <div className="min-w-0">
-                        <div className="flex min-w-0 flex-wrap items-center gap-2">
-                          <span className="min-w-0 truncate text-sm font-bold text-black">{lab.name}</span>
-                        </div>
-                        <div className="mt-1 text-xs leading-5 text-black/60">{description}</div>
-                        {disabledReason && (
-                          <div className="mt-1 text-xs font-mono text-black/45">{disabledReason}</div>
-                        )}
-                      </div>
-                      <Switch
-                        size="md"
-                        checked={checked}
-                        disabled={!editable || activeSavingTarget != null}
-                        onCheckedChange={(enabled) => handleEnrollmentChange(lab.key, enabled)}
-                        aria-label={formatMessage({ id: "settings.labs.enrollmentAria" }, { name: lab.name })}
-                        className="mt-0.5 justify-self-end"
-                        title={disabledReason || undefined}
-                      />
-                      {saving && (
-                        <span className="sr-only">
-                          {formatMessage({ id: "settings.labs.savingEnrollment" }, { name: lab.name })}
-                        </span>
-                      )}
-                    </div>
-                  );
-                })}
+              <div data-testid="server-labs-list">
+                {activeReadback.labs.map((lab, index) => (
+                  <Fragment key={lab.key}>
+                  {index > 0 ? <Separator /> : null}
+                  <ServerLabRow
+                    lab={lab}
+                    authority={authority}
+                    masterEnabled={activeReadback.masterEnabled}
+                    mutationPending={activeSavingTarget != null}
+                    saving={activeSavingTarget?.target === `lab:${lab.key}`}
+                    onEnrollmentChange={handleEnrollmentChange}
+                  />
+                  </Fragment>
+                ))}
               </div>
             )}
 
             {error && (
-              <Banner intent="warning" density="sm" className="font-bold">
+              <Banner intent="warning" density="sm">
                 {error}
               </Banner>
             )}
           </div>
         ) : error ? (
-          <Banner intent="warning" density="sm" className="font-bold">
+          <Banner intent="warning" density="sm">
             {error}
           </Banner>
         ) : null}
-      </div>
+      </Card>
     </div>
+  );
+}
+
+type AdminRole = Extract<ServerRole, "owner" | "admin">;
+
+export function renderPrincipalAvatar(principal: ServerAdminSettingsPrincipal, context: "list-row" | "compact-list") {
+  return principal.kind === "human" ? (
+    <AvatarSlot
+      context={context}
+      type="human"
+      humanAvatarUrl={principal.avatarUrl}
+      gravatarHash={principal.gravatarHash}
+      email={principal.email}
+      className={context === "list-row" ? "self-start" : ""}
+    />
+  ) : (
+    <AvatarSlot
+      context={context}
+      type="agent"
+      agentAvatarUrl={principal.avatarUrl}
+      className={context === "list-row" ? "self-start" : ""}
+    />
   );
 }
 
@@ -2390,10 +2661,9 @@ function AdminsSection() {
   const updateAgent = useAgentStore((s) => s.updateAgent);
   const { role, capabilities } = useServerPermissions();
 
-  const pickerRef = useRef<HTMLDivElement>(null);
   const agents = useMemo(() => allAgents.filter((agent) => !agent.deletedAt), [allAgents]);
   const [selectedPrincipalKey, setSelectedPrincipalKey] = useState("");
-  const [selectedRole, setSelectedRole] = useState<Extract<ServerRole, "owner" | "admin">>("admin");
+  const [selectedRole, setSelectedRole] = useState<AdminRole>("admin");
   const [adminPrincipalSearch, setAdminPrincipalSearch] = useState("");
   const [principalPickerOpen, setPrincipalPickerOpen] = useState(false);
   const [savingPrincipalKey, setSavingPrincipalKey] = useState<string | null>(null);
@@ -2404,11 +2674,14 @@ function AdminsSection() {
   const candidates = useMemo(() => getAdminCandidatePrincipals(members, agents, role), [members, agents, role]);
   // oxlint-disable-next-line react-doctor/no-event-handler -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
   const selectedCandidate = candidates.find((principal) => getAdminPrincipalKey(principal) === selectedPrincipalKey) ?? null;
-  const selectedRoleOptions = selectedCandidate ? getAdminPrincipalRoleOptions(role, selectedCandidate) : [];
-  const adminRoleSelectOptions: SelectOption[] = [
+  const selectedRoleOptions = useMemo(
+    () => (selectedCandidate ? getAdminPrincipalRoleOptions(role, selectedCandidate) : []),
+    [role, selectedCandidate],
+  );
+  const adminRoleSelectOptions = useMemo<SelectOption[]>(() => [
     { value: "owner", label: formatMessage({ id: "settings.admins.owner" }), disabled: !selectedRoleOptions.includes("owner") },
     { value: "admin", label: formatMessage({ id: "settings.admins.admin" }), disabled: !selectedRoleOptions.includes("admin") },
-  ];
+  ], [formatMessage, selectedRoleOptions]);
   const ownerCount = members.filter((member) => member.role === "owner").length;
   const filteredCandidates = useMemo(() => {
     if (!adminPrincipalSearch.trim()) return candidates;
@@ -2436,20 +2709,11 @@ function AdminsSection() {
     }
   }, [candidates, selectedPrincipalKey]);
 
-  useEffect(() => {
-    if (!principalPickerOpen) return;
-    // Reset search input when dropdown opens. Intentional reset-on-open, not
-    // prop-derived state.
-    // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
-    setAdminPrincipalSearch("");
-    const handleClickOutside = (event: MouseEvent) => {
-      if (pickerRef.current && !pickerRef.current.contains(event.target as Node)) {
-        setPrincipalPickerOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClickOutside);
-    return () => document.removeEventListener("mousedown", handleClickOutside);
-  }, [principalPickerOpen]);
+  // Each opening starts from an empty search.
+  const handlePrincipalPickerOpenChange = useCallback((open: boolean) => {
+    if (open) setAdminPrincipalSearch("");
+    setPrincipalPickerOpen(open);
+  }, []);
 
   // List-dep default narrowing: when the candidate (or current admin's own
   // role) changes, the available admin role options shrink/grow; fall the
@@ -2471,42 +2735,7 @@ function AdminsSection() {
     }
   }, [role, selectedCandidate, selectedRole]);
 
-  if (!canManageAdminRoles) return null;
-
-  const formatAdminRoleLabel = (role: string) => {
-    if (role === "owner") return formatMessage({ id: "member.roles.owner" });
-    if (role === "admin") return formatMessage({ id: "member.roles.admin" });
-    if (role === "member") return formatMessage({ id: "member.roles.member" });
-    return role;
-  };
-  const getPrincipalSubtitle = (principal: ServerAdminSettingsPrincipal) => {
-    const roleLabel = formatAdminRoleLabel(principal.role);
-    return principal.kind === "human"
-      ? principal.email ? `${principal.email} · ${roleLabel}` : roleLabel
-      : formatMessage({ id: "settings.admins.agentPrefix" }, { role: roleLabel });
-  };
-
-  const renderPrincipalAvatar = (principal: ServerAdminSettingsPrincipal, context: "surface-list" | "compact-list") => (
-    principal.kind === "human" ? (
-      <AvatarSlot
-        context={context}
-        type="human"
-        humanAvatarUrl={principal.avatarUrl}
-        gravatarHash={principal.gravatarHash}
-        email={principal.email}
-        className={context === "surface-list" ? "self-start" : ""}
-      />
-    ) : (
-      <AvatarSlot
-        context={context}
-        type="agent"
-        agentAvatarUrl={principal.avatarUrl}
-        className={context === "surface-list" ? "self-start" : ""}
-      />
-    )
-  );
-
-  const popoverOptions = filteredCandidates.map((principal) => {
+  const popoverOptions = useMemo(() => filteredCandidates.map((principal) => {
     const key = getAdminPrincipalKey(principal);
     return {
       key,
@@ -2525,9 +2754,9 @@ function AdminsSection() {
       reserveLeadingSlot: true,
       avatar: renderPrincipalAvatar(principal, "compact-list"),
     };
-  });
+  }), [filteredCandidates, formatMessage, selectedPrincipalKey]);
 
-  const updateAdminPrincipalRole = (
+  const updateAdminPrincipalRole = useCallback((
     principal: ServerAdminSettingsPrincipal,
     nextRole: Extract<ServerRole, "owner" | "admin" | "member">,
   ) => {
@@ -2536,9 +2765,9 @@ function AdminsSection() {
     }
     const agentRole: Extract<ServerRole, "admin" | "member"> = nextRole === "member" ? "member" : "admin";
     return updateAgent(principal.id, { serverRole: agentRole });
-  };
+  }, [updateAgent, updateMemberRole]);
 
-  const handlePromote = async () => {
+  const handlePromote = useCallback(async () => {
     if (!selectedCandidate) return;
     const key = getAdminPrincipalKey(selectedCandidate);
     setSavingPrincipalKey(key);
@@ -2551,9 +2780,9 @@ function AdminsSection() {
     } finally {
       setSavingPrincipalKey(null);
     }
-  };
+  }, [formatMessage, selectedCandidate, selectedRole, updateAdminPrincipalRole]);
 
-  const handleDemote = async (principal: ServerAdminSettingsPrincipal) => {
+  const handleDemote = useCallback(async (principal: ServerAdminSettingsPrincipal) => {
     const key = getAdminPrincipalKey(principal);
     setSavingPrincipalKey(key);
     setError("");
@@ -2564,7 +2793,19 @@ function AdminsSection() {
     } finally {
       setSavingPrincipalKey(null);
     }
-  };
+  }, [formatMessage, updateAdminPrincipalRole]);
+
+  const handleClearPrincipal = useCallback(() => {
+    setSelectedPrincipalKey("");
+    setPrincipalPickerOpen(false);
+  }, []);
+
+  const handleSelectedRoleChange = useCallback((value: string | null) => {
+    if (value == null) return;
+    setSelectedRole(value as AdminRole);
+  }, []);
+
+  if (!canManageAdminRoles) return null;
 
   return (
     <div className="mb-6">
@@ -2575,28 +2816,34 @@ function AdminsSection() {
         count={admins.length}
       />
 
-      <div className="border-2 border-black bg-white shadow-brutal-sm p-4 space-y-4">
+      <Card className="space-y-4 p-4">
         <div>
-          <div className="mb-2 text-xs font-bold text-black/60">{formatMessage({ id: "settings.admins.addLabel" })}</div>
+          <div className="mb-1.5 text-footnote font-semibold text-foreground">{formatMessage({ id: "settings.admins.addLabel" })}</div>
           <div className="flex flex-col gap-2 sm:flex-row">
-            <div ref={pickerRef} className="relative min-w-0 sm:flex-[1_1_0%]">
-              <button
-                type="button"
-                data-testid="admin-principal-picker"
-                onClick={() => setPrincipalPickerOpen((open) => !open)}
-                disabled={candidates.length === 0 || savingPrincipalKey != null}
-                className="flex h-10 w-full min-w-0 items-center justify-between gap-2 border-2 border-black bg-white px-3 text-left text-xs font-bold shadow-brutal-sm transition-colors hover:bg-soft-signal/30 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <span className={`truncate ${selectedCandidate ? "text-black" : "text-black/45"}`}>
-                  {selectedCandidate
-                    ? selectedCandidate.kind === "human" && selectedCandidate.email
-                      ? `${getAdminPrincipalLabel(selectedCandidate, formatMessage)} · ${selectedCandidate.email}`
-                      : getAdminPrincipalLabel(selectedCandidate, formatMessage)
-                    : candidates.length > 0 ? formatMessage({ id: "settings.admins.membersSearchPlaceholder" }) : formatMessage({ id: "settings.admins.noMembers" })}
-                </span>
-                <ChevronRight size={14} className={`shrink-0 transition-transform ${principalPickerOpen ? "rotate-90" : ""}`} />
-              </button>
-              {principalPickerOpen && (
+            {/* raft-ui Popover: the list is placed in a portal under the
+                field, as wide as it, and kept on screen; the popover owns the
+                toggle, outside presses and Escape. */}
+            <div className="min-w-0 sm:flex-[1_1_0%]">
+              <Popover open={principalPickerOpen} onOpenChange={handlePrincipalPickerOpenChange}>
+                <PopoverTrigger
+                  render={(
+                    <button
+                      type="button"
+                      data-testid="admin-principal-picker"
+                      disabled={candidates.length === 0 || savingPrincipalKey != null}
+                      className="flex h-11 w-full min-w-0 items-center justify-between gap-2 rounded-control border-[1.5px] border-line-strong bg-layer-card pr-3 pl-3.5 text-left text-subhead font-semibold outline-none hover:press-overlay focus-visible:shadow-focus disabled:cursor-not-allowed disabled:border-line-hairline disabled:bg-fill-muted disabled:text-foreground-disabled"
+                    />
+                  )}
+                >
+                  <span className={`truncate ${selectedCandidate ? "text-foreground" : "font-medium text-foreground-hint"}`}>
+                    {selectedCandidate
+                      ? selectedCandidate.kind === "human" && selectedCandidate.email
+                        ? `${getAdminPrincipalLabel(selectedCandidate, formatMessage)} · ${selectedCandidate.email}`
+                        : getAdminPrincipalLabel(selectedCandidate, formatMessage)
+                      : candidates.length > 0 ? formatMessage({ id: "settings.admins.membersSearchPlaceholder" }) : formatMessage({ id: "settings.admins.noMembers" })}
+                  </span>
+                  <ChevronRight size={16} className={`shrink-0 text-foreground-hint transition-transform ${principalPickerOpen ? "rotate-90" : ""}`} />
+                </PopoverTrigger>
                 <SelectionPopover
                   title={formatMessage({ id: "settings.admins.membersPickerTitle" })}
                   width="trigger"
@@ -2607,20 +2854,14 @@ function AdminsSection() {
                   emptyLabel={formatMessage({ id: "settings.admins.noMatchingMembers" })}
                   options={popoverOptions}
                   showClear={!!selectedCandidate}
-                  onClear={() => {
-                    setSelectedPrincipalKey("");
-                    setPrincipalPickerOpen(false);
-                  }}
+                  onClear={handleClearPrincipal}
                 />
-              )}
+              </Popover>
             </div>
             <div className="sm:w-[120px] sm:shrink-0">
               <Select
                 value={selectedRole}
-                onValueChange={(value) => {
-                  if (value == null) return;
-                  setSelectedRole(value as Extract<ServerRole, "owner" | "admin">);
-                }}
+                onValueChange={handleSelectedRoleChange}
                 items={adminRoleSelectOptions}
                 disabled={!selectedCandidate || selectedRoleOptions.length === 0 || savingPrincipalKey != null}
               >
@@ -2635,78 +2876,55 @@ function AdminsSection() {
                 </SelectContent>
               </Select>
             </div>
-            <button
+            <Button
+              variant="accent" size="lg"
               type="button"
               onClick={handlePromote}
               disabled={!selectedCandidate || selectedRoleOptions.length === 0 || savingPrincipalKey != null}
-              className="btn-brutal bg-brutal-pink px-3 py-2 [@media(max-height:600px)]:py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed sm:shrink-0"
+              className="sm:shrink-0"
             >
               {selectedCandidate && savingPrincipalKey === getAdminPrincipalKey(selectedCandidate) ? formatMessage({ id: "settings.common.saving" }) : formatMessage({ id: "settings.admins.updateRole" })}
-            </button>
+            </Button>
           </div>
         </div>
 
-        <div className="border-t-2 border-black pt-4">
+        <div>
+          <Separator className="mb-4" />
           {admins.length > 0 ? (
-            <div className="space-y-2">
-              {admins.map((admin) => {
-                const canRemove = canRemoveAdminPrincipal(role, admin, ownerCount);
-                const label = admin.kind === "human" ? getMemberLabel(admin, formatMessage) : getAdminPrincipalLabel(admin, formatMessage);
-                const key = getAdminPrincipalKey(admin);
-                return (
-                  <AvatarListRow
-                    key={key}
-                    avatar={
-                      // stdrc #wg-theme:7470ca2a: admin avatar pins to the
-                      // top of the row (so the avatar lines up with the
-                      // first line — the name) while the Remove button on
-                      // the right stays vertically centered. self-start on
-                      // the avatar achieves that without disrupting the
-                      // shared row alignment.
-                      renderPrincipalAvatar(admin, "surface-list")
-                    }
-                    name={label}
-                    subtitle={getPrincipalSubtitle(admin)}
-                    rightContent={
-                      canRemove ? (
-                        <button
-                          type="button"
-                          onClick={() => handleDemote(admin)}
-                          disabled={savingPrincipalKey != null}
-                          className="btn-brutal-sm shrink-0 bg-white px-2 py-1 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                          {savingPrincipalKey === key ? formatMessage({ id: "settings.common.saving" }) : admin.role === "owner" ? formatMessage({ id: "settings.admins.removeOwner" }) : formatMessage({ id: "settings.admins.removeAdmin" })}
-                        </button>
-                      ) : (
-                        <span className="shrink-0 text-[10px] font-mono text-black/40">
-                          {admin.role === "owner" && ownerCount <= 1 ? formatMessage({ id: "settings.admins.lastOwner" }) : formatMessage({ id: "settings.admins.ownerOnly" })}
-                        </span>
-                      )
-                    }
-                  />
-                );
-              })}
-            </div>
+            // DS ListRow › `rf-list--inset`: one card, hairlines between rows.
+            <ListRowGroup>
+              {admins.map((admin) => (
+                <AdminPrincipalRow
+                  key={getAdminPrincipalKey(admin)}
+                  admin={admin}
+                  role={role}
+                  ownerCount={ownerCount}
+                  savingPrincipalKey={savingPrincipalKey}
+                  onDemote={handleDemote}
+                />
+              ))}
+            </ListRowGroup>
           ) : (
-            <div className="text-xs text-black/40 italic">
+            <div className="text-footnote text-foreground-hint">
               {formatMessage({ id: "settings.admins.emptyState" })}
             </div>
           )}
         </div>
 
         {error && (
-          <Banner intent="warning" density="sm" className="font-bold">
+          <Banner intent="warning" density="sm">
             {error}
           </Banner>
         )}
-      </div>
+      </Card>
     </div>
   );
 }
 
 function InvitesSection() {
-  const { formatDate, formatMessage } = useIntl();
+  const { formatMessage } = useIntl();
   const current = useServerStore((s) => s.current);
+  const serverId = current?.id;
   const { capabilities } = useServerPermissions();
 
   const [invites, setInvites] = useState<PendingInvite[]>([]);
@@ -2715,35 +2933,41 @@ function InvitesSection() {
 
   const canInvite = capabilities.inviteMembers;
 
-  useEffect(() => {
-    if (current && canInvite) {
-      loadInvites();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current?.id, canInvite]);
-
-  const loadInvites = async () => {
-    if (!current) return;
+  const loadInvites = useCallback(async () => {
+    if (!serverId) return;
     setLoading(true);
     try {
-      const { data } = await api.get(`/servers/${current.id}/invites`);
+      const { data } = await api.get(`/servers/${serverId}/invites`);
       setInvites(data);
     } catch {
       // Ignore errors
     } finally {
       setLoading(false);
     }
-  };
+  }, [serverId]);
 
-  const handleRevoke = async (inviteId: string) => {
-    if (!current) return;
+  // Reload when the active server id (via `loadInvites`) or permission changes.
+  useEffect(() => {
+    if (serverId && canInvite) {
+      void loadInvites();
+    }
+  }, [canInvite, loadInvites, serverId]);
+
+  const handleRevoke = useCallback(async (inviteId: string) => {
+    if (!serverId) return;
     try {
-      await api.delete(`/servers/${current.id}/invites/${inviteId}`);
+      await api.delete(`/servers/${serverId}/invites/${inviteId}`);
       await loadInvites();
     } catch {
       // Ignore
     }
-  };
+  }, [loadInvites, serverId]);
+
+  const handleConfirmRevoke = useCallback(
+    () => (revokeTarget ? handleRevoke(revokeTarget.id) : undefined),
+    [handleRevoke, revokeTarget],
+  );
+  const handleCloseRevoke = useCallback(() => setRevokeTarget(null), []);
 
   if (!canInvite) return null;
 
@@ -2756,39 +2980,19 @@ function InvitesSection() {
         count={invites.length > 0 ? invites.length : null}
       />
 
-      <div className="border-2 border-black bg-white shadow-brutal-sm p-4">
+      <Card className="p-4">
         {invites.length > 0 ? (
-          <div className="space-y-1.5">
+          <div className="divide-y divide-line-hairline">
             {invites.map((invite) => (
-              <div
-                key={invite.id}
-                className="flex items-center gap-2 border-2 border-black/30 px-3 py-2"
-              >
-                <span className="flex-1 font-mono text-xs text-black truncate">
-                  {invite.invitedEmail}
-                </span>
-                <span className="text-[10px] text-black/40 font-mono shrink-0">
-                  {formatDate(invite.createdAt, {
-                    month: "short",
-                    day: "numeric",
-                  })}
-                </span>
-                <button
-                  onClick={() => setRevokeTarget(invite)}
-                  className="shrink-0 btn-brutal-sm bg-white p-1"
-                  title={formatMessage({ id: "settings.invites.revokeInviteTitle" })}
-                >
-                  <X size={12} />
-                </button>
-              </div>
+              <PendingInviteRow key={invite.id} invite={invite} onRequestRevoke={setRevokeTarget} />
             ))}
           </div>
         ) : !loading ? (
-          <div className="text-xs text-black/40 italic">
+          <div className="text-footnote text-foreground-hint">
             {formatMessage({ id: "settings.invites.emptyState" })}
           </div>
         ) : null}
-      </div>
+      </Card>
 
       {revokeTarget && (
         <ConfirmDialog
@@ -2797,17 +3001,24 @@ function InvitesSection() {
           message={formatMessage({ id: "settings.invites.confirmMessage" }, { email: revokeTarget.invitedEmail })}
           confirmLabel={formatMessage({ id: "settings.invites.confirmLabel" })}
           loadingLabel={formatMessage({ id: "settings.invites.revoking" })}
-          onConfirm={() => handleRevoke(revokeTarget.id)}
-          onClose={() => setRevokeTarget(null)}
+          onConfirm={handleConfirmRevoke}
+          onClose={handleCloseRevoke}
         />
       )}
     </div>
   );
 }
 
+// Shareable web origin, not window.location.origin: the desktop shell's origin
+// is `app://raft`, which produces an unopenable invite link. Web is unchanged.
+export function buildJoinLinkUrl(token: string) {
+  return `${shareableWebOrigin()}/join/${token}`;
+}
+
 function JoinLinksSection() {
   const { formatMessage } = useIntl();
   const current = useServerStore((s) => s.current);
+  const serverId = current?.id;
   const { capabilities } = useServerPermissions();
   const { formatShortDateTime } = useTimeFormatter();
 
@@ -2822,25 +3033,25 @@ function JoinLinksSection() {
 
   const canManageLinks = capabilities.inviteMembers;
 
-  useEffect(() => {
-    if (current && canManageLinks) {
-      loadLinks();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current?.id, canManageLinks]);
-
-  const loadLinks = async () => {
-    if (!current) return;
+  const loadLinks = useCallback(async () => {
+    if (!serverId) return;
     setLoading(true);
     try {
-      const { data } = await api.get(`/servers/${current.id}/join-links`);
+      const { data } = await api.get(`/servers/${serverId}/join-links`);
       setLinks(data);
     } catch {
       // Ignore
     } finally {
       setLoading(false);
     }
-  };
+  }, [serverId]);
+
+  // Reload when the active server id (via `loadLinks`) or permission changes.
+  useEffect(() => {
+    if (serverId && canManageLinks) {
+      void loadLinks();
+    }
+  }, [canManageLinks, loadLinks, serverId]);
 
   const handleCreate = async (e: FormEvent) => {
     e.preventDefault();
@@ -2860,23 +3071,29 @@ function JoinLinksSection() {
     }
   };
 
-  const buildJoinLinkUrl = (token: string) => `${window.location.origin}/join/${token}`;
-
-  const handleCopy = async (linkId: string, token: string) => {
+  const handleCopy = useCallback(async (linkId: string, token: string) => {
     await navigator.clipboard.writeText(buildJoinLinkUrl(token));
     setCopiedLinkId(linkId);
     window.setTimeout(() => setCopiedLinkId((current) => current === linkId ? null : current), 1500);
-  };
+  }, []);
 
-  const handleRevoke = async (linkId: string) => {
-    if (!current) return;
+  const handleRevoke = useCallback(async (linkId: string) => {
+    if (!serverId) return;
     try {
-      await api.delete(`/servers/${current.id}/join-links/${linkId}`);
+      await api.delete(`/servers/${serverId}/join-links/${linkId}`);
       setLinks((prev) => prev.filter((link) => link.id !== linkId));
     } catch {
       // Ignore
     }
-  };
+  }, [serverId]);
+
+  const handleConfirmRevoke = useCallback(
+    () => (revokeTarget ? handleRevoke(revokeTarget.id) : undefined),
+    [handleRevoke, revokeTarget],
+  );
+  const handleCloseRevoke = useCallback(() => setRevokeTarget(null), []);
+  const handleMaxUsesChange = useCallback((e: ChangeEvent<HTMLInputElement>) => setMaxUses(e.target.value), []);
+  const handleExpiresAtChange = useCallback((e: ChangeEvent<HTMLInputElement>) => setExpiresAt(e.target.value), []);
 
   if (!canManageLinks) return null;
 
@@ -2889,94 +3106,70 @@ function JoinLinksSection() {
         count={links.length > 0 ? links.length : null}
       />
 
-      <div className="border-2 border-black bg-white shadow-brutal-sm p-4">
+      <Card className="p-4">
         <form onSubmit={handleCreate} className="space-y-3">
           <div className="grid gap-3 md:grid-cols-2">
-            <FormField label={formatMessage({ id: "settings.joinLinks.maxUses" })} labelStyle="plain" size="compact" htmlFor="join-link-max-uses">
-              <input
+            <FormField label={formatMessage({ id: "settings.joinLinks.maxUses" })} size="compact" htmlFor="join-link-max-uses">
+              <Input
                 id="join-link-max-uses"
                 type="number"
                 min="1"
                 value={maxUses}
-                onChange={(e) => setMaxUses(e.target.value)}
+                onChange={handleMaxUsesChange}
                 placeholder={formatMessage({ id: "settings.joinLinks.unlimited" })}
-                className="w-full border-2 border-black p-2 text-sm shadow-brutal-sm focus:shadow-brutal focus:outline-none"
+                className="w-full"
               />
             </FormField>
 
-            <FormField label={formatMessage({ id: "settings.joinLinks.expiresAt" })} labelStyle="plain" size="compact" htmlFor="join-link-expires-at">
-              <input
+            <FormField label={formatMessage({ id: "settings.joinLinks.expiresAt" })} size="compact" htmlFor="join-link-expires-at">
+              <Input
                 id="join-link-expires-at"
                 type="datetime-local"
                 value={expiresAt}
-                onChange={(e) => setExpiresAt(e.target.value)}
-                className="w-full border-2 border-black p-2 text-sm shadow-brutal-sm focus:shadow-brutal focus:outline-none"
+                onChange={handleExpiresAtChange}
+                className="w-full"
               />
             </FormField>
           </div>
 
           {createError && (
-            <Banner intent="warning" density="sm" className="font-bold">
+            <Banner intent="warning" density="sm">
               {createError}
             </Banner>
           )}
 
-          <button
+          <Button
+            variant="outline" size="sm"
             type="submit"
             disabled={creating}
-            className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs flex items-center gap-1.5"
           >
             <Plus size={14} />
             {creating ? formatMessage({ id: "settings.joinLinks.creating" }) : formatMessage({ id: "settings.joinLinks.createLink" })}
-          </button>
+          </Button>
         </form>
 
-        <div className="mt-4 border-t-2 border-black pt-4">
+        <div className="mt-4">
+          <Separator className="mb-4" />
           {links.length > 0 ? (
-            <div className="space-y-2">
+            <div className="divide-y divide-line-hairline">
               {links.map((link) => (
-                <div
+                <JoinLinkRow
                   key={link.id}
-                  className="border-2 border-black/30 px-3 py-2.5 space-y-1.5"
-                >
-                  <div className="flex items-center gap-2">
-                    <div className="min-w-0 flex-1 border-2 border-black bg-white px-2 py-1 font-mono text-[11px] truncate select-all">
-                      {buildJoinLinkUrl(link.token)}
-                    </div>
-                    <button
-                      onClick={() => handleCopy(link.id, link.token)}
-                      className="btn-brutal-sm shrink-0 bg-white p-1.5"
-                      title={formatMessage({ id: "settings.joinLinks.copyLink" })}
-                    >
-                      {copiedLinkId === link.id ? <Check size={14} /> : <Copy size={14} />}
-                    </button>
-                    <button
-                      onClick={() => setRevokeTarget(link)}
-                      className="btn-brutal-sm shrink-0 bg-white p-1.5"
-                      title={formatMessage({ id: "settings.joinLinks.revokeLink" })}
-                    >
-                      <X size={14} />
-                    </button>
-                  </div>
-                  <div className="text-[11px] text-black/50 font-mono">
-                    {link.maxUses != null
-                      ? formatMessage({ id: "settings.joinLinks.usesWithMax" }, { used: link.useCount, max: link.maxUses })
-                      : formatMessage({ id: "settings.joinLinks.uses" }, { used: link.useCount })}
-                    {" · "}
-                    {link.expiresAt
-                      ? formatMessage({ id: "settings.joinLinks.expires" }, { when: formatShortDateTime(link.expiresAt) })
-                      : formatMessage({ id: "settings.joinLinks.noExpiry" })}
-                  </div>
-                </div>
+                  link={link}
+                  copied={copiedLinkId === link.id}
+                  formatShortDateTime={formatShortDateTime}
+                  onCopy={handleCopy}
+                  onRequestRevoke={setRevokeTarget}
+                />
               ))}
             </div>
           ) : !loading ? (
-            <div className="text-xs text-black/40 italic">
+            <div className="text-footnote text-foreground-hint">
               {formatMessage({ id: "settings.joinLinks.emptyState" })}
             </div>
           ) : null}
         </div>
-      </div>
+      </Card>
 
       {revokeTarget && (
         <ConfirmDialog
@@ -2985,8 +3178,8 @@ function JoinLinksSection() {
           message={formatMessage({ id: "settings.joinLinks.confirmMessage" })}
           confirmLabel={formatMessage({ id: "settings.joinLinks.confirmLabel" })}
           loadingLabel={formatMessage({ id: "settings.joinLinks.revoking" })}
-          onConfirm={() => handleRevoke(revokeTarget.id)}
-          onClose={() => setRevokeTarget(null)}
+          onConfirm={handleConfirmRevoke}
+          onClose={handleCloseRevoke}
         />
       )}
     </div>
@@ -3016,32 +3209,38 @@ function OnboardingAgentSection() {
   } | null>(null);
   const [reopeningSetup, setReopeningSetup] = useState(false);
 
+  const serverId = current?.id;
+  const serverSlug = current?.slug;
   const canManageLinks = capabilities.editServerSettings;
-  const onboardingAgentOptions: SelectOption[] = [
+  const onboardingAgentOptions = useMemo<SelectOption[]>(() => [
     { value: "", label: formatMessage({ id: "settings.onboarding.disabledOption" }) },
     ...agents.map((agent) => ({
       value: agent.id,
       label: `@${agent.name}${agent.displayName ? ` (${agent.displayName})` : ""}`,
     })),
-  ];
-  const agentGreetingOptions: SelectOption[] = [
+  ], [agents, formatMessage]);
+  const agentGreetingOptions = useMemo<SelectOption[]>(() => [
     { value: "yes", label: formatMessage({ id: "settings.onboarding.yes" }) },
     { value: "no", label: formatMessage({ id: "settings.onboarding.no" }) },
-  ];
+  ], [formatMessage]);
 
-  // oxlint-disable react-hooks/exhaustive-deps -- load onboarding settings only when the active server id (or permission) changes; depending on the whole `current` store object would refetch on unrelated server-store churn.
-  // Async-loader: load onboarding-settings on server change. Same FP family
-  // as PR #2530 useChannelMembers / InviteAcceptPage / AgentSkills loaders.
+  // Read at failure time so a locale switch does not refetch the settings.
+  const formatLoadError = useEffectEvent(() => formatMessage({ id: "settings.onboarding.failedLoad" }));
+
+  // Async-loader: load onboarding-settings on server change (keyed on the
+  // server id, not the whole `current` store object, so unrelated server-store
+  // churn does not refetch). Same FP family as PR #2530 useChannelMembers /
+  // InviteAcceptPage / AgentSkills loaders.
   // oxlint-disable-next-line react-doctor/no-cascading-set-state
   useEffect(() => {
-    if (!current || !canManageLinks) return;
+    if (!serverId || !canManageLinks) return;
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setLoading(true);
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setError("");
     void Promise.all([
       loadServerSettings(),
-      api.get(`/servers/${current.id}/setup-projection`).catch(() => null),
+      api.get(`/servers/${serverId}/setup-projection`).catch(() => null),
     ])
       .then(([settings, projectionResponse]) => {
         if (!settings) throw new Error("Server settings unavailable");
@@ -3056,25 +3255,24 @@ function OnboardingAgentSection() {
         setSaved(false);
       })
       .catch(() => {
-        setError(formatMessage({ id: "settings.onboarding.failedLoad" }));
+        setError(formatLoadError());
       })
       .finally(() => {
         setLoading(false);
       });
-  }, [canManageLinks, current?.id, loadServerSettings]);
-  // oxlint-enable react-hooks/exhaustive-deps
+  }, [canManageLinks, loadServerSettings, serverId]);
 
   const dirty =
     onboardingAgentId !== savedOnboardingAgentId
     || agentAllChannelGreetingEnabled !== savedAgentAllChannelGreetingEnabled;
 
-  const handleSave = async () => {
-    if (!current || !canManageLinks) return;
+  const handleSave = useCallback(async () => {
+    if (!serverId || !canManageLinks) return;
     setSaving(true);
     setSaved(false);
     setError("");
     try {
-      await api.patch(`/servers/${current.id}/onboarding-settings`, {
+      await api.patch(`/servers/${serverId}/onboarding-settings`, {
         onboardingAgentId: onboardingAgentId || null,
         agentAllChannelGreetingEnabled,
       });
@@ -3088,26 +3286,38 @@ function OnboardingAgentSection() {
     } finally {
       setSaving(false);
     }
-  };
+  }, [agentAllChannelGreetingEnabled, canManageLinks, formatMessage, loadServerSettings, onboardingAgentId, serverId]);
 
-  const handleFinishSetup = async () => {
-    if (!current || !isAdminOrOwner || reopeningSetup) return;
+  const handleFinishSetup = useCallback(async () => {
+    if (!serverId || !isAdminOrOwner || reopeningSetup) return;
     setReopeningSetup(true);
     setError("");
     try {
-      const { data } = await api.post(`/servers/${current.id}/setup-transition`, { action: "start" });
+      const { data } = await api.post(`/servers/${serverId}/setup-transition`, { action: "start" });
       setSetupProjection(data);
       // Tell the gate. Without this the server reopened setup and the only visible effect
       // was a navigation: the modal that was supposed to appear never heard about it.
       bumpServerSetupRevision();
-      navigate(`/s/${current.slug}`);
+      navigate(`/s/${serverSlug}`);
     } catch (error: unknown) {
       const responseError = (error as { response?: { data?: { error?: unknown } } }).response?.data?.error;
       setError(typeof responseError === "string" ? responseError : formatMessage({ id: "settings.onboarding.reopenSetupFailed" }));
     } finally {
       setReopeningSetup(false);
     }
-  };
+  }, [formatMessage, isAdminOrOwner, navigate, reopeningSetup, serverId, serverSlug]);
+
+  const handleOnboardingAgentChange = useCallback((value: string | null) => {
+    if (value == null) return;
+    setOnboardingAgentId(value);
+    setSaved(false);
+  }, []);
+
+  const handleGreetingChange = useCallback((value: string | null) => {
+    if (value == null) return;
+    setAgentAllChannelGreetingEnabled(value === "yes");
+    setSaved(false);
+  }, []);
 
   if (!canManageLinks) return null;
 
@@ -3119,25 +3329,21 @@ function OnboardingAgentSection() {
         label={formatMessage({ id: "settings.onboarding.sectionLabel" })}
       />
 
-      <div className="border-2 border-black bg-white shadow-brutal-sm p-4">
+      <Card className="p-4">
         <div className="space-y-4">
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0 pr-0 sm:pr-4">
-              <div className="text-sm font-bold text-black">
+              <div className="text-subhead font-semibold text-foreground">
                 {formatMessage({ id: "settings.onboarding.humanAgentTitle" })}
               </div>
-              <div className="mt-0.5 text-xs text-black/60">
+              <div className="mt-0.5 text-footnote text-foreground-muted">
                 {formatMessage({ id: "settings.onboarding.humanAgentDescription" })}
               </div>
             </div>
             <div className="w-full sm:w-80 sm:shrink-0">
               <Select
                 value={onboardingAgentId}
-                onValueChange={(value) => {
-                  if (value == null) return;
-                  setOnboardingAgentId(value);
-                  setSaved(false);
-                }}
+                onValueChange={handleOnboardingAgentChange}
                 disabled={!canManageLinks || saving || loading}
                 items={onboardingAgentOptions}
               >
@@ -3156,21 +3362,17 @@ function OnboardingAgentSection() {
 
           <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
             <div className="min-w-0 pr-0 sm:pr-4">
-              <div className="text-sm font-bold text-black">
+              <div className="text-subhead font-semibold text-foreground">
                 {formatMessage({ id: "settings.onboarding.greetingTitle" })}
               </div>
-              <div className="mt-0.5 text-xs text-black/60">
+              <div className="mt-0.5 text-footnote text-foreground-muted">
                 {formatMessage({ id: "settings.onboarding.greetingDescription" })}
               </div>
             </div>
             <div className="w-full sm:w-28 sm:shrink-0">
               <Select
                 value={agentAllChannelGreetingEnabled ? "yes" : "no"}
-                onValueChange={(value) => {
-                  if (value == null) return;
-                  setAgentAllChannelGreetingEnabled(value === "yes");
-                  setSaved(false);
-                }}
+                onValueChange={handleGreetingChange}
                 disabled={!canManageLinks || saving || loading}
                 items={agentGreetingOptions}
               >
@@ -3189,23 +3391,23 @@ function OnboardingAgentSection() {
         </div>
 
         {error && (
-          <Banner intent="warning" density="sm" className="mt-2 font-bold">
+          <Banner intent="warning" density="sm" className="mt-2">
             {error}
           </Banner>
         )}
 
         <div className="mt-2 flex items-center justify-between">
           {!canManageLinks && (
-            <div className="text-[11px] text-black/50">{formatMessage({ id: "settings.onboarding.adminOnly" })}</div>
+            <div className="text-footnote text-foreground-hint">{formatMessage({ id: "settings.onboarding.adminOnly" })}</div>
           )}
-          <button
+          <Button
+            variant="accent" size="sm"
             type="button"
             onClick={handleSave}
             disabled={!canManageLinks || !dirty || saving || loading}
-            className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {saving ? formatMessage({ id: "settings.common.saving" }) : saved ? formatMessage({ id: "settings.common.saved" }) : formatMessage({ id: "settings.common.save" })}
-          </button>
+          </Button>
         </div>
 
         {/* Who may see the setup flow is the SERVER's answer, in one place: a non-owner's
@@ -3213,24 +3415,28 @@ function OnboardingAgentSection() {
             role would be a second opinion that can drift — hide it in one surface, leak it in
             another (@Jianwei's point). The projection alone decides. */}
         {setupProjection && setupProjection.phase !== "complete" && setupProjection.surface !== "none" ? (
-          <div className="mt-4 flex items-center justify-between border-t-2 border-black pt-3">
-            <div>
-              <div className="text-xs font-bold">{formatMessage({ id: "settings.onboarding.serverSetupTitle" })}</div>
-              <div className="text-[11px] text-black/50">{formatMessage({ id: "settings.onboarding.serverSetupDescription" })}</div>
+          <div className="mt-4">
+            <Separator className="mb-3" />
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.onboarding.serverSetupTitle" })}</div>
+                <div className="mt-0.5 text-footnote text-foreground-muted">{formatMessage({ id: "settings.onboarding.serverSetupDescription" })}</div>
+              </div>
+              <Button
+                variant="outline" size="sm"
+                type="button"
+                onClick={handleFinishSetup}
+                disabled={reopeningSetup}
+                className="ml-4 shrink-0"
+                data-testid="finish-server-setup"
+              >
+                {formatMessage({ id: reopeningSetup ? "settings.onboarding.openingSetup" : "settings.onboarding.finishSetup" })}
+                {!reopeningSetup && <ChevronRight size={14} />}
+              </Button>
             </div>
-            <button
-              type="button"
-              onClick={() => void handleFinishSetup()}
-              disabled={reopeningSetup}
-              className="btn-brutal inline-flex items-center gap-1.5 bg-white px-3 py-1.5 text-xs disabled:opacity-50"
-              data-testid="finish-server-setup"
-            >
-              {formatMessage({ id: reopeningSetup ? "settings.onboarding.openingSetup" : "settings.onboarding.finishSetup" })}
-              {!reopeningSetup && <ChevronRight size={14} />}
-            </button>
           </div>
         ) : null}
-      </div>
+      </Card>
     </div>
   );
 }
@@ -3257,6 +3463,8 @@ function MemberPermissionsSection() {
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setError("");
   }, [server?.id, server?.hideHumansFromMembers]);
+
+  const handleHideHumansChange = useCallback((checked: boolean) => setHideHumansFromMembers(checked), []);
 
   if (!server) return null;
 
@@ -3286,39 +3494,39 @@ function MemberPermissionsSection() {
         label={formatMessage({ id: "settings.memberPermissions.sectionLabel" })}
       />
 
-      <form onSubmit={handleSave} className="border-2 border-black bg-white shadow-brutal-sm p-4 space-y-3">
-        <label className={`flex items-start gap-3 ${canEdit ? "" : "opacity-60"}`}>
+      <Card render={<form onSubmit={handleSave} />} className="block space-y-3 p-4">
+        <label className={`flex items-start gap-3 ${!canEdit ? "cursor-not-allowed" : ""}`}>
           <Checkbox
-            size="md"
             checked={hideHumansFromMembers}
             disabled={!canEdit || saving}
-            onChange={(event) => setHideHumansFromMembers(event.currentTarget.checked)}
+            onCheckedChange={handleHideHumansChange}
             className="mt-0.5"
           />
           <span className="min-w-0">
-            <span className="block text-sm font-bold text-black">{formatMessage({ id: "settings.memberPermissions.hideHumansTitle" })}</span>
-            <span className="block text-xs text-black/60 mt-0.5">
+            <span className={`block text-subhead font-semibold ${!canEdit ? "text-foreground-disabled" : "text-foreground"}`}>{formatMessage({ id: "settings.memberPermissions.hideHumansTitle" })}</span>
+            <span className="block text-footnote text-foreground-muted mt-0.5">
               {formatMessage({ id: "settings.memberPermissions.hideHumansDescription" })}
             </span>
           </span>
         </label>
 
         {error && (
-          <Banner intent="warning" density="sm" className="font-bold">{error}</Banner>
+          <Banner intent="warning" density="sm">{error}</Banner>
         )}
 
         {canEdit && (
-          <button
+          <Button
+            variant="accent" size="sm"
             type="submit"
             disabled={!dirty || saving}
-            className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-1.5"
           >
             {saving ? formatMessage({ id: "settings.common.saving" }) : saved ? (
               <><Check size={14} /> {formatMessage({ id: "settings.common.saved" })}</>
             ) : formatMessage({ id: "settings.common.save" })}
-          </button>
+          </Button>
         )}
-      </form>
+      </Card>
     </div>
   );
 }
@@ -3348,6 +3556,11 @@ function SystemChannelsSection() {
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setError("");
   }, [currentAllChannelHidden]);
+
+  const handleAllChannelHiddenChange = useCallback((checked: boolean) => {
+    setAllChannelHidden(checked);
+    setSaved(false);
+  }, []);
 
   if (!showSystemChannelSettings) return null;
 
@@ -3384,40 +3597,38 @@ function SystemChannelsSection() {
         label={formatMessage({ id: "settings.systemChannels.sectionLabel" })}
       />
 
-      <form onSubmit={handleSave} className="border-2 border-black bg-white shadow-brutal-sm p-4 space-y-3">
-        <label className={`flex items-start gap-3 ${saving ? "opacity-60" : ""}`}>
+      <Card render={<form onSubmit={handleSave} />} className="block space-y-3 p-4">
+        <label className={`flex items-start gap-3 ${saving ? "cursor-not-allowed" : ""}`}>
           <Checkbox
-            size="md"
             checked={allChannelHidden}
             disabled={saving}
-            onChange={(event) => {
-              setAllChannelHidden(event.currentTarget.checked);
-              setSaved(false);
-            }}
+            onCheckedChange={handleAllChannelHiddenChange}
             className="mt-0.5"
           />
           <span className="min-w-0">
-            <span className="block text-sm font-bold text-black">{formatMessage({ id: "settings.systemChannels.hideAllTitle" })}</span>
-            <span className="block text-xs text-black/60 mt-0.5">
+            <span className={`block text-subhead font-semibold ${saving ? "text-foreground-disabled" : "text-foreground"}`}>{formatMessage({ id: "settings.systemChannels.hideAllTitle" })}</span>
+            <span className="block text-footnote text-foreground-muted mt-0.5">
               {formatMessage({ id: "settings.systemChannels.hideAllDescription" })}
             </span>
           </span>
         </label>
 
         {error && (
-          <Banner intent="warning" density="sm" className="font-bold">{error}</Banner>
+          <Banner intent="warning" density="sm">{error}</Banner>
         )}
 
-        <button
+        <Button
+
+          variant="accent" size="sm"
           type="submit"
           disabled={!dirty || saving}
-          className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="flex items-center gap-1.5"
         >
           {saving ? formatMessage({ id: "settings.common.saving" }) : saved ? (
             <><Check size={14} /> {formatMessage({ id: "settings.common.saved" })}</>
           ) : formatMessage({ id: "settings.common.save" })}
-        </button>
-      </form>
+        </Button>
+      </Card>
     </div>
   );
 }
@@ -3451,6 +3662,8 @@ function ServerTranslationSection() {
     setError("");
   }, [settings.serverTranslationEnabled]);
 
+  const handleEnabledChange = useCallback((checked: boolean) => setEnabled(checked), []);
+
   if (!currentServer) return null;
 
   const dirty = enabled !== settings.serverTranslationEnabled;
@@ -3480,45 +3693,45 @@ function ServerTranslationSection() {
         label={formatMessage({ id: "settings.serverTranslation.sectionLabel" })}
       />
 
-      <form onSubmit={handleSave} className="border-2 border-black bg-white shadow-brutal-sm p-4 space-y-3">
-        <label className={`flex items-start gap-3 ${settingsLoading || !settings.canManageServerTranslation ? "opacity-60" : ""}`}>
+      <Card render={<form onSubmit={handleSave} />} className="block space-y-3 p-4">
+        <label className={`flex items-start gap-3 ${settingsLoading || !settings.canManageServerTranslation ? "cursor-not-allowed" : ""}`}>
           <Checkbox
-            size="md"
             checked={enabled}
             disabled={saving || settingsLoading || !settings.canManageServerTranslation}
-            onChange={(event) => setEnabled(event.currentTarget.checked)}
+            onCheckedChange={handleEnabledChange}
             className="mt-0.5"
           />
           <span className="min-w-0">
-            <span className="block text-sm font-bold text-black">{formatMessage({ id: "settings.serverTranslation.enableTitle" })}</span>
-            <span className="block text-xs text-black/60 mt-0.5">
+            <span className={`block text-subhead font-semibold ${settingsLoading || !settings.canManageServerTranslation ? "text-foreground-disabled" : "text-foreground"}`}>{formatMessage({ id: "settings.serverTranslation.enableTitle" })}</span>
+            <span className="block text-footnote text-foreground-muted mt-0.5">
               {formatMessage({ id: "settings.serverTranslation.enableDescription" })}
             </span>
           </span>
         </label>
 
         {showProviderWarning && (
-          <Banner intent="warning" density="sm" className="font-bold">
+          <Banner intent="warning" density="sm">
             {formatMessage({ id: "settings.serverTranslation.providerWarning" })}
           </Banner>
         )}
 
         {(settingsError || error) && (
-          <Banner intent="warning" density="sm" className="font-bold">{error || settingsError}</Banner>
+          <Banner intent="warning" density="sm">{error || settingsError}</Banner>
         )}
 
         {settings.canManageServerTranslation && (
-          <button
+          <Button
+            variant="accent" size="sm"
             type="submit"
             disabled={!dirty || saving || settingsLoading}
-            className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+            className="flex items-center gap-1.5"
           >
             {saving ? formatMessage({ id: "settings.common.saving" }) : saved ? (
               <><Check size={14} /> {formatMessage({ id: "settings.common.saved" })}</>
             ) : formatMessage({ id: "settings.common.save" })}
-          </button>
+          </Button>
         )}
-      </form>
+      </Card>
     </div>
   );
 }
@@ -3534,8 +3747,8 @@ function PlanBillingLoadingSection() {
         icon={<CreditCard size={16} />}
         label={formatMessage({ id: "billing.planBilling" })}
       />
-      <div className="mb-6 border-2 border-black bg-white shadow-brutal-sm">
-        <div className="border-b-2 border-black bg-brutal-cream px-4 py-4">
+      <Card className="mb-6">
+        <div className="border-b border-line-hairline px-4 py-4">
           <Skeleton variant="line" className="mb-2 h-5 w-32" />
           <Skeleton variant="line" className="h-4 w-64 max-w-full" />
         </div>
@@ -3547,7 +3760,7 @@ function PlanBillingLoadingSection() {
               <div className="space-y-3">
                 {[0, 1, 2].map((row) => (
                   <div key={row} className="flex items-start gap-3">
-                    <Skeleton variant="block" className="mt-0.5 h-4 w-4 border-2 border-black/20" />
+                    <Skeleton variant="block" className="mt-0.5 h-4 w-4" />
                     <Skeleton variant="line" className={row === 2 ? "w-3/5" : row === 1 ? "w-4/5" : "w-full"} />
                   </div>
                 ))}
@@ -3556,39 +3769,41 @@ function PlanBillingLoadingSection() {
           ))}
         </div>
 
-        <div className="border-t-2 border-black/10 px-4 py-4">
+        <Separator />
+        <div className="px-4 py-4">
           <div className="grid gap-3 sm:grid-cols-2">
             {(["billing.seat", "billing.messageHistory", "billing.fileUploads"] as const).map((label) => (
               <div key={label} className="flex items-center justify-between gap-3">
-                <span className="text-xs font-bold text-black/45">{formatMessage({ id: label })}</span>
+                <span className="text-footnote font-semibold text-foreground-muted">{formatMessage({ id: label })}</span>
                 <Skeleton variant="line" className="w-20" />
               </div>
             ))}
           </div>
         </div>
 
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t-2 border-black/10 px-4 py-4">
-          <Skeleton variant="block" className="h-8 w-28 border-2 border-black/20" />
-          <Skeleton variant="block" className="h-8 w-44 border-2 border-black/20" />
+        <Separator />
+        <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-4">
+          <Skeleton variant="block" className="h-8 w-28" />
+          <Skeleton variant="block" className="h-8 w-44" />
         </div>
-      </div>
+      </Card>
 
       <SectionHeader
         className="mb-3"
         icon={<Plus size={16} />}
         label={formatMessage({ id: "billing.managePlan" })}
       />
-      <div className="mb-6 grid gap-4 border-2 border-black bg-white p-4 shadow-brutal-sm lg:grid-cols-[minmax(0,1fr)_280px]">
+      <Card className="mb-6 grid gap-4 p-4 lg:grid-cols-[minmax(0,1fr)_280px]">
         <div>
           <Skeleton variant="line" className="mb-3 h-4 w-56 max-w-full" />
           <div className="flex flex-wrap items-center gap-3">
-            <Skeleton variant="block" className="h-8 w-24 border-2 border-black/20" />
+            <Skeleton variant="block" className="h-8 w-24" />
             <Skeleton variant="line" className="w-48 max-w-full" />
           </div>
-          <Skeleton variant="block" className="mt-4 h-8 w-32 border-2 border-black/20" />
+          <Skeleton variant="block" className="mt-4 h-8 w-32" />
         </div>
 
-        <div className="border-2 border-black bg-brutal-cream p-4 shadow-brutal-sm">
+        <Card className="p-4">
           <Skeleton variant="line" className="mb-4 h-3 w-32" />
           <div className="space-y-3">
             {[0, 1, 2].map((row) => (
@@ -3598,13 +3813,13 @@ function PlanBillingLoadingSection() {
               </div>
             ))}
           </div>
-        </div>
-      </div>
+        </Card>
+      </Card>
     </div>
   );
 }
 
-function DowngradeWarningCard({ server, usage }: { server: { planDowngradedAt: string | null }; usage: { agents: number; machines: number; channels?: number } | null }) {
+export function DowngradeWarningCard({ server, usage }: { server: { planDowngradedAt: string | null }; usage: { agents: number; machines: number; channels?: number } | null }) {
   const { formatMessage } = useIntl();
   if (!server.planDowngradedAt) return null;
 
@@ -3627,64 +3842,65 @@ function DowngradeWarningCard({ server, usage }: { server: { planDowngradedAt: s
   const excessChannels = getFinitePlanLimitExcess(channelCount, limits.maxChannels);
 
   return (
-    <div className="mb-4 border-2 border-black bg-brutal-orange/20 shadow-brutal-sm p-4">
-      <div className="flex items-center gap-2 mb-2">
-        <AlertTriangle size={16} className="text-black" />
-        <span className="text-sm font-bold">
-          {graceExpired ? formatMessage({ id: "billing.gracePeriodExpired" }) : formatMessage({ id: "billing.planDowngraded" })}
-        </span>
-      </div>
+    // A problem with a deadline: the orange warning banner (problems are
+    // orange; red is only for what cannot be undone).
+    <Banner
+      intent="warning"
+      withIcon
+      className="mb-4"
+      title={graceExpired ? formatMessage({ id: "billing.gracePeriodExpired" }) : formatMessage({ id: "billing.planDowngraded" })}
+    >
       {graceExpired ? (
-        <p className="text-xs text-black/60 font-mono">
+        <p>
           {formatMessage({ id: "billing.theGracePeriodHasEndedExcessAgentsHaveBeenSt" })}
         </p>
       ) : (
         <>
-                <p className="text-xs text-black/60 font-mono mb-2">
+                <p className="mb-2">
                   {formatMessage(
                     {
                       id: excessAgents === 0 && excessMachines === 0 && excessChannels === 0
                         ? "billing.graceAllWithinLimits"
                         : "billing.graceExcessWillStop",
                     },
-                    { days: daysLeft, b: (chunks) => <span key="b" className="font-bold text-black">{chunks}</span> },
+                    { days: daysLeft, b: (chunks) => <span key="b" className="font-bold text-foreground">{chunks}</span> },
                   )}
                 </p>
           {(excessAgents > 0 || excessMachines > 0 || excessChannels > 0) && (
             <div className="space-y-1">
               {excessAgents > 0 && (
-                <div className="text-xs font-mono">
+                <div>
                   {formatMessage(
                       { id: "billing.agentsOverLimit" },
-                      { count: excessAgents, b: (chunks) => <span key="b" className="font-bold text-brutal-orange">{chunks}</span> },
-                    )} ({agentCount}/{limits.maxAgents})
+                      { count: excessAgents, b: (chunks) => <span key="b" className="font-bold text-foreground">{chunks}</span> },
+                    )} <span className="font-mono text-mono-meta">({agentCount}/{limits.maxAgents})</span>
                 </div>
               )}
               {excessMachines > 0 && (
-                <div className="text-xs font-mono">
+                <div>
                   {formatMessage(
                       { id: "billing.computersOverLimit" },
-                      { count: excessMachines, b: (chunks) => <span key="b" className="font-bold text-brutal-orange">{chunks}</span> },
-                    )} ({machineCount}/{limits.maxMachines})
+                      { count: excessMachines, b: (chunks) => <span key="b" className="font-bold text-foreground">{chunks}</span> },
+                    )} <span className="font-mono text-mono-meta">({machineCount}/{limits.maxMachines})</span>
                 </div>
               )}
               {excessChannels > 0 && (
-                <div className="text-xs font-mono">
+                <div>
                   {formatMessage(
                       { id: "billing.channelsOverLimit" },
-                      { count: excessChannels, b: (chunks) => <span key="b" className="font-bold text-brutal-orange">{chunks}</span> },
-                    )} ({channelCount}/{limits.maxChannels})
+                      { count: excessChannels, b: (chunks) => <span key="b" className="font-bold text-foreground">{chunks}</span> },
+                    )} <span className="font-mono text-mono-meta">({channelCount}/{limits.maxChannels})</span>
                 </div>
               )}
             </div>
           )}
         </>
       )}
-    </div>
+    </Banner>
   );
 }
 
-interface BillingSeatUpdatePreview {
+export interface BillingSeatUpdatePreview {
   status: "preview";
   currentPackQuantity: number;
   requestedPackQuantity: number;
@@ -3704,15 +3920,10 @@ interface BillingSeatUpdatePreview {
 }
 
 // Stryker disable all: Settings billing UI wiring is covered by billingSeatInput behavior tests, source-copy contracts, and visual preview screenshots.
-export function PlanSection() {
-  const { formatMessage, locale: intlLocale } = useIntl();
-  const server = useServerStore((s) => s.current);
-  const usage = useServerStore((s) => s.usage);
-  const billing = useServerStore((s) => s.billing);
-  const loadingUsage = useServerStore((s) => s.loadingUsage);
-  const loadingBilling = useServerStore((s) => s.loadingBilling);
-  const loadUsage = useServerStore((s) => s.loadUsage);
-  const loadBilling = useServerStore((s) => s.loadBilling);
+// The billing draft lives above PlanSection's loading gate: `loadBilling()`
+// flips the section back to its skeleton mid-action, and the notice, error and
+// draft it leaves behind must survive that remount of PlanSectionContent.
+export function usePlanBillingDraft() {
   const [billingAction, setBillingAction] = useState<"checkout" | "portal" | "preview" | "update" | "cancel" | null>(null);
   const [billingError, setBillingError] = useState("");
   const [billingNotice, setBillingNotice] = useState("");
@@ -3723,6 +3934,29 @@ export function PlanSection() {
   const [confirmBillingAction, setConfirmBillingAction] = useState<"checkout" | "update" | null>(null);
   const [promotionCode, setPromotionCode] = useState("");
   const [seatUpdatePreview, setSeatUpdatePreview] = useState<BillingSeatUpdatePreview | null>(null);
+  return {
+    billingAction, setBillingAction,
+    billingError, setBillingError,
+    billingNotice, setBillingNotice,
+    desiredSeatOverride, setDesiredSeatOverride,
+    desiredSeatInput, setDesiredSeatInput,
+    billingInterval, setBillingInterval,
+    showCancelSubscriptionConfirm, setShowCancelSubscriptionConfirm,
+    confirmBillingAction, setConfirmBillingAction,
+    promotionCode, setPromotionCode,
+    seatUpdatePreview, setSeatUpdatePreview,
+  };
+}
+
+export function PlanSection() {
+  const server = useServerStore((s) => s.current);
+  const usage = useServerStore((s) => s.usage);
+  const billing = useServerStore((s) => s.billing);
+  const loadingUsage = useServerStore((s) => s.loadingUsage);
+  const loadingBilling = useServerStore((s) => s.loadingBilling);
+  const loadUsage = useServerStore((s) => s.loadUsage);
+  const loadBilling = useServerStore((s) => s.loadBilling);
+  const draft = usePlanBillingDraft();
 
   useEffect(() => {
     loadUsage();
@@ -3733,865 +3967,9 @@ export function PlanSection() {
     return <PlanBillingLoadingSection />;
   }
 
-  const plan = (billing?.plan ?? server.plan) as ServerPlan;
-  const config = PLAN_CONFIG[plan];
-  const limits = getEffectiveLimits(plan);
-  const pricedLimits = config.limits;
-  const capacity = billing?.capacity;
-
-  const agentCount = billing?.usage.agents ?? usage?.agents ?? 0;
-  const humanCount = billing?.usage.humans;
-  const usesUniversalSeats = capacity != null && capacity.maxUniversalSeats !== -1;
-  const universalSeatLimit = usesUniversalSeats ? capacity?.maxUniversalSeats ?? 0 : 0;
-  const usedHumanUniversalSeats = Math.max(0, humanCount ?? 0);
-  const usedAgentUniversalSeats = Math.max(0, agentCount * PRO_AGENT_SEAT_FRACTION);
-  const usedUniversalSeats = Math.max(
-    0,
-    billing?.usage.universalSeats ?? usedHumanUniversalSeats + usedAgentUniversalSeats,
-  );
-  const seatUsageScale = universalSeatLimit > 0 && usedUniversalSeats > universalSeatLimit
-    ? universalSeatLimit / usedUniversalSeats
-    : 1;
-  const humanSeatUsagePercent = universalSeatLimit > 0
-    ? Math.min(100, (usedHumanUniversalSeats * seatUsageScale / universalSeatLimit) * 100)
-    : 0;
-  const agentSeatUsagePercent = universalSeatLimit > 0
-    ? Math.min(100, (usedAgentUniversalSeats * seatUsageScale / universalSeatLimit) * 100)
-    : 0;
-  const canManageBilling = billing?.permissions.canManageBilling === true;
-  const billingControlsState = getBillingControlsState({
-    plan: billing?.plan ?? server?.plan ?? null,
-    subscriptionStatus: billing?.subscription?.status ?? null,
-  });
-  const isProPlan = plan === "pro";
-  const showSeatUsage = isProPlan;
-  const billingControlsDisabledReason = !canManageBilling
-    ? formatMessage({ id: "billing.onlyServerOwnersCanChangeBilling" })
-    : !billing?.stripeConfigured
-      ? formatMessage({ id: "billing.paidPlansAreNotAvailableYet" })
-      : null;
-  const formatLimit = (value: number | undefined) => value == null
-    ? "..."
-    : value === -1 ? formatMessage({ id: "billing.unlimited" }) : String(value);
-  const formatBytes = (value: number | undefined) => {
-    if (value == null || value < 0) return formatMessage({ id: "billing.unlimited" });
-    if (value >= 1024 * 1024) return `${Math.round(value / 1024 / 1024)} MB`;
-    return `${Math.round(value / 1024)} KB`;
-  };
-  const formatSeatUsageNumber = (value: number) => value.toFixed(1).replace(/\.0$/, "");
-  const finalTrialActive = isTrialActive();
-  const formatUsd = (value: number) => Number.isInteger(value) ? String(value) : value.toFixed(2);
-  const currentHumanSeats = billing?.provisioned.humans ?? 0;
-  const currentAgentSeats = billing?.provisioned.agents ?? 0;
-  const currentSeatQuantity = billing?.provisioned.proPackQuantity ?? 0;
-  const minimumUsageSeatQuantity = Math.max(1, Math.ceil(usedUniversalSeats));
-  const minimumSeatQuantity = isProPlan ? Math.max(1, currentSeatQuantity) : 1;
-  const isCheckoutMode = billingControlsState.canCheckout;
-  const isManageSeatMode = !isCheckoutMode && billingControlsState.canUpdatePacks && isProPlan;
-  const showManagePlanSection = isCheckoutMode || billingControlsState.canUpdatePacks;
-  const isCancelScheduled = billing?.subscription?.cancelAtPeriodEnd === true;
-  const minimumManageSeatQuantity = Math.max(1, minimumUsageSeatQuantity);
-  const defaultSeatInputQuantity = isManageSeatMode
-    ? Math.max(minimumManageSeatQuantity, currentSeatQuantity)
-    : Math.max(minimumUsageSeatQuantity, minimumSeatQuantity);
-  const requestedSeatInputQuantity = desiredSeatOverride ?? defaultSeatInputQuantity;
-  const draftRequestedSeatQuantity = requestedSeatInputQuantity;
-  const billingSeatDraftState = getBillingSeatDraftState({
-    requestedSeatQuantity: draftRequestedSeatQuantity,
-    draftSeatQuantity: draftRequestedSeatQuantity,
-    minimumUsageSeatQuantity,
-    minimumSeatQuantity: isManageSeatMode ? 1 : minimumSeatQuantity,
-  });
-  const requestedSeatQuantity = billingSeatDraftState.requestedSeatQuantity;
-  const draftSeatQuantity = billingSeatDraftState.draftSeatQuantity;
-  const draftProvisionedAgentSeats = draftSeatQuantity * PRO_AGENT_SEAT_BLOCK_SIZE;
-  const requestedHumanSeatCapacity = requestedSeatQuantity;
-  const requestedAgentSeatCapacity = requestedSeatQuantity * PRO_AGENT_SEAT_BLOCK_SIZE;
-  const draftBelowRequiredCoverage = billingSeatDraftState.belowCurrentUsage;
-  const checkoutRequest = {
-    targetPlan: "pro",
-    billingInterval,
-    seatQuantity: requestedSeatQuantity,
-    humanSeatQuantity: requestedHumanSeatCapacity,
-    agentSeatQuantity: requestedAgentSeatCapacity,
-  };
-  const managePlanTitle = isCheckoutMode
-    ? formatMessage({ id: "billing.upgradeToPro" })
-    : isManageSeatMode ? (formatMessage({ id: "billing.manageSeats" })) : formatMessage({ id: "billing.managePlan" });
-  const currentBillingInterval = billing?.subscription?.billingInterval ?? billing?.price?.billingInterval ?? DEFAULT_BILLING_INTERVAL;
-  const currentBillingIntervalLabel = currentBillingInterval === "annual" ? formatMessage({ id: "billing.yearly" }) : formatMessage({ id: "billing.monthly" });
-  const currentTotalLabel = billing?.price
-    ? getBillingCurrentTotalLabel(
-      currentBillingInterval,
-      billing.price.monthlyUsd,
-      billing.price.annualUsd,
-      formatUsd,
-    )
-    : null;
-  const currentPlanPresentation = getSettingsBillingPlanPresentation(
-    plan,
-    config.displayName,
-    currentHumanSeats,
-    currentAgentSeats,
-    currentSeatQuantity,
-    formatProAgentSeatFraction(),
-  );
-  const currentPlanDisplayName = formatMessage({ id: currentPlanPresentation.displayName });
-  const currentPlanDescription = formatMessage(
-    { id: currentPlanPresentation.description },
-    currentPlanPresentation.descriptionValues,
-  );
-  const pricedFileUploadLimitLabel = plan === "free" ? `${formatBytes(FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES)}/${formatMessage({ id: "billing.month" })}` : formatMessage({ id: "billing.unlimited" });
-  const comparePlansHref = "https://raft.build/#pricing";
-  const currentIncludedFeatures = currentPlanPresentation.includedFeatures.map((id) => formatMessage({ id }));
-  const currentNotIncludedFeatures = currentPlanPresentation.notIncludedFeatures.map((id) => formatMessage({ id }));
-  const hasNotIncludedFeatures = currentNotIncludedFeatures.length > 0;
-  const selectedTotalLabels = getBillingSelectedTotalLabels(
-    isManageSeatMode ? currentBillingInterval : billingInterval,
-    draftSeatQuantity,
-    PRO_SEAT_MONTHLY_USD,
-    PRO_SEAT_ANNUAL_USD,
-    formatUsd,
-  );
-  // Priced totals arrive as {id, amount}; the "/ year" | "/ 年" period is part of
-  // the translation now, so there is nothing left to patch after the fact.
-  const formatPricedTotal = (total: BillingPricedTotal | null) =>
-    total == null ? null : formatMessage({ id: total.id }, { amount: total.amount });
-  const localizedSelectedTotalLabels = {
-    totalLabel: formatPricedTotal(selectedTotalLabels.totalLabel)!,
-    originalLabel: formatPricedTotal(selectedTotalLabels.originalLabel),
-  };
-  const localizedCurrentTotalLabel = formatPricedTotal(currentTotalLabel);
-  const seatDelta = draftSeatQuantity - currentSeatQuantity;
-  const additionalSeats = Math.max(0, seatDelta);
-  const removedSeats = Math.max(0, -seatDelta);
-  const normalizedPromotionCode = promotionCode.trim();
-  const formatBillingAmount = (amount: number, currency: string) => new Intl.NumberFormat(
-    intlLocale.toLowerCase().startsWith("zh") ? "zh-CN" : "en-US",
-    { style: "currency", currency: currency.toUpperCase() },
-  ).format(amount / 100);
-  const formatSeatLabel = (count: number) => formatMessage({ id: "billing.seatCount" }, { count });
-  const formatHumanCapacityLabel = (count: number) => formatMessage({ id: "billing.upToHumans" }, { count });
-  const formatAgentCapacityLabel = (count: number) => formatMessage({ id: "billing.orAgents" }, { count });
-  const handleSeatInputChange = (event: ChangeEvent<HTMLInputElement>) => {
-    applyBillingSeatInputChange(
-      event.currentTarget.value,
-      setDesiredSeatInput,
-      setDesiredSeatOverride,
-    );
-  };
-  // Stryker disable next-line BlockStatement: component wiring delegates to billingSeatInput helpers covered by DOM-gate behavior tests.
-  const commitSeatInput = () => {
-    applyBillingSeatInputCommit(
-      desiredSeatInput,
-      requestedSeatInputQuantity,
-      isManageSeatMode ? minimumManageSeatQuantity : Math.max(minimumUsageSeatQuantity, minimumSeatQuantity),
-      setDesiredSeatOverride,
-      setDesiredSeatInput,
-    );
-  };
-  const noSeatChangeSelected = requestedSeatQuantity === currentSeatQuantity;
-  const updateSeatButtonDisabled = !!billingControlsDisabledReason
-    || draftBelowRequiredCoverage
-    || billingAction != null
-    || (!isCancelScheduled && noSeatChangeSelected);
-  const updateSeatButtonTitle = billingControlsDisabledReason
-    ?? (draftBelowRequiredCoverage
-      ? formatMessage({ id: "billing.keepAtLeastSeats" }, { min: minimumUsageSeatQuantity })
-      : null)
-    ?? (isCancelScheduled
-      ? noSeatChangeSelected
-        ? formatMessage({ id: "billing.reactivateThisProSubscriptionBeforeTheCurren" })
-        : formatMessage({ id: "billing.reactivateThisSubscriptionAndUpdateSeats" })
-      : noSeatChangeSelected
-        ? formatMessage({ id: "billing.enterADifferentSeatTotal" })
-      : formatMessage({ id: "billing.reviewProSeatUpdateBeforeConfirming" }));
-  const updateSeatButtonLabel = isCancelScheduled
-    ? noSeatChangeSelected ? formatMessage({ id: "billing.reactivateSubscription" }) : formatMessage({ id: "billing.reactivateAndUpdateSeats" })
-    : formatMessage({ id: "billing.reviewSeatUpdate" });
-  const updateSeatButtonBusyLabel = billingAction === "preview"
-    ? formatMessage({ id: "billing.reviewing" })
-    : isCancelScheduled && noSeatChangeSelected ? formatMessage({ id: "billing.reactivating" }) : formatMessage({ id: "billing.updating" });
-  const capacityLabel = isManageSeatMode
-    ? seatDelta > 0
-      ? formatMessage({ id: "billing.addsSeats" }, { seats: formatSeatLabel(additionalSeats) })
-      : seatDelta < 0
-        ? formatMessage({ id: "billing.removesSeats" }, { seats: formatSeatLabel(removedSeats) })
-        : formatMessage({ id: "billing.keepsCurrentSeats" })
-    : formatMessage({ id: "billing.selectedSeats" }, { seats: formatSeatLabel(draftSeatQuantity) });
-  const billingSeatCopyMode = isManageSeatMode ? "manageSeats" : "default";
-  const billingSeatCopyLabels = getBillingSeatCopyLabels(billingSeatCopyMode);
-  const billingTotalSummaryLabels = getBillingTotalSummaryLabels(
-    billingSeatCopyMode,
-    isManageSeatMode ? currentBillingInterval : billingInterval,
-  );
-  // The two `localized…Labels` objects used to hold a full parallel Chinese copy
-  // of these label groups behind `locale === "zh-CN"`, so every label existed
-  // twice and could drift independently. The ids carry both languages now, so
-  // the branch is gone and there is only one place to change a label.
-  // Format at this boundary so the ~11 consumers below keep receiving STRINGS.
-  // Without this the ids typecheck perfectly and the UI renders the literal text
-  // "billing.totalSeats" — the same trap as the plan-presentation change in
-  // #5774: the type system proves every value is a valid id and says nothing
-  // about whether the consumer formats it.
-  const localizedBillingSeatCopyLabels = {
-    seatQuantityLabel: formatMessage({ id: billingSeatCopyLabels.seatQuantityLabel }),
-    seatSummaryLabel: formatMessage({ id: billingSeatCopyLabels.seatSummaryLabel }),
-    billableSeatsSummaryLabel: formatMessage({ id: billingSeatCopyLabels.billableSeatsSummaryLabel }),
-    capacitySummaryLabel: formatMessage({ id: billingSeatCopyLabels.capacitySummaryLabel }),
-    quantityHelpLabel: formatMessage(
-      { id: billingSeatCopyLabels.quantityHelpLabel },
-      { capacity: capacityLabel },
-    ),
-  };
-  const localizedBillingTotalSummaryLabels = {
-    currentTotalLabel: billingTotalSummaryLabels.currentTotalLabel
-      ? formatMessage({ id: billingTotalSummaryLabels.currentTotalLabel })
-      : null,
-    totalLabel: formatMessage({ id: billingTotalSummaryLabels.totalLabel }),
-  };
-  const billingSeatDraftError = draftBelowRequiredCoverage
-    ? isManageSeatMode
-      ? formatMessage({ id: "billing.keepAtLeastSeats" }, { min: minimumUsageSeatQuantity })
-      : formatMessage({ id: "billing.enterAtLeastSeats" }, { min: minimumUsageSeatQuantity })
-    : null;
-  // Stryker disable next-line StringLiteral: validated by source-copy contracts and visual preview, not by the DOM mutation corpus.
-  const managePlanInputPrompt = isCheckoutMode
-    ? formatMessage({ id: "billing.enterTheNumberOfSeatsToBuy" })
-    : formatMessage({ id: "billing.enterTheTotalSeatsAfterThisUpdate" });
-  const seatInputValue = getBillingSeatInputValue(desiredSeatInput, requestedSeatInputQuantity);
-  const seatSummaryValue = draftSeatQuantity;
-
-  const handleCheckout = async () => {
-    if (billingControlsDisabledReason || !billingControlsState.canCheckout) return;
-    setBillingError("");
-    setBillingNotice("");
-    setBillingAction("checkout");
-    try {
-      const { data } = await api.post("/billing/checkout", {
-        ...checkoutRequest,
-        successUrl: window.location.href,
-        cancelUrl: window.location.href,
-      });
-      window.location.href = data.url;
-    } catch (err: any) {
-      setBillingError(err.response?.data?.error || formatMessage({ id: "billing.failedToStartCheckout" }));
-      setBillingAction(null);
-    }
-  };
-
-  const handlePortal = async () => {
-    if (billingControlsDisabledReason || !billingControlsState.canOpenPortal) return;
-    setBillingError("");
-    setBillingNotice("");
-    setBillingAction("portal");
-    try {
-      const { data } = await api.post("/billing/portal", {
-        returnUrl: window.location.href,
-      });
-      window.location.href = data.url;
-    } catch (err: any) {
-      setBillingError(err.response?.data?.error || formatMessage({ id: "billing.failedToOpenBillingPortal" }));
-      setBillingAction(null);
-    }
-  };
-
-  const handlePackQuantityUpdate = async () => {
-    if (billingControlsDisabledReason || !billingControlsState.canUpdatePacks) return;
-    setBillingError("");
-    setBillingNotice("");
-    setBillingAction("update");
-    try {
-      const { data } = await api.post("/billing/seat-pack-quantity", {
-        seatQuantity: requestedSeatQuantity,
-        humanSeatQuantity: requestedHumanSeatCapacity,
-        agentSeatQuantity: requestedAgentSeatCapacity,
-        ...(seatUpdatePreview ? { previewToken: seatUpdatePreview.previewToken } : {}),
-      });
-      if (data.status === "pending_payment") {
-        setBillingNotice(formatMessage({ id: "billing.seatUpdateIsPendingStripePaymentConfirmation" }));
-      } else if (data.status === "unchanged") {
-        setBillingNotice(formatMessage({ id: "billing.seatQuantitiesAreAlreadyUpToDate" }));
-      } else if (data.status === "reactivated") {
-        setBillingNotice(formatMessage({ id: "billing.subscriptionReactivatedYourCurrentProSeatCap" }));
-      } else if (data.status === "updated" || data.effectiveAt === "current") {
-        setBillingNotice(formatMessage({ id: "billing.seatUpdateConfirmedCapacityHasBeenRefreshedFro" }));
-      } else {
-        setBillingNotice(formatMessage({ id: "billing.seatUpdateRequestedCapacityWillUpdateAfterStri" }));
-      }
-      await loadBilling();
-      setDesiredSeatOverride(null);
-      setDesiredSeatInput(null);
-      setPromotionCode("");
-      setSeatUpdatePreview(null);
-    } catch (err: any) {
-      setBillingError(err.response?.data?.error || formatMessage({ id: "billing.failedToUpdateSeats" }));
-    } finally {
-      setBillingAction(null);
-    }
-  };
-
-  const handleCancelSubscription = async () => {
-    if (billingControlsDisabledReason || !billingControlsState.canOpenPortal) return;
-    setBillingError("");
-    setBillingNotice("");
-    setBillingAction("cancel");
-    try {
-      await api.post("/billing/cancel");
-      await loadBilling();
-      setBillingNotice(formatMessage({ id: "billing.subscriptionCancellationScheduledForTheEndOf" }));
-      setShowCancelSubscriptionConfirm(false);
-    } catch (err: any) {
-      setBillingError(err.response?.data?.error || formatMessage({ id: "billing.failedToCancelSubscription" }));
-    } finally {
-      setBillingAction(null);
-    }
-  };
-
-  const openCheckoutConfirm = () => {
-    if (billingControlsDisabledReason || billingSeatDraftError || !billingControlsState.canCheckout) return;
-    setConfirmBillingAction("checkout");
-  };
-
-  const openSeatUpdateConfirm = async () => {
-    if (updateSeatButtonDisabled || !billingControlsState.canUpdatePacks) return;
-    setBillingError("");
-    setBillingNotice("");
-    setSeatUpdatePreview(null);
-    if (seatDelta <= 0 || !normalizedPromotionCode) {
-      setConfirmBillingAction("update");
-      return;
-    }
-    setBillingAction("preview");
-    try {
-      const { data } = await api.post<BillingSeatUpdatePreview>("/billing/seat-pack-quantity/preview", {
-        seatQuantity: requestedSeatQuantity,
-        humanSeatQuantity: requestedHumanSeatCapacity,
-        agentSeatQuantity: requestedAgentSeatCapacity,
-        promotionCode: normalizedPromotionCode,
-      });
-      setSeatUpdatePreview(data);
-      setConfirmBillingAction("update");
-    } catch (err: unknown) {
-      const axiosErr = err as { response?: { data?: { error?: string } } };
-      setBillingError(axiosErr.response?.data?.error || formatMessage({ id: "billing.failedToPreviewSeatUpdate" }));
-    } finally {
-      setBillingAction(null);
-    }
-  };
-
-  return (
-    <div className="mb-6">
-      <SectionHeader
-        className="mb-3"
-        icon={<CreditCard size={16} />}
-        label={formatMessage({ id: "billing.currentPlan" })}
-      />
-
-      {/* Downgrade warning */}
-      {server?.planDowngradedAt && (
-        <DowngradeWarningCard server={server} usage={usage} />
-      )}
-
-      {/* Free trial notice */}
-      {plan === "free" && finalTrialActive && (
-        <div className="mb-4 border-2 border-black bg-soft-signal/30 shadow-brutal-sm p-4">
-          <div className="flex items-center gap-2 mb-1">
-            <span className="text-sm font-bold">{formatMessage({ id: "billing.finalTrialPeriod" })}</span>
-          </div>
-          <p className="text-xs text-black/60 font-mono">
-                  {formatMessage(
-                    { id: "billing.trialActiveThrough" },
-                    {
-                      date: formatGlobalTrialCutoffDate(intlLocale),
-                    },
-                  )}
-          </p>
-        </div>
-      )}
-
-      <div className="mb-6 border-2 border-black bg-white shadow-brutal-sm">
-        <div className="border-b-2 border-black bg-brutal-cream px-4 py-4">
-          <div className="flex flex-wrap items-center gap-3">
-            <div className="min-w-0">
-              <div className="text-lg font-bold text-black">{currentPlanDisplayName}</div>
-              <div className="text-sm text-black/60">
-                {currentPlanDescription}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div className={`grid gap-4 p-4 ${hasNotIncludedFeatures ? "lg:grid-cols-2" : ""}`}>
-          <div>
-            <div className="mb-3 text-sm font-bold text-black">{formatMessage({ id: "billing.included" })}</div>
-            <div className="space-y-3">
-              {currentIncludedFeatures.map((feature) => (
-                <div key={feature} className="flex items-start gap-3 text-sm text-black">
-                  <Check size={16} className="mt-0.5 shrink-0 text-green-700" />
-                  <span>{feature}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          {hasNotIncludedFeatures && (
-            <div>
-              <div className="mb-3 text-sm font-bold text-black/60">{formatMessage({ id: "billing.notIncluded" })}</div>
-              <div className="space-y-3">
-                {currentNotIncludedFeatures.map((feature) => (
-                  <div key={feature} className="flex items-start gap-3 text-sm text-black">
-                    <X size={16} className="mt-0.5 shrink-0 text-brutal-red" />
-                    <span>{feature}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="border-t-2 border-black/10 px-4 py-4">
-          {showSeatUsage && usesUniversalSeats && (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs font-bold text-black">{formatMessage({ id: "billing.seat" })}</span>
-                <span className="text-xs font-mono text-black/60">
-                  {formatSeatUsageNumber(usedUniversalSeats)} / {formatLimit(universalSeatLimit)} {formatMessage({ id: "billing.used" })}
-                </span>
-              </div>
-              <div className="flex h-4 w-full overflow-hidden border-2 border-black bg-white">
-                {humanSeatUsagePercent > 0 && (
-                  <div
-                    className="h-full bg-soft-signal"
-                    style={{ width: `${humanSeatUsagePercent}%` }}
-                    title={formatMessage(
-                      { id: "billing.humansUsingSeats" },
-                      {
-                        people: humanCount ?? 0,
-                        seatsText: formatSeatUsageNumber(usedHumanUniversalSeats),
-                        seatCount: usedHumanUniversalSeats,
-                      },
-                    )}
-                  />
-                )}
-                {agentSeatUsagePercent > 0 && (
-                  <div
-                    className="h-full bg-brutal-pink"
-                    style={{ width: `${agentSeatUsagePercent}%` }}
-                    title={formatMessage(
-                      { id: "billing.agentsUsingSeats" },
-                      {
-                        people: agentCount,
-                        seatsText: formatSeatUsageNumber(usedAgentUniversalSeats),
-                        seatCount: usedAgentUniversalSeats,
-                      },
-                    )}
-                  />
-                )}
-              </div>
-              <div className="flex flex-wrap items-center gap-4 text-xs">
-                <div className="flex items-center gap-2">
-                  <span className="flex items-center gap-2 font-bold text-black">
-                    <span className="size-2 border border-black bg-soft-signal" />
-                    {formatMessage({ id: "billing.humans" })}
-                  </span>
-                </div>
-                <div className="flex items-center gap-2">
-                  <span className="flex items-center gap-2 font-bold text-black">
-                    <span className="size-2 border border-black bg-brutal-pink" />
-                    {formatMessage({ id: "billing.agents" })}
-                  </span>
-                </div>
-              </div>
-            </div>
-          )}
-          {showSeatUsage && !usesUniversalSeats && (
-            <div className="grid gap-3 sm:grid-cols-2">
-              {humanCount != null && (
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-xs font-bold text-black">{formatMessage({ id: "billing.humans" })}</span>
-                  <span className="text-xs font-mono text-black/60">
-                    {humanCount} / {formatLimit(capacity?.maxHumans)}
-                  </span>
-                </div>
-              )}
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs font-bold text-black">{formatMessage({ id: "billing.agents" })}</span>
-                <span className="text-xs font-mono text-black/60">
-                  {agentCount} / {formatLimit(capacity?.maxAgents ?? limits.maxAgents)}
-                </span>
-              </div>
-            </div>
-          )}
-          <div className="grid gap-3 sm:grid-cols-2">
-            {plan === "free" && (
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs font-bold text-black">{formatMessage({ id: "billing.messageHistory" })}</span>
-                <span className="text-xs font-mono text-black/60">
-                  {pricedLimits.messageHistoryDays === -1 ? formatMessage({ id: "billing.unlimited" }) : `${pricedLimits.messageHistoryDays} ${formatMessage({ id: "billing.days" })}`}
-                </span>
-              </div>
-            )}
-            {plan === "free" && billing?.fileUploadQuota && (
-              <div className="flex items-center justify-between gap-3">
-                <span className="text-xs font-bold text-black">{formatMessage({ id: "billing.fileUploads" })}</span>
-                <span className="text-xs font-mono text-black/60">
-                  {billing.fileUploadQuota.limited
-                    ? `${formatBytes(billing.fileUploadQuota.usedBytes)} / ${formatBytes(billing.fileUploadQuota.limitBytes)} ${formatMessage({ id: "billing.thisMonth" })}`
-                    : pricedFileUploadLimitLabel}
-                </span>
-              </div>
-            )}
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center justify-between gap-3 border-t-2 border-black/10 px-4 py-4">
-          {billingControlsState.canOpenPortal ? (
-            <div className="flex min-w-0 flex-wrap gap-2">
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  className="btn-brutal-sm bg-white px-3 py-1.5 text-xs disabled:opacity-50"
-                  disabled={!!billingControlsDisabledReason || billingAction != null}
-                  onClick={handlePortal}
-                  title={billingControlsDisabledReason ?? formatMessage({ id: "billing.openStripeBillingPortal" })}
-                >
-                  {billingAction === "portal" ? formatMessage({ id: "billing.opening" }) : formatMessage({ id: "billing.billingPortal" })}
-                </button>
-                {!isCancelScheduled && (
-                  <button
-                    type="button"
-                    className="btn-brutal-sm bg-white px-3 py-1.5 text-xs disabled:opacity-50"
-                    disabled={!!billingControlsDisabledReason || billingAction != null}
-                    onClick={() => setShowCancelSubscriptionConfirm(true)}
-                    title={billingControlsDisabledReason ?? formatMessage({ id: "billing.cancelTheWholeProSubscriptionAtPeriodEnd" })}
-                  >
-                    {formatMessage({ id: "billing.cancelSubscription2" })}
-                  </button>
-                )}
-              </div>
-            </div>
-          ) : (
-            <span />
-          )}
-          <a
-            href={comparePlansHref}
-            className="btn-brutal-sm cursor-default bg-white px-3 py-1.5 text-xs"
-          >
-            {formatMessage({ id: "billing.seeAllFeaturesAndComparePlans" })}
-          </a>
-        </div>
-      </div>
-
-      {showManagePlanSection && (
-        <>
-          <SectionHeader
-            className="mb-3"
-            icon={isCheckoutMode ? <CreditCard size={16} /> : <Plus size={16} />}
-            label={managePlanTitle}
-          />
-
-          <div className="mb-6 grid gap-4 border-2 border-black bg-white p-4 shadow-brutal-sm lg:grid-cols-[minmax(0,1fr)_280px]">
-            <div>
-              {isCheckoutMode && (
-                <div className="mb-4">
-                  <div className="mb-2 text-sm font-bold text-black">{formatMessage({ id: "billing.howOftenDoYouWantToBeBilled" })}</div>
-                  <BillingIntervalSegmentedControl
-                    value={billingInterval}
-                    onValueChange={setBillingInterval}
-                    disabled={!!billingControlsDisabledReason || billingAction != null}
-                  />
-                </div>
-              )}
-
-              {billing?.subscription && (
-                <div className="mb-4 text-xs font-mono text-black/60">
-                  {formatMessage({ id: "billing.billingInterval" })}: {isCancelScheduled
-                    ? formatMessage(
-                        { id: "billing.intervalWithCancellationScheduled" },
-                        { interval: currentBillingIntervalLabel },
-                      )
-                    : currentBillingIntervalLabel}
-                </div>
-              )}
-
-              <div className="flex min-w-0 flex-col gap-3">
-                <span className="text-sm font-bold text-black">
-                  {managePlanInputPrompt}
-                </span>
-                <div className="flex flex-wrap items-end gap-3">
-                  <label className="flex flex-col gap-1">
-                    <span className="text-xs font-bold text-black/60">{localizedBillingSeatCopyLabels.seatQuantityLabel}</span>
-                    <input
-                      className="w-28 border-2 border-black bg-white px-2 py-1 text-sm font-mono"
-                      type="text"
-                      inputMode="numeric"
-                      pattern="[0-9]*"
-                      min={isManageSeatMode ? minimumManageSeatQuantity : Math.max(minimumUsageSeatQuantity, minimumSeatQuantity)}
-                      step={1}
-                      aria-label={localizedBillingSeatCopyLabels.seatQuantityLabel}
-                      value={seatInputValue}
-                      disabled={!!billingControlsDisabledReason || billingAction != null}
-                      onChange={handleSeatInputChange}
-                      onBlur={commitSeatInput}
-                    />
-                  </label>
-                  {isManageSeatMode && seatDelta > 0 && (
-                    <label className="flex w-64 max-w-full flex-col gap-1">
-                      <span className="text-xs font-bold text-black/60">{formatMessage({ id: "billing.promotionCodeOptional" })}</span>
-                      <input
-                        className="w-full border-2 border-black bg-white px-2 py-1 text-sm font-mono uppercase"
-                        type="text"
-                        autoComplete="off"
-                        aria-label={formatMessage({ id: "billing.promotionCodeOptional" })}
-                        value={promotionCode}
-                        disabled={!!billingControlsDisabledReason || billingAction != null}
-                        onChange={(event) => {
-                          setPromotionCode(event.currentTarget.value);
-                          setSeatUpdatePreview(null);
-                        }}
-                      />
-                    </label>
-                  )}
-                </div>
-                {isManageSeatMode && seatDelta > 0 && (
-                  <span className="text-[11px] font-mono text-black/50">
-                    {formatMessage({ id: "billing.enterACodeApprovedForExistingSeatUpdate" })}
-                  </span>
-                )}
-                <span className="text-xs font-mono text-black/60">
-                    {localizedBillingSeatCopyLabels.quantityHelpLabel} {formatMessage(
-                      { id: "billing.seatCoverageHelp" },
-                      { min: minimumUsageSeatQuantity, price: PRO_SEAT_MONTHLY_USD },
-                    )}
-                </span>
-                {billingSeatDraftError && (
-                  <span className="text-xs font-mono text-brutal-red">
-                    {billingSeatDraftError}
-                  </span>
-                )}
-              </div>
-
-              <div className="mt-4 flex flex-wrap gap-2">
-                {isCheckoutMode && (
-                  <button
-                    type="button"
-                    className="btn-brutal-sm bg-brutal-pink px-3 py-1.5 text-xs disabled:opacity-50"
-                    disabled={!!billingControlsDisabledReason || !!billingSeatDraftError || billingAction != null}
-                    onClick={openCheckoutConfirm}
-                      title={billingControlsDisabledReason ?? billingSeatDraftError ?? formatMessage(
-                        { id: "billing.startCheckoutTitle" },
-                        {
-                          interval: formatMessage({
-                            id: billingInterval === "annual" ? "billing.yearly" : "billing.monthly",
-                          }),
-                          seats: requestedSeatQuantity,
-                        },
-                      )}
-                  >
-                    {billingAction === "checkout" ? formatMessage({ id: "billing.opening" }) : formatMessage({ id: "billing.upgradeToPro" })}
-                  </button>
-                )}
-                {billingControlsState.canUpdatePacks && (
-                  <button
-                    type="button"
-                    className="btn-brutal-sm bg-brutal-pink px-3 py-1.5 text-xs disabled:opacity-50"
-                    disabled={updateSeatButtonDisabled}
-                    onClick={openSeatUpdateConfirm}
-                    title={updateSeatButtonTitle}
-                  >
-                    {billingAction === "update" || billingAction === "preview" ? updateSeatButtonBusyLabel : updateSeatButtonLabel}
-                  </button>
-                )}
-              </div>
-              {billingControlsDisabledReason && (
-                <p className="mt-2 text-xs font-mono text-black/60">{billingControlsDisabledReason}</p>
-              )}
-              {billingNotice && (
-                <p className="mt-2 text-xs font-mono text-black/60">{billingNotice}</p>
-              )}
-              {billingError && (
-                <p className="mt-2 text-xs font-mono text-brutal-red">{billingError}</p>
-              )}
-            </div>
-
-            <div className="border-2 border-black bg-brutal-cream p-4 shadow-brutal-sm">
-              <div className="mb-3 text-xs font-bold uppercase tracking-widest text-black/50">
-                {isCheckoutMode ? formatMessage({ id: "billing.checkoutSummary" }) : isManageSeatMode ? (formatMessage({ id: "billing.manageSeatsSummary" })) : formatMessage({ id: "billing.subscriptionSummary" })}
-              </div>
-              <div className="space-y-3">
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-sm font-bold text-black">{localizedBillingSeatCopyLabels.seatSummaryLabel}</span>
-                  <span className="text-sm font-mono text-black/60">{seatSummaryValue}</span>
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-sm font-bold text-black">{localizedBillingSeatCopyLabels.billableSeatsSummaryLabel}</span>
-                  <span className="text-sm font-mono text-black/60">{draftSeatQuantity}</span>
-                </div>
-                <div className="flex items-center justify-between gap-3">
-                  <span className="text-sm font-bold text-black">{localizedBillingSeatCopyLabels.capacitySummaryLabel}</span>
-                  <span className="inline-flex flex-col items-end text-sm font-mono leading-5 text-black/60">
-                    <span>{formatHumanCapacityLabel(draftSeatQuantity)}</span>
-                    <span>{formatAgentCapacityLabel(draftProvisionedAgentSeats)}</span>
-                  </span>
-                </div>
-                {isCheckoutMode ? (
-                  <>
-                    <div className="flex items-center justify-between gap-3">
-                      <span className="text-sm font-bold text-black">{localizedBillingTotalSummaryLabels.totalLabel}</span>
-                      <span className="inline-flex flex-col items-end text-sm font-mono leading-5 text-black/60">
-                        {localizedSelectedTotalLabels.originalLabel && (
-                          <span className="text-black/40 line-through">{localizedSelectedTotalLabels.originalLabel}</span>
-                        )}
-                        <span>{localizedSelectedTotalLabels.totalLabel}</span>
-                      </span>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    {isManageSeatMode && (
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-sm font-bold text-black">{formatMessage({ id: "billing.currentSeats" })}</span>
-                        <span className="text-sm font-mono text-black/60">{currentSeatQuantity}</span>
-                      </div>
-                    )}
-                    {isManageSeatMode && seatDelta !== 0 && (
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-sm font-bold text-black">{seatDelta > 0 ? formatMessage({ id: "billing.addedCapacity" }) : formatMessage({ id: "billing.removedCapacity" })}</span>
-                        <span className="inline-flex flex-col items-end text-sm font-mono leading-5 text-black/60">
-                          <span>{formatHumanCapacityLabel(Math.abs(seatDelta))}</span>
-                          <span>{formatAgentCapacityLabel(Math.abs(seatDelta) * PRO_AGENT_SEAT_BLOCK_SIZE)}</span>
-                        </span>
-                      </div>
-                    )}
-                    {isManageSeatMode && localizedCurrentTotalLabel && localizedBillingTotalSummaryLabels.currentTotalLabel && (
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-sm font-bold text-black">{localizedBillingTotalSummaryLabels.currentTotalLabel}</span>
-                        <span className="text-sm font-mono text-black/60">{localizedCurrentTotalLabel}</span>
-                      </div>
-                    )}
-                    {isManageSeatMode && (
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-sm font-bold text-black">{localizedBillingTotalSummaryLabels.totalLabel}</span>
-                        <span className="inline-flex flex-col items-end text-sm font-mono leading-5 text-black/60">
-                          {localizedSelectedTotalLabels.originalLabel && (
-                            <span className="text-black/40 line-through">{localizedSelectedTotalLabels.originalLabel}</span>
-                          )}
-                          <span>{localizedSelectedTotalLabels.totalLabel}</span>
-                        </span>
-                      </div>
-                    )}
-                    <div className="border-t-2 border-black pt-3 text-xs font-mono text-black/60">
-                      {formatMessage({ id: "billing.seatIncreasesMayBillImmediatelyAfterStripeConf" })}
-                    </div>
-                  </>
-                )}
-              </div>
-            </div>
-          </div>
-        </>
-      )}
-
-      {showCancelSubscriptionConfirm && (
-        <ConfirmDialog
-          chromeLocale="active"
-          title={formatMessage({ id: "billing.cancelSubscription" })}
-          message={formatMessage({ id: "billing.cancelTheWholeProSubscriptionAtTheEndOfTheCu" })}
-          confirmLabel={formatMessage({ id: "billing.cancelSubscription2" })}
-          loadingLabel={formatMessage({ id: "billing.canceling" })}
-          confirmColor="bg-brutal-orange"
-          onConfirm={handleCancelSubscription}
-          onClose={() => setShowCancelSubscriptionConfirm(false)}
-        />
-      )}
-      {/* Stryker restore all: the real PlanSection composition test owns this complete dialog boundary. */}
-      {confirmBillingAction && (
-        <ConfirmDialog
-          chromeLocale="active"
-          title={confirmBillingAction === "checkout"
-            ? formatMessage({ id: "billing.confirmProCheckout" })
-            : formatMessage({ id: "billing.confirmSeatUpdate" })}
-          message={(
-            <div className="space-y-2">
-              <p>
-                {confirmBillingAction === "checkout"
-                  ? formatMessage({ id: "billing.youAreAboutToStartProCheckout" })
-                  : formatMessage({ id: "billing.youAreAboutToUpdateThisProSubscription" })}
-              </p>
-              <div className="font-mono text-xs">
-                {confirmBillingAction === "update" ? (
-                  <>
-                    <div>{formatMessage({ id: "billing.currentSeats" })}: {currentSeatQuantity}</div>
-                    {seatDelta > 0 && <div>{formatMessage({ id: "billing.seatsToAdd" })}: {additionalSeats}</div>}
-                    {seatDelta < 0 && <div>{formatMessage({ id: "billing.seatsToRemove" })}: {removedSeats}</div>}
-                    <div>{formatMessage({ id: "billing.totalSeatsAfterUpdate" })}: {draftSeatQuantity}</div>
-                    <div>{formatMessage({ id: "billing.capacityAfterUpdate" })}: {formatMessage(
-                        { id: "billing.capacityPair" },
-                        {
-                          human: formatHumanCapacityLabel(draftSeatQuantity),
-                          agent: formatAgentCapacityLabel(draftProvisionedAgentSeats),
-                        },
-                      )}</div>
-                    {seatUpdatePreview && (
-                      <>
-                        {seatUpdatePreview.promotion && (
-                          <div>{formatMessage({ id: "billing.appliedPromotion" })}: {seatUpdatePreview.promotion.code}</div>
-                        )}
-                        <div>{formatMessage({ id: "billing.estimatedProratedCharge" })}: {formatBillingAmount(seatUpdatePreview.prorationAmount, seatUpdatePreview.currency)}</div>
-                        {seatUpdatePreview.discountAmount > 0 && (
-                          <div>{formatMessage({ id: "billing.discount" })}: {formatBillingAmount(-seatUpdatePreview.discountAmount, seatUpdatePreview.currency)}</div>
-                        )}
-                        <div>
-                          {currentBillingInterval === "annual" ? formatMessage({ id: "billing.estimatedNextYearlyTotal" }) : formatMessage({ id: "billing.estimatedNextMonthlyTotal" })}: {formatBillingAmount(seatUpdatePreview.recurringAmount, seatUpdatePreview.currency)}
-                        </div>
-                      </>
-                    )}
-                  </>
-                ) : (
-                  <>
-                    <div>{formatMessage({ id: "billing.seats" })}: {draftSeatQuantity}</div>
-                    <div>{formatMessage({ id: "billing.capacity" })}: {formatMessage(
-                        { id: "billing.capacityPair" },
-                        {
-                          human: formatHumanCapacityLabel(draftSeatQuantity),
-                          agent: formatAgentCapacityLabel(draftProvisionedAgentSeats),
-                        },
-                      )}</div>
-                  </>
-                )}
-                <div>{localizedBillingTotalSummaryLabels.totalLabel}: {localizedSelectedTotalLabels.totalLabel}</div>
-              </div>
-              <p>
-                {confirmBillingAction === "checkout"
-                  ? formatMessage({ id: "billing.theNextPageIsStripeCheckoutWhereThePaymentAmou" })
-                  : seatDelta > 0
-                    ? formatMessage({ id: "billing.stripeMayBillThisSeatIncreaseImmediatelyAfterY" })
-                    : seatDelta < 0
-                      ? formatMessage({ id: "billing.stripeWillUpdateTheSubscriptionQuantityAfterYo" })
-                      : formatMessage({ id: "billing.stripeWillReactivateThisSubscriptionWithoutCha" })}
-              </p>
-              {seatUpdatePreview && (
-                <p>{formatMessage({ id: "billing.thisStripeEstimateExpiresAfter5MinutesRe" })}</p>
-              )}
-            </div>
-          )}
-          confirmLabel={confirmBillingAction === "checkout"
-            ? formatMessage({ id: "billing.continueToStripe" })
-            : formatMessage({ id: "billing.confirmAndUpdateSeats" })}
-          loadingLabel={confirmBillingAction === "checkout"
-            ? formatMessage({ id: "billing.opening2" })
-            : formatMessage({ id: "billing.updating2" })}
-          confirmColor="bg-brutal-pink"
-          onConfirm={confirmBillingAction === "checkout" ? handleCheckout : handlePackQuantityUpdate}
-          onClose={() => {
-            setConfirmBillingAction(null);
-            setSeatUpdatePreview(null);
-          }}
-        />
-      )}
-      {/* Stryker disable all: remaining billing wiring is covered by the broader billing contract suite. */}
-    </div>
-  );
+  return <PlanSectionContent server={server} usage={usage} billing={billing} loadBilling={loadBilling} draft={draft} />;
 }
+
 // Stryker restore all
 
 // ── Danger Zone Section ──
@@ -4604,7 +3982,6 @@ function DangerActionCard({
   actionLabel,
   actionIcon,
   onAction,
-  actionSize = "md",
   testId,
   actionTestId,
 }: {
@@ -4613,58 +3990,56 @@ function DangerActionCard({
   actionLabel: string;
   actionIcon: ReactNode;
   onAction: () => void;
-  actionSize?: "sm" | "md";
   testId: string;
   actionTestId?: string;
 }) {
   return (
-    <div data-testid={testId} className="border-2 border-black bg-white p-4 shadow-brutal-sm">
+    <Card data-testid={testId} className="p-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div>
-          <div className="text-sm font-bold text-black">{title}</div>
-          <p className="mt-0.5 text-xs text-black/60">{description}</p>
+          <div className="text-subhead font-semibold text-foreground">{title}</div>
+          <p className="mt-0.5 text-footnote text-foreground-muted">{description}</p>
         </div>
         <Button
           type="button"
-          size={actionSize}
-          shape="iconText"
-          tone="red"
+          size="sm"
+          
+          variant="danger"
           onClick={onAction}
-          className="sm:ml-4"
+          className="shrink-0 self-start sm:ml-4 sm:self-auto"
           data-testid={actionTestId}
         >
           {actionIcon}
           {actionLabel}
         </Button>
       </div>
-    </div>
+    </Card>
   );
 }
 
 function DangerZoneSection() {
   const { formatMessage } = useIntl();
   const server = useServerStore((s) => s.current);
-  const deleteServer = useServerStore((s) => s.deleteServer);
   const leaveServer = useServerStore((s) => s.leaveServer);
   const { isOwner, role } = useServerPermissions();
 
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
-  const [confirmSlug, setConfirmSlug] = useState("");
 
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
 
+  const handleCloseDelete = useCallback(() => setShowDeleteConfirm(false), []);
+
+  const handleLeave = useCallback(async () => {
+    requestServerSelection();
+    await leaveServer();
+  }, [leaveServer]);
+
+  const handleOpenLeave = useCallback(() => setShowLeaveConfirm(true), []);
+  const handleCloseLeave = useCallback(() => setShowLeaveConfirm(false), []);
+  const handleOpenDelete = useCallback(() => setShowDeleteConfirm(true), []);
+
   if (!server) return null;
   const canLeave = role === "admin" || role === "member" || role === "guest";
-
-  const handleDelete = async () => {
-    requestServerSelection();
-    await deleteServer();
-  };
-
-  const handleCloseDelete = () => {
-    setShowDeleteConfirm(false);
-    setConfirmSlug("");
-  };
 
   return (
     <div className="mb-6">
@@ -4675,23 +4050,24 @@ function DangerZoneSection() {
       />
 
       {canLeave && (
-        <div className="border-2 border-black bg-white shadow-brutal-sm p-4 mb-3">
+        <Card className="mb-3 p-4">
           <div className="flex items-center justify-between">
             <div>
-              <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.dangerZone.leaveServerTitle" })}</div>
-              <p className="text-xs text-black/60 mt-0.5">
+              <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.dangerZone.leaveServerTitle" })}</div>
+              <p className="text-footnote text-foreground-muted mt-0.5">
                 {formatMessage({ id: "settings.dangerZone.leaveServerDescription" })}
               </p>
             </div>
-            <button
+            <Button
+              variant="warning" size="sm" type="button"
               data-testid="server-danger-leave-button"
-              onClick={() => setShowLeaveConfirm(true)}
-              className="btn-brutal bg-brutal-orange px-4 py-2 [@media(max-height:600px)]:py-1 text-sm font-bold flex items-center gap-1.5 shrink-0 ml-4"
+              onClick={handleOpenLeave}
+              className="ml-4 shrink-0"
             >
               {formatMessage({ id: "settings.dangerZone.leaveServer" })}
-            </button>
+            </Button>
           </div>
-        </div>
+        </Card>
       )}
 
       {isOwner && (
@@ -4702,7 +4078,7 @@ function DangerZoneSection() {
           description={formatMessage({ id: "settings.dangerZone.deleteServerDescription" })}
           actionLabel={formatMessage({ id: "settings.dangerZone.deleteServer" })}
           actionIcon={<Trash2 size={14} />}
-          onAction={() => setShowDeleteConfirm(true)}
+          onAction={handleOpenDelete}
         />
       )}
 
@@ -4713,61 +4089,26 @@ function DangerZoneSection() {
           message={formatMessage({ id: "settings.dangerZone.leaveConfirmMessage" }, { serverName: server.name })}
           confirmLabel={formatMessage({ id: "settings.dangerZone.leaveServer" })}
           loadingLabel={formatMessage({ id: "settings.dangerZone.leaving" })}
-          confirmColor="bg-brutal-orange"
+          confirmVariant="warning"
           confirmTestId="server-leave-confirm-button"
-          onConfirm={async () => {
-            requestServerSelection();
-            await leaveServer();
-          }}
-          onClose={() => setShowLeaveConfirm(false)}
+          onConfirm={handleLeave}
+          onClose={handleCloseLeave}
         />
       )}
 
-      {showDeleteConfirm && (
-        <ConfirmDialog
-          chromeLocale="active"
-          title={formatMessage({ id: "settings.dangerZone.deleteServerTitle" })}
-          message={(
-            <div className="space-y-4">
-              <p>
-                {formatMessage({ id: "settings.dangerZone.deleteWarningPrefix" })}<span className="font-bold">{server.name}</span>{formatMessage({ id: "settings.dangerZone.deleteWarningSuffix" })}
-              </p>
-              <div>
-                <p className="text-sm text-black/60 mb-2">
-                  {formatMessage({ id: "settings.dangerZone.typeToConfirmPrefix" })}<span className="font-mono font-bold text-black">{server.slug}</span>{formatMessage({ id: "settings.dangerZone.typeToConfirmSuffix" })}
-                </p>
-                <SlugInput
-                  data-testid="server-delete-slug-input"
-                  type="text"
-                  value={confirmSlug}
-                  onChange={(e) => setConfirmSlug(e.target.value)}
-                  inputClassName="text-sm font-mono"
-                  placeholder={server.slug}
-                  autoFocus
-                />
-              </div>
-            </div>
-          )}
-          confirmLabel={formatMessage({ id: "settings.dangerZone.deleteServer" })}
-          loadingLabel={formatMessage({ id: "settings.dangerZone.deleting" })}
-          confirmDisabled={confirmSlug !== server.slug}
-          confirmTestId="server-delete-confirm-button"
-          onConfirm={handleDelete}
-          onClose={handleCloseDelete}
-        />
-      )}
+      {showDeleteConfirm && <DeleteServerConfirmDialog onClose={handleCloseDelete} />}
     </div>
   );
 }
 
 export type ConnectedAppStatus = "private" | "publish_requested" | "in_review" | "published" | "rejected" | "unpublish_requested";
-type ConnectedAppsViewMode = "grid" | "list";
+export type ConnectedAppsViewMode = "grid" | "list";
 
 const CONNECTED_APPS_VIEW_MODE_STORAGE_KEY = "raft:connected-apps:view-mode";
-const CONNECTED_APP_EDITOR_SECTION_IDS = ["profile", "login", "notifications", "distribution", "danger"] as const;
-type ConnectedAppEditorSectionId = typeof CONNECTED_APP_EDITOR_SECTION_IDS[number];
+const CONNECTED_APP_EDITOR_SECTION_IDS = ["profile", "login", "setup", "permissions", "notifications", "distribution", "danger"] as const;
+export type ConnectedAppEditorSectionId = typeof CONNECTED_APP_EDITOR_SECTION_IDS[number];
 
-function canEditSourceOwnedConnectedApp(status: ConnectedAppStatus) {
+export function canEditSourceOwnedConnectedApp(status: ConnectedAppStatus) {
   return status === "private" || status === "publish_requested" || status === "in_review" || status === "published" || status === "rejected";
 }
 
@@ -4815,11 +4156,11 @@ export function ConnectedAppDistributionBadge({ status }: { status: ConnectedApp
   const { formatMessage } = useIntl();
   if (!status) return null;
   const label = formatMessage({ id: connectedAppOverviewDistributionLabel(status) });
-  if (status === "published") return <Badge variant="success" uppercase>{label}</Badge>;
+  if (status === "published") return <Badge appearance="soft" variant="success">{label}</Badge>;
   if (status === "publish_requested" || status === "in_review" || status === "unpublish_requested" || status === "rejected") {
-    return <Badge variant="warning" uppercase>{label}</Badge>;
+    return <Badge appearance="soft" variant="warning">{label}</Badge>;
   }
-  return <Badge appearance="outline" uppercase>{label}</Badge>;
+  return <Badge appearance="soft" variant="muted">{label}</Badge>;
 }
 
 function getInitialConnectedAppsViewMode(): ConnectedAppsViewMode {
@@ -4841,34 +4182,30 @@ function ConnectedAppsViewToggle({
   const { formatMessage } = useIntl();
   const gridLabel = formatMessage({ id: "settings.connectedApps.gridView" });
   const listLabel = formatMessage({ id: "settings.connectedApps.listView" });
+  const groupValue = useMemo(() => [value], [value]);
+  const handleGroupValueChange = useCallback((values: string[]) => {
+    const next = values[0];
+    if (next === "grid" || next === "list") onValueChange(next);
+  }, [onValueChange]);
   return (
-    <div
-      className="box-border flex h-10 min-h-10 shrink-0 items-stretch border-2 border-black bg-white shadow-brutal-sm"
-      role="group"
+    <ToggleGroup
+      value={groupValue}
+      onValueChange={handleGroupValueChange}
       aria-label={formatMessage({ id: "settings.connectedApps.viewMode" })}
+      className="box-border shrink-0"
       data-testid="connected-apps-view-toggle"
     >
-      <button
-        type="button"
-        onClick={() => onValueChange("grid")}
-        aria-label={gridLabel}
-        title={gridLabel}
-        aria-pressed={value === "grid"}
-        className={`flex w-10 items-center justify-center border-r-2 border-black transition-colors ${value === "grid" ? "bg-soft-signal" : "bg-white hover:bg-brutal-cream"}`}
-      >
+      <Tooltip content={gridLabel}>
+      <ToggleGroupItem value="grid" aria-label={gridLabel} className="h-8 w-8" data-slot="toggle-group-item">
         <LayoutGrid size={16} />
-      </button>
-      <button
-        type="button"
-        onClick={() => onValueChange("list")}
-        aria-label={listLabel}
-        title={listLabel}
-        aria-pressed={value === "list"}
-        className={`flex w-10 items-center justify-center transition-colors ${value === "list" ? "bg-soft-signal" : "bg-white hover:bg-brutal-cream"}`}
-      >
-        <List size={17} />
-      </button>
-    </div>
+      </ToggleGroupItem>
+      </Tooltip>
+      <Tooltip content={listLabel}>
+      <ToggleGroupItem value="list" aria-label={listLabel} className="h-8 w-8" data-slot="toggle-group-item">
+        <List size={16} />
+      </ToggleGroupItem>
+      </Tooltip>
+    </ToggleGroup>
   );
 }
 
@@ -4880,55 +4217,81 @@ function AppNotificationsLabel() {
   const { formatMessage } = useIntl();
   return (
     <span className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
-      <span>{formatMessage({ id: "settings.connectedApps.section.appNotifications" })}</span>
+      <span>{formatMessage({ id: "settings.connectedApps.section.webhook" })}</span>
       <Badge.Experimental />
     </span>
   );
 }
 
-function AppNotificationsEditorRailLabel() {
-  const { formatMessage } = useIntl();
-  return <span>{formatMessage({ id: "settings.connectedApps.section.appNotifications" })}</span>;
-}
-
+/**
+ * One part of the app editor: raft-ui's FormSection (small heading, its
+ * status as a quiet tag, a line on what it is for) with a stable anchor the
+ * editor's section list scrolls to.
+ */
 function ConnectedAppEditorSection({
   sectionId,
   title,
   description,
   status,
-  tone = "default",
   children,
 }: {
   sectionId: ConnectedAppEditorSectionId;
   title: ReactNode;
   description: string;
   status: string;
-  tone?: "default" | "warning";
   children: ReactNode;
 }) {
   return (
-    <section
+    <FormSection
       id={`connected-app-editor-${sectionId}`}
       data-testid={`connected-app-editor-section-${sectionId}`}
-      className={`scroll-mt-4 border-2 border-black ${tone === "warning" ? "bg-brutal-pink/15" : "bg-brutal-cream/35"}`}
+      title={title}
+      status={status}
+      description={description}
     >
-      <div className="flex flex-col gap-2 border-b-2 border-black bg-brutal-cream px-4 py-3 sm:flex-row sm:items-start sm:justify-between">
+      {children}
+    </FormSection>
+  );
+}
+
+/**
+ * An action inside an editor section (share link, publish request, client
+ * secret, delete): what it does on the left, its button on the right, and
+ * whatever it reveals (the share URL) underneath. Plain rows in the section,
+ * not cards inside a card.
+ */
+function ConnectedAppEditorActionRow({
+  title,
+  description,
+  action,
+  children,
+  testId,
+}: {
+  title: ReactNode;
+  description: ReactNode;
+  action: ReactNode;
+  children?: ReactNode;
+  testId?: string;
+}) {
+  return (
+    <div className="flex flex-col gap-3 [&+&]:mt-1" data-testid={testId}>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="min-w-0">
-          <h3 className="flex flex-wrap items-center gap-2 text-base font-black text-black">{title}</h3>
-          <p className="mt-0.5 text-xs leading-relaxed text-black/60">{description}</p>
+          <div className="text-subhead font-semibold text-foreground">{title}</div>
+          <div className="mt-0.5 text-footnote text-foreground-muted">{description}</div>
         </div>
-        <span className="w-fit shrink-0 border-2 border-black bg-white px-2 py-1 font-mono text-[10px] font-black uppercase text-black">
-          {status}
-        </span>
+        <div className="flex shrink-0 flex-wrap gap-2">{action}</div>
       </div>
-      <div className="space-y-4 bg-white p-4">{children}</div>
-    </section>
+      {children}
+    </div>
   );
 }
 
 type ConnectedAppCategory = OAuthClientCategory;
 
 type ConnectedAppListing = {
+  setupUrl?: string | null;
+  setupDescription?: string | null;
   id: string;
   clientId: string;
   name: string;
@@ -4941,27 +4304,21 @@ type ConnectedAppListing = {
   logoUrl: string | null;
   defaultLogoSeed: string;
   installed: boolean;
+  official: boolean;
   marketplaceInstallBadge: MarketplaceInstallBadge;
   allowedScopes: string[] | null;
   appNotificationGroups: AppNotificationSelection["groups"];
   appNotificationEvents: AppNotificationSelection["events"];
   appNotificationReviewPending: boolean;
+  appNotificationPendingRevisionId: string | null;
+  appNotificationPendingGroups: AppNotificationSelection["groups"];
+  appNotificationPendingEvents: AppNotificationSelection["events"];
+  canReviewAppNotifications: boolean;
 };
 
-type BuiltInConnectedApp = {
-  id: string;
-  clientId: string;
-  name: string;
-  description: string | null;
-  homepageUrl: string | null;
-  homepageDomain: string | null;
-  agentManifestUrl: string | null;
-  logoUrl: string | null;
-  defaultLogoSeed: string;
-  allowedScopes: string[] | null;
-};
-
-type InstalledConnectedApp = {
+export type InstalledConnectedApp = {
+  setupUrl?: string | null;
+  setupDescription?: string | null;
   id: string;
   clientId: string;
   name: string;
@@ -4975,6 +4332,7 @@ type InstalledConnectedApp = {
   origin: "marketplace" | "private";
   privateShared: boolean;
   editable: boolean;
+  official: boolean;
   allowedScopes: string[] | null;
   grantedScopes: string[];
   sourceClientId?: string;
@@ -4990,13 +4348,13 @@ export function ConnectedAppOriginBadges({ app, className = "" }: { app: Install
   if (!app.privateShared && app.origin !== "private") return null;
   return (
     <div className={`flex flex-wrap items-center gap-1.5 ${className}`.trim()}>
-      {app.privateShared ? <Badge appearance="outline" uppercase>{formatMessage({ id: "settings.connectedApps.sharedBadge" })}</Badge> : null}
-      {app.origin === "private" ? <Badge variant="success" uppercase>{formatMessage({ id: "settings.connectedApps.thisServerBadge" })}</Badge> : null}
+      {app.privateShared ? <Badge appearance="soft">{formatMessage({ id: "settings.connectedApps.sharedBadge" })}</Badge> : null}
+      {app.origin === "private" ? <Badge appearance="soft" variant="information">{formatMessage({ id: "settings.connectedApps.thisServerBadge" })}</Badge> : null}
     </div>
   );
 }
 
-type ServerRegisteredApp = OAuthClientRecord & {
+export type ServerRegisteredApp = OAuthClientRecord & {
   status: ConnectedAppStatus;
   logoUrl: string | null;
   defaultLogoSeed: string;
@@ -5009,7 +4367,7 @@ const CONNECTED_APP_CATEGORY_OPTIONS: { value: ConnectedAppCategory | "all" }[] 
 const CONNECTED_APP_PUBLISH_CATEGORY_OPTIONS = OAUTH_CLIENT_CATEGORIES.map((value) => ({ value }));
 
 // Category enum values are data; the display labels live in the catalog.
-const CONNECTED_APP_CATEGORY_LABEL_ID: Record<string, MessageId> = {
+export const CONNECTED_APP_CATEGORY_LABEL_ID: Record<string, MessageId> = {
   all: "settings.connectedApps.categoryAll",
   "AI & Automation": "settings.connectedApps.categoryAiAutomation",
   Communication: "settings.connectedApps.categoryCommunication",
@@ -5033,7 +4391,7 @@ export function matchesConnectedAppFilter(
     .some((value) => value?.toLowerCase().includes(normalizedSearch));
 }
 
-function getDomainFromUrl(raw: string | null | undefined): string | null {
+export function getDomainFromUrl(raw: string | null | undefined): string | null {
   const trimmed = raw?.trim();
   if (!trimmed) return null;
   try {
@@ -5051,13 +4409,15 @@ function initialsForApp(name: string) {
   return letters.toUpperCase() || "A";
 }
 
-function ConnectedAppSummary({ description }: { description?: string | null }) {
+export function ConnectedAppSummary({ description }: { description?: string | null }) {
   const text = description?.trim();
   if (!text) return null;
   return (
-    <div className="mt-1 line-clamp-2 break-words text-sm leading-snug text-black/65" title={text}>
+    <Tooltip content={text}>
+    <div className="mt-1 line-clamp-2 break-words text-callout text-foreground-muted">
       {text}
     </div>
+    </Tooltip>
   );
 }
 
@@ -5071,10 +4431,10 @@ export function ConnectedAppMarketplaceInstallBadge({ badge }: { badge: Marketpl
   const { formatMessage } = useIntl();
   if (badge.kind === "none") return null;
   if (badge.kind === "new") {
-    return <Badge variant="warning" uppercase>{formatMessage({ id: "settings.connectedApps.marketplaceNew" })}</Badge>;
+    return <Badge appearance="soft" variant="information">{formatMessage({ id: "settings.connectedApps.marketplaceNew" })}</Badge>;
   }
   return (
-    <Badge appearance="outline" uppercase={false}>
+    <Badge appearance="outline">
       {formatMessage(
         { id: "settings.connectedApps.marketplaceInstallCount" },
         { count: MARKETPLACE_INSTALL_BUCKET_LABEL[badge.bucket] },
@@ -5083,41 +4443,41 @@ export function ConnectedAppMarketplaceInstallBadge({ badge }: { badge: Marketpl
   );
 }
 
-function ConnectedAppLogo({ name, logoUrl, seed, size = "md" }: { name: string; logoUrl?: string | null; seed: string; size?: "sm" | "md" | "lg" }) {
+export function ConnectedAppLogo({ name, logoUrl, seed, size = "md" }: { name: string; logoUrl?: string | null; seed: string; size?: "sm" | "md" | "lg" }) {
   return (
     <AvatarSlot
-      context={size === "lg" ? "account-tile" : size === "md" ? "mention-card" : "surface-list"}
+      context={size === "lg" ? "account-tile" : size === "md" ? "mention-card" : "list-row"}
       type="app"
       appAvatarUrl={logoUrl}
       appInitials={initialsForApp(name || seed)}
-      className="shadow-brutal-sm"
     />
   );
 }
 
-function ConnectedAppUrlLink({ url, label, className = "" }: { url?: string | null; label?: string | null; className?: string }) {
+export function ConnectedAppUrlLink({ url, label, className = "" }: { url?: string | null; label?: string | null; className?: string }) {
   const href = url?.trim();
   if (!href) return null;
   const visibleLabel = label?.trim() || href;
   return (
+    <Tooltip content={href}>
     <a
       href={href}
       target="_blank"
       rel="noreferrer"
       onClick={(event) => event.stopPropagation()}
-      title={href}
-      className={`inline-flex max-w-full min-w-0 items-center gap-1.5 text-xs font-mono font-bold text-black/55 underline decoration-2 underline-offset-2 hover:text-black ${className}`.trim()}
+      className={`inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-sticker font-mono text-mono-meta text-foreground-muted underline decoration-[1.5px] underline-offset-[3px] outline-none hover:text-foreground focus-visible:shadow-focus ${className}`.trim()}
     >
       <ExternalLink size={12} className="shrink-0" />
       <span className="min-w-0 truncate">{visibleLabel}</span>
     </a>
+    </Tooltip>
   );
 }
 
 function OAuthScopeNegativeCapabilityBlock({ className = "" }: { className?: string }) {
   const { formatMessage } = useIntl();
   return (
-    <div className={`border-2 border-black bg-soft-signal/25 p-3 text-xs font-bold leading-relaxed text-black shadow-brutal-sm ${className}`.trim()}>
+    <div className={`rounded-container bg-warning-soft px-3 py-2.5 text-footnote font-semibold text-foreground ${className}`.trim()}>
       {formatMessage({ id: AGENT_INBOUND_NEGATIVE_CAPABILITY_ID })}
     </div>
   );
@@ -5138,46 +4498,47 @@ export function OAuthScopeList({
   const visibleScopes = defaultToDeclared ? normalizeDeclaredOAuthScopes(scopes) : normalizeDeclaredOAuthScopes(scopes).filter((scope) => scopes?.includes(scope));
   const grouped: Record<OAuthScopeTier, RaftOAuthScopeId[]> = {
     identity: visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === "identity"),
+    agent_directory: visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === "agent_directory"),
     agent_messaging: visibleScopes.filter((scope) => OAUTH_SCOPE_PRESENTATION[scope].tier === "agent_messaging"),
   };
 
   return (
     <div className="space-y-3" data-testid="oauth-scope-list">
       {visibleScopes.length === 0 && (
-        <div className="border-2 border-black/15 bg-white p-2 text-xs font-bold text-black/55">
+        <Card className="px-3 py-2 text-footnote text-foreground-muted">
           {formatMessage({ id: "settings.connectedApps.noGrantScopes" })}
-        </div>
+        </Card>
       )}
       {compact ? (
         <div className="flex flex-wrap gap-1.5">
           {visibleScopes.map((scope) => {
             const detail = OAUTH_SCOPE_PRESENTATION[scope];
             return (
+              <Tooltip key={scope} content={formatMessage({ id: detail.copyId })}>
               <span
-                key={scope}
-                title={formatMessage({ id: detail.copyId })}
-                className={`inline-flex items-center border border-black/20 bg-white px-2 py-1 text-[11px] font-bold text-black/70 ${detail.requiresResource ? "bg-soft-signal/20" : ""}`}
+                className={`inline-flex items-center rounded-chip px-2 py-0.5 font-mono text-mono-meta text-foreground ${detail.requiresResource ? "bg-info-soft" : "bg-fill-muted"}`}
               >
                 {scope}
               </span>
+              </Tooltip>
             );
           })}
         </div>
       ) : (
         <>
-          {(["identity", "agent_messaging"] as OAuthScopeTier[]).map((tier) => {
+          {(["identity", "agent_directory", "agent_messaging"] as OAuthScopeTier[]).map((tier) => {
             const tierScopes = grouped[tier];
             if (tierScopes.length === 0) return null;
             return (
               <div key={tier} className="space-y-2">
-                <div className="text-[10px] font-black uppercase tracking-widest text-black/50">{formatMessage({ id: scopeGroupLabelId(tier) })}</div>
+                <SectionEyebrow as="div">{formatMessage({ id: scopeGroupLabelId(tier) })}</SectionEyebrow>
                 <div className="space-y-2">
                   {tierScopes.map((scope) => {
                     const detail = OAUTH_SCOPE_PRESENTATION[scope];
                     return (
-                      <div key={scope} className="border-2 border-black/15 bg-white p-2">
+                      <div key={scope} className="rounded-control border border-line-hairline bg-layer-card px-3 py-2">
                         <div className="flex flex-wrap items-center gap-2">
-                          <code className="break-all text-[11px] font-bold text-black/70">{scope}</code>
+                          <code className="break-all font-mono text-mono-meta text-foreground">{scope}</code>
                           {detail.requiresResource && <Badge appearance="outline">{formatMessage({ id: "settings.connectedApps.scopeRequiresResource" })}</Badge>}
                         </div>
                       </div>
@@ -5213,13 +4574,13 @@ function OAuthScopeSummaryPanel({
   return (
     <div className="space-y-2">
       <SectionEyebrow as="div">{title}</SectionEyebrow>
-      {description && <div className="mt-2 text-xs leading-relaxed text-black/60">{description}</div>}
-      <details open={defaultOpen} className="border-2 border-black/15 bg-brutal-cream p-2">
-        <summary className="text-xs font-black text-black">{formatMessage({ id: "settings.connectedApps.detail.declaredAccess" })}</summary>
+      {description && <div className="mt-2 text-footnote text-foreground-muted">{description}</div>}
+      <Card render={<details open={defaultOpen} />} className="block px-3 py-2">
+        <summary className="text-footnote font-semibold text-foreground">{formatMessage({ id: "settings.connectedApps.detail.declaredAccess" })}</summary>
         <div className="mt-2">
           <OAuthScopeList scopes={scopes} compact={compact} defaultToDeclared={defaultToDeclared} />
         </div>
-      </details>
+      </Card>
     </div>
   );
 }
@@ -5236,9 +4597,9 @@ function ConnectedAppDetailSection({
   tone?: "white" | "cream";
 }) {
   return (
-    <section className={`border-2 border-black p-3 shadow-brutal-sm ${tone === "cream" ? "bg-brutal-cream" : "bg-white"}`}>
+    <section className={`rounded-container border border-line-hairline p-4 ${tone === "cream" ? "bg-fill-muted" : "bg-layer-card"}`}>
       <SectionEyebrow as="div">{title}</SectionEyebrow>
-      {description && <div className="mt-1 text-xs leading-relaxed text-black/60">{description}</div>}
+      {description && <div className="mt-1 text-footnote text-foreground-muted">{description}</div>}
       <div className="mt-3">{children}</div>
     </section>
   );
@@ -5253,8 +4614,8 @@ function ConnectedAppDetailRow({
 }) {
   return (
     <div className="flex flex-col gap-1 py-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
-      <span className="shrink-0 text-black/55">{label}</span>
-      <div className="min-w-0 text-left font-bold text-black sm:text-right">{children}</div>
+      <span className="shrink-0 text-footnote text-foreground-muted">{label}</span>
+      <div className="min-w-0 text-left text-callout font-semibold text-foreground sm:text-right">{children}</div>
     </div>
   );
 }
@@ -5269,80 +4630,73 @@ export function DeclaredScopesPicker({
 }) {
   const { formatMessage } = useIntl();
   const selected = new Set<RaftOAuthScopeId>([...IDENTITY_OAUTH_SCOPES, ...value]);
-  const updateScope = (scope: RaftOAuthScopeId, checked: boolean) => {
+  const updateScope = useCallback((scope: RaftOAuthScopeId, checked: boolean) => {
     if (IDENTITY_OAUTH_SCOPES.includes(scope)) return;
-    const next = new Set(selected);
+    const next = new Set<RaftOAuthScopeId>([...IDENTITY_OAUTH_SCOPES, ...value]);
     if (checked) next.add(scope);
     else next.delete(scope);
     onChange([
       ...IDENTITY_OAUTH_SCOPES,
       ...OPTIONAL_IDENTITY_OAUTH_SCOPES.filter((item) => next.has(item)),
+      ...AGENT_DIRECTORY_OAUTH_SCOPES.filter((item) => next.has(item)),
       ...AGENT_INBOUND_OAUTH_SCOPES.filter((item) => next.has(item)),
     ]);
-  };
+  }, [onChange, value]);
 
   return (
-    <div className="border-2 border-black bg-white p-3 shadow-brutal-sm" data-testid="connected-app-declared-scopes">
-      <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.declaredScopesTitle" })}</SectionEyebrow>
-      <div className="mt-1 text-xs leading-relaxed text-black/60">
-        {formatMessage({ id: "settings.connectedApps.declaredScopesDescription" })}
-      </div>
+    <Card className="p-3" data-testid="connected-app-declared-scopes">
+      {value.includes("agent:read") ? <p className="mt-2 text-footnote text-foreground-muted" data-testid="legacy-agent-login-scope">{formatMessage({ id: "settings.connectedApps.appPermissions.legacyLoginScope" })}</p> : null}
       <div className="mt-3 space-y-2">
-        <details className="border-2 border-black/15 bg-brutal-cream p-2">
-          <summary className="text-xs font-black text-black">
+        <div className="rounded-control bg-fill-muted p-3">
+          <div className="text-footnote font-semibold text-foreground">
             {formatMessage({ id: "settings.connectedApps.identitySection" })}
-          </summary>
+          </div>
           <div className="mt-2 flex flex-wrap gap-1.5">
             {IDENTITY_OAUTH_SCOPES.map((scope) => {
               const detail = OAUTH_SCOPE_PRESENTATION[scope];
               return (
-                <span key={scope} title={formatMessage({ id: detail.copyId })} className="inline-flex items-center border border-black/20 bg-white px-2 py-1 text-[11px] font-bold text-black/70">
+                <Tooltip key={scope} content={formatMessage({ id: detail.copyId })}>
+                <span className="inline-flex min-h-8 items-center rounded-control border border-line-hairline bg-layer-card px-2.5 py-1 font-mono text-mono-meta text-foreground">
                   {scope}
                 </span>
+                </Tooltip>
               );
             })}
-            {OPTIONAL_IDENTITY_OAUTH_SCOPES.map((scope) => {
-              const detail = OAUTH_SCOPE_PRESENTATION[scope];
-              return (
-                <label key={scope} title={formatMessage({ id: detail.copyId })} className="inline-flex items-center gap-2 border border-black/20 bg-white px-2 py-1 text-[11px] font-bold text-black/70">
-                  <Checkbox
-                    size="sm"
-                    checked={selected.has(scope)}
-                    onChange={(event) => updateScope(scope, event.currentTarget.checked)}
-                  />
-                  <span>{scope}</span>
-                </label>
-              );
-            })}
+            {OPTIONAL_IDENTITY_OAUTH_SCOPES.map((scope) => (
+              <DeclaredScopeToggle
+                key={scope}
+                scope={scope}
+                checked={selected.has(scope)}
+                className="inline-flex min-h-8 items-center gap-2 rounded-control border border-line-hairline bg-layer-card px-2.5 py-1 font-mono text-mono-meta text-foreground"
+                onScopeChange={updateScope}
+              />
+            ))}
           </div>
-        </details>
-        <details open className="border-2 border-black/15 bg-brutal-cream p-2">
-          <summary className="text-xs font-black text-black">
+        </div>
+
+        <div className="rounded-control bg-fill-muted p-3">
+          <div className="text-footnote font-semibold text-foreground">
             {formatMessage({ id: "settings.connectedApps.agentMessagingSection" })}
-          </summary>
+          </div>
           <div className="mt-2 flex flex-wrap gap-2">
-            {AGENT_INBOUND_OAUTH_SCOPES.map((scope) => {
-              const detail = OAUTH_SCOPE_PRESENTATION[scope];
-              return (
-                <label key={scope} title={formatMessage({ id: detail.copyId })} className="inline-flex items-center gap-2 border border-black/20 bg-white px-2 py-1.5 text-xs font-bold text-black/70">
-                  <Checkbox
-                    size="sm"
-                    checked={selected.has(scope)}
-                    onChange={(event) => updateScope(scope, event.currentTarget.checked)}
-                  />
-                  <span>{scope}</span>
-                </label>
-              );
-            })}
+            {AGENT_INBOUND_OAUTH_SCOPES.map((scope) => (
+              <DeclaredScopeToggle
+                key={scope}
+                scope={scope}
+                checked={selected.has(scope)}
+                className="inline-flex min-h-8 items-center gap-2 rounded-control border border-line-hairline bg-layer-card px-2.5 py-1 font-mono text-mono-meta text-foreground"
+                onScopeChange={updateScope}
+              />
+            ))}
           </div>
           {hasAgentInboundOAuthScope(value) && (
-            <div className="mt-2 text-xs font-bold text-black/55">
+            <div className="mt-2 text-footnote text-foreground-muted">
               {formatMessage({ id: "settings.connectedApps.scopeRequiresResourceDetail" })}
             </div>
           )}
-        </details>
+        </div>
       </div>
-    </div>
+    </Card>
   );
 }
 
@@ -5369,26 +4723,17 @@ function mapClientToMarketplaceApp(
     logoUrl: client.logoUrl,
     defaultLogoSeed: client.clientId,
     installed: !!client.installedAt,
+    setupUrl: client.setupUrl, setupDescription: client.setupDescription,
+    official: client.official,
     marketplaceInstallBadge: client.marketplaceInstallBadge ?? { kind: "none" },
     allowedScopes: client.allowedScopes,
     appNotificationGroups: client.appNotificationGroups ?? [],
     appNotificationEvents: client.appNotificationEvents ?? [],
     appNotificationReviewPending: client.appNotificationReviewPending ?? false,
-  };
-}
-
-function mapClientToBuiltInApp(client: BuiltInOAuthClientRecord): BuiltInConnectedApp {
-  return {
-    id: client.id,
-    clientId: client.clientId,
-    name: client.name,
-    description: client.description,
-    homepageUrl: client.homepageUrl,
-    homepageDomain: getDomainFromUrl(client.homepageUrl),
-    agentManifestUrl: client.agentManifestUrl,
-    logoUrl: null,
-    defaultLogoSeed: client.clientId,
-    allowedScopes: client.allowedScopes,
+    appNotificationPendingRevisionId: client.appNotificationPendingRevisionId ?? null,
+    appNotificationPendingGroups: client.appNotificationPendingGroups ?? [],
+    appNotificationPendingEvents: client.appNotificationPendingEvents ?? [],
+    canReviewAppNotifications: client.canReviewAppNotifications ?? false,
   };
 }
 
@@ -5398,6 +4743,17 @@ function mapClientToRegisteredApp(client: OAuthClientRecord): ServerRegisteredAp
     status: client.publishStatus,
     logoUrl: client.logoUrl,
     defaultLogoSeed: client.clientId,
+  };
+}
+
+function emptyAppNotificationState(): AppNotificationsDeveloperState {
+  return {
+    request_revision: 0,
+    current_revision_id: null,
+    current_groups: [],
+    current_events: [],
+    pending_revision: null,
+    webhook: null,
   };
 }
 
@@ -5413,10 +4769,9 @@ export function IntegrationsSection() {
   const [connectedAppsCategory, setConnectedAppsCategory] = useState<ConnectedAppCategory | "all">("all");
   const [connectedAppsViewMode, setConnectedAppsViewMode] = useState<ConnectedAppsViewMode>(getInitialConnectedAppsViewMode);
   const [selectedListing, setSelectedListing] = useState<ConnectedAppListing | null>(null);
-  const [selectedBuiltInApp, setSelectedBuiltInApp] = useState<BuiltInConnectedApp | null>(null);
+  const [reviewingPermissionClientId, setReviewingPermissionClientId] = useState<string | null>(null);
   const [selectedInstalledApp, setSelectedInstalledApp] = useState<InstalledConnectedApp | null>(null);
   const [marketplaceClients, setMarketplaceClients] = useState<MarketplaceOAuthClientRecord[]>([]);
-  const [builtInClients, setBuiltInClients] = useState<BuiltInOAuthClientRecord[]>([]);
   const [clients, setClients] = useState<OAuthClientRecord[]>([]);
   const [integrationOverview, setIntegrationOverview] = useState<IntegrationOverviewItem[]>([]);
   const [loading, setLoading] = useState(false);
@@ -5427,7 +4782,6 @@ export function IntegrationsSection() {
   const [createdSecretClientId, setCreatedSecretClientId] = useState<string | null>(null);
   const [secretCopied, setSecretCopied] = useState(false);
   const [showRegisterDrawer, setShowRegisterDrawer] = useState(false);
-  const [appEditorSection, setAppEditorSection] = useState<ConnectedAppEditorSectionId>("profile");
   const [editingClient, setEditingClient] = useState<OAuthClientRecord | null>(null);
   const [savingClientId, setSavingClientId] = useState<string | null>(null);
   const [regeneratingClientId, setRegeneratingClientId] = useState<string | null>(null);
@@ -5438,9 +4792,13 @@ export function IntegrationsSection() {
   const [clientName, setClientName] = useState("");
   const [clientId, setClientId] = useState("");
   const [clientDescription, setClientDescription] = useState("");
+  const [clientWhenToUse, setClientWhenToUse] = useState("");
   const [clientHomepageUrl, setClientHomepageUrl] = useState("");
   const [clientReturnUrl, setClientReturnUrl] = useState("");
   const [clientAgentManifestUrl, setClientAgentManifestUrl] = useState("");
+  const [clientSetupRequired, setClientSetupRequired] = useState(false);
+  const [clientSetupUrl, setClientSetupUrl] = useState("");
+  const [clientSetupDescription, setClientSetupDescription] = useState("");
   const [clientAllowedScopes, setClientAllowedScopes] = useState<RaftOAuthScopeId[]>([...DEFAULT_DECLARED_OAUTH_SCOPES]);
   const [appNotificationSelection, setAppNotificationSelection] = useState<AppNotificationSelection>({ groups: [], events: [] });
   const [appNotificationState, setAppNotificationState] = useState<AppNotificationsDeveloperState | null>(null);
@@ -5452,24 +4810,21 @@ export function IntegrationsSection() {
   const [shareLoading, setShareLoading] = useState(false);
   const [shareCopied, setShareCopied] = useState(false);
   const logoInputRef = useRef<HTMLInputElement | null>(null);
-  const appEditorRailRef = useRef<HTMLElement | null>(null);
-  const appEditorContentRef = useRef<HTMLDivElement | null>(null);
-  const secretCopyResetRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
-  const shareCopyResetRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const secretCopyResetRef = useRef<number | null>(null);
+  const shareCopyResetRef = useRef<number | null>(null);
 
-  const load = async () => {
-    if (!current) return;
+  const serverId = current?.id;
+  const load = useCallback(async () => {
+    if (!serverId) return;
     setLoading(true);
     setError("");
     try {
-      const [clientsRes, builtInRes, marketplaceRes, overviewRes] = await Promise.all([
+      const [clientsRes, marketplaceRes, overviewRes] = await Promise.all([
         api.get("/integrations/clients"),
-        api.get("/integrations/built-in"),
         api.get("/integrations/marketplace"),
         api.get("/integrations/overview"),
       ]);
       setClients(clientsRes.data);
-      setBuiltInClients(builtInRes.data);
       const nextMarketplaceClients = marketplaceRes.data as MarketplaceOAuthClientRecord[];
       setMarketplaceClients(nextMarketplaceClients);
       const requestedMarketplaceId = new URLSearchParams(window.location.search).get("marketplace_app")?.trim();
@@ -5480,18 +4835,29 @@ export function IntegrationsSection() {
           .find((app) => app.id === requestedMarketplaceId || app.clientId === requestedMarketplaceId);
         if (requestedListing) setSelectedListing(requestedListing);
       }
+      // Keep an open detail modal in sync with the reloaded rows — e.g. a
+      // permission-update approve must drop the pending badge instead of
+      // showing a stale snapshot of the pre-review listing.
+      setSelectedListing((currentListing) => {
+        if (!currentListing) return currentListing;
+        const fresh = nextMarketplaceClients
+          .map((client) => mapClientToMarketplaceApp(client, formatMessage))
+          .find((app) => app.id === currentListing.id || app.clientId === currentListing.clientId);
+        return fresh ?? null;
+      });
       setIntegrationOverview(overviewRes.data);
     } catch (err: any) {
       setError(err.response?.data?.error || formatMessage({ id: "settings.connectedApps.failedLoad" }));
     } finally {
       setLoading(false);
     }
-  };
+  }, [formatMessage, serverId]);
 
+  // Load once per server; a locale switch (new `formatMessage`) must not refetch.
+  const loadForServer = useEffectEvent(load);
   useEffect(() => {
-    void load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current?.id]);
+    void loadForServer();
+  }, [serverId]);
 
   useEffect(() => {
     return () => {
@@ -5504,38 +4870,31 @@ export function IntegrationsSection() {
     };
   }, []);
 
-  useEffect(() => {
-    const rail = appEditorRailRef.current;
-    const active = rail?.querySelector<HTMLElement>(`[data-app-editor-section="${appEditorSection}"]`);
-    if (!rail || !active || rail.scrollWidth <= rail.clientWidth) return;
-    const left = active.offsetLeft - (rail.clientWidth - active.offsetWidth) / 2;
-    rail.scrollTo?.({ left: Math.max(0, left), behavior: "smooth" });
-  }, [appEditorSection]);
-
-  const resetForm = () => {
+  const resetForm = useCallback(() => {
     setClientName("");
     setClientId("");
     setClientDescription("");
+    setClientWhenToUse("");
     setClientHomepageUrl("");
     setClientReturnUrl("");
     setClientAgentManifestUrl("");
+    setClientSetupRequired(false); setClientSetupUrl(""); setClientSetupDescription("");
     setClientAllowedScopes([...DEFAULT_DECLARED_OAUTH_SCOPES]);
     setAppNotificationSelection({ groups: [], events: [] });
     setAppNotificationState(null);
     setAppNotificationLoading(false);
     setAppNotificationConfigurationOpen(false);
     setClientCategory("Other");
-  };
+  }, []);
 
-  const resetShareState = () => {
+  const resetShareState = useCallback(() => {
     setShareLink(null);
     setShareUrl("");
     setShareCopied(false);
-  };
+  }, []);
 
-  const openRegisterDrawer = () => {
+  const openRegisterDrawer = useCallback(() => {
     setEditingClient(null);
-    setAppEditorSection("profile");
     resetForm();
     setCreatedSecret(null);
     setCreatedSecretClientId(null);
@@ -5543,9 +4902,9 @@ export function IntegrationsSection() {
     setError("");
     resetShareState();
     setShowRegisterDrawer(true);
-  };
+  }, [resetForm, resetShareState]);
 
-  const loadShareLink = async (clientId: string) => {
+  const loadShareLink = useCallback(async (clientId: string) => {
     setShareLoading(true);
     resetShareState();
     try {
@@ -5558,9 +4917,9 @@ export function IntegrationsSection() {
     } finally {
       setShareLoading(false);
     }
-  };
+  }, [formatMessage, resetShareState]);
 
-  const loadAppNotificationState = async (clientId: string) => {
+  const loadAppNotificationState = useCallback(async (clientId: string) => {
     setAppNotificationLoading(true);
     try {
       const { data } = await api.get(`/integrations/clients/${clientId}/app-notifications`);
@@ -5586,17 +4945,18 @@ export function IntegrationsSection() {
     } finally {
       setAppNotificationLoading(false);
     }
-  };
+  }, [formatMessage]);
 
-  const beginEditClient = (client: OAuthClientRecord) => {
+  const beginEditClient = useCallback((client: OAuthClientRecord) => {
     setEditingClient(client);
-    setAppEditorSection("profile");
     setClientName(client.name);
     setClientId(client.clientId);
     setClientDescription(client.description ?? "");
+    setClientWhenToUse(client.whenToUse ?? "");
     setClientHomepageUrl(client.homepageUrl ?? "");
     setClientReturnUrl(client.returnUrl ?? "");
     setClientAgentManifestUrl(client.agentManifestUrl ?? "");
+    setClientSetupRequired(Boolean(client.setupUrl)); setClientSetupUrl(client.setupUrl ?? ""); setClientSetupDescription(client.setupDescription ?? "");
     setClientAllowedScopes(normalizeDeclaredOAuthScopes(client.allowedScopes));
     setAppNotificationSelection({ groups: [], events: [] });
     setAppNotificationState(null);
@@ -5611,39 +4971,29 @@ export function IntegrationsSection() {
     void loadShareLink(client.id);
     void loadAppNotificationState(client.id);
     setShowRegisterDrawer(true);
-  };
+  }, [createdSecretClientId, loadAppNotificationState, loadShareLink]);
 
-  const closeRegisterDrawer = () => {
+  const closeRegisterDrawer = useCallback(() => {
     setShowRegisterDrawer(false);
     setEditingClient(null);
-    setAppEditorSection("profile");
     setError("");
     resetShareState();
     resetForm();
-  };
+  }, [resetForm, resetShareState]);
 
-  const applyUpdatedClient = (client: OAuthClientRecord) => {
+  const applyUpdatedClient = useCallback((client: OAuthClientRecord) => {
     setClients((items) => items.map((item) => item.id === client.id ? client : item));
     setEditingClient((currentClient) => currentClient?.id === client.id ? client : currentClient);
-  };
+  }, []);
 
-  const saveAppNotificationPermissions = async (clientRowId: string) => {
+  const saveAppNotificationPermissions = useCallback(async (clientRowId: string) => {
     await api.put(`/integrations/clients/${clientRowId}/app-notifications/permissions`, {
       groups: appNotificationSelection.groups,
       events: appNotificationSelection.events,
     });
-  };
+  }, [appNotificationSelection]);
 
-  const emptyAppNotificationState = (): AppNotificationsDeveloperState => ({
-    request_revision: 0,
-    current_revision_id: null,
-    current_groups: [],
-    current_events: [],
-    pending_revision: null,
-    webhook: null,
-  });
-
-  const appNotificationRequestChanged = () => {
+  const appNotificationRequestChanged = useCallback(() => {
     if (!appNotificationState) return appNotificationSelection.groups.length > 0 || appNotificationSelection.events.length > 0;
     const requested = appNotificationState.pending_revision ?? {
       groups: appNotificationState.current_groups,
@@ -5651,11 +5001,19 @@ export function IntegrationsSection() {
     };
     return requested.groups.join("\0") !== appNotificationSelection.groups.join("\0")
       || requested.events.join("\0") !== appNotificationSelection.events.join("\0");
-  };
+  }, [appNotificationSelection, appNotificationState]);
 
-  const handleSaveClient = async (event: FormEvent) => {
+  const handleSaveClient = useCallback(async (event: FormEvent) => {
     event.preventDefault();
-    if (!current) return;
+    if (!serverId) return;
+    if (isAppWhenToUseTooLong(clientWhenToUse)) {
+      setError(formatMessage({ id: "settings.connectedApps.whenToUseTooLong" }, { limit: APP_WHEN_TO_USE_MAX_CODE_POINTS }));
+      return;
+    }
+    if (clientSetupRequired) {
+      try { if (!normalizeAppSetupUrl(clientSetupUrl)) throw new Error("missing setup URL"); }
+      catch { setError(formatMessage({ id: "appSetup.invalidUrl" })); return; }
+    }
     setSubmitting(true);
     setSavingClientId(editingClient?.id ?? null);
     setError("");
@@ -5665,9 +5023,12 @@ export function IntegrationsSection() {
         const { data } = await api.patch(`/integrations/clients/${editingClient.id}`, {
           name: clientName,
           description: clientDescription || null,
+          whenToUse: clientWhenToUse || null,
           homepageUrl: clientHomepageUrl || null,
           returnUrl: clientReturnUrl || null,
           agentManifestUrl: clientAgentManifestUrl || null,
+          setupUrl: clientSetupRequired ? clientSetupUrl : null,
+          setupDescription: clientSetupRequired ? clientSetupDescription : null,
           allowedScopes: clientAllowedScopes,
           category: clientCategory,
         });
@@ -5681,9 +5042,12 @@ export function IntegrationsSection() {
           name: clientName,
           clientId: clientId || undefined,
           description: clientDescription || undefined,
+          whenToUse: clientWhenToUse || undefined,
           homepageUrl: clientHomepageUrl || undefined,
           returnUrl: clientReturnUrl || undefined,
           agentManifestUrl: clientAgentManifestUrl || undefined,
+          setupUrl: clientSetupRequired ? clientSetupUrl : undefined,
+          setupDescription: clientSetupRequired ? clientSetupDescription : undefined,
           allowedScopes: clientAllowedScopes,
           category: clientCategory,
         });
@@ -5708,9 +5072,30 @@ export function IntegrationsSection() {
       setSubmitting(false);
       setSavingClientId(null);
     }
-  };
+  }, [
+    appNotificationRequestChanged,
+    appNotificationState,
+    applyUpdatedClient,
+    clientAgentManifestUrl,
+    clientSetupRequired, clientSetupUrl, clientSetupDescription,
+    clientAllowedScopes,
+    clientCategory,
+    clientDescription,
+    clientHomepageUrl,
+    clientId,
+    clientName,
+    clientReturnUrl,
+    clientWhenToUse,
+    closeRegisterDrawer,
+    editingClient,
+    formatMessage,
+    load,
+    resetForm,
+    saveAppNotificationPermissions,
+    serverId,
+  ]);
 
-  const handleCopyCreatedSecret = async () => {
+  const handleCopyCreatedSecret = useCallback(async () => {
     if (!createdSecret) return;
     setError("");
     try {
@@ -5726,9 +5111,9 @@ export function IntegrationsSection() {
     } catch (err: any) {
       setError(err?.message || formatMessage({ id: "settings.connectedApps.failedCopySecret" }));
     }
-  };
+  }, [createdSecret, formatMessage]);
 
-  const handleRegenerateClientSecret = async (client: OAuthClientRecord) => {
+  const handleRegenerateClientSecret = useCallback(async (client: OAuthClientRecord) => {
     setRegeneratingClientId(client.id);
     setError("");
     try {
@@ -5744,9 +5129,9 @@ export function IntegrationsSection() {
     } finally {
       setRegeneratingClientId(null);
     }
-  };
+  }, [applyUpdatedClient, formatMessage]);
 
-  const handleCreateShareLink = async () => {
+  const handleCreateShareLink = useCallback(async () => {
     if (!editingClient) return;
     setShareLoading(true);
     setError("");
@@ -5754,16 +5139,16 @@ export function IntegrationsSection() {
       const { data } = await api.post(`/integrations/clients/${editingClient.id}/share-link`);
       applyUpdatedClient(data.client);
       setShareLink(data.link);
-      setShareUrl(`${window.location.origin}/integration-invites/${encodeURIComponent(data.token)}`);
+      setShareUrl(buildIntegrationInviteUrl(shareableWebOrigin(), data.token));
       setShareCopied(false);
     } catch (err: any) {
       setError(err.response?.data?.error || formatMessage({ id: "settings.connectedApps.failedCreateShare" }));
     } finally {
       setShareLoading(false);
     }
-  };
+  }, [applyUpdatedClient, editingClient, formatMessage]);
 
-  const handleRevokeShareLink = async () => {
+  const handleRevokeShareLink = useCallback(async () => {
     if (!editingClient) return;
     setShareLoading(true);
     setError("");
@@ -5775,9 +5160,9 @@ export function IntegrationsSection() {
     } finally {
       setShareLoading(false);
     }
-  };
+  }, [editingClient, formatMessage, resetShareState]);
 
-  const handleCopyShareUrl = async () => {
+  const handleCopyShareUrl = useCallback(async () => {
     if (!shareUrl) return;
     setError("");
     try {
@@ -5793,7 +5178,7 @@ export function IntegrationsSection() {
     } catch (err: any) {
       setError(err?.message || formatMessage({ id: "settings.connectedApps.failedCopyShare" }));
     }
-  };
+  }, [formatMessage, shareUrl]);
 
   const handleLogoFileChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
@@ -5813,7 +5198,7 @@ export function IntegrationsSection() {
     }
   };
 
-  const handleClearLogo = async () => {
+  const handleClearLogo = useCallback(async () => {
     if (!editingClient) return;
     setLogoUploading(true);
     setError("");
@@ -5825,23 +5210,29 @@ export function IntegrationsSection() {
     } finally {
       setLogoUploading(false);
     }
-  };
+  }, [applyUpdatedClient, editingClient, formatMessage]);
 
-  const handleDeleteClient = async (client: ServerRegisteredApp) => {
+  const editingClientId = editingClient?.id;
+  const handleDeleteClient = useCallback(async (client: ServerRegisteredApp) => {
     await api.delete(`/integrations/clients/${client.id}`);
     setClients((items) => items.filter((item) => item.id !== client.id));
-    if (editingClient?.id === client.id) {
+    if (editingClientId === client.id) {
       closeRegisterDrawer();
     }
-  };
+  }, [closeRegisterDrawer, editingClientId]);
 
-  const handleRequestPublish = async (client: ServerRegisteredApp) => {
+  const handleRequestPublish = useCallback(async (client: ServerRegisteredApp) => {
+    if (isAppWhenToUseTooLong(clientWhenToUse)) {
+      setError(formatMessage({ id: "settings.connectedApps.whenToUseTooLong" }, { limit: APP_WHEN_TO_USE_MAX_CODE_POINTS }));
+      return;
+    }
     setSavingClientId(client.id);
     setError("");
     try {
       await api.patch(`/integrations/clients/${client.id}`, {
         name: clientName,
         description: clientDescription || null,
+        whenToUse: clientWhenToUse || null,
         homepageUrl: clientHomepageUrl || null,
         returnUrl: clientReturnUrl || null,
         agentManifestUrl: clientAgentManifestUrl || null,
@@ -5855,9 +5246,20 @@ export function IntegrationsSection() {
     } finally {
       setSavingClientId(null);
     }
-  };
+  }, [
+    applyUpdatedClient,
+    clientAgentManifestUrl,
+    clientAllowedScopes,
+    clientCategory,
+    clientDescription,
+    clientHomepageUrl,
+    clientName,
+    clientReturnUrl,
+    clientWhenToUse,
+    formatMessage,
+  ]);
 
-  const handleRequestOffline = async (client: ServerRegisteredApp) => {
+  const handleRequestOffline = useCallback(async (client: ServerRegisteredApp) => {
     setSavingClientId(client.id);
     setError("");
     try {
@@ -5870,23 +5272,23 @@ export function IntegrationsSection() {
     } finally {
       setSavingClientId(null);
     }
-  };
+  }, [applyUpdatedClient, formatMessage]);
 
-  const handleInstallMarketplaceApp = async (listing: ConnectedAppListing) => {
+  const handleInstallMarketplaceApp = useCallback(async (listing: ConnectedAppListing) => {
     setSavingClientId(listing.id);
     setError("");
     try {
       await api.post(`/integrations/marketplace/${listing.id}/install`);
-      setSelectedListing(null);
+      setSelectedListing(listing.setupUrl ? { ...listing, installed: true } : null);
       await load();
     } catch (err: any) {
       setError(err.response?.data?.error || formatMessage({ id: "settings.connectedApps.failedInstall" }));
     } finally {
       setSavingClientId(null);
     }
-  };
+  }, [formatMessage, load]);
 
-  const handleUninstallMarketplaceApp = async (app: InstalledConnectedApp | ConnectedAppListing) => {
+  const handleUninstallMarketplaceApp = useCallback(async (app: InstalledConnectedApp | ConnectedAppListing) => {
     setSavingClientId(app.id);
     setError("");
     try {
@@ -5899,14 +5301,32 @@ export function IntegrationsSection() {
     } finally {
       setSavingClientId(null);
     }
-  };
+  }, [formatMessage, load]);
 
-  const openBuiltInApp = (app: BuiltInConnectedApp) => {
-    if (!app.homepageUrl) return;
-    window.open(app.homepageUrl, "_blank", "noopener,noreferrer");
-  };
+  const handleApproveSelectedAppPermissionUpdate = useCallback(async () => {
+    const listing = selectedListing;
+    if (!listing) return;
+    setReviewingPermissionClientId(listing.id);
+    setError("");
+    try {
+      await api.post(`/integrations/clients/${listing.id}/app-notifications/permissions/review`, {
+        // Bind the approval to the exact revision the reviewer displayed so a
+        // publisher replacing the request mid-review cannot smuggle unseen
+        // groups into the grant (server returns 409 and we surface the error).
+        expected_revision_id: listing.appNotificationPendingRevisionId ?? undefined,
+      });
+      await load();
+    } catch (err: unknown) {
+      const axiosError = err as { response?: { data?: { error?: string } } };
+      setError(axiosError.response?.data?.error || formatMessage({ id: "settings.connectedApps.appNotifications.reviewFailed" }));
+    } finally {
+      setReviewingPermissionClientId(null);
+    }
+  }, [formatMessage, load, selectedListing]);
+  const handleApproveAppPermissionUpdateClick = useCallback(() => {
+    void handleApproveSelectedAppPermissionUpdate();
+  }, [handleApproveSelectedAppPermissionUpdate]);
 
-  const builtInApps = builtInClients.map(mapClientToBuiltInApp);
   const registeredApps = clients.map(mapClientToRegisteredApp);
   const grantedScopesByClientId = integrationOverview
     .filter((item) => item.type === "active" && !item.revokedAt)
@@ -5928,6 +5348,7 @@ export function IntegrationsSection() {
       developer: renderMarketplaceText("developer_name", app.publisherServerName ?? app.publisherName ?? formatMessage({ id: "settings.connectedApps.thirdPartyDeveloper" })),
       description: renderMarketplaceText("description", app.description),
       homepageUrl: app.homepageUrl,
+      setupUrl: app.setupUrl, setupDescription: app.setupDescription,
       homepageDomain: getDomainFromUrl(app.homepageUrl),
       callbackDomain: getDomainFromUrl(app.returnUrl),
       logoUrl: app.logoUrl,
@@ -5935,6 +5356,7 @@ export function IntegrationsSection() {
       origin: "marketplace" as const,
       privateShared: app.privateShared,
       editable: false,
+      official: app.official,
       category: app.category,
       publishStatus: app.publishStatus ?? null,
       allowedScopes: app.allowedScopes,
@@ -5947,6 +5369,7 @@ export function IntegrationsSection() {
       developer: formatMessage({ id: "settings.connectedApps.thisServer" }),
       description: app.description,
       homepageUrl: app.homepageUrl,
+      setupUrl: app.setupUrl, setupDescription: app.setupDescription,
       homepageDomain: getDomainFromUrl(app.homepageUrl),
       callbackDomain: getDomainFromUrl(app.returnUrl),
       logoUrl: app.logoUrl,
@@ -5954,6 +5377,7 @@ export function IntegrationsSection() {
       origin: "private" as const,
       privateShared: false,
       editable: true,
+      official: false,
       category: app.category,
       publishStatus: app.status,
       allowedScopes: app.allowedScopes,
@@ -5971,49 +5395,61 @@ export function IntegrationsSection() {
     .filter((app) => matchesConnectedAppFilter(app, normalizedSearch, connectedAppsCategory));
   const filteredRegisteredApps = registeredApps
     .filter((app) => matchesConnectedAppFilter(app, normalizedSearch, connectedAppsCategory));
-  const marketplaceCount = builtInApps.length + publicMarketplaceClients.length;
-  const connectedAppsTabOptions = [
+  const marketplaceCount = publicMarketplaceClients.length;
+  const installedCount = installedApps.length;
+  const registeredCount = registeredApps.length;
+  const connectedAppsTabOptions = useMemo(() => [
     { value: "marketplace" as const, label: formatMessage({ id: "settings.connectedApps.tabMarketplace" }), count: marketplaceCount, testId: "connected-apps-tab-marketplace" },
-    { value: "installed" as const, label: formatMessage({ id: "settings.connectedApps.installed" }), count: installedApps.length, testId: "connected-apps-tab-installed" },
-    { value: "myapps" as const, label: formatMessage({ id: "settings.connectedApps.tabMyApps" }), count: registeredApps.length, testId: "connected-apps-tab-my-apps" },
-  ];
+    { value: "installed" as const, label: formatMessage({ id: "settings.connectedApps.installed" }), count: installedCount, testId: "connected-apps-tab-installed" },
+    { value: "myapps" as const, label: formatMessage({ id: "settings.connectedApps.tabMyApps" }), count: registeredCount, testId: "connected-apps-tab-my-apps" },
+  ], [formatMessage, installedCount, marketplaceCount, registeredCount]);
+  const connectedAppsCategoryItems = useMemo(() => CONNECTED_APP_CATEGORY_OPTIONS.map((option) => ({
+    value: option.value,
+    label: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[option.value] }),
+  })), [formatMessage]);
+  const publishCategoryItems = useMemo(() => CONNECTED_APP_PUBLISH_CATEGORY_OPTIONS.map((option) => ({
+    value: option.value,
+    label: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[option.value] }),
+  })), [formatMessage]);
   const connectedAppsErrorSurface = getConnectedAppsErrorSurface(
     error,
     selectedListing,
-    selectedBuiltInApp,
     showRegisterDrawer,
     deleteClientTarget,
     offlineRequestTarget,
     marketplaceUninstallTarget,
   );
-  const updateConnectedAppsViewMode = (viewMode: ConnectedAppsViewMode) => {
+  const updateConnectedAppsViewMode = useCallback((viewMode: ConnectedAppsViewMode) => {
     setConnectedAppsViewMode(viewMode);
     try {
       window.localStorage.setItem(CONNECTED_APPS_VIEW_MODE_STORAGE_KEY, viewMode);
     } catch {
       // The preference is optional; the view switch must keep working when storage is unavailable.
     }
-  };
+  }, []);
 
   const renderClientSecretReveal = () => {
     if (!createdSecret) return null;
     return (
-      <div className="border-2 border-black bg-brutal-lime/20 p-3 space-y-2">
+      <div className="space-y-2 rounded-container bg-success-soft p-3">
         <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.clientSecret" })}</SectionEyebrow>
-        <div className="text-sm text-black">{formatMessage({ id: "settings.connectedApps.secretOnce" })}</div>
+        <div className="text-callout text-foreground">{formatMessage({ id: "settings.connectedApps.secretOnce" })}</div>
         <div className="flex items-center gap-2">
-          <div className="flex-1 border-2 border-black bg-white p-2 font-mono text-xs break-all">{createdSecret}</div>
-          <button
+          <div className="min-w-0 flex-1 break-all rounded-control border border-line-hairline bg-layer-card px-2.5 py-1.5 font-mono text-mono-meta text-foreground">{createdSecret}</div>
+          <Tooltip content={secretCopied ? formatMessage({ id: "settings.connectedApps.copiedSecret" }) : formatMessage({ id: "settings.connectedApps.copySecret" })}>
+          <Button
+            variant="outline" size="icon-sm"
             type="button"
-            onClick={() => void handleCopyCreatedSecret()}
-            className="btn-brutal-sm shrink-0 bg-white p-2"
+            onClick={handleCopyCreatedSecret}
+            className="shrink-0"
             data-testid="connected-app-secret-copy-button"
+            data-slot="button"
             aria-live="polite"
             aria-label={secretCopied ? formatMessage({ id: "settings.connectedApps.copiedSecret" }) : formatMessage({ id: "settings.connectedApps.copySecret" })}
-            title={secretCopied ? formatMessage({ id: "settings.connectedApps.copiedSecret" }) : formatMessage({ id: "settings.connectedApps.copySecret" })}
           >
             {secretCopied ? <Check size={14} /> : <Copy size={14} />}
-          </button>
+          </Button>
+          </Tooltip>
         </div>
       </div>
     );
@@ -6026,7 +5462,8 @@ export function IntegrationsSection() {
     ? (editingClient
       ? "settings.connectedApps.editor.status.oauthReady"
       : "settings.connectedApps.editor.status.readyToSave")
-    : "settings.connectedApps.editor.status.callbackMissing" });
+    : "settings.connectedApps.editor.status.loginOptional" });
+  const appPermissionsStatus = formatMessage({ id: "settings.connectedApps.appPermissions.selectionCount" }, { count: appNotificationSelection.groups.length });
   const notificationsStatus = appNotificationLoading
     ? formatMessage({ id: "common.loadingLabel" })
     : formatMessage({ id: !editingClient
@@ -6037,47 +5474,95 @@ export function IntegrationsSection() {
           ? "settings.connectedApps.editor.status.setup"
           : "settings.connectedApps.editor.status.off" });
   const distributionStatus = formatMessage({ id: connectedAppDistributionStatus(editingClient?.publishStatus ?? null) });
-  const appEditorSections: Array<{
-    id: ConnectedAppEditorSectionId;
-    label: ReactNode;
-    status: string;
-    icon: ReactNode;
-  }> = [
-    { id: "profile", label: formatMessage({ id: "settings.connectedApps.section.profile" }), status: profileStatus, icon: <User size={14} /> },
-    { id: "login", label: formatMessage({ id: "settings.connectedApps.section.loginWithRaft" }), status: loginStatus, icon: <Shield size={14} /> },
-    { id: "notifications", label: <AppNotificationsEditorRailLabel />, status: notificationsStatus, icon: <Bell size={14} /> },
-    { id: "distribution", label: formatMessage({ id: "settings.connectedApps.section.distribution" }), status: distributionStatus, icon: <Link2 size={14} /> },
-    { id: "danger", label: formatMessage({ id: "settings.connectedApps.section.dangerZone" }), status: formatMessage({ id: editingClient ? "settings.connectedApps.editor.dangerStatusRestricted" : "settings.connectedApps.editor.dangerStatusAvailableAfterSave" }), icon: <AlertTriangle size={14} /> },
-  ];
-  const scrollToAppEditorSection = (sectionId: ConnectedAppEditorSectionId) => {
-    setAppEditorSection(sectionId);
-    const content = appEditorContentRef.current;
-    const target = content?.querySelector<HTMLElement>(`#connected-app-editor-${sectionId}`);
-    if (!content || !target) return;
-    const top = target.getBoundingClientRect().top
-      - content.getBoundingClientRect().top
-      + content.scrollTop
-      - 16;
-    content.scrollTo?.({ top, behavior: "smooth" });
-  };
-  const syncAppEditorSectionFromScroll = () => {
-    const content = appEditorContentRef.current;
-    if (!content) return;
-
-    let nextSection: ConnectedAppEditorSectionId = CONNECTED_APP_EDITOR_SECTION_IDS[0];
-    const atBottom = content.scrollHeight - content.scrollTop - content.clientHeight <= 2;
-    if (atBottom) {
-      nextSection = CONNECTED_APP_EDITOR_SECTION_IDS[CONNECTED_APP_EDITOR_SECTION_IDS.length - 1];
-    } else {
-      const activationLine = content.getBoundingClientRect().top + 16;
-      for (const sectionId of CONNECTED_APP_EDITOR_SECTION_IDS) {
-        const target = content.querySelector<HTMLElement>(`#connected-app-editor-${sectionId}`);
-        if (!target || target.getBoundingClientRect().top > activationLine) break;
-        nextSection = sectionId;
-      }
-    }
-    setAppEditorSection((current) => current === nextSection ? current : nextSection);
-  };
+  // The editor's section list, in the order the sections are drawn (a new
+  // app's form stops before Distribution and the Danger zone).
+  const appEditorSections = useMemo(() => [
+    { id: "connected-app-editor-profile", label: formatMessage({ id: "settings.connectedApps.section.profile" }) },
+    { id: "connected-app-editor-login", label: formatMessage({ id: "settings.connectedApps.section.loginWithRaft" }) },
+    { id: "connected-app-editor-setup", label: formatMessage({ id: "appSetup.title" }) },
+    { id: "connected-app-editor-permissions", label: formatMessage({ id: "settings.connectedApps.section.appPermissions" }) },
+    { id: "connected-app-editor-notifications", label: formatMessage({ id: "settings.connectedApps.section.webhook" }) },
+    ...(editingClient
+      ? [
+        { id: "connected-app-editor-distribution", label: formatMessage({ id: "settings.connectedApps.section.distribution" }) },
+        { id: "connected-app-editor-danger", label: formatMessage({ id: "settings.connectedApps.section.dangerZone" }) },
+      ]
+      : []),
+  ], [editingClient, formatMessage]);
+  const handleConnectedAppsSearchChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setConnectedAppsSearch(event.target.value), []);
+  const handleConnectedAppsCategoryChange = useCallback((value: string | null) => {
+    if (value == null) return;
+    setConnectedAppsCategory(value as ConnectedAppCategory | "all");
+  }, []);
+  const handleOpenInstalledApp = useCallback((app: InstalledConnectedApp) => {
+    setError("");
+    setSelectedInstalledApp(app);
+  }, []);
+  const handleEditInstalledApp = useCallback((app: InstalledConnectedApp) => {
+    const match = clients.find((client) => client.id === (app.sourceClientId ?? app.id));
+    if (match) beginEditClient(match);
+  }, [beginEditClient, clients]);
+  const handleRequestMarketplaceUninstall = useCallback((app: InstalledConnectedApp | ConnectedAppListing) => {
+    setError("");
+    setMarketplaceUninstallTarget(app);
+  }, []);
+  const handleCloseInstalledApp = useCallback(() => setSelectedInstalledApp(null), []);
+  const handleCloseListing = useCallback(() => setSelectedListing(null), []);
+  const handleRequestUninstallSelectedListing = useCallback(() => {
+    if (selectedListing) handleRequestMarketplaceUninstall(selectedListing);
+  }, [handleRequestMarketplaceUninstall, selectedListing]);
+  const handleInstallSelectedListing = useCallback(() => {
+    if (selectedListing) void handleInstallMarketplaceApp(selectedListing);
+  }, [handleInstallMarketplaceApp, selectedListing]);
+  const handlePickLogo = useCallback(() => logoInputRef.current?.click(), []);
+  const handleClientNameChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setClientName(event.target.value), []);
+  const handleClientHomepageUrlChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setClientHomepageUrl(event.target.value), []);
+  const handleClientCategoryChange = useCallback((value: string | null) => {
+    if (value == null) return;
+    setClientCategory(value as ConnectedAppCategory);
+  }, []);
+  const handleClientDescriptionChange = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => setClientDescription(event.target.value), []);
+  const handleClientWhenToUseChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setClientWhenToUse(event.target.value), []);
+  const handleClientIdChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setClientId(event.target.value), []);
+  const handleClientReturnUrlChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setClientReturnUrl(event.target.value), []);
+  const handleClientSetupUrlChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setClientSetupUrl(event.target.value), []);
+  const handleClientSetupDescriptionChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setClientSetupDescription(event.target.value), []);
+  const handleClientAgentManifestUrlChange = useCallback((event: ChangeEvent<HTMLInputElement>) => setClientAgentManifestUrl(event.target.value), []);
+  const handleAppNotificationStateChange = useCallback((next: AppNotificationsDeveloperState) => {
+    setAppNotificationState(next);
+    const requested = next.pending_revision ?? { groups: next.current_groups, events: next.current_events };
+    setAppNotificationSelection({ groups: requested.groups, events: requested.events });
+  }, []);
+  const handleRequestPublishEditingClient = useCallback(() => {
+    if (editingClient) void handleRequestPublish(mapClientToRegisteredApp(editingClient));
+  }, [editingClient, handleRequestPublish]);
+  const handleRequestRegenerateSecret = useCallback(() => setRegenerateSecretTarget(editingClient), [editingClient]);
+  const handleRequestOfflineEditingClient = useCallback(() => {
+    if (editingClient) setOfflineRequestTarget(mapClientToRegisteredApp(editingClient));
+  }, [editingClient]);
+  const handleRequestDeleteEditingClient = useCallback(() => {
+    if (editingClient) setDeleteClientTarget(mapClientToRegisteredApp(editingClient));
+  }, [editingClient]);
+  const handleCloseDeleteClient = useCallback(() => setDeleteClientTarget(null), []);
+  const handleConfirmDeleteClient = useCallback(
+    () => (deleteClientTarget ? handleDeleteClient(deleteClientTarget) : undefined),
+    [deleteClientTarget, handleDeleteClient],
+  );
+  const handleCloseRegenerateSecret = useCallback(() => setRegenerateSecretTarget(null), []);
+  const handleConfirmRegenerateSecret = useCallback(
+    () => (regenerateSecretTarget ? handleRegenerateClientSecret(regenerateSecretTarget) : undefined),
+    [handleRegenerateClientSecret, regenerateSecretTarget],
+  );
+  const handleCloseOfflineRequest = useCallback(() => setOfflineRequestTarget(null), []);
+  const handleConfirmOfflineRequest = useCallback(
+    () => (offlineRequestTarget ? handleRequestOffline(offlineRequestTarget) : undefined),
+    [handleRequestOffline, offlineRequestTarget],
+  );
+  const handleCloseMarketplaceUninstall = useCallback(() => setMarketplaceUninstallTarget(null), []);
+  const handleConfirmMarketplaceUninstall = useCallback(
+    () => (marketplaceUninstallTarget ? handleUninstallMarketplaceApp(marketplaceUninstallTarget) : undefined),
+    [handleUninstallMarketplaceApp, marketplaceUninstallTarget],
+  );
 
   if (!current) return null;
 
@@ -6087,18 +5572,19 @@ export function IntegrationsSection() {
         icon={<Link2 size={16} />}
         label={connectedAppsLabel}
         action={canManage ? (
-          <button type="button" onClick={openRegisterDrawer} className="btn-brutal inline-flex items-center gap-1.5 bg-brutal-pink px-3 py-1.5 text-xs">
+          <Button
+            variant="accent" size="sm" type="button" onClick={openRegisterDrawer}>
             <Plus size={14} />
             {formatMessage({ id: "settings.connectedApps.registerApp" })}
-          </button>
+          </Button>
         ) : undefined}
       />
 
-      <div className="border-2 border-black bg-white p-4 shadow-brutal-sm">
+      <Card className="p-4">
         <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
           <div>
-            <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.connectedApps.title" })}</div>
-            <div className="mt-1 max-w-2xl text-xs leading-relaxed text-black/60">
+            <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.connectedApps.title" })}</div>
+            <div className="mt-1 max-w-2xl text-footnote text-foreground-muted">
               {formatMessage({
                 id: canManage
                   ? "settings.connectedApps.sectionDescriptionManage"
@@ -6106,12 +5592,12 @@ export function IntegrationsSection() {
               })}
             </div>
             {!canManage && (
-              <div className="mt-1 text-xs leading-relaxed text-black/60">
+              <div className="mt-1 text-footnote text-foreground-muted">
                 {formatMessage({ id: "settings.connectedApps.adminOnlyNote" })}
               </div>
             )}
           </div>
-          {loading && <div className="text-xs font-bold text-black/50">{formatMessage({ id: "settings.common.loading" })}</div>}
+          {loading && <div className="text-footnote text-foreground-hint">{formatMessage({ id: "settings.common.loading" })}</div>}
         </div>
         <ConnectedAppsTabSegmentedControl
           value={activeTab}
@@ -6119,45 +5605,36 @@ export function IntegrationsSection() {
           className="mt-4"
           onValueChange={setActiveTab}
         />
-      </div>
+      </Card>
 
       <div className="grid items-stretch gap-2 sm:grid-cols-[minmax(0,1fr)_auto] md:grid-cols-[minmax(0,1fr)_220px_auto]" data-testid="connected-apps-filters">
-        <div className="relative h-10 min-h-10">
-          <input
+        <div className="relative h-11 min-h-11">
+          <Input
             type="search"
             value={connectedAppsSearch}
-            onChange={(event) => setConnectedAppsSearch(event.target.value)}
+            onChange={handleConnectedAppsSearchChange}
             placeholder={formatMessage({ id: "settings.connectedApps.searchApps" })}
             aria-label={formatMessage({ id: "settings.connectedApps.searchAppsAriaLabel" })}
-            className="input-brutal box-border h-10 min-h-10 w-full text-sm"
+            className="box-border h-11 min-h-11 w-full"
             data-testid="connected-apps-search"
           />
         </div>
-        <div className="h-10 min-h-10 min-w-0 sm:col-span-1 md:w-[220px]">
+        <div className="h-11 min-h-11 min-w-0 sm:col-span-1 md:w-[220px]">
           <Select
             value={connectedAppsCategory}
-            onValueChange={(value) => {
-              if (value == null) return;
-              setConnectedAppsCategory(value as ConnectedAppCategory | "all");
-            }}
-            items={CONNECTED_APP_CATEGORY_OPTIONS.map((option) => ({
-              value: option.value,
-              label: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[option.value] }),
-            }))}
+            onValueChange={handleConnectedAppsCategoryChange}
+            items={connectedAppsCategoryItems}
           >
-            <SelectTrigger className="box-border h-10 min-h-10 w-full" data-testid="connected-apps-category-filter" aria-label={formatMessage({ id: "settings.connectedApps.filterByCategoryAriaLabel" })}>
+            <SelectTrigger className="box-border h-11 min-h-11 w-full" data-testid="connected-apps-category-filter" aria-label={formatMessage({ id: "settings.connectedApps.filterByCategoryAriaLabel" })}>
               <SelectValue placeholder={formatMessage({ id: "settings.connectedApps.categoryLabel" })} />
               <SelectIcon />
             </SelectTrigger>
             <SelectContent>
-              <SelectList>{renderSelectItems(CONNECTED_APP_CATEGORY_OPTIONS.map((option) => ({
-                value: option.value,
-                label: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[option.value] }),
-              })))}</SelectList>
+              <SelectList>{renderSelectItems(connectedAppsCategoryItems)}</SelectList>
             </SelectContent>
           </Select>
         </div>
-        <div className="flex h-10 min-h-10 justify-end sm:col-start-2 sm:row-start-1 md:col-start-3">
+        <div className="flex h-11 min-h-11 items-center justify-end sm:col-start-2 sm:row-start-1 md:col-start-3">
           <ConnectedAppsViewToggle value={connectedAppsViewMode} onValueChange={updateConnectedAppsViewMode} />
         </div>
       </div>
@@ -6168,71 +5645,27 @@ export function IntegrationsSection() {
 
       {activeTab === "marketplace" && (
         <div className="space-y-3" data-testid="connected-apps-marketplace-tab">
-          {builtInApps.length > 0 && (
-            <div className="border-2 border-black bg-brutal-cream p-3 shadow-brutal-sm" data-testid="connected-apps-built-in-band">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.builtIn" })}</SectionEyebrow>
-                  <div className="mt-1 text-sm font-bold text-black">{formatMessage({ id: "settings.connectedApps.builtInAvailable" })}</div>
-                </div>
-              </div>
-              <div
-                className={`mt-3 ${connectedAppsCollectionClassName(connectedAppsViewMode)}`}
-                data-testid="connected-apps-built-in-collection"
-                data-view={connectedAppsViewMode}
-              >
-                {builtInApps.map((app) => (
-                  <button
-                    key={app.id}
-                    type="button"
-                    onClick={() => setSelectedBuiltInApp(app)}
-                    className={`w-full border-2 border-black bg-white p-3 text-left shadow-brutal-sm transition-shadow hover:shadow-brutal ${
-                      connectedAppsViewMode === "grid" ? "flex h-full flex-col" : "flex items-center gap-3"
-                    }`}
-                  >
-                    <div className="flex items-start gap-3">
-                      <ConnectedAppLogo name={app.name} logoUrl={app.logoUrl} seed={app.defaultLogoSeed} />
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <div className="font-bold text-black">{app.name}</div>
-                          <Badge variant="success" uppercase>{formatMessage({ id: "settings.connectedApps.builtIn" })}</Badge>
-                        </div>
-                        <div className="mt-0.5 text-xs text-black/55">{formatMessage({ id: "settings.connectedApps.availableAll" })}</div>
-                        {connectedAppsViewMode === "list" && (
-                          <ConnectedAppSummary description={app.description} />
-                        )}
-                      </div>
-                    </div>
-                    <div className={`${connectedAppsViewMode === "grid" ? "mt-auto pt-3" : "ml-auto"} flex items-center justify-end`}>
-                      <span className="btn-brutal-sm bg-brutal-pink px-2.5 py-1 text-xs">{formatMessage({ id: "settings.connectedApps.open" })}</span>
-                    </div>
-                  </button>
-                ))}
-              </div>
-            </div>
-          )}
           <div
             className={connectedAppsCollectionClassName(connectedAppsViewMode)}
             data-testid="connected-apps-marketplace-collection"
             data-view={connectedAppsViewMode}
           >
             {marketplaceApps.map((app) => (
-              <button
+              <Card
                 key={app.id}
-                type="button"
-                onClick={() => setSelectedListing(app)}
-                className={`w-full border-2 border-black bg-white p-3 text-left shadow-brutal-sm transition-shadow hover:shadow-brutal ${
-                  connectedAppsViewMode === "grid" ? "flex h-full flex-col" : "flex items-center gap-3"
-                }`}
+                render={<button type="button" onClick={() => setSelectedListing(app)} />}
+                className={`w-full p-3 text-left outline-none hover:press-overlay focus-visible:shadow-focus ${
+ connectedAppsViewMode === "grid" ? "h-full" : "flex-row items-center gap-3"
+ }`}
               >
                 <div className="flex items-start gap-3">
                   <ConnectedAppLogo name={app.name} logoUrl={app.logoUrl} seed={app.defaultLogoSeed} />
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
-                      <div className="font-bold text-black">{app.name}</div>
+                      <div className="text-body font-semibold text-foreground">{app.name}</div>
                       <ConnectedAppMarketplaceInstallBadge badge={app.marketplaceInstallBadge} />
                     </div>
-                    <div className="mt-0.5 text-xs text-black/55">{formatMessage({ id: "settings.connectedApps.byLine" }, { category: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[app.category] ?? "settings.connectedApps.categoryOther" }), developer: app.developer })}</div>
+                    <div className="mt-0.5 text-footnote text-foreground-muted">{formatMessage({ id: "settings.connectedApps.byLine" }, { category: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[app.category] ?? "settings.connectedApps.categoryOther" }), developer: app.developer })}</div>
                     {connectedAppsViewMode === "list" && (
                       <ConnectedAppSummary description={app.description} />
                     )}
@@ -6240,22 +5673,22 @@ export function IntegrationsSection() {
                 </div>
                 <div className={`${connectedAppsViewMode === "grid" ? "mt-auto pt-3" : "ml-auto"} flex items-center justify-end gap-2`}>
                   {app.installed ? (
-                    <Badge variant="success" uppercase>{formatMessage({ id: "settings.connectedApps.installed" })}</Badge>
+                    <Badge appearance="soft" variant="success">{formatMessage({ id: "settings.connectedApps.installed" })}</Badge>
                   ) : canManage ? (
-                    <span className="btn-brutal-sm bg-brutal-pink px-2.5 py-1 text-xs">{formatMessage({ id: "settings.connectedApps.install" })}</span>
+                    <span className="inline-flex h-7 items-center rounded-control border-[1.5px] border-line-strong px-2.5 text-footnote font-bold text-foreground">{formatMessage({ id: "settings.connectedApps.install" })}</span>
                   ) : (
-                    <Badge appearance="outline" uppercase>{formatMessage({ id: "settings.connectedApps.available" })}</Badge>
+                    <Badge appearance="soft" variant="muted">{formatMessage({ id: "settings.connectedApps.available" })}</Badge>
                   )}
                 </div>
-              </button>
+              </Card>
             ))}
           </div>
           {marketplaceApps.length === 0 && (
-            <div className="border-2 border-black bg-white p-6 text-center text-sm text-black/60 shadow-brutal-sm">
+            <div className="px-4 py-8 text-center text-callout text-foreground-hint">
               {formatMessage({ id: "settings.connectedApps.noMarketplaceMatch" })}
             </div>
           )}
-          <div className="text-center text-xs text-black/55">
+          <div className="text-center text-footnote text-foreground-muted">
             {formatMessage({ id: "settings.connectedApps.reviewNote" })}
           </div>
         </div>
@@ -6269,88 +5702,20 @@ export function IntegrationsSection() {
             data-view={connectedAppsViewMode}
           >
           {filteredInstalledApps.map((app) => (
-            <SurfaceListItem
+            <InstalledConnectedAppItem
               key={`${app.origin}-${app.id}`}
-              interactive={false}
-              className={connectedAppsViewMode === "grid"
-                ? "flex min-h-[184px] w-full flex-col gap-3"
-                : "flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"}
-            >
-              <div className="flex min-w-0 flex-1 items-start gap-3">
-                <ConnectedAppLogo name={app.name} logoUrl={app.logoUrl} seed={app.defaultLogoSeed} size="sm" />
-                <div className="min-w-0 flex-1">
-                  {app.editable ? (
-                    <div className="min-w-0 break-words font-bold text-black">{app.name}</div>
-                  ) : (
-                    <div
-                      role="button"
-                      tabIndex={0}
-                      aria-label={app.name}
-                      onClick={() => {
-                        setError("");
-                        setSelectedInstalledApp(app);
-                      }}
-                      onKeyDown={(event) => {
-                        if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") return;
-                        event.preventDefault();
-                        setError("");
-                        setSelectedInstalledApp(app);
-                      }}
-                      className="w-fit max-w-full break-words font-bold text-black underline-offset-2 hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black"
-                    >
-                      {app.name}
-                    </div>
-                  )}
-                  <div className="mt-0.5 text-xs text-black/50">
-                    <span>{formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[app.category] ?? "settings.connectedApps.categoryOther" })}</span>
-                    <span aria-hidden="true"> · </span>
-                    <span>{app.developer}</span>
-                  </div>
-                  <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                    <ConnectedAppDistributionBadge status={app.publishStatus} />
-                    <ConnectedAppOriginBadges app={app} />
-                  </div>
-                  {connectedAppsViewMode === "list" && (
-                    <ConnectedAppSummary description={app.description} />
-                  )}
-                  {connectedAppsViewMode === "grid" && (
-                    <ConnectedAppUrlLink url={app.homepageUrl} label={app.homepageDomain} className="mt-1" />
-                  )}
-                </div>
-              </div>
-              {canManage && (app.editable ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    const match = clients.find((client) => client.id === (app.sourceClientId ?? app.id));
-                    if (match) beginEditClient(match);
-                  }}
-                  className={`btn-brutal-sm inline-flex w-fit items-center justify-center gap-1.5 bg-white px-2.5 py-1 text-xs ${connectedAppsViewMode === "grid" ? "mt-auto self-end" : "self-end sm:self-auto"}`}
-                >
-                  <Pencil size={14} />
-                  {formatMessage({ id: "settings.connectedApps.edit" })}
-                </button>
-              ) : (
-                <div className={`flex w-full flex-wrap justify-end gap-2 sm:w-auto ${connectedAppsViewMode === "grid" ? "mt-auto self-end" : "self-end sm:self-auto"}`}>
-                  <button
-                    type="button"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      setError("");
-                      setMarketplaceUninstallTarget(app);
-                    }}
-                    disabled={savingClientId === app.id}
-                    className="btn-brutal-sm inline-flex items-center justify-center gap-1.5 bg-white px-2.5 py-1 text-xs disabled:opacity-50"
-                  >
-                    {savingClientId === app.id ? formatMessage({ id: "settings.connectedApps.uninstalling" }) : formatMessage({ id: "settings.connectedApps.uninstall" })}
-                  </button>
-                </div>
-              ))}
-            </SurfaceListItem>
+              app={app}
+              viewMode={connectedAppsViewMode}
+              canManage={canManage}
+              uninstalling={savingClientId === app.id}
+              onOpen={handleOpenInstalledApp}
+              onEdit={handleEditInstalledApp}
+              onRequestUninstall={handleRequestMarketplaceUninstall}
+            />
           ))}
           </div>
           {filteredInstalledApps.length === 0 && (
-            <div className="border-2 border-black bg-white p-6 text-center text-sm text-black/60 shadow-brutal-sm">
+            <div className="px-4 py-8 text-center text-callout text-foreground-hint">
               {formatMessage({ id: "settings.connectedApps.noInstalledAppsMatch" })}
             </div>
           )}
@@ -6359,13 +5724,13 @@ export function IntegrationsSection() {
 
       {activeTab === "myapps" && (
         <div className="space-y-3" data-testid="connected-apps-my-apps-tab">
-          <div className="text-xs leading-relaxed text-black/60">
+          <div className="text-footnote text-foreground-muted">
             {canManage
               ? formatMessage({ id: "settings.connectedApps.myAppsIntro" })
               : formatMessage({ id: "settings.connectedApps.myAppsReadOnlyIntro" })}
           </div>
           {filteredRegisteredApps.length === 0 ? (
-            <div className="border-2 border-black bg-white p-6 text-center text-sm text-black/60 shadow-brutal-sm">
+            <div className="px-4 py-8 text-center text-callout text-foreground-hint">
               {registeredApps.length === 0
                 ? formatMessage({ id: "settings.connectedApps.noRegisteredApps" })
                 : formatMessage({ id: "settings.connectedApps.noRegisteredAppsMatch" })}
@@ -6377,47 +5742,13 @@ export function IntegrationsSection() {
               data-view={connectedAppsViewMode}
             >
               {filteredRegisteredApps.map((app) => (
-                <SurfaceListItem
+                <RegisteredConnectedAppItem
                   key={app.id}
-                  interactive={false}
-                  className={connectedAppsViewMode === "grid"
-                    ? "flex min-h-[184px] w-full flex-col gap-3"
-                    : "flex w-full flex-col gap-3 sm:flex-row sm:items-center sm:justify-between"}
-                >
-                  <div className="flex min-w-0 flex-1 items-start gap-3">
-                    <ConnectedAppLogo name={app.name} logoUrl={app.logoUrl} seed={app.defaultLogoSeed} size="sm" />
-                    <div className="min-w-0 flex-1">
-                      <div className="min-w-0 break-words font-bold text-black">{app.name}</div>
-                      <div className="mt-0.5 text-xs text-black/50">{formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[app.category] ?? "settings.connectedApps.categoryOther" })}</div>
-                      <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                        <ConnectedAppDistributionBadge status={app.status} />
-                      </div>
-                      {connectedAppsViewMode === "list" && (
-                        <ConnectedAppSummary description={app.description} />
-                      )}
-                      {connectedAppsViewMode === "grid" && (
-                        <>
-                          {sourceOwnedConnectedAppStatusHint(app.status) && (
-                            <div className="mt-1 line-clamp-2 text-xs leading-relaxed text-black/55" title={formatMessage({ id: sourceOwnedConnectedAppStatusHint(app.status)! })}>
-                              {formatMessage({ id: sourceOwnedConnectedAppStatusHint(app.status)! })}
-                            </div>
-                          )}
-                          <ConnectedAppUrlLink url={app.homepageUrl} label={getDomainFromUrl(app.homepageUrl)} className="mt-1" />
-                        </>
-                      )}
-                    </div>
-                  </div>
-                  {canManage && (
-                    <div className={`flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto ${connectedAppsViewMode === "grid" ? "mt-auto" : ""}`}>
-                      {canEditSourceOwnedConnectedApp(app.status) && (
-                        <button type="button" onClick={() => beginEditClient(app)} className="btn-brutal-sm inline-flex items-center justify-center gap-1.5 bg-white px-2.5 py-1 text-xs">
-                          <Pencil size={14} />
-                          {formatMessage({ id: "settings.connectedApps.edit" })}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </SurfaceListItem>
+                  app={app}
+                  viewMode={connectedAppsViewMode}
+                  canManage={canManage}
+                  onEdit={beginEditClient}
+                />
               ))}
             </div>
           )}
@@ -6425,22 +5756,24 @@ export function IntegrationsSection() {
       )}
 
       {selectedInstalledApp && (
-        <Modal onClose={() => setSelectedInstalledApp(null)}>
-          <div className="w-full max-w-2xl card-brutal space-y-4 p-5">
+        <Modal onClose={handleCloseInstalledApp}>
+          <DialogSurface className="w-full max-w-2xl gap-4 p-5">
             <div className="flex items-start justify-between gap-3">
               <div className="flex min-w-0 items-start gap-3">
                 <ConnectedAppLogo name={selectedInstalledApp.name} logoUrl={selectedInstalledApp.logoUrl} seed={selectedInstalledApp.defaultLogoSeed} size="lg" />
                 <div className="min-w-0">
                   <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.installedAppEyebrow" })}</SectionEyebrow>
-                  <div className="mt-1 break-words text-xl font-bold text-black">{selectedInstalledApp.name}</div>
-                  <div className="mt-0.5 text-xs text-black/55">{selectedInstalledApp.developer}</div>
+                  <div className="mt-1 break-words text-headline text-foreground">{selectedInstalledApp.name}</div>
+                  <div className="mt-0.5 text-footnote text-foreground-muted">{selectedInstalledApp.developer}</div>
                 </div>
               </div>
-              <Button type="button" onClick={() => setSelectedInstalledApp(null)} shape="icon" aria-label={formatMessage({ id: "settings.connectedApps.closeInstalledAppDetail" })}>
+              <CloseButton
+                type="button" onClick={handleCloseInstalledApp}  aria-label={formatMessage({ id: "settings.connectedApps.closeInstalledAppDetail" })}>
                 <X size={14} />
-              </Button>
+              </CloseButton>
             </div>
-            {error ? <Banner intent="warning" density="sm" className="font-bold">{error}</Banner> : null}
+            {error ? <Banner intent="warning" density="sm">{error}</Banner> : null}
+            {selectedInstalledApp.setupUrl && serverId ? <AppSetupPanel clientId={selectedInstalledApp.id} serverId={serverId} /> : null}
             <OAuthScopeSummaryPanel
               title={formatMessage({ id: "settings.connectedApps.loginAccessTitle" })}
               description={formatMessage({ id: "settings.connectedApps.loginAccessDescription" })}
@@ -6452,48 +5785,55 @@ export function IntegrationsSection() {
               canManage={canManage}
               onError={setError}
             />
-            <div className="flex justify-end border-t-2 border-black pt-4">
-              <Button type="button" onClick={() => setSelectedInstalledApp(null)} size="md">{formatMessage({ id: "settings.common.close" })}</Button>
+            <div>
+              <Separator className="mb-4" />
+              <div className="flex justify-end">
+                <Button
+                  type="button" variant="outline" onClick={handleCloseInstalledApp} size="lg">{formatMessage({ id: "settings.common.close" })}</Button>
+              </div>
             </div>
-          </div>
+          </DialogSurface>
         </Modal>
       )}
 
       {selectedListing && (
-        <Modal onClose={() => setSelectedListing(null)}>
-          <div className="w-full max-w-2xl card-brutal space-y-4 p-5" aria-labelledby="connected-app-detail-title">
+        <Modal onClose={handleCloseListing}>
+          <DialogSurface className="w-full max-w-2xl gap-4 p-5" aria-labelledby="connected-app-detail-title">
             <div className="flex items-start justify-between gap-3">
               <div className="flex items-start gap-3">
                 <ConnectedAppLogo name={selectedListing.name} logoUrl={selectedListing.logoUrl} seed={selectedListing.defaultLogoSeed} size="lg" />
                 <div>
                   <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.appDetail" })}</SectionEyebrow>
                   <div className="mt-1 flex flex-wrap items-center gap-2">
-                    <h2 id="connected-app-detail-title" className="text-xl font-bold text-black">{selectedListing.name}</h2>
+                    <h2 id="connected-app-detail-title" className="text-headline text-foreground">{selectedListing.name}</h2>
                     <ConnectedAppMarketplaceInstallBadge badge={selectedListing.marketplaceInstallBadge} />
                   </div>
-                  <div className="mt-0.5 text-xs text-black/55">{formatMessage({ id: "settings.connectedApps.byLine" }, { category: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[selectedListing.category] ?? "settings.connectedApps.categoryOther" }), developer: selectedListing.developer })}</div>
+                  <div className="mt-0.5 text-footnote text-foreground-muted">{formatMessage({ id: "settings.connectedApps.byLine" }, { category: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[selectedListing.category] ?? "settings.connectedApps.categoryOther" }), developer: selectedListing.developer })}</div>
                 </div>
               </div>
-              <Button type="button" onClick={() => setSelectedListing(null)} shape="icon" aria-label={formatMessage({ id: "settings.connectedApps.closeAppDetail" })}>
+              <CloseButton
+                type="button" onClick={handleCloseListing}  aria-label={formatMessage({ id: "settings.connectedApps.closeAppDetail" })}>
                 <X size={14} />
-              </Button>
+              </CloseButton>
             </div>
             <ConnectedAppsErrorBanner surface={connectedAppsErrorSurface} target={CONNECTED_APPS_ERROR_LISTING} error={error} />
             <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.profile" })}>
-              <p className="mb-2 text-sm leading-relaxed text-black/70">{selectedListing.description}</p>
-              <div className="divide-y-2 divide-black/10 text-sm">
+              <p className="mb-2 text-callout text-foreground-muted">{selectedListing.description}</p>
+              <div className="text-callout">
                 <ConnectedAppDetailRow label={formatMessage({ id: "settings.connectedApps.publisher" })}>
                   {selectedListing.developer}
                 </ConnectedAppDetailRow>
+                <Separator />
                 <ConnectedAppDetailRow label={formatMessage({ id: "settings.connectedApps.homepageUrlLabel" })}>
                   {selectedListing.homepageUrl ? (
                     <ConnectedAppUrlLink url={selectedListing.homepageUrl} />
                   ) : (
-                    <span className="break-all font-mono text-xs font-bold text-black">{selectedListing.homepageDomain}</span>
+                    <span className="break-all font-mono text-mono-meta text-foreground">{selectedListing.homepageDomain}</span>
                   )}
                 </ConnectedAppDetailRow>
+                <Separator />
                 <ConnectedAppDetailRow label={formatMessage({ id: "settings.connectedApps.redirectCallback" })}>
-                  <span className="break-all font-mono text-xs font-bold text-black">{selectedListing.callbackDomain}</span>
+                  <span className="break-all font-mono text-mono-meta text-foreground">{selectedListing.callbackDomain}</span>
                 </ConnectedAppDetailRow>
               </div>
             </ConnectedAppDetailSection>
@@ -6507,313 +5847,205 @@ export function IntegrationsSection() {
                 scopes={selectedListing.allowedScopes}
               />
             </ConnectedAppDetailSection>
-            <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.appNotifications" })} tone="cream">
+            {selectedListing.setupUrl ? selectedListing.installed && serverId
+              ? <AppSetupPanel clientId={selectedListing.id} serverId={serverId} />
+              : <AppSetupRequirement url={selectedListing.setupUrl} description={selectedListing.setupDescription} /> : null}
+            <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.appPermissions" })} tone="cream">
               <AppNotificationRequestSummary
                 groups={selectedListing.appNotificationGroups}
                 events={selectedListing.appNotificationEvents}
+                pendingGroups={selectedListing.appNotificationPendingGroups}
+                pendingEvents={selectedListing.appNotificationPendingEvents}
+                pendingRevisionId={selectedListing.appNotificationPendingRevisionId}
                 reviewPending={selectedListing.appNotificationReviewPending}
+                canReview={selectedListing.canReviewAppNotifications}
+                reviewing={reviewingPermissionClientId === selectedListing.id}
+                onApprove={handleApproveAppPermissionUpdateClick}
               />
             </ConnectedAppDetailSection>
             <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.distribution" })} tone="cream">
-              <div className="text-xs leading-relaxed text-black/70">
+              <div className="text-footnote text-foreground-muted">
                 {formatMessage({ id: "settings.connectedApps.listingReviewNote" })}
               </div>
             </ConnectedAppDetailSection>
             {canManage && selectedListing.installed && (
               <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.dangerZone" })}>
                 <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="text-xs leading-relaxed text-black/60">
+                  <div className="text-footnote text-foreground-muted">
                     {formatMessage({ id: "settings.connectedApps.detail.removeInstalledDescription" })}
                   </div>
                   <Button
                     type="button"
                     disabled={savingClientId === selectedListing.id}
-                    onClick={() => {
-                      setError("");
-                      setMarketplaceUninstallTarget(selectedListing);
-                    }}
-                    tone="red"
-                    size="md"
+                    onClick={handleRequestUninstallSelectedListing}
+                    variant="danger"
+                    size="sm"
                   >
                     {savingClientId === selectedListing.id ? formatMessage({ id: "settings.connectedApps.uninstalling" }) : formatMessage({ id: "settings.connectedApps.uninstallFromServer" })}
                   </Button>
                 </div>
               </ConnectedAppDetailSection>
             )}
-            <div className="flex items-center justify-end gap-2 border-t-2 border-black pt-4">
-              <Button type="button" onClick={() => setSelectedListing(null)} size="md">
-                {canManage ? formatMessage({ id: "settings.common.cancel" }) : formatMessage({ id: "settings.common.close" })}
-              </Button>
-              {canManage && !selectedListing.installed && (
+            <div>
+              <Separator className="mb-4" />
+              <div className="flex items-center justify-end gap-2">
                 <Button
-                  type="button"
-                  disabled={savingClientId === selectedListing.id}
-                  onClick={() => void handleInstallMarketplaceApp(selectedListing)}
-                  tone="pink"
-                  size="md"
-                >
-                  {savingClientId === selectedListing.id ? formatMessage({ id: "settings.connectedApps.installing" }) : formatMessage({ id: "settings.connectedApps.installToServer" })}
+                  type="button" variant={canManage && !selectedListing.installed ? "ghost" : "outline"} onClick={handleCloseListing} size="lg">
+                  {canManage ? formatMessage({ id: "settings.common.cancel" }) : formatMessage({ id: "settings.common.close" })}
                 </Button>
-              )}
-            </div>
-          </div>
-        </Modal>
-      )}
-
-      {selectedBuiltInApp && (
-        <Modal onClose={() => setSelectedBuiltInApp(null)}>
-          <div className="w-full max-w-2xl card-brutal space-y-4 p-5" aria-labelledby="connected-built-in-app-detail-title">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-start gap-3">
-                <ConnectedAppLogo name={selectedBuiltInApp.name} logoUrl={selectedBuiltInApp.logoUrl} seed={selectedBuiltInApp.defaultLogoSeed} size="lg" />
-                <div>
-                  <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.builtInApp" })}</SectionEyebrow>
-                  <h2 id="connected-built-in-app-detail-title" className="mt-1 text-xl font-bold text-black">{selectedBuiltInApp.name}</h2>
-                  <div className="mt-0.5 text-xs text-black/55">{formatMessage({ id: "settings.connectedApps.builtInAvailableNoInstall" })}</div>
-                </div>
+                {canManage && !selectedListing.installed && (
+                  <Button
+                    type="button"
+                    disabled={savingClientId === selectedListing.id}
+                    onClick={handleInstallSelectedListing}
+                    variant="accent"
+                    size="lg"
+                  >
+                    {savingClientId === selectedListing.id ? formatMessage({ id: "settings.connectedApps.installing" }) : formatMessage({ id: "settings.connectedApps.installToServer" })}
+                  </Button>
+                )}
               </div>
-              <Button type="button" onClick={() => setSelectedBuiltInApp(null)} shape="icon" aria-label={formatMessage({ id: "settings.connectedApps.closeBuiltInDetail" })}>
-                <X size={14} />
-              </Button>
             </div>
-            <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.profile" })}>
-              {selectedBuiltInApp.description && (
-                <p className="mb-2 text-sm leading-relaxed text-black/70">{selectedBuiltInApp.description}</p>
-              )}
-              <div className="divide-y-2 divide-black/10 text-sm">
-                <ConnectedAppDetailRow label={formatMessage({ id: "settings.connectedApps.publisher" })}>
-                  {formatMessage({ id: "brand.productName" })}
-                </ConnectedAppDetailRow>
-                <ConnectedAppDetailRow label={formatMessage({ id: "settings.connectedApps.homepageUrlLabel" })}>
-                  {selectedBuiltInApp.homepageUrl ? (
-                    <ConnectedAppUrlLink url={selectedBuiltInApp.homepageUrl} />
-                  ) : (
-                    <span className="break-all font-mono text-xs font-bold text-black">{selectedBuiltInApp.homepageDomain ?? formatMessage({ id: "settings.connectedApps.notConfigured" })}</span>
-                  )}
-                </ConnectedAppDetailRow>
-              </div>
-            </ConnectedAppDetailSection>
-            <ConnectedAppDetailSection
-              title={formatMessage({ id: "settings.connectedApps.section.loginWithRaft" })}
-              description={formatMessage({ id: "settings.connectedApps.detail.builtInLoginDescription" })}
-              tone="cream"
-            >
-              <OAuthScopeSummaryPanel
-                title={formatMessage({ id: "settings.connectedApps.detail.requestableDeclared" })}
-                scopes={selectedBuiltInApp.allowedScopes}
-              />
-            </ConnectedAppDetailSection>
-            <ConnectedAppDetailSection title={formatMessage({ id: "settings.connectedApps.section.distribution" })} tone="cream">
-              <div className="text-xs leading-relaxed text-black/70">
-                {formatMessage({ id: "settings.connectedApps.builtInFirstParty" })}
-              </div>
-            </ConnectedAppDetailSection>
-            <div className="flex items-center justify-end gap-2 border-t-2 border-black pt-4">
-              <Button type="button" onClick={() => setSelectedBuiltInApp(null)} size="md">{formatMessage({ id: "settings.common.close" })}</Button>
-              <Button
-                type="button"
-                disabled={!selectedBuiltInApp.homepageUrl}
-                onClick={() => openBuiltInApp(selectedBuiltInApp)}
-                tone="pink"
-                size="md"
-              >
-                {formatMessage({ id: "settings.connectedApps.open" })}
-              </Button>
-            </div>
-          </div>
+          </DialogSurface>
         </Modal>
       )}
 
       {canManage && showRegisterDrawer && (
-        <Modal onClose={closeRegisterDrawer}>
-          <form
-            onSubmit={handleSaveClient}
-            className="card-brutal flex h-[min(52rem,calc(100dvh-2rem))] max-h-[calc(100dvh-2rem)] w-full max-w-5xl flex-col overflow-hidden bg-white"
-            aria-labelledby="connected-app-form-title"
-            data-testid="connected-app-editor"
-          >
-            <div className="flex flex-col gap-3 border-b-2 border-black bg-brutal-cream px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-              <div className="flex min-w-0 items-center gap-3">
-                <ConnectedAppLogo
-                  name={clientName || editingClient?.name || "App"}
-                  logoUrl={editingClient?.logoUrl}
-                  seed={clientId || editingClient?.clientId || "new-app"}
-                />
-                <div className="min-w-0">
-                  <SectionEyebrow as="div">{editingClient ? formatMessage({ id: "settings.connectedApps.editApp" }) : formatMessage({ id: "settings.connectedApps.registerApp" })}</SectionEyebrow>
-                  <h2 id="connected-app-form-title" className="mt-0.5 truncate text-xl font-black text-black">
-                    {editingClient ? editingClient.name : formatMessage({ id: "settings.connectedApps.newConnectedApp" })}
-                  </h2>
-                  <p className="mt-0.5 text-xs text-black/55">{formatMessage({ id: "settings.connectedApps.editor.headerDescription" })}</p>
-                </div>
-              </div>
-              <div className="flex shrink-0 items-center justify-end gap-2">
-                <Button
-                  type="button"
-                  onClick={closeRegisterDrawer}
-                  size="sm"
-                  shape="icon"
-                  aria-label={formatMessage({ id: "settings.connectedApps.closeAppForm" })}
-                >
-                  <X size={16} />
-                </Button>
-                <Button type="submit" disabled={submitting || appNotificationLoading || savingClientId === editingClient?.id} tone="pink" size="sm">
-                  {submitting ? formatMessage({ id: "settings.common.saving" }) : editingClient ? formatMessage({ id: "settings.common.save" }) : formatMessage({ id: "settings.connectedApps.registerApp" })}
-                </Button>
-              </div>
-            </div>
-            {(error || createdSecret) && (
-              <div className="space-y-2 border-b-2 border-black bg-white px-4 py-3">
-                <ConnectedAppsErrorBanner surface={connectedAppsErrorSurface} target={CONNECTED_APPS_ERROR_FORM} error={error} />
-                {renderClientSecretReveal()}
-              </div>
-            )}
-
-            <div className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] md:grid-cols-[220px_minmax(0,1fr)] md:grid-rows-1">
-              <nav
-                ref={appEditorRailRef}
-                className="flex gap-2 overflow-x-auto border-b-2 border-black bg-brutal-cream p-3 md:block md:space-y-2 md:overflow-y-auto md:border-b-0 md:border-r-2"
-                aria-label={formatMessage({ id: "settings.connectedApps.appEditorSectionsAriaLabel" })}
-                data-testid="connected-app-editor-rail"
+        <FormDialog
+          testId="connected-app-editor"
+          bodyTestId="connected-app-editor-content"
+          navTestId="connected-app-editor-nav"
+          navLabel={formatMessage({ id: "settings.connectedApps.appEditorSectionsAriaLabel" })}
+          sections={appEditorSections}
+          title={editingClient ? formatMessage({ id: "settings.connectedApps.editTitle" }, { name: editingClient.name }) : formatMessage({ id: "settings.connectedApps.registerApp" })}
+          leading={(
+            <ConnectedAppLogo
+              name={clientName || editingClient?.name || "App"}
+              logoUrl={editingClient?.logoUrl}
+              seed={clientId || editingClient?.clientId || "new-app"}
+              size="sm"
+            />
+          )}
+          closeLabel={formatMessage({ id: "settings.connectedApps.closeAppForm" })}
+          onClose={closeRegisterDrawer}
+          onSubmit={handleSaveClient}
+          notice={error || createdSecret ? (
+            <>
+              <ConnectedAppsErrorBanner surface={connectedAppsErrorSurface} target={CONNECTED_APPS_ERROR_FORM} error={error} />
+              {renderClientSecretReveal()}
+            </>
+          ) : null}
+          footer={(
+            <>
+              <Button type="button" variant="ghost" size="lg" onClick={closeRegisterDrawer}>
+                {formatMessage({ id: "settings.common.cancel" })}
+              </Button>
+              <Button
+                type="submit"
+                variant="accent"
+                size="lg"
+                disabled={isAppWhenToUseTooLong(clientWhenToUse) || submitting || appNotificationLoading || savingClientId === editingClient?.id}
               >
-                {appEditorSections.map((section) => (
-                  <button
-                    key={section.id}
-                    type="button"
-                    data-app-editor-section={section.id}
-                    onClick={() => scrollToAppEditorSection(section.id)}
-                    aria-current={appEditorSection === section.id ? "true" : undefined}
-                    className={`min-w-[155px] border-2 border-black px-3 py-2 text-left md:min-w-0 md:w-full ${
-                      appEditorSection === section.id ? "bg-soft-signal shadow-brutal-sm" : "bg-white"
-                    }`}
-                  >
-                    <span className="flex items-center gap-2 text-xs font-black text-black">
-                      {section.icon}
-                      {section.label}
-                    </span>
-                    <span className="mt-1 block truncate text-[10px] font-bold text-black/50">{section.status}</span>
-                  </button>
-                ))}
-              </nav>
-              <div
-                ref={appEditorContentRef}
-                onScroll={syncAppEditorSectionFromScroll}
-                className="min-h-0 space-y-4 overflow-y-auto bg-white p-4"
-                data-testid="connected-app-editor-content"
-              >
-
+                {submitting ? formatMessage({ id: "settings.common.saving" }) : editingClient ? formatMessage({ id: "settings.common.save" }) : formatMessage({ id: "settings.connectedApps.registerApp" })}
+              </Button>
+            </>
+          )}
+        >
             <ConnectedAppEditorSection
               sectionId="profile"
               title={formatMessage({ id: "settings.connectedApps.section.profile" })}
               description={formatMessage({ id: "settings.connectedApps.editor.profileDescription" })}
               status={profileStatus}
             >
-            <div className="grid gap-4 sm:grid-cols-[140px_minmax(0,1fr)]">
-              <div>
-                <FormField
-                  label={formatMessage({ id: "settings.connectedApps.logoLabel" })}
-                  labelStyle="plain"
-                  size="compact"
-                  hint={editingClient ? formatMessage({ id: "settings.connectedApps.logoHintEdit" }) : formatMessage({ id: "settings.connectedApps.logoHintNew" })}
-                >
-                  <div className="space-y-2">
-                    <div className="flex h-[120px] w-[120px] items-center justify-center border-2 border-dashed border-black bg-brutal-cream">
-                      <ConnectedAppLogo
-                        name={clientName || editingClient?.name || "App"}
-                        logoUrl={editingClient?.logoUrl}
-                        seed={clientId || editingClient?.clientId || "new-app"}
-                        size="lg"
-                      />
-                    </div>
-                    {editingClient && (
-                      <div className="flex flex-wrap gap-2">
-                        <input
-                          ref={logoInputRef}
-                          type="file"
-                          accept="image/png,image/jpeg,image/gif,image/webp"
-                          className="hidden"
-                          onChange={handleLogoFileChange}
-                        />
-                        <Button
-                          type="button"
-                          onClick={() => logoInputRef.current?.click()}
-                          disabled={logoUploading}
-                          size="sm"
-                          shape="iconText"
-                        >
-                          <Upload size={14} />
-                          {logoUploading ? formatMessage({ id: "settings.connectedApps.uploading" }) : editingClient.logoUrl ? formatMessage({ id: "settings.connectedApps.change" }) : formatMessage({ id: "settings.connectedApps.upload" })}
-                        </Button>
-                        {editingClient.logoUrl && (
-                          <Button
-                            type="button"
-                            onClick={() => void handleClearLogo()}
-                            disabled={logoUploading}
-                            size="sm"
-                          >
-                            {formatMessage({ id: "settings.connectedApps.reset" })}
-                          </Button>
-                        )}
-                      </div>
+            <FormField
+              label={formatMessage({ id: "settings.connectedApps.logoLabel" })}
+              hint={editingClient ? formatMessage({ id: "settings.connectedApps.logoHintEdit" }) : formatMessage({ id: "settings.connectedApps.logoHintNew" })}
+            >
+              <div className="flex items-center gap-4">
+                <ConnectedAppLogo
+                  name={clientName || editingClient?.name || "App"}
+                  logoUrl={editingClient?.logoUrl}
+                  seed={clientId || editingClient?.clientId || "new-app"}
+                  size="lg"
+                />
+                {editingClient && (
+                  <div className="flex flex-wrap gap-2">
+                    <input
+                      ref={logoInputRef}
+                      type="file"
+                      accept="image/png,image/jpeg,image/gif,image/webp"
+                      className="hidden"
+                      onChange={handleLogoFileChange}
+                    />
+                    <Button type="button" onClick={handlePickLogo} disabled={logoUploading} size="sm">
+                      <Upload size={16} />
+                      {logoUploading ? formatMessage({ id: "settings.connectedApps.uploading" }) : editingClient.logoUrl ? formatMessage({ id: "settings.connectedApps.change" }) : formatMessage({ id: "settings.connectedApps.upload" })}
+                    </Button>
+                    {editingClient.logoUrl && (
+                      <Button type="button" variant="ghost" onClick={handleClearLogo} disabled={logoUploading} size="sm">
+                        {formatMessage({ id: "settings.connectedApps.reset" })}
+                      </Button>
                     )}
                   </div>
-                </FormField>
+                )}
               </div>
-              <div className="space-y-3">
-                <FormField label={formatMessage({ id: "settings.connectedApps.appNameLabel" })} labelStyle="plain" size="compact">
-                  <input
-                    type="text"
-                    value={clientName}
-                    onChange={(event) => setClientName(event.target.value)}
-                    className="input-brutal w-full text-sm"
-                    placeholder={formatMessage({ id: "settings.connectedApps.appNamePlaceholder" })}
-                    required
-                  />
-                </FormField>
-                <FormField label={formatMessage({ id: "settings.connectedApps.homepageUrlFieldLabel" })} labelStyle="plain" size="compact">
-                  <input
-                    type="url"
-                    value={clientHomepageUrl}
-                    onChange={(event) => setClientHomepageUrl(event.target.value)}
-                    className="input-brutal w-full text-sm"
-                    placeholder="https://example.com"
-                  />
-                </FormField>
-                <FormField label={formatMessage({ id: "settings.connectedApps.categoryLabel" })} labelStyle="plain" size="compact">
-                  <Select
-                    value={clientCategory}
-                    onValueChange={(value) => {
-                      if (value == null) return;
-                      setClientCategory(value as ConnectedAppCategory);
-                    }}
-                    items={CONNECTED_APP_PUBLISH_CATEGORY_OPTIONS.map((option) => ({
-                      value: option.value,
-                      label: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[option.value] }),
-                    }))}
-                  >
-                    <SelectTrigger className="w-full" aria-label={formatMessage({ id: "settings.connectedApps.appCategoryAriaLabel" })}>
-                      <SelectValue placeholder={formatMessage({ id: "settings.connectedApps.categoryLabel" })} />
-                      <SelectIcon />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectList>{renderSelectItems(CONNECTED_APP_PUBLISH_CATEGORY_OPTIONS.map((option) => ({
-                        value: option.value,
-                        label: formatMessage({ id: CONNECTED_APP_CATEGORY_LABEL_ID[option.value] }),
-                      })))}</SelectList>
-                    </SelectContent>
-                  </Select>
-                </FormField>
-              </div>
+            </FormField>
+            <FormField label={formatMessage({ id: "settings.connectedApps.appNameLabel" })}>
+              <Input
+                type="text"
+                value={clientName}
+                onChange={handleClientNameChange}
+                className="w-full"
+                placeholder={formatMessage({ id: "settings.connectedApps.appNamePlaceholder" })}
+                required
+              />
+            </FormField>
+            <div className="grid gap-3 sm:grid-cols-2">
+              <FormField label={formatMessage({ id: "settings.connectedApps.homepageUrlFieldLabel" })}>
+                <Input
+                  type="url"
+                  value={clientHomepageUrl}
+                  onChange={handleClientHomepageUrlChange}
+                  className="w-full"
+                  render={<input placeholder="https://example.com" />}
+                />
+              </FormField>
+              <FormField label={formatMessage({ id: "settings.connectedApps.categoryLabel" })}>
+                <Select
+                  value={clientCategory}
+                  onValueChange={handleClientCategoryChange}
+                  items={publishCategoryItems}
+                >
+                  <SelectTrigger className="w-full" aria-label={formatMessage({ id: "settings.connectedApps.appCategoryAriaLabel" })}>
+                    <SelectValue placeholder={formatMessage({ id: "settings.connectedApps.categoryLabel" })} />
+                    <SelectIcon />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectList>{renderSelectItems(publishCategoryItems)}</SelectList>
+                  </SelectContent>
+                </Select>
+              </FormField>
             </div>
-            <FormField label={formatMessage({ id: "settings.connectedApps.descriptionLabel" })} labelStyle="plain" size="compact">
+            <FormField label={formatMessage({ id: "settings.connectedApps.descriptionLabel" })}>
               <Textarea
                 value={clientDescription}
-                onChange={(event) => setClientDescription(event.target.value)}
+                onChange={handleClientDescriptionChange}
                 rows={3}
                 placeholder={formatMessage({ id: "settings.connectedApps.descriptionPlaceholder" })}
                 className="resize-none"
               />
             </FormField>
+            <FormField label={formatMessage({ id: "settings.connectedApps.clientIdLabel" })} hint={formatMessage({ id: "settings.connectedApps.clientIdHint" })} optional>
+              <Input
+                type="text"
+                value={clientId}
+                onChange={handleClientIdChange}
+                className="w-full font-mono"
+                placeholder={formatMessage({ id: "settings.connectedApps.clientIdPlaceholder" })}
+                disabled={!!editingClient}
+              />
+            </FormField>
+            <AppWhenToUseField value={clientWhenToUse} onChange={handleClientWhenToUseChange} />
             </ConnectedAppEditorSection>
 
             <ConnectedAppEditorSection
@@ -6822,35 +6054,36 @@ export function IntegrationsSection() {
               description={formatMessage({ id: "settings.connectedApps.editor.loginDescription" })}
               status={loginStatus}
             >
-            <FormField label={formatMessage({ id: "settings.connectedApps.clientIdLabel" })} labelStyle="plain" size="compact" hint={formatMessage({ id: "settings.connectedApps.clientIdHint" })} optional>
-              <input
-                type="text"
-                value={clientId}
-                onChange={(event) => setClientId(event.target.value)}
-                className="input-brutal w-full font-mono text-sm disabled:bg-black/5 disabled:text-black/45"
-                placeholder={formatMessage({ id: "settings.connectedApps.clientIdPlaceholder" })}
-                disabled={!!editingClient}
-              />
-            </FormField>
-            <FormField label={formatMessage({ id: "settings.connectedApps.returnUrlLabel" })} labelStyle="plain" size="compact">
-              <input
+            <FormField label={formatMessage({ id: "settings.connectedApps.returnUrlLabel" })}>
+              <Input
                 type="url"
                 value={clientReturnUrl}
-                onChange={(event) => setClientReturnUrl(event.target.value)}
-                className="input-brutal w-full text-sm"
-                placeholder="https://example.com/login/callback"
+                onChange={handleClientReturnUrlChange}
+                className="w-full"
+                render={<input placeholder="https://example.com/login/callback" />}
               />
             </FormField>
-            <FormField label={formatMessage({ id: "settings.connectedApps.agentManifestLabel" })} labelStyle="plain" size="compact" optional>
-              <input
+            <FormField label={formatMessage({ id: "settings.connectedApps.agentManifestLabel" })} optional>
+              <Input
                 type="url"
                 value={clientAgentManifestUrl}
-                onChange={(event) => setClientAgentManifestUrl(event.target.value)}
-                className="input-brutal w-full text-sm"
-                placeholder="https://example.com/.well-known/raft-agent-manifest.json"
+                onChange={handleClientAgentManifestUrlChange}
+                className="w-full"
+                render={<input placeholder="https://example.com/.well-known/raft-agent-manifest.json" />}
               />
             </FormField>
             <DeclaredScopesPicker value={clientAllowedScopes} onChange={setClientAllowedScopes} />
+            </ConnectedAppEditorSection>
+            <ConnectedAppEditorSection sectionId="setup" title={formatMessage({ id: "appSetup.title" })} description={formatMessage({ id: "appSetup.editorHint" })} status={formatMessage({ id: clientSetupRequired ? "appSetup.requiredAfterInstall" : "appSetup.notRequired" })}>
+              <AppSetupFields required={clientSetupRequired} url={clientSetupUrl} description={clientSetupDescription} onRequiredChange={setClientSetupRequired} onUrlChange={handleClientSetupUrlChange} onDescriptionChange={handleClientSetupDescriptionChange} />
+            </ConnectedAppEditorSection>
+            <ConnectedAppEditorSection
+              sectionId="permissions"
+              title={formatMessage({ id: "settings.connectedApps.section.appPermissions" })}
+              description={formatMessage({ id: "settings.connectedApps.appPermissions.description" })}
+              status={appPermissionsStatus}
+            >
+              <DeveloperAppPermissions clientId={editingClient?.id ?? null} value={appNotificationSelection} onChange={setAppNotificationSelection} state={appNotificationState} loading={appNotificationLoading} />
             </ConnectedAppEditorSection>
             <ConnectedAppEditorSection
               sectionId="notifications"
@@ -6866,160 +6099,145 @@ export function IntegrationsSection() {
               state={appNotificationState}
               loading={appNotificationLoading}
               onConfigurationOpenChange={setAppNotificationConfigurationOpen}
-              onStateChange={(next) => {
-                setAppNotificationState(next);
-                const requested = next.pending_revision ?? { groups: next.current_groups, events: next.current_events };
-                setAppNotificationSelection({ groups: requested.groups, events: requested.events });
-              }}
+              onStateChange={handleAppNotificationStateChange}
               onError={setError}
             />
             </ConnectedAppEditorSection>
+            {/* Sharing, publishing and the app's lifecycle act on a saved app;
+                a new app's form stops at what can be filled in now (the
+                Webhook section says that it waits for the save). */}
+            {editingClient && (
             <ConnectedAppEditorSection
               sectionId="distribution"
               title={formatMessage({ id: "settings.connectedApps.section.distribution" })}
               description={formatMessage({ id: "settings.connectedApps.editor.distributionDescription" })}
               status={distributionStatus}
             >
-            {!editingClient ? (
-              <div className="border-l-4 border-black/30 bg-brutal-cream px-3 py-2 text-xs font-bold text-black/60">
-                {formatMessage({ id: "settings.connectedApps.saveBeforeShareOrReview" })}
-              </div>
-            ) : null}
-            {editingClient && sourceOwnedConnectedAppStatusHint(editingClient.publishStatus) ? (
-              <div className="border-l-4 border-soft-signal bg-soft-signal/20 px-3 py-2 text-xs leading-relaxed text-black/70">
+            {sourceOwnedConnectedAppStatusHint(editingClient.publishStatus) ? (
+              <Banner live={false} intent="warning" density="sm">
                 {formatMessage({ id: sourceOwnedConnectedAppStatusHint(editingClient.publishStatus)! })}
-              </div>
+              </Banner>
             ) : null}
-            {editingClient && (editingClient.publishStatus === "private" || editingClient.publishStatus === "rejected") && (
-              <div className="border-2 border-black bg-white p-3 shadow-brutal-sm" data-testid="connected-app-private-share-card">
-                <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
-                  <div>
-                    <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.privateShareTitle" })}</SectionEyebrow>
-                    <div className="mt-1 text-xs leading-relaxed text-black/60">
-                      {formatMessage({ id: "settings.connectedApps.privateShareDesc" })}
-                    </div>
+            {(editingClient.publishStatus === "private" || editingClient.publishStatus === "rejected") && (
+              <ConnectedAppEditorActionRow
+                testId="connected-app-private-share-card"
+                title={formatMessage({ id: "settings.connectedApps.privateShareTitle" })}
+                description={(
+                  <>
+                    {formatMessage({ id: "settings.connectedApps.privateShareDesc" })}
                     {shareLink && (
-                      <div className="mt-2 text-xs text-black/55">
+                      <span className="mt-1 block">
                         {formatMessage({ id: "settings.connectedApps.activeLinkExpires" }, { when: shareLink.expiresAt ? formatDate(shareLink.expiresAt) : formatMessage({ id: "settings.connectedApps.never" }) })}
-                      </div>
+                      </span>
                     )}
-                  </div>
-                  <div className="flex flex-wrap justify-end gap-2">
-                    <Button type="button" size="sm" onClick={() => void handleCreateShareLink()} disabled={shareLoading}>
+                  </>
+                )}
+                action={(
+                  <>
+                    <Button type="button" size="sm" onClick={handleCreateShareLink} disabled={shareLoading}>
                       {shareLoading ? formatMessage({ id: "settings.connectedApps.working" }) : shareLink ? formatMessage({ id: "settings.connectedApps.regenerate" }) : formatMessage({ id: "settings.connectedApps.createLink" })}
                     </Button>
                     {shareLink && (
-                      <Button type="button" size="sm" onClick={() => void handleRevokeShareLink()} disabled={shareLoading}>
+                      <Button type="button" variant="ghost" size="sm" onClick={handleRevokeShareLink} disabled={shareLoading}>
                         {formatMessage({ id: "settings.connectedApps.revoke" })}
                       </Button>
                     )}
-                  </div>
-                </div>
+                  </>
+                )}
+              >
                 {shareUrl && (
-                  <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center">
-                    <input
+                  <div className="flex gap-2">
+                    <Input
                       type="text"
                       readOnly
                       value={shareUrl}
-                      className="input-brutal min-w-0 flex-1 font-mono text-xs"
+                      className="min-w-0 flex-1 font-mono"
                       aria-label={formatMessage({ id: "settings.connectedApps.privateShareUrlAria" })}
                     />
-                    <Button type="button" size="sm" shape="iconText" onClick={() => void handleCopyShareUrl()}>
-                      {shareCopied ? <Check size={14} /> : <Copy size={14} />}
+                    <Button type="button" size="lg" onClick={handleCopyShareUrl}>
+                      {shareCopied ? <Check size={18} /> : <Copy size={18} />}
                       {shareCopied ? formatMessage({ id: "settings.connectedApps.copied" }) : formatMessage({ id: "settings.connectedApps.copy" })}
                     </Button>
                   </div>
                 )}
-              </div>
+              </ConnectedAppEditorActionRow>
             )}
-            {editingClient && (editingClient.publishStatus === "private" || editingClient.publishStatus === "rejected") && (
-              <div className="border-2 border-black bg-brutal-cream p-3 shadow-brutal-sm">
-                <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.publishRequestTitle" })}</SectionEyebrow>
-                <div className="mt-1 text-xs leading-relaxed text-black/60">
-                  {formatMessage({ id: "settings.connectedApps.distributionMetadataNote" })}
-                </div>
-                <div className="mt-3 flex justify-end">
+            {(editingClient.publishStatus === "private" || editingClient.publishStatus === "rejected") && (
+              <ConnectedAppEditorActionRow
+                title={formatMessage({ id: "settings.connectedApps.publishRequestTitle" })}
+                description={formatMessage({ id: "settings.connectedApps.distributionMetadataNote" })}
+                action={(
                   <Button
                     type="button"
-                    onClick={() => void handleRequestPublish(mapClientToRegisteredApp(editingClient))}
-                    disabled={savingClientId === editingClient.id}
-                    tone="pink"
+                    onClick={handleRequestPublishEditingClient}
+                    disabled={isAppWhenToUseTooLong(clientWhenToUse) || savingClientId === editingClient.id}
                     size="sm"
                   >
                     {savingClientId === editingClient.id ? formatMessage({ id: "settings.connectedApps.requesting" }) : formatMessage({ id: "settings.connectedApps.requestPublish" })}
                   </Button>
-                </div>
-              </div>
+                )}
+              />
             )}
-            {editingClient?.publishStatus === "published" ? (
-              <div className="border-l-4 border-brutal-lime bg-brutal-lime/15 px-3 py-2 text-xs leading-relaxed text-black/70">
+            {editingClient.publishStatus === "published" ? (
+              <Banner live={false} intent="success" density="sm">
                 {formatMessage({ id: "settings.connectedApps.publishedMarketplaceNote" })}
-              </div>
+              </Banner>
             ) : null}
             </ConnectedAppEditorSection>
+            )}
 
+            {editingClient && (
             <ConnectedAppEditorSection
               sectionId="danger"
               title={formatMessage({ id: "settings.connectedApps.section.dangerZone" })}
               description={formatMessage({ id: "settings.connectedApps.editor.dangerDescription" })}
-              status={formatMessage({ id: editingClient
-                ? "settings.connectedApps.editor.dangerStatusRestricted"
-                : "settings.connectedApps.editor.dangerStatusAvailableAfterSave" })}
-              tone="warning"
+              status={formatMessage({ id: "settings.connectedApps.editor.dangerStatusRestricted" })}
             >
-              {!editingClient ? (
-                <div className="text-xs font-bold leading-relaxed text-black/55">{formatMessage({ id: "settings.connectedApps.editor.saveBeforeLifecycle" })}</div>
-              ) : (
-                <>
-                  <div className="flex flex-col gap-3 border-2 border-black/20 bg-white p-3 sm:flex-row sm:items-start sm:justify-between">
-                    <div>
-                      <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.editor.clientSecretTitle" })}</SectionEyebrow>
-                      <div className="mt-1 text-xs leading-relaxed text-black/60">
-                        {formatMessage({ id: "settings.connectedApps.editor.clientSecretDescription" })}
-                      </div>
-                    </div>
-                    <Button
-                      type="button"
-                      size="sm"
-                      tone="yellow"
-                      onClick={() => setRegenerateSecretTarget(editingClient)}
-                      disabled={submitting || regeneratingClientId === editingClient.id}
-                      data-testid="connected-app-regenerate-secret-button"
-                    >
-                      {formatMessage({ id: regeneratingClientId === editingClient.id
-                        ? "settings.connectedApps.editor.regeneratingClientSecret"
-                        : "settings.connectedApps.editor.regenerateClientSecret" })}
+              <ConnectedAppEditorActionRow
+                title={formatMessage({ id: "settings.connectedApps.editor.clientSecretTitle" })}
+                description={formatMessage({ id: "settings.connectedApps.editor.clientSecretDescription" })}
+                action={(
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="warning"
+                    onClick={handleRequestRegenerateSecret}
+                    disabled={submitting || regeneratingClientId === editingClient.id}
+                    data-testid="connected-app-regenerate-secret-button"
+                  >
+                    {formatMessage({ id: regeneratingClientId === editingClient.id
+                      ? "settings.connectedApps.editor.regeneratingClientSecret"
+                      : "settings.connectedApps.editor.regenerateClientSecret" })}
+                  </Button>
+                )}
+              />
+              {canRequestOfflineSourceOwnedConnectedApp(editingClient.publishStatus) ? (
+                <ConnectedAppEditorActionRow
+                  title={formatMessage({ id: "settings.connectedApps.editor.marketplaceLifecycleTitle" })}
+                  description={formatMessage({ id: "settings.connectedApps.editor.marketplaceLifecycleDescription" })}
+                  action={(
+                    <Button type="button" size="sm" onClick={handleRequestOfflineEditingClient}>
+                      {formatMessage({ id: "settings.connectedApps.editor.requestOffline" })}
                     </Button>
-                  </div>
-                  {canRequestOfflineSourceOwnedConnectedApp(editingClient.publishStatus) ? (
-                    <div className="flex flex-col gap-3 border-2 border-black/20 bg-white p-3 sm:flex-row sm:items-start sm:justify-between">
-                      <div>
-                        <SectionEyebrow as="div">{formatMessage({ id: "settings.connectedApps.editor.marketplaceLifecycleTitle" })}</SectionEyebrow>
-                        <div className="mt-1 text-xs leading-relaxed text-black/60">{formatMessage({ id: "settings.connectedApps.editor.marketplaceLifecycleDescription" })}</div>
-                      </div>
-                      <Button type="button" size="sm" onClick={() => setOfflineRequestTarget(mapClientToRegisteredApp(editingClient))}>
-                        {formatMessage({ id: "settings.connectedApps.editor.requestOffline" })}
-                      </Button>
-                    </div>
-                  ) : null}
-                  {canDeleteSourceOwnedConnectedApp(editingClient.publishStatus) ? (
-                    <DangerActionCard
-                      testId="connected-app-delete-card"
-                      title={formatMessage({ id: "settings.connectedApps.deleteApp" })}
-                      description={formatMessage({ id: "settings.connectedApps.deleteAppDescription" })}
-                      actionLabel={formatMessage({ id: "settings.connectedApps.delete" })}
-                      actionIcon={<Trash2 size={14} />}
-                      actionSize="sm"
-                      onAction={() => setDeleteClientTarget(mapClientToRegisteredApp(editingClient))}
-                    />
-                  ) : null}
-                </>
-              )}
+                  )}
+                />
+              ) : null}
+              {canDeleteSourceOwnedConnectedApp(editingClient.publishStatus) ? (
+                <ConnectedAppEditorActionRow
+                  testId="connected-app-delete-card"
+                  title={formatMessage({ id: "settings.connectedApps.deleteApp" })}
+                  description={formatMessage({ id: "settings.connectedApps.deleteAppDescription" })}
+                  action={(
+                    <Button type="button" size="sm" variant="danger" onClick={handleRequestDeleteEditingClient}>
+                      <Trash2 size={16} />
+                      {formatMessage({ id: "settings.connectedApps.delete" })}
+                    </Button>
+                  )}
+                />
+              ) : null}
             </ConnectedAppEditorSection>
-              </div>
-            </div>
-          </form>
-        </Modal>
+            )}
+        </FormDialog>
       )}
 
       {canManage && deleteClientTarget && (
@@ -7029,7 +6247,7 @@ export function IntegrationsSection() {
           message={(
             <>
               {formatMessage({ id: "settings.connectedApps.deleteAppMessagePrefix" })}
-              <code className="font-mono font-bold">{deleteClientTarget.clientId}</code>
+              <code className="rounded-sticker bg-fill-muted px-1 font-mono text-mono-code text-foreground">{deleteClientTarget.clientId}</code>
               {formatMessage({ id: "settings.connectedApps.deleteAppMessageSuffix" })}
             </>
           )}
@@ -7038,8 +6256,8 @@ export function IntegrationsSection() {
           confirmIcon={<Trash2 size={14} />}
           confirmTestId="connected-app-delete-confirm-button"
           layer={showRegisterDrawer ? 1 : undefined}
-          onClose={() => setDeleteClientTarget(null)}
-          onConfirm={() => handleDeleteClient(deleteClientTarget)}
+          onClose={handleCloseDeleteClient}
+          onConfirm={handleConfirmDeleteClient}
         />
       )}
 
@@ -7053,17 +6271,17 @@ export function IntegrationsSection() {
             { id: "settings.connectedApps.editor.regenerateSecretConfirmMessage" },
             {
               clientId: regenerateSecretTarget.clientId,
-              code: (chunks) => <code key="client-id" className="font-mono font-bold">{chunks}</code>,
+              code: (chunks) => <code key="client-id" className="rounded-sticker bg-fill-muted px-1 font-mono text-mono-code text-foreground">{chunks}</code>,
             },
           )}
           confirmLabel={formatMessage({ id: "settings.connectedApps.editor.regenerateSecretConfirmLabel" })}
           loadingLabel={formatMessage({ id: "settings.connectedApps.editor.regeneratingClientSecret" })}
           confirmIcon={<AlertTriangle size={14} />}
-          confirmColor="bg-soft-signal"
+          confirmVariant="warning"
           confirmTestId="connected-app-regenerate-secret-confirm-button"
           layer={1}
-          onClose={() => setRegenerateSecretTarget(null)}
-          onConfirm={() => handleRegenerateClientSecret(regenerateSecretTarget)}
+          onClose={handleCloseRegenerateSecret}
+          onConfirm={handleConfirmRegenerateSecret}
         />
       )}
 
@@ -7077,15 +6295,16 @@ export function IntegrationsSection() {
             { id: "settings.connectedApps.editor.requestOfflineConfirmMessage" },
             {
               clientId: offlineRequestTarget.clientId,
-              code: (chunks) => <code key="client-id" className="font-mono font-bold">{chunks}</code>,
+              code: (chunks) => <code key="client-id" className="rounded-sticker bg-fill-muted px-1 font-mono text-mono-code text-foreground">{chunks}</code>,
             },
           )}
           confirmLabel={formatMessage({ id: "settings.connectedApps.editor.requestOffline" })}
           loadingLabel={formatMessage({ id: "settings.connectedApps.editor.requestOfflineConfirmLoading" })}
           confirmIcon={<Upload size={14} className="rotate-180" />}
+          confirmVariant="warning"
           layer={showRegisterDrawer ? 1 : undefined}
-          onClose={() => setOfflineRequestTarget(null)}
-          onConfirm={() => handleRequestOffline(offlineRequestTarget)}
+          onClose={handleCloseOfflineRequest}
+          onConfirm={handleConfirmOfflineRequest}
         />
       )}
 
@@ -7096,8 +6315,11 @@ export function IntegrationsSection() {
           message={(
             <>
               {formatMessage({ id: "settings.connectedApps.uninstallMessagePrefix" })}
-              <code className="font-mono font-bold">{marketplaceUninstallTarget.clientId}</code>
+              <code className="rounded-sticker bg-fill-muted px-1 font-mono text-mono-code text-foreground">{marketplaceUninstallTarget.clientId}</code>
               {formatMessage({ id: "settings.connectedApps.uninstallMessageSuffix" })}
+              {marketplaceUninstallTarget.official && (
+                <> {formatMessage({ id: "settings.connectedApps.uninstallOfficialOptOut" })}</>
+              )}
             </>
           )}
           confirmLabel={formatMessage({ id: "settings.connectedApps.uninstallApp" })}
@@ -7105,8 +6327,8 @@ export function IntegrationsSection() {
           confirmIcon={<Trash2 size={14} />}
           confirmTestId="connected-app-uninstall-confirm-button"
           layer={selectedListing?.id === marketplaceUninstallTarget.id ? 1 : undefined}
-          onClose={() => setMarketplaceUninstallTarget(null)}
-          onConfirm={() => handleUninstallMarketplaceApp(marketplaceUninstallTarget)}
+          onClose={handleCloseMarketplaceUninstall}
+          onConfirm={handleConfirmMarketplaceUninstall}
         />
       )}
     </div>
@@ -7126,19 +6348,24 @@ function PreJoinAgreementSection() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
+  const serverId = currentServer?.id;
 
-  // oxlint-disable react-hooks/exhaustive-deps -- load the agreement only when the active server id changes; depending on the whole `currentServer` store object would refetch on unrelated server-store churn.
-  // Async-loader: load agreement on server change. Same FP family as L1696.
+  // Read at failure time so a locale switch does not refetch the agreement.
+  const formatLoadError = useEffectEvent(() => formatMessage({ id: "settings.preJoinAgreement.failedLoad" }));
+
+  // Async-loader: load the agreement only when the active server id changes,
+  // not on unrelated churn of the `currentServer` store object. Same FP family
+  // as L1696.
   // oxlint-disable-next-line react-doctor/no-cascading-set-state
   useEffect(() => {
-    if (!currentServer) return;
+    if (!serverId) return;
     let cancelled = false;
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setLoading(true);
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setError("");
     void api
-      .get(`/servers/${currentServer.id}/agreement`)
+      .get(`/servers/${serverId}/agreement`)
       .then(({ data }) => {
         if (cancelled) return;
         const nextEnabled = !!data.enabled;
@@ -7158,7 +6385,7 @@ function PreJoinAgreementSection() {
         setError(
           typeof responseError === "string" && responseError.trim()
             ? responseError
-            : formatMessage({ id: "settings.preJoinAgreement.failedLoad" }),
+            : formatLoadError(),
         );
       })
       .finally(() => {
@@ -7167,27 +6394,32 @@ function PreJoinAgreementSection() {
     return () => {
       cancelled = true;
     };
-  }, [currentServer?.id]);
-  // oxlint-enable react-hooks/exhaustive-deps
+  }, [serverId]);
 
-  if (!currentServer) return null;
+  const handleEnabledChange = useCallback((checked: boolean) => {
+    setEnabled(checked);
+    setSaved(false);
+  }, []);
 
-  const dirty =
-    enabled !== savedEnabled
-    || title !== savedTitle
-    || bodyMarkdown !== savedBodyMarkdown;
+  const handleTitleChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    setTitle(event.target.value);
+    setSaved(false);
+  }, []);
+
+  const handleBodyMarkdownChange = useCallback((event: ChangeEvent<HTMLTextAreaElement>) => {
+    setBodyMarkdown(event.target.value);
+    setSaved(false);
+  }, []);
+
   const bodyMarkdownTooLong = bodyMarkdown.length > PRE_JOIN_AGREEMENT_BODY_MAX_LENGTH;
-  const bodyMarkdownError = bodyMarkdownTooLong
-    ? formatMessage({ id: "settings.preJoinAgreement.bodyTooLong" }, { max: PRE_JOIN_AGREEMENT_BODY_MAX_LENGTH_LABEL })
-    : "";
 
-  const handleSave = async () => {
-    if (bodyMarkdownTooLong) return;
+  const handleSave = useCallback(async () => {
+    if (!serverId || bodyMarkdownTooLong) return;
     setSaving(true);
     setSaved(false);
     setError("");
     try {
-      const { data } = await api.put(`/servers/${currentServer.id}/agreement`, {
+      const { data } = await api.put(`/servers/${serverId}/agreement`, {
         enabled,
         title,
         bodyMarkdown,
@@ -7208,7 +6440,17 @@ function PreJoinAgreementSection() {
     } finally {
       setSaving(false);
     }
-  };
+  }, [bodyMarkdown, bodyMarkdownTooLong, enabled, formatMessage, serverId, title]);
+
+  if (!currentServer) return null;
+
+  const dirty =
+    enabled !== savedEnabled
+    || title !== savedTitle
+    || bodyMarkdown !== savedBodyMarkdown;
+  const bodyMarkdownError = bodyMarkdownTooLong
+    ? formatMessage({ id: "settings.preJoinAgreement.bodyTooLong" }, { max: PRE_JOIN_AGREEMENT_BODY_MAX_LENGTH_LABEL })
+    : "";
 
   return (
     <div className="mb-6">
@@ -7218,21 +6460,17 @@ function PreJoinAgreementSection() {
         label={formatMessage({ id: "settings.preJoinAgreement.sectionLabel" })}
       />
 
-      <div className="border-2 border-black bg-white shadow-brutal-sm p-4 space-y-4">
-        <label className={`flex items-start gap-3 ${saving || loading ? "opacity-60" : ""}`}>
+      <Card className="space-y-4 p-4">
+        <label className={`flex items-start gap-3 ${saving || loading ? "cursor-not-allowed" : ""}`}>
           <Checkbox
-            size="md"
             checked={enabled}
             disabled={saving || loading}
-            onChange={(event) => {
-              setEnabled(event.currentTarget.checked);
-              setSaved(false);
-            }}
+            onCheckedChange={handleEnabledChange}
             className="mt-0.5"
           />
           <span className="min-w-0">
-            <span className="block text-sm font-bold text-black">{formatMessage({ id: "settings.preJoinAgreement.requireTitle" })}</span>
-            <span className="block text-xs text-black/60 mt-0.5">
+            <span className={`block text-subhead font-semibold ${saving || loading ? "text-foreground-disabled" : "text-foreground"}`}>{formatMessage({ id: "settings.preJoinAgreement.requireTitle" })}</span>
+            <span className="block text-footnote text-foreground-muted mt-0.5">
               {formatMessage({ id: "settings.preJoinAgreement.requireDescription" })}
             </span>
           </span>
@@ -7240,36 +6478,40 @@ function PreJoinAgreementSection() {
 
         {enabled && (
           <>
-            <FormField label={formatMessage({ id: "settings.preJoinAgreement.titleLabel" })} labelStyle="plain" size="compact">
-              <input
+            <FormField label={formatMessage({ id: "settings.preJoinAgreement.titleLabel" })} size="compact">
+              <Input
                 value={title}
-                onChange={(event) => {
-                  setTitle(event.target.value);
-                  setSaved(false);
-                }}
+                onChange={handleTitleChange}
                 maxLength={160}
                 disabled={saving || loading}
-                className="w-full border-2 border-black p-2 text-sm shadow-brutal-sm focus:shadow-brutal focus:outline-none disabled:opacity-60"
+                className="w-full"
               />
             </FormField>
-            <FormField label={formatMessage({ id: "settings.preJoinAgreement.bodyLabel" })} labelStyle="plain" size="compact">
+            <FormField label={formatMessage({ id: "settings.preJoinAgreement.bodyLabel" })} size="compact">
               <Textarea
                 value={bodyMarkdown}
-                onChange={(event) => {
-                  setBodyMarkdown(event.target.value);
-                  setSaved(false);
-                }}
+                onChange={handleBodyMarkdownChange}
                 rows={7}
-                limit={PRE_JOIN_AGREEMENT_BODY_MAX_LENGTH}
-                showCounter
-                error={bodyMarkdownError}
+                maxLength={PRE_JOIN_AGREEMENT_BODY_MAX_LENGTH}
+                aria-invalid={bodyMarkdownError ? true : undefined}
+                aria-describedby={bodyMarkdownError ? "pre-join-agreement-error" : "pre-join-agreement-counter"}
                 disabled={saving || loading}
-                className="resize-y font-mono text-xs disabled:opacity-60"
+                className="resize-y font-mono"
               />
+              <div className="mt-1 flex items-start justify-between gap-3">
+                {bodyMarkdownError ? (
+                  <p id="pre-join-agreement-error" role="alert" className="text-caption text-danger-strong">
+                    {bodyMarkdownError}
+                  </p>
+                ) : (
+                  <span />
+                )}
+                <TextareaCounter id="pre-join-agreement-counter" value={bodyMarkdown} limit={PRE_JOIN_AGREEMENT_BODY_MAX_LENGTH} />
+              </div>
             </FormField>
-            <div className="border-2 border-black/30 bg-brutal-cream p-3">
-              <div className="mb-2 text-[11px] font-bold uppercase tracking-widest text-black/50">{formatMessage({ id: "settings.preJoinAgreement.preview" })}</div>
-              <div className="text-sm">
+            <div className="rounded-container border border-line-hairline bg-layer-canvas p-3">
+              <SectionEyebrow as="div" className="mb-2">{formatMessage({ id: "settings.preJoinAgreement.preview" })}</SectionEyebrow>
+              <div className="text-callout">
                 <AgreementBody source={bodyMarkdown} />
               </div>
             </div>
@@ -7277,25 +6519,25 @@ function PreJoinAgreementSection() {
         )}
 
         {error && (
-          <Banner intent="warning" density="sm" className="font-bold">
+          <Banner intent="warning" density="sm">
             {error}
           </Banner>
         )}
 
         <div className="flex flex-col items-start gap-2">
-          <div className="text-[11px] text-black/50">
+          <div className="text-caption text-foreground-hint">
             {formatMessage({ id: "settings.preJoinAgreement.versionNote" })}
           </div>
-          <button
+          <Button
+            variant="accent" size="sm"
             type="button"
             onClick={handleSave}
             disabled={!dirty || bodyMarkdownTooLong || saving || loading}
-            className="btn-brutal bg-brutal-pink px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
           >
             {saving ? formatMessage({ id: "settings.common.saving" }) : saved ? formatMessage({ id: "settings.common.saved" }) : formatMessage({ id: "settings.common.save" })}
-          </button>
+          </Button>
         </div>
-      </div>
+      </Card>
     </div>
   );
 }
@@ -7306,6 +6548,7 @@ function ServerTabContent() {
       <ProfileSection />
       <PublicVisibilitySection />
       <ArchivedChannelsSection />
+      <ArchivedAgentsSection />
       <DangerZoneSection />
     </>
   );
@@ -7334,9 +6577,9 @@ function BillingTabContent() {
           icon={<CreditCard size={16} />}
           label={formatMessage({ id: "billing.billing" })}
         />
-        <div className="border-2 border-black bg-white p-4 text-sm text-black/60 shadow-brutal-sm">
+        <Card className="p-4 text-callout text-foreground-muted">
           {formatMessage({ id: "billing.onlyServerOwnersAndAdminsCanViewBilling" })}
-        </div>
+        </Card>
       </div>
     );
   }
@@ -7358,6 +6601,7 @@ function AdministrationTabContent() {
       {capabilities.editServerSettings && <PreJoinAgreementSection />}
       <OnboardingAgentSection />
       <ServerTranslationSection />
+      {capabilities.editServerSettings && <WorkspaceProductAnalyticsSection />}
       <MemberPermissionsSection />
     </>
   );
@@ -7378,10 +6622,27 @@ export const ADMINISTRATION_VISUAL_SECTIONS = {
   "pre-join-agreement": PreJoinAgreementSection,
   onboarding: OnboardingAgentSection,
   translation: ServerTranslationSection,
+  "product-analytics": WorkspaceProductAnalyticsSection,
   "member-permissions": MemberPermissionsSection,
 } as const;
 
-function AppearanceSection() {
+export function AppearanceThemeSettingsControl() {
+  const theme = useOptionalAppTheme();
+  if (!theme) return null;
+  return <AppearanceThemePicker mode={theme.mode} onModeChange={theme.setMode} />;
+}
+
+/**
+ * `publicSurface`: the public server page (anonymous or nonmember reader). It has
+ * no live agent activity bar, carries no agent model on messages and has no
+ * Pinned / Joint / DM sidebar groups, so those three device toggles would do
+ * nothing visible there (cindyz, #wg-rbac:22e4889c). Anonymous visitors only
+ * need the browser-local theme picker on this surface (cindyz,
+ * #wg-rbac:a88cfff6), so every other appearance control stays member-only.
+ */
+// Exported for publicSettingsAppearance.behavior.test.tsx (rendered directly,
+// same precedent as AboutSection).
+export function AppearanceSection({ publicSurface = false }: { publicSurface?: boolean }) {
   const { formatMessage } = useIntl();
   const messageBodyFontSize = useAppearanceStore((s) => s.messageBodyFontSize);
   const setMessageBodyFontSize = useAppearanceStore((s) => s.setMessageBodyFontSize);
@@ -7389,6 +6650,8 @@ function AppearanceSection() {
   const setShowLiveAgentActivityBar = useAppearanceStore((s) => s.setShowLiveAgentActivityBar);
   const showAgentModelName = useAppearanceStore((s) => s.showAgentModelName);
   const setShowAgentModelName = useAppearanceStore((s) => s.setShowAgentModelName);
+  const hideEmptySidebarSections = useAppearanceStore((s) => s.hideEmptySidebarSections);
+  const setHideEmptySidebarSections = useAppearanceStore((s) => s.setHideEmptySidebarSections);
   const previewMessage = useMemo<Message>(() => ({
     id: "appearance-preview-message",
     channelId: APPEARANCE_PREVIEW_CHANNEL.id,
@@ -7404,17 +6667,25 @@ function AppearanceSection() {
 
   return (
     <div className="mb-6">
-      <div className="flex items-center gap-2 mb-3">
-        <Type size={16} className="text-black/60" />
-        <span className="text-xs font-bold uppercase text-black/60 tracking-widest">
-          {formatMessage({ id: "settings.appearance.sectionLabel" })}
-        </span>
-      </div>
+      <Card className="mb-6 p-4">
+        <div className="mb-3">
+          <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.appearance.themeTitle" })}</div>
+          <p className="mt-1 text-footnote text-foreground-muted">{formatMessage({ id: "settings.appearance.themeDescription" })}</p>
+        </div>
+        <AppearanceThemeSettingsControl />
+      </Card>
+      {!publicSurface && (
+        <>
+      <SectionHeader
+        className="mb-3"
+        icon={<Type size={16} />}
+        label={formatMessage({ id: "settings.appearance.sectionLabel" })}
+      />
 
-      <div className="border-2 border-black bg-white shadow-brutal-sm p-4 space-y-4">
+      <Card className="space-y-4 p-4">
         <div>
-          <div className="text-sm font-bold text-black">{formatMessage({ id: "settings.appearance.messageFontSizeTitle" })}</div>
-          <p className="mt-1 text-xs text-black/55">
+          <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "settings.appearance.messageFontSizeTitle" })}</div>
+          <p className="mt-1 text-footnote text-foreground-muted">
             {formatMessage({ id: "settings.appearance.messageFontSizeDescription" })}
           </p>
         </div>
@@ -7424,74 +6695,89 @@ function AppearanceSection() {
           onValueChange={setMessageBodyFontSize}
         />
 
-        <div className="text-[11px] font-bold text-black/45">
+        <div className="text-caption text-foreground-hint">
           {formatMessage({ id: "settings.appearance.savedOnDevice" })}
         </div>
 
         <div className="space-y-2">
-          <div className="text-[10px] font-bold uppercase tracking-widest text-black/50">
+          <SectionEyebrow as="div">
             {formatMessage({ id: "settings.appearance.preview" })}
-          </div>
-          <div className="pointer-events-none -mx-2" aria-label={formatMessage({ id: "settings.appearance.fontSizePreviewAria" })}>
+          </SectionEyebrow>
+          <div className="pointer-events-none -mx-2 rounded-control bg-layer-canvas" aria-label={formatMessage({ id: "settings.appearance.fontSizePreviewAria" })}>
             <MessageItem
               message={previewMessage}
               mentionMap={APPEARANCE_PREVIEW_MENTION_MAP}
-              channels={[APPEARANCE_PREVIEW_CHANNEL]}
+              channels={APPEARANCE_PREVIEW_CHANNELS}
               previewSenderAgent={APPEARANCE_PREVIEW_AGENT}
               hideThreadActions
             />
           </div>
         </div>
-      </div>
+      </Card>
 
-      <div className="mt-4 border-2 border-black bg-white p-4 shadow-brutal-sm">
-        <div className="flex items-start justify-between gap-4">
-          <span className="min-w-0">
-            <span id="live-agent-activity-setting-label" className="block text-sm font-bold text-black">
-              {formatMessage({ id: "settings.appearance.liveAgentActivityTitle" })}
-            </span>
-            <span id="live-agent-activity-setting-description" className="mt-0.5 block text-xs leading-5 text-black/60">
-              {formatMessage({ id: "settings.appearance.liveAgentActivityDescription" })}
-            </span>
-            <span className="mt-2 block text-[11px] font-bold text-black/45">
-              {formatMessage({ id: "settings.appearance.savedOnDevice" })}
-            </span>
-          </span>
-          <Switch
-            size="md"
-            checked={showLiveAgentActivityBar}
-            onCheckedChange={setShowLiveAgentActivityBar}
-            aria-labelledby="live-agent-activity-setting-label"
-            aria-describedby="live-agent-activity-setting-description"
-            className="mt-0.5 shrink-0"
-          />
-        </div>
-      </div>
-
-      <div className="mt-4 border-2 border-black bg-white p-4 shadow-brutal-sm">
-        <div className="flex items-start justify-between gap-4">
-          <span className="min-w-0">
-            <span id="agent-model-name-setting-label" className="block text-sm font-bold text-black">
-              {formatMessage({ id: "settings.appearance.showAgentModelNameTitle" })}
-            </span>
-            <span id="agent-model-name-setting-description" className="mt-0.5 block text-xs leading-5 text-black/60">
-              {formatMessage({ id: "settings.appearance.showAgentModelNameDescription" })}
-            </span>
-            <span className="mt-2 block text-[11px] font-bold text-black/45">
-              {formatMessage({ id: "settings.appearance.savedOnDevice" })}
-            </span>
-          </span>
-          <Switch
-            size="md"
-            checked={showAgentModelName}
-            onCheckedChange={setShowAgentModelName}
-            aria-labelledby="agent-model-name-setting-label"
-            aria-describedby="agent-model-name-setting-description"
-            className="mt-0.5 shrink-0"
-          />
-        </div>
-      </div>
-
+        {/* DS ListRow › setting rows (`plain`, display-only: the Switch is the
+            target) in an inset group, hairlines from the 16px edge. */}
+        <ListRowGroup className="mt-4">
+          <ListRow variant="plain" interactive={false}>
+            <ListRowBody>
+              <ListRowTitle id="live-agent-activity-setting-label">
+                {formatMessage({ id: "settings.appearance.liveAgentActivityTitle" })}
+              </ListRowTitle>
+              <ListRowDescription id="live-agent-activity-setting-description" wrap>
+                {formatMessage({ id: "settings.appearance.liveAgentActivityDescription" })}
+              </ListRowDescription>
+              <span className="text-caption text-foreground-hint">
+                {formatMessage({ id: "settings.appearance.savedOnDevice" })}
+              </span>
+            </ListRowBody>
+            <Switch
+              checked={showLiveAgentActivityBar}
+              onCheckedChange={setShowLiveAgentActivityBar}
+              aria-labelledby="live-agent-activity-setting-label"
+              aria-describedby="live-agent-activity-setting-description"
+            />
+          </ListRow>
+          <ListRow variant="plain" interactive={false}>
+            <ListRowBody>
+              <ListRowTitle id="agent-model-name-setting-label">
+                {formatMessage({ id: "settings.appearance.showAgentModelNameTitle" })}
+              </ListRowTitle>
+              <ListRowDescription id="agent-model-name-setting-description" wrap>
+                {formatMessage({ id: "settings.appearance.showAgentModelNameDescription" })}
+              </ListRowDescription>
+              <span className="text-caption text-foreground-hint">
+                {formatMessage({ id: "settings.appearance.savedOnDevice" })}
+              </span>
+            </ListRowBody>
+            <Switch
+              checked={showAgentModelName}
+              onCheckedChange={setShowAgentModelName}
+              aria-labelledby="agent-model-name-setting-label"
+              aria-describedby="agent-model-name-setting-description"
+            />
+          </ListRow>
+          <ListRow variant="plain" interactive={false}>
+            <ListRowBody>
+              <ListRowTitle id="hide-empty-sidebar-sections-setting-label">
+                {formatMessage({ id: "settings.appearance.hideEmptySidebarSectionsTitle" })}
+              </ListRowTitle>
+              <ListRowDescription id="hide-empty-sidebar-sections-setting-description" wrap>
+                {formatMessage({ id: "settings.appearance.hideEmptySidebarSectionsDescription" })}
+              </ListRowDescription>
+              <span className="text-caption text-foreground-hint">
+                {formatMessage({ id: "settings.appearance.savedOnDevice" })}
+              </span>
+            </ListRowBody>
+            <Switch
+              checked={hideEmptySidebarSections}
+              onCheckedChange={setHideEmptySidebarSections}
+              aria-labelledby="hide-empty-sidebar-sections-setting-label"
+              aria-describedby="hide-empty-sidebar-sections-setting-description"
+            />
+          </ListRow>
+        </ListRowGroup>
+        </>
+      )}
     </div>
   );
 }
@@ -7500,7 +6786,13 @@ function AppearanceSection() {
 // zh teeth exercise the real component without mounting the full SettingsPanel
 // (whose account tab reads the Vite-only `import.meta.env` graph). Same precedent
 // as the exported `AccountSection` used by sub-batch A.
-export function AboutSection({ appVersion = WEB_APP_VERSION }: { appVersion?: string } = {}) {
+export function AboutSection({
+  appVersion = WEB_APP_VERSION,
+  showWorkspace = true,
+}: {
+  appVersion?: string;
+  showWorkspace?: boolean;
+} = {}) {
   const { formatMessage } = useIntl();
   const currentServer = useServerStore((s) => s.current);
   // Absolute, because the phone scanning this is not on our origin — a relative
@@ -7516,18 +6808,31 @@ export function AboutSection({ appVersion = WEB_APP_VERSION }: { appVersion?: st
   // the API origin can never open the app, however correct the native side is
   // (@Mahua). The chooser at /download is public and does the platform split,
   // so nothing is lost for someone who does not have the app.
-  const mobileDownloadQrUrl = `${typeof window === "undefined" ? "" : window.location.origin}${MOBILE_DOWNLOAD_CHOOSER_PATH}`;
+  const mobileDownloadQrUrl = `${typeof window === "undefined" ? "" : shareableWebOrigin()}${MOBILE_DOWNLOAD_CHOOSER_PATH}`;
 
   return (
-    <div className="space-y-4">
-      <section className="space-y-2">
+    <div className="space-y-6">
+      <section className="space-y-3">
         <SectionHeader label={formatMessage({ id: "settings.about.versionSectionLabel" })} icon={<Tag size={16} />} />
         <SurfaceListItem interactive={false} className="space-y-1">
           {/* Product wordmark — catalog brand id; locale values may match. */}
-          <div className="text-sm font-bold text-black">{formatMessage({ id: "brand.productName" })}</div>
-          <div className="text-xs text-black/60">{appVersion}</div>
+          <div className="text-subhead font-semibold text-foreground">{formatMessage({ id: "brand.productName" })}</div>
+          <div className="font-mono text-mono-meta text-foreground-muted">{appVersion}</div>
         </SurfaceListItem>
       </section>
+
+      {/*
+        Desktop app: offered on the web only. Inside Raft Desktop the reader
+        already has it, and updates arrive in-app.
+      */}
+      {isElectronDesktopShell() ? null : (
+        <section className="space-y-3">
+          <SectionHeader label={formatMessage({ id: "settings.desktopApp.sectionLabel" })} icon={<Monitor size={16} />} />
+          <SurfaceListItem interactive={false}>
+            <DesktopDownloadOptions />
+          </SurfaceListItem>
+        </section>
+      )}
 
       {/*
         Mobile app is a companion surface, not an entry point: someone who
@@ -7536,38 +6841,52 @@ export function AboutSection({ appVersion = WEB_APP_VERSION }: { appVersion?: st
         menu carries only a signpost to it — this section is the single content
         host, so there is exactly one place to keep current.
       */}
-      <section className="space-y-2">
+      <section className="space-y-3">
         <SectionHeader label={formatMessage({ id: "settings.mobileApp.sectionLabel" })} icon={<Smartphone size={16} />} />
         <SurfaceListItem interactive={false}>
           <div className="min-w-0 space-y-3">
-            <div className="text-xs text-black/60">{formatMessage({ id: "settings.mobileApp.description" })}</div>
+            <div className="text-footnote text-foreground-muted">{formatMessage({ id: "settings.mobileApp.description" })}</div>
             {/* Both buttons are peers, deliberately. A primary/secondary pair
                 reads as a recommendation, and we have no basis for one: the
                 person's phone is not the device rendering this, so we cannot
                 know which applies to them. Styling Android as the CTA sent
                 iPhone users looking for the "real" button (@wenyi). */}
             <div className="flex flex-wrap gap-2">
-              <a
-                className="btn-brutal-sm bg-white px-3 py-1.5 text-sm font-bold"
-                href={mobileDownloadUrl("android")}
-                data-testid="mobile-download-android"
+              <Button
+                render={(
+                  <a
+                    href={mobileDownloadUrl("android")}
+                    aria-label={formatMessage({ id: "settings.mobileApp.android" })}
+                    data-testid="mobile-download-android"
+                  />
+                )}
+                nativeButton={false}
+                size="sm"
+                variant="outline"
               >
                 {formatMessage({ id: "settings.mobileApp.android" })}
-              </a>
+              </Button>
               {/* New tab, because this one LEAVES Raft: our route 302s to
                   testflight.apple.com. Android deliberately does NOT get this —
                   it resolves to a file download, and a download in a fresh tab
                   strands an empty tab behind it. The asymmetry is the point
                   (@wenyi). */}
-              <a
-                className="btn-brutal-sm bg-white px-3 py-1.5 text-sm font-bold"
-                href={mobileDownloadUrl("ios")}
-                target="_blank"
-                rel="noopener noreferrer"
-                data-testid="mobile-download-ios"
+              <Button
+                render={(
+                  <a
+                    href={mobileDownloadUrl("ios")}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    aria-label={formatMessage({ id: "settings.mobileApp.ios" })}
+                    data-testid="mobile-download-ios"
+                  />
+                )}
+                nativeButton={false}
+                size="sm"
+                variant="outline"
               >
                 {formatMessage({ id: "settings.mobileApp.ios" })}
-              </a>
+              </Button>
             </div>
             {/* Left-aligned with the rest of the card rather than pinned to the
                 far edge: on a wide settings panel the right edge is a long way
@@ -7582,13 +6901,13 @@ export function AboutSection({ appVersion = WEB_APP_VERSION }: { appVersion?: st
         </SurfaceListItem>
       </section>
 
-      <section className="space-y-2">
+      {showWorkspace ? <section className="space-y-3" data-testid="settings-about-workspace">
         <SectionHeader label={formatMessage({ id: "settings.about.workspaceSectionLabel" })} icon={<Building2 size={16} />} />
         <SurfaceListItem interactive={false} className="space-y-1">
-          <div className="text-sm font-bold text-black">{currentServer?.name ?? formatMessage({ id: "settings.about.workspaceNameFallback" })}</div>
-          <div className="text-xs text-black/60">{currentServer?.slug ? `/${currentServer.slug}` : formatMessage({ id: "settings.about.workspaceDetailsFallback" })}</div>
+          <div className="text-subhead font-semibold text-foreground">{currentServer?.name ?? formatMessage({ id: "settings.about.workspaceNameFallback" })}</div>
+          <div className={currentServer?.slug ? "font-mono text-mono-meta text-foreground-muted" : "text-footnote text-foreground-muted"}>{currentServer?.slug ? `/${currentServer.slug}` : formatMessage({ id: "settings.about.workspaceDetailsFallback" })}</div>
         </SurfaceListItem>
-      </section>
+      </section> : null}
     </div>
   );
 }
@@ -7603,57 +6922,39 @@ function McpSettingsSection() {
   );
 }
 
-// NOT exported for tests: this card is gated by useWorkspaceGridAvailability(),
-// which reads `import.meta.env.DEV` — undefined in the node test harness, so it
-// throws before rendering. Its `settings.workspaceMode.*` ids therefore have only
-// catalog-parity coverage in settingsSubBatchC.i18n.behavior.test.tsx, not a
-// render tooth; see the GAP note there.
-function WorkspaceModeSettingsCard() {
-  const { formatMessage } = useIntl();
-  const availability = useWorkspaceGridAvailability();
-  const userId = useAuthStore((s) => s.user?.id ?? null);
-  const enabled = useWorkspaceGridNavigationStore((s) => s.enabled);
-  const setEnabled = useWorkspaceGridNavigationStore((s) => s.setEnabled);
-  if (!availability.resolved || !availability.enabled) return null;
-
-  return (
-    <label className="mb-4 flex items-center justify-between gap-4 border-2 border-black bg-brutal-cream p-4 shadow-brutal-sm">
-      <span className="min-w-0">
-        <span className="block text-sm font-bold">{formatMessage({ id: "settings.workspaceMode.title" })}</span>
-        <span className="mt-1 block text-xs leading-5 text-black/60">{formatMessage({ id: "settings.workspaceMode.description" })}</span>
-      </span>
-      <input
-        type="checkbox"
-        checked={enabled}
-        onChange={(event) => setEnabled(event.currentTarget.checked, userId)}
-        className="size-5 shrink-0 accent-black"
-      />
-    </label>
-  );
-}
-
 export default function SettingsPanel({
   tab: tabProp,
   accountInitialError,
   accountPasswordChangeIntent = false,
+  showAboutWorkspace = true,
+  publicTranslationContext,
+  publicSurface = false,
 }: {
   tab?: string;
   accountInitialError?: string;
   accountPasswordChangeIntent?: boolean;
+  showAboutWorkspace?: boolean;
+  publicTranslationContext?: PublicTranslationSettingsContext;
+  /** Rendered inside the public server page (anonymous or nonmember). */
+  publicSurface?: boolean;
 }) {
   const { formatMessage } = useIntl();
+  // A host-shell embed skips the chat startup loads, and the channel list is one
+  // of them. Two sections here read it (system channels, archived channels), so
+  // settings asks for it itself there.
+  const settingsServerId = useServerStore((s) => s.current?.id ?? null);
+  useEffect(() => {
+    if (!hasChatSurfaces() && settingsServerId) void useChannelStore.getState().loadChannels();
+  }, [settingsServerId]);
   const requestedSettingsTab = normalizeSettingsTab(tabProp);
   const providerConnectionsEnabled = useServerFeatureFlag(PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY).enabled;
   const slackBridgeGate = useServerFeatureFlag(SLACK_BRIDGE_FEATURE_FLAG_KEYS.master);
   const slackBridgeEnabled = isSlackBridgeSurfaceEnabled(slackBridgeGate);
-  const wikiEnabled = useServerFeatureFlag(WIKI_FEATURE_FLAG_KEY).enabled;
   const { capabilities, role } = useServerPermissions();
   const settingsTab = (
     (requestedSettingsTab === "providers" && (!providerConnectionsEnabled || !capabilities.manageExternalAuth))
     || (requestedSettingsTab === "im-bridges" && !slackBridgeEnabled)
   )
-    ? "account"
-    : requestedSettingsTab === "wiki" && (!wikiEnabled || !capabilities.editServerSettings)
     ? "account"
     : !canOpenSettingsTab(requestedSettingsTab, capabilities, role)
     ? "account"
@@ -7662,7 +6963,6 @@ export default function SettingsPanel({
   // claim cannot go stale again. It had: `about` was absent, and this fallback
   // silently rendered the English `label`.
   const activeLabel = formatMessage({ id: SETTINGS_TAB_TITLE_ID[settingsTab] });
-  const ActiveIcon = SETTINGS_ICON_BY_ID[settingsTab] ?? Settings;
   const serverSlug = useServerStore((s) => s.current?.slug);
   // Mobile back: Settings sub-pages (account / browser / server) are
   // level-2 views inside the Settings tab. Per iOS NavigationView model
@@ -7674,40 +6974,45 @@ export default function SettingsPanel({
   // own native header (Administration/Billing pattern, botiverse/mobile#868).
   // Drop the panel header so the page isn't double-chromed; content only.
   const embedded = typeof window !== "undefined" && new URLSearchParams(window.location.search).get("embed") === "1";
+  const headerContainerProps = useMemo(() => ({
+    "data-testid": "settings-panel-header",
+    "data-slock-settings-tab": settingsTab,
+  }), [settingsTab]);
+  const mobileBackProps = useMemo(
+    () => ({ "data-testid": "settings-mobile-back", title: formatMessage({ id: "settings.tabs.back" }) }),
+    [formatMessage],
+  );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    // One seam between two regions: the settings list beside this panel
+    // already draws it, so the frame is inset and draws none of its own.
+    // Settings content sits on paper.
+    <Panel edge="inset" className="flex min-h-0 flex-1 flex-col bg-layer-canvas text-foreground" data-testid="settings-panel-frame">
       {!embedded && settingsTab !== "feedback" && (
         <PanelHeader
           title={activeLabel}
-          icon={<ActiveIcon size={18} />}
-          iconBg="bg-soft-signal text-black"
-          containerProps={{
-            "data-testid": "settings-panel-header",
-            "data-slock-settings-tab": settingsTab,
-          }}
+          containerProps={headerContainerProps}
           onMobileBack={onMobileBack}
-          mobileBackProps={{ "data-testid": "settings-mobile-back", title: formatMessage({ id: "settings.tabs.back" }) }}
+          mobileBackProps={mobileBackProps}
         />
       )}
 
       {/* Content */}
       <div className={settingsTab === "feedback"
-        ? "min-h-0 flex-1 bg-white"
-        : "flex-1 overflow-y-auto bg-white px-5 py-4"}
+ ? "min-h-0 flex-1 bg-layer-canvas"
+ : "flex-1 overflow-y-auto bg-layer-canvas px-4 py-4 text-foreground mobile-nav-clearance md:px-5"}
       >
-        {settingsTab === "account" && <WorkspaceModeSettingsCard />}
         {settingsTab === "account" && (
           <AccountSection
             initialError={accountInitialError}
             passwordChangeIntent={accountPasswordChangeIntent}
           />
         )}
-        {settingsTab === "language-region" && <LanguageRegionSection />}
-        {settingsTab === "appearance" && <AppearanceSection />}
+        {settingsTab === "account" && <UsageDataSettingsCard />}
+        {settingsTab === "language-region" && <LanguageRegionSection publicContext={publicTranslationContext} />}
+        {settingsTab === "appearance" && <AppearanceSection publicSurface={publicSurface} />}
         {settingsTab === "notifications" && <NotificationsTabContent />}
         {settingsTab === "server" && <ServerTabContent />}
-        {settingsTab === "wiki" && <WikiSettingsSection />}
         {settingsTab === "mcp" && <McpSettingsSection />}
         {settingsTab === "providers" && <ProviderConnectionsSettings />}
         {settingsTab === "labs" && <LabsTabContent />}
@@ -7715,9 +7020,9 @@ export default function SettingsPanel({
         {settingsTab === "administration" && <AdministrationTabContent />}
         {settingsTab === "im-bridges" && <IMBridgesSettingsSection />}
         {settingsTab === "integrations" && <IntegrationsSection />}
-        {settingsTab === "about" && <AboutSection />}
+        {settingsTab === "about" && <AboutSection showWorkspace={showAboutWorkspace} />}
         {settingsTab === "feedback" && <LazyAboutFeedbackPanel />}
       </div>
-    </div>
+    </Panel>
   );
 }

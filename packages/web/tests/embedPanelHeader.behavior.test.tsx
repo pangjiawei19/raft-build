@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, render } from "@testing-library/react";
 
@@ -44,7 +43,7 @@ test("host-shell: the title bar is GONE on the first render — no flash, no sec
 
 test("host-shell: the ACTIONS survive — the + does not die with the header", async () => {
   // THE POINT (@artin's original question). The pre-contract client hid the whole
-  // header, which silently deleted Computers' "+" and Connected Apps' "Register app".
+  // header, which silently deleted Computers' "+" and Connected Apps' "Register App".
   // Dropping the chrome must not drop the affordance.
   const { queryByTestId } = await renderHeader("?embed=raft-settings-v1&shell=host");
   assert.ok(queryByTestId("add-computer"), "the page action must survive host-shell embed");
@@ -95,4 +94,33 @@ test("legacy embed=1 is NOT honoured — it falls back to a normal page", async 
   // @artin: 不用兼容. An old client gets one extra web header — NOT the double header.
   const { queryByTestId } = await renderHeader("?embed=1");
   assert.ok(queryByTestId("panel-header"));
+});
+
+test("the header icon tile is neutral unless the panel is a channel location", async () => {
+  // Raft Design System: the yellow "you are here" sticker belongs to a channel
+  // (#) head only; Tasks / Activity / Saved / Graph / Settings get the neutral
+  // tile (`rf-chan` / `rf-tile`: sunken fill, ink-2 glyph, no visible edge).
+  // A plain tile is not a sticker, so it never takes the die-cut ring that
+  // stickers wear in dark mode.
+  window.history.replaceState({}, "", "/");
+  const { __embedTestInternals } = await import("../src/embed");
+  __embedTestInternals.reset();
+  const { default: PanelHeader } = await import("../src/components/ui/PanelHeader");
+  const { container, rerender } = render(<PanelHeader title="Saved" icon={<svg />} />);
+  const neutral = container.querySelector('[data-slot="panel-header-icon"]');
+  assert.ok(neutral, "the icon tile renders");
+  assert.match(neutral.className, /\bbg-fill-muted\b/);
+  assert.match(neutral.className, /\bborder-transparent\b/);
+  assert.match(neutral.className, /\btext-foreground-muted\b/);
+  assert.match(neutral.className, /(?:^|\s)ring-0(?:\s|$)/, "no die-cut ring round a plain tile");
+  assert.doesNotMatch(neutral.className, /ring-\[1\.5px\]/);
+  assert.doesNotMatch(neutral.className, /\bbg-brand\b/);
+  assert.doesNotMatch(neutral.className, /\bborder-sticker-ink\b/);
+
+  rerender(<PanelHeader title="general" icon={<svg />} iconTone="location" />);
+  const location = container.querySelector('[data-slot="panel-header-icon"]');
+  assert.ok(location);
+  assert.match(location.className, /\bbg-brand\b/);
+  assert.match(location.className, /\bborder-sticker-ink\b/);
+  assert.doesNotMatch(location.className, /\bbg-fill-muted\b/);
 });

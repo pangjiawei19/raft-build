@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { createElement } from "react";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -136,7 +135,7 @@ test("mounted Create Cindy asks for a Computer before rendering dead runtime fie
   assert.ok(screen.getByText("Connect a computer first"));
   assert.equal(screen.queryByRole("combobox"), null);
 
-  fireEvent.click(screen.getByRole("button", { name: "Connect a Computer" }));
+  fireEvent.click(screen.getByRole("button", { name: "Add Computer" }));
   assert.equal(closeCalls, 1);
   assert.equal(useMachineStore.getState().showAddMachine, true);
 });

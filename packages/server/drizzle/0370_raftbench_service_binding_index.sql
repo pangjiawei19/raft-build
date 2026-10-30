@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "idx_raftbench_configs_agent" ON "raftbench_configs" USING btree ("agent_id") WHERE "raftbench_configs"."agent_id" IS NOT NULL;

@@ -6,19 +6,21 @@
 import type { Command } from "commander";
 import { basename, extname } from "node:path";
 import { existsSync, readFileSync, statSync } from "node:fs";
+import type {
+  AgentApiIntegrationAppPrepareResponse,
+  AgentApiOwnedIntegrationApp,
+  OAuthClientCategory,
+} from "@botiverse/raft-shared";
 import {
   OAUTH_CLIENT_CATEGORIES,
   canonicalizeOAuthClientCategory,
-  type AgentApiIntegrationAppPrepareResponse,
-  type AgentApiOwnedIntegrationApp,
-  type OAuthClientCategory,
-} from "@botiverse/raft-shared";
+} from "@botiverse/raft-shared/src/agentCliSurface";
 
-import { defineCommand, registerCliCommand } from "../../core/command.js";
-import type { CommandContext, CommandRuntimeOptions } from "../../core/context.js";
-import { cliError } from "../../core/errors.js";
-import { writeJson, writeText, NL, adoptCliReplyText } from "../../core/renderer.js";
-import { createAgentApiSurfaceClient } from "../../agentApiPath.js";
+import { defineCommand, registerCliCommand } from "../../core/command";
+import type { CommandContext, CommandRuntimeOptions } from "../../core/context";
+import { cliError } from "../../core/errors";
+import { writeJson, writeText, NL, adoptCliReplyText } from "../../core/renderer";
+import { createAgentApiSurfaceClient } from "../../agentApiPath";
 import {
   projectActionPrepareReceipt,
   projectAppListReceipt,
@@ -29,12 +31,12 @@ import {
   projectAppStatusReceipt,
   projectAppTransferOwnerReceipt,
   projectAppUpdateReceipt,
-} from "./appReceipts.js";
+} from "./appReceipts";
 import {
   closePrivateSecretSink,
   preparePrivateSecretSink,
   writePrivateSecretSink,
-} from "./privateSecretSink.js";
+} from "./privateSecretSink";
 
 const MAX_APP_LOGO_BYTES = 5 * 1024 * 1024;
 const APP_LOGO_MIME_BY_EXTENSION: Record<string, string> = {
@@ -54,6 +56,8 @@ interface AppPrepareOptions {
   description?: string;
   category?: string;
   agentManifestUrl?: string;
+  setupUrl?: string;
+  setupDescription?: string;
   scope?: string[];
   scopes?: string[];
   unsafeDemoUrlOverride?: boolean;
@@ -105,6 +109,8 @@ function formatAppPrepare(data: AgentApiIntegrationAppPrepareResponse): string {
   if (data.action.homepageUrl) lines.push(`app URL: ${data.action.homepageUrl}`);
   if (data.action.returnUrl) lines.push(`redirect URL: ${data.action.returnUrl}`);
   if (data.action.agentManifestUrl) lines.push(`agent manifest: ${data.action.agentManifestUrl}`);
+  if (data.action.setupUrl) lines.push(`post-install setup: ${data.action.setupUrl}`);
+  if (data.action.setupDescription) lines.push(`setup instructions: ${data.action.setupDescription}`);
   if (data.action.scopes) lines.push(`scopes: ${data.action.scopes.length > 0 ? data.action.scopes.join(", ") : "-"}`);
   if (data.action.unsafeDemoUrlOverride) lines.push("unsafe demo URL override: requested");
   lines.push("capability: every agent can self-register an app; App Admin is not involved");
@@ -134,6 +140,8 @@ async function prepareApp(
     homepageUrl: optionalTrimmed(opts.homepageUrl) ?? optionalTrimmed(opts.appUrl),
     returnUrl: optionalTrimmed(opts.redirectUrl),
     agentManifestUrl: optionalTrimmed(opts.agentManifestUrl),
+    ...(opts.setupUrl !== undefined ? { setupUrl: optionalTrimmed(opts.setupUrl) } : {}),
+    ...(opts.setupDescription !== undefined ? { setupDescription: optionalTrimmed(opts.setupDescription) } : {}),
     scopes,
     unsafeDemoUrlOverride: opts.unsafeDemoUrlOverride === true,
   };
@@ -281,10 +289,13 @@ interface AppUpdateOptions {
   client: string;
   name?: string;
   description?: string;
+  whenToUse?: string;
   category?: string;
   homepageUrl?: string;
   redirectUrl?: string;
   agentManifestUrl?: string;
+  setupUrl?: string;
+  setupDescription?: string;
   scope?: string[];
   scopes?: string[];
   clearScopes?: boolean;
@@ -306,10 +317,13 @@ async function updateApp(ctx: CommandContext, opts: AppUpdateOptions): Promise<v
     clientKey,
     name: opts.name === undefined ? undefined : opts.name.trim(),
     description: opts.description === undefined ? undefined : opts.description.trim(),
+    whenToUse: opts.whenToUse === undefined ? undefined : opts.whenToUse.trim(),
     category,
     homepageUrl: opts.homepageUrl === undefined ? undefined : opts.homepageUrl.trim(),
     returnUrl: opts.redirectUrl === undefined ? undefined : opts.redirectUrl.trim(),
     agentManifestUrl: opts.agentManifestUrl === undefined ? undefined : opts.agentManifestUrl.trim(),
+    ...(opts.setupUrl !== undefined ? { setupUrl: opts.setupUrl.trim() } : {}),
+    ...(opts.setupDescription !== undefined ? { setupDescription: opts.setupDescription.trim() } : {}),
     scopes,
     unsafeDemoUrlOverride: opts.unsafeDemoUrlOverride === true,
   };
@@ -337,6 +351,7 @@ export const integrationAppUpdateCommand = defineCommand(
       { flags: "--client <key>", description: "App client key / OAuth client_id" },
       { flags: "--name <name>", description: "New app display name" },
       { flags: "--description <text>", description: "New description; pass an empty value to clear" },
+      { flags: "--when-to-use <text>", description: "When agents should use this app (one line, ≤160 chars); pass an empty value to clear" },
       {
         flags: "--category <category>",
         description: `New Connected App category: ${OAUTH_CLIENT_CATEGORIES.join(", ")}`,
@@ -344,6 +359,8 @@ export const integrationAppUpdateCommand = defineCommand(
       { flags: "--homepage-url <url>", description: "New homepage URL; pass an empty value to clear" },
       { flags: "--redirect-url <url>", description: "New OAuth redirect URL; cannot be cleared" },
       { flags: "--agent-manifest-url <url>", description: "New agent manifest URL; pass an empty value to clear" },
+      { flags: "--setup-url <url>", description: "Post-install configuration page; pass an empty value to disable setup" },
+      { flags: "--setup-description <text>", description: "Short explanation of configuration needed after installation" },
       {
         flags: "--scope <scope>",
         description: "Allowed scope; can be repeated or comma-separated",
@@ -552,6 +569,7 @@ function formatAppStatus(app: AgentApiOwnedIntegrationApp): string {
     `description: ${app.description ?? "-"}`,
     `app type: ${app.appType ?? "-"}`,
     `enabled: ${app.enabled === null || app.enabled === undefined ? "-" : app.enabled ? "yes" : "no"}`,
+    ...(app.installationId !== undefined ? [`installation ID: ${app.installationId ?? "-"}`] : []),
     ...(app.card ? [`card: ${app.card}`] : []),
     ...(app.clientKey ? [`client key: ${app.clientKey}`] : []),
     `created: ${app.createdAt}`,
@@ -566,6 +584,11 @@ function formatAppStatus(app: AgentApiOwnedIntegrationApp): string {
     `publish status: ${app.publishStatus ?? "-"}`,
     `logo: ${app.logoUrl ?? "-"}`,
   ];
+  if (app.setupUrl) lines.push(`setup declaration: ${app.setupUrl}`);
+  if (app.setup) {
+    lines.push(`installation setup: ${app.setup.status}`);
+    if (app.setup.url) lines.push(`setup link for a Server administrator: ${app.setup.url}`);
+  }
   if (app.recoveryCommand) {
     lines.push(`recovery: lost the secret? Run \`${app.recoveryCommand}\`; it writes a replacement only to a new private file and invalidates the previous secret`);
     lines.push("secret handling: choose a path outside Web/static/shared surfaces, pass that file directly to the authorized secret store, then remove it; the path is caller-managed after return and secret bytes are not disclosed through stdout/JSON, Raft messages or chat, logs, receipts, history, or Raft/server persistence outside the selected private file");
@@ -711,6 +734,8 @@ const sharedOptions = [
     description: `Connected App category: ${OAUTH_CLIENT_CATEGORIES.join(", ")}`,
   },
   { flags: "--agent-manifest-url <url>", description: "Optional agent behavior manifest URL" },
+  { flags: "--setup-url <url>", description: "Optional post-install configuration page" },
+  { flags: "--setup-description <text>", description: "What a human must configure after installation" },
   {
     flags: "--scope <scope>",
     description: "Requested/displayed scope; can be repeated or comma-separated",

@@ -2,7 +2,7 @@ import type {
   ParsedEvent,
   RuntimeSendResult,
   RuntimeSession,
-} from "./drivers/index.js";
+} from "./drivers/index";
 
 export interface RuntimeBindingProcess {
   readonly runtime: RuntimeSession;
@@ -62,7 +62,21 @@ type RuntimeBindingTrace = (
 export interface RuntimeProcessBindingFenceOptions {
   getCurrentProcess(agentId: string): RuntimeBindingProcess | null;
   recordTrace: RuntimeBindingTrace;
+  /** Test seam; production reads Date.now(). */
+  now?: () => number;
 }
+
+/**
+ * A replaced process can keep writing for a while, and every stdout chunk or
+ * parsed event from it is rejected. Recording each one flooded traces (7k/min
+ * from one machine), so per process × reason × source the first output
+ * rejection is recorded and later ones are counted, re-recorded at most once
+ * per window with `suppressed_count`. Input rejections are one per send
+ * attempt and stay one record each.
+ */
+export const OUTPUT_REJECTION_TRACE_WINDOW_MS = 10_000;
+
+type OutputRejectionWindow = { lastRecordedMs: number; suppressed: number };
 
 type RuntimeBindingRebindSource =
   | "server_start_rebind"
@@ -83,10 +97,14 @@ export class RuntimeProcessBindingFence {
   private readonly bindings = new WeakMap<RuntimeSession, RuntimeProcessBinding>();
   private readonly getCurrentProcess: RuntimeProcessBindingFenceOptions["getCurrentProcess"];
   private readonly recordTrace: RuntimeBindingTrace;
+  private readonly now: () => number;
+
+  private readonly outputRejections = new WeakMap<RuntimeSession, Map<string, OutputRejectionWindow>>();
 
   constructor(options: RuntimeProcessBindingFenceOptions) {
     this.getCurrentProcess = options.getCurrentProcess;
     this.recordTrace = options.recordTrace;
+    this.now = options.now ?? Date.now;
   }
 
   bind(runtime: RuntimeSession, binding: RuntimeProcessBinding): void {
@@ -248,8 +266,35 @@ export class RuntimeProcessBindingFence {
   ): boolean {
     const validation = this.validate(agentId, process, runtime);
     if (validation.ok) return true;
-    this.recordRejection(agentId, process, runtime, validation, "output", source);
+    const suppressedCount = this.takeOutputRejectionSlot(runtime, validation.reason, source);
+    if (suppressedCount !== null) {
+      this.recordRejection(agentId, process, runtime, validation, "output", source, undefined, suppressedCount);
+    }
     return false;
+  }
+
+  /** null: count this rejection without recording it; otherwise record it with the count suppressed before it. */
+  private takeOutputRejectionSlot(runtime: RuntimeSession, reason: RuntimeBindingMismatchReason, source: string): number | null {
+    const now = this.now();
+    let windows = this.outputRejections.get(runtime);
+    if (!windows) {
+      windows = new Map();
+      this.outputRejections.set(runtime, windows);
+    }
+    const key = `${reason}\u0000${source}`;
+    const window = windows.get(key);
+    if (!window) {
+      windows.set(key, { lastRecordedMs: now, suppressed: 0 });
+      return 0;
+    }
+    if (now - window.lastRecordedMs < OUTPUT_REJECTION_TRACE_WINDOW_MS) {
+      window.suppressed += 1;
+      return null;
+    }
+    const suppressed = window.suppressed;
+    window.lastRecordedMs = now;
+    window.suppressed = 0;
+    return suppressed;
   }
 
   recordMissingProcessEvent(
@@ -325,12 +370,18 @@ export class RuntimeProcessBindingFence {
     direction: "input" | "output",
     source: string,
     observedSessionId?: string | null,
+    suppressedCount?: number,
   ): void {
     const expectedRuntimeContext = process.config.runtimeContext;
     this.recordTrace("daemon.agent.runtime_binding.rejected", {
       direction,
       source,
       reason: validation.reason,
+      // Allowlisted id keys; the expected_/bound_/current_ ids below are dropped
+      // by the local trace sink, so these are what tells agents and processes apart.
+      agent_id: agentId,
+      process_instance_id: process.processInstanceId,
+      launch_id: process.launchId || undefined,
       expected_agent_id: agentId,
       expected_server_id: expectedRuntimeContext?.serverId,
       expected_machine_id: expectedRuntimeContext?.machineId,
@@ -357,6 +408,7 @@ export class RuntimeProcessBindingFence {
       session_id_present: Boolean(process.sessionId),
       stdin_write_attempted: direction === "input" ? false : undefined,
       output_applied: direction === "output" ? false : undefined,
+      suppressed_count: suppressedCount,
     }, "error");
   }
 

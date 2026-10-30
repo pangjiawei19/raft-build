@@ -1,6 +1,6 @@
-import { canChangeMemberRole, hasServerCapability, type ManageableServerRole, type ServerCapability, type ServerRole } from "@botiverse/raft-shared";
-import * as serverService from "../services/serverService.js";
-import { getDb, type DatabaseExecutor } from "../db/index.js";
+import { canChangeMemberRole, hasServerCapability, isAdminOrOwner, isGuestRole, type ManageableServerRole, type ServerCapability, type ServerRole } from "@botiverse/raft-shared";
+import * as serverService from "../services/serverService";
+import { getDb, type DatabaseExecutor } from "../db/index";
 
 export type ActorContext =
   | {
@@ -60,6 +60,18 @@ export async function getActorServerRoleInServer(
   return (await resolveActorContext(serverId, actorType, actorId)).serverRole;
 }
 
+/**
+ * getActorServerRoleInServer for a list of agents, in one query: roster
+ * routes read every listed agent's role, and one query per agent under
+ * Promise.all borrowed a pool connection each.
+ */
+export async function getAgentServerRolesInServer(
+  serverId: string,
+  agentIds: readonly string[],
+): Promise<Map<string, ServerRole>> {
+  return serverService.getAgentMemberRoles(serverId, agentIds);
+}
+
 export async function actorHasServerCapabilityInServer(
   serverId: string,
   actorType: ActorContextType,
@@ -87,6 +99,41 @@ export function userCanActOnAgentResource(
 ): boolean {
   return hasServerCapability(callerRole, capability)
     || (agent.creatorType === "user" && agent.creatorId === userId);
+}
+
+/**
+ * Default-deny visibility rule for everything beyond an agent's public Profile
+ * tab: only the agent's human creator and users whose current server role has
+ * `editAgents` (owner / admin) may see its private surfaces (workspace,
+ * activity, DMs, reminders, skills, ...). `callerRole` must be the caller's
+ * current role in the agent's server; membership itself is an upstream
+ * precondition, exactly as for userCanActOnAgentResource.
+ */
+export function roleCanInspectAgentPrivateSurfaces(
+  callerRole: ServerRole | null | undefined,
+  userId: string,
+  agent: { creatorType: string | null; creatorId: string | null },
+): boolean {
+  return userCanActOnAgentResource(callerRole, userId, agent, "editAgents");
+}
+
+/**
+ * Authority over a tenant-level account connector (e.g. a server's GitHub
+ * connection shared by several agents): its creator or a server owner/admin
+ * may assign it to an agent or disconnect it; guests never, even as creator.
+ * Returns the acting role Raft vouches for to the provider, or null (refuse).
+ * Stable priority: `creator` over `admin`, so the provider can re-check it.
+ * Managing the agent itself is a separate, additional precondition.
+ */
+export function decideAgentConnectorAuthority(
+  callerRole: ServerRole | null | undefined,
+  userId: string,
+  connectorCreatorId: string | null,
+): "creator" | "admin" | null {
+  if (!callerRole || isGuestRole(callerRole)) return null;
+  if (connectorCreatorId !== null && connectorCreatorId === userId) return "creator";
+  if (isAdminOrOwner(callerRole)) return "admin";
+  return null;
 }
 
 /** Which policy branch authorized a human -> agent read-frontier delegation.

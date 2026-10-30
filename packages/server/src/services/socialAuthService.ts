@@ -1,11 +1,11 @@
 import { createHash, createPublicKey, randomBytes } from "node:crypto";
 import jwt from "jsonwebtoken";
-import { and, eq, isNotNull, isNull, lt } from "drizzle-orm";
+import { and, eq, gt, isNotNull, isNull, lt, type SQL } from "drizzle-orm";
 import { currentTimeMs, sanitizeAppLocalReturnPath } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
-import { oauthTransactions, socialAuthCompletions, userAuthIdentities } from "../db/schema.js";
-import { getAppUrl as getConfiguredOrDefaultAppUrl } from "../config/appUrl.js";
-import { findExistingSocialLoginUser } from "./userService.js";
+import { getDb, type DatabaseExecutor } from "../db/index";
+import { oauthTransactions, socialAuthCompletions, userAuthIdentities } from "../db/schema";
+import { getAppUrl as getConfiguredOrDefaultAppUrl } from "../config/appUrl";
+import { findExistingSocialLoginUser, getUserByEmail, SocialEmailConflictError } from "./userService";
 
 export type SocialAuthProvider = "google" | "github" | "apple";
 export type SocialAuthMode = "login" | "link";
@@ -14,6 +14,7 @@ export type MobileOAuthRequestStatus =
   | "pending_provider"
   | "provider_processing"
   | "provider_completed"
+  | "pending_link"
   | "completed"
   | "failed"
   | "expired";
@@ -41,6 +42,12 @@ export interface SocialAuthStatePayload {
   returnTo?: string;
   mobileRequestId?: string;
   desktopNonce?: string;
+  /**
+   * The client can continue an account_link_required response, so an email
+   * conflict on login becomes a completion that turns into a pending link
+   * instead of an error. Older clients omit it and keep the error.
+   */
+  linkOnConflict?: boolean;
 }
 
 interface CookieOptions {
@@ -96,6 +103,7 @@ export interface MobileOAuthCompletionResult {
   requestId: string;
   provider: SocialAuthProvider;
   mode: SocialAuthMode;
+  intendedAction: SocialAuthMode;
   returnUri: string;
   userId?: string;
   providerUserId?: string;
@@ -494,6 +502,7 @@ export async function createMobileOAuthStart(params: {
   returnUri: unknown;
   codeChallenge: unknown;
   userId?: string;
+  linkOnConflict?: boolean;
 }): Promise<MobileOAuthStartResult> {
   const mode = parseMobileOAuthMode(params.mode);
   if (mode === "link" && !params.userId) {
@@ -524,6 +533,7 @@ export async function createMobileOAuthStart(params: {
     nonce,
     mobileRequestId: request.id,
     desktopNonce: getDesktopNonceFromReturnUri(returnUri),
+    ...(mode === "login" && params.linkOnConflict ? { linkOnConflict: true } : {}),
   });
 
   return {
@@ -695,12 +705,21 @@ export async function completeMobileOAuthProviderCallback(params: {
   }
 
   let profile: SocialAuthProfile;
-  let existingUser = null as Awaited<ReturnType<typeof findExistingSocialLoginUser>> | null;
+  let existingUserId: string | null = null;
+  let intendedAction: SocialAuthMode = request.mode;
   try {
     const { accessToken } = await exchangeProviderCode(params.provider, params.providerCode);
     profile = await fetchSocialAuthProfile(params.provider, accessToken, params.state.nonce);
     assertVerifiedSocialAuthProfile(profile);
-    existingUser = request.mode === "login" ? await findExistingSocialLoginUser(profile) : null;
+    if (request.mode === "login") {
+      try {
+        existingUserId = (await findExistingSocialLoginUser(profile))?.id ?? null;
+      } catch (err) {
+        if (!(err instanceof SocialEmailConflictError) || !params.state.linkOnConflict) throw err;
+        existingUserId = err.userId;
+        intendedAction = "link";
+      }
+    }
   } catch (err) {
     const error = classifyMobileOAuthProviderFailure(err);
     await markMobileOAuthRequestTerminal(request.id, "failed");
@@ -717,7 +736,10 @@ export async function completeMobileOAuthProviderCallback(params: {
   await database.update(oauthTransactions).set({
     status: "provider_completed",
     codeHash,
-    userId: request.mode === "link" ? request.userId : existingUser?.id ?? null,
+    intendedAction,
+    // A conflict completion carries no userId: a server that predates pending
+    // links must not read it as "sign in to the existing account".
+    userId: request.mode === "link" ? request.userId : intendedAction === "link" ? null : existingUserId,
     providerUserId: profile.providerUserId,
     providerEmail: profile.email,
     providerDisplayName: profile.displayName ?? null,
@@ -883,6 +905,7 @@ function toMobileOAuthCompletionResult(request: typeof oauthTransactions.$inferS
     requestId: request.id,
     provider: request.provider,
     mode: request.mode,
+    intendedAction: request.intendedAction,
     returnUri,
     userId: request.userId ?? undefined,
     providerUserId: request.providerUserId ?? undefined,
@@ -1405,6 +1428,7 @@ export async function getSocialAuthCompletion(provider: SocialAuthProvider, code
     .where(and(
       eq(socialAuthCompletions.codeHash, codeHash),
       isNull(socialAuthCompletions.codeChallenge),
+      eq(socialAuthCompletions.status, "provider_completed"),
     ))
     .limit(1);
 
@@ -1420,11 +1444,157 @@ export async function exchangeSocialAuthCompletion(provider: SocialAuthProvider,
     .where(and(
       eq(socialAuthCompletions.codeHash, codeHash),
       isNull(socialAuthCompletions.codeChallenge),
+      eq(socialAuthCompletions.status, "provider_completed"),
     ))
     .returning();
 
   validateSocialAuthCompletion(provider, completion);
   return toSocialAuthCompletionResult(completion);
+}
+
+// ── Pending social link ──
+//
+// A login whose provider email already has an account (and the client sent
+// linkOnConflict) completes as mode "login" + intendedAction "link". The
+// completion endpoint swaps that one-time code for a pending link token; the
+// verified provider identity stays here until the person signs in to that
+// account with a method it already has, and the sign-in links it before any
+// session is issued.
+
+export const PENDING_SOCIAL_LINK_TTL_MS = 10 * 60 * 1000;
+
+export type PendingSocialLinkErrorCode = "pending_link_expired" | "pending_link_account_mismatch";
+
+export class PendingSocialLinkError extends Error {
+  constructor(public readonly code: PendingSocialLinkErrorCode) {
+    super(code === "pending_link_expired"
+      ? "This sign-in link has expired. Please start again."
+      : "The signed-in account is not the account for this email.");
+    this.name = "PendingSocialLinkError";
+  }
+}
+
+export interface PendingSocialLink {
+  token: string;
+  provider: SocialAuthProvider;
+  userId: string;
+  email: string;
+  expiresAt: Date;
+}
+
+async function convertCompletionToPendingLink(match: SQL): Promise<PendingSocialLink> {
+  const database = getDb();
+  const live = and(
+    match,
+    eq(socialAuthCompletions.status, "provider_completed"),
+    eq(socialAuthCompletions.mode, "login"),
+    eq(socialAuthCompletions.intendedAction, "link"),
+    isNull(socialAuthCompletions.userId),
+    gt(socialAuthCompletions.expiresAt, new Date(currentTimeMs())),
+  );
+  const [completion] = await database.select().from(socialAuthCompletions).where(live).limit(1);
+  // The account is resolved now, from the verified provider email, rather than
+  // stored on the completion (see completeMobileOAuthProviderCallback).
+  const account = completion?.providerEmail ? await getUserByEmail(completion.providerEmail) : null;
+  if (!completion?.providerEmail || !account) {
+    throw new PendingSocialLinkError("pending_link_expired");
+  }
+  const token = randomBytes(32).toString("hex");
+  const expiresAt = new Date(currentTimeMs() + PENDING_SOCIAL_LINK_TTL_MS);
+  const [row] = await database.update(socialAuthCompletions).set({
+    status: "pending_link",
+    codeHash: hashValue(token),
+    userId: account.id,
+    expiresAt,
+  }).where(and(live, eq(socialAuthCompletions.id, completion.id))).returning();
+  if (!row) {
+    throw new PendingSocialLinkError("pending_link_expired");
+  }
+  return { token, provider: row.provider, userId: account.id, email: account.email, expiresAt };
+}
+
+/** Web: swap a conflict completion code for a pending link token. */
+export async function exchangeWebConflictCompletionForPendingLink(provider: SocialAuthProvider, code: string): Promise<PendingSocialLink> {
+  return convertCompletionToPendingLink(and(
+    eq(socialAuthCompletions.codeHash, hashValue(code)),
+    eq(socialAuthCompletions.provider, provider),
+    isNull(socialAuthCompletions.codeChallenge),
+  )!);
+}
+
+/** Mobile/desktop: swap a PKCE-verified conflict completion for a pending link token. */
+export async function exchangeMobileConflictCompletionForPendingLink(requestId: string): Promise<PendingSocialLink> {
+  return convertCompletionToPendingLink(eq(socialAuthCompletions.id, requestId));
+}
+
+function parsePendingLinkTokenHash(token: string): string {
+  return hashValue(parseRequiredBoundedString(token, "pendingLinkToken", 256));
+}
+
+async function loadLivePendingLink(tokenHash: string) {
+  const database = getDb();
+  const [row] = await database.select().from(socialAuthCompletions).where(and(
+    eq(socialAuthCompletions.codeHash, tokenHash),
+    eq(socialAuthCompletions.status, "pending_link"),
+    gt(socialAuthCompletions.expiresAt, new Date(currentTimeMs())),
+  )).limit(1);
+  return row;
+}
+
+/**
+ * Non-consuming check, for sign-ins that would otherwise spend a one-time
+ * credential (an OAuth completion code) before the claim could refuse.
+ */
+export async function assertPendingSocialLinkFor(token: string, userId: string | null | undefined): Promise<SocialAuthProfile> {
+  const row = await loadLivePendingLink(parsePendingLinkTokenHash(token));
+  if (!row) throw new PendingSocialLinkError("pending_link_expired");
+  if (!userId || row.userId !== userId) throw new PendingSocialLinkError("pending_link_account_mismatch");
+  return pendingLinkProfile(row);
+}
+
+function pendingLinkProfile(row: typeof socialAuthCompletions.$inferSelect): SocialAuthProfile {
+  if (!row.providerUserId || !row.providerEmail) throw new PendingSocialLinkError("pending_link_expired");
+  return {
+    provider: row.provider,
+    providerUserId: row.providerUserId,
+    email: row.providerEmail,
+    // Only verified provider profiles are written (assertVerifiedSocialAuthProfile).
+    emailVerified: true,
+    displayName: row.providerDisplayName,
+    avatarUrl: row.providerAvatarUrl,
+  };
+}
+
+/**
+ * Claim the pending link for the account that just proved it can sign in.
+ * A wrong account leaves the token usable, so the person can retry with the
+ * right one. Returns the provider identity to link.
+ */
+export async function claimPendingSocialLink(
+  token: string,
+  userId: string,
+  database: DatabaseExecutor = getDb(),
+): Promise<SocialAuthProfile> {
+  const tokenHash = parsePendingLinkTokenHash(token);
+  const [row] = await database.update(socialAuthCompletions).set({ status: "completed" }).where(and(
+    eq(socialAuthCompletions.codeHash, tokenHash),
+    eq(socialAuthCompletions.status, "pending_link"),
+    eq(socialAuthCompletions.userId, userId),
+    gt(socialAuthCompletions.expiresAt, new Date(currentTimeMs())),
+  )).returning();
+  if (!row) {
+    if (await loadLivePendingLink(tokenHash)) throw new PendingSocialLinkError("pending_link_account_mismatch");
+    throw new PendingSocialLinkError("pending_link_expired");
+  }
+  return pendingLinkProfile(row);
+}
+
+export async function cancelPendingSocialLink(token: string): Promise<void> {
+  const database = getDb();
+  await database.delete(socialAuthCompletions).where(and(
+    eq(socialAuthCompletions.codeHash, parsePendingLinkTokenHash(token)),
+    eq(socialAuthCompletions.status, "pending_link"),
+  ));
 }
 
 export async function cleanupExpiredSocialAuthCompletions(): Promise<void> {

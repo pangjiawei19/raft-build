@@ -4,7 +4,7 @@
 
 ## 使用方式
 
-运行前需要安装 Node.js 24、pnpm、Docker 和 `tmux`，并启动 Docker。启动器会检查缺失依赖；例如 macOS 使用 Homebrew 时可通过 `brew install tmux` 安装 `tmux`。
+运行前需要安装 Node.js 24（仓库基准为 24.21）、pnpm 12.11.2、Docker 和 `tmux`，并启动 Docker。启动器会检查缺失依赖；例如 macOS 使用 Homebrew 时可通过 `brew install tmux` 安装 `tmux`。在仓库内运行 `pnpm --version`，应与 `package.json` 的 `packageManager` 一致。
 
 本机已经配置的入口为 `./.slockdev/local-dev`，默认启用持久模式。该入口负责选择本机的 Node 和 tmux，实际功能由纳入版本控制的 `raftdev` 实现。
 
@@ -62,6 +62,8 @@
 ```
 
 `migrate` 会停止应用、执行迁移并保持服务停止。迁移失败时保留数据和日志，不重新建库。它不是自动回滚或备份工具。
+
+从 `v1.13.0-source.1` 升级到 `v1.21.23-source.1` 时，上游重排了历史迁移，已有数据库不能直接沿用常规 `migrate` 流程。需要保留数据时应单独制定迁移方案；明确不需要旧数据时，可销毁该环境后重新初始化。
 
 只有明确删除环境时才执行以下命令，它会永久删除指定环境的托管容器、命名数据卷和本地配置：
 

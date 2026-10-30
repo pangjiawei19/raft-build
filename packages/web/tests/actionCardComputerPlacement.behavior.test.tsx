@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import type { ReactElement } from "react";
 import { cleanup, fireEvent, render as rtlRender, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -144,7 +143,7 @@ afterEach(() => {
 test("agent:create ActionCard carries a required Computer into the real create dialog", async () => {
   renderPlacementActionCard("required");
 
-  assert.ok(screen.getByText("Required computer:"));
+  assert.ok(screen.getByText("Required computer"));
   assert.ok(screen.getByText("Required Studio"));
   fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
 
@@ -159,7 +158,7 @@ test("agent:create ActionCard carries a required Computer into the real create d
 test("agent:create ActionCard carries a suggested Computer without locking alternatives", async () => {
   renderPlacementActionCard("suggested");
 
-  assert.ok(screen.getByText("Suggested computer:"));
+  assert.ok(screen.getByText("Suggested computer"));
   assert.ok(screen.getByText("Required Studio"));
   fireEvent.click(screen.getByRole("button", { name: "Create Agent" }));
 
@@ -169,4 +168,25 @@ test("agent:create ActionCard carries a suggested Computer without locking alter
   fireEvent.click(computerSelect!);
   const alternative = await screen.findByRole("option", { name: "Alternative Studio (alternative.local)" });
   assert.notEqual(alternative.getAttribute("aria-disabled"), "true");
+});
+
+test("agent:create ActionCard that presets hosting says where the agent runs, with the model", () => {
+  seedPlacementStores();
+  mockPlacementApi();
+  render(
+    <MemoryRouter initialEntries={["/s/server/channel/source-channel"]}>
+      <ActionCard
+        messageId="placement-hosted"
+        channelId="source-channel"
+        metadata={{
+          kind: "action-card",
+          state: "prepared",
+          action: { type: "agent:create", name: "Hosted Agent", hosting: "antiproton", model: "gpt-5.6-luna" },
+        } as never}
+      />
+    </MemoryRouter>,
+  );
+  assert.ok(screen.getByText("Runs on"));
+  assert.ok(screen.getByText("Cloud agent, model gpt-5.6-luna"));
+  assert.ok(screen.queryByText("Suggested computer") === null);
 });

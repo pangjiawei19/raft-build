@@ -1,15 +1,19 @@
-import { createApiTest } from "../test/integration/apiTest.js";
+import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 
 import argon2 from "argon2";
 import { and, eq } from "drizzle-orm";
 
-import { getDb } from "../db/index.js";
-import { pushRegistrations, sessionFamilies, sessions, users } from "../db/schema.js";
-import { openTestApp } from "../test/integration/app.js";
-import { addMember, createServer } from "../services/serverService.js";
+import { getDb } from "../db/index";
+import { featureFlags, pushRegistrations, pushSubscriptions, sessionFamilies, sessions, users } from "../db/schema";
+import { openTestApp } from "../test/integration/app";
+import { __resetWebPushRuntimeForTests, __setWebPushRuntimeForTests } from "../services/pushService";
+import { __resetFcmTransportForTests, __setFcmAccessTokenSourceForTests } from "../services/fcmPushProvider";
+import { MOBILE_PUSH_FCM_FEATURE_FLAG_KEY } from "../services/featureFlagService";
+import { addMember, createServer } from "../services/serverService";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+const RETIRED_MOBILE_PUSH_DELIVERY_FLAG_KEY = "mobile_push_delivery_v0";
 
 async function login(baseUrl: string, email: string, password = "password123") {
   return (await loginSession(baseUrl, email, password)).accessToken;
@@ -186,6 +190,135 @@ test("mobile push registrations validate the APNs tuple and upsert by installati
   }
 });
 
+test("mobile push registrations accept the FCM tuple: colon tokens, production only", async () => {
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  try {
+    const owner = await seedVerifiedUser("push-fcm-owner@slock.test", "push-fcm-owner");
+    const server = await createServer("Push FCM API", "push-fcm-api", owner.id);
+    const ownerToken = await login(baseUrl, owner.email);
+    const fcmToken = `dGVzdA:APA91b${"x".repeat(150)}`;
+    const register = (body: Record<string, unknown>) => fetch(`${baseUrl}/api/push/registrations`, {
+      method: "POST",
+      headers: headers(ownerToken, server.id),
+      body: JSON.stringify({
+        installationId: "android-install-1",
+        provider: "fcm",
+        env: "production",
+        topic: "build.raft.app",
+        deviceToken: fcmToken,
+        ...body,
+      }),
+    });
+
+    const sandbox = await register({ env: "sandbox" });
+    assert.equal(sandbox.status, 400, "FCM has no sandbox environment");
+
+    const malformed = await register({ deviceToken: "token with spaces" });
+    assert.equal(malformed.status, 400);
+
+    const apnsWithColon = await register({ provider: "apns", deviceToken: fcmToken });
+    assert.equal(apnsWithColon.status, 400, "APNs tokens keep their stricter shape");
+
+    const create = await register({});
+    assert.equal(create.status, 200, await create.clone().text());
+    const body = await create.json() as { registration: { provider: string; env: string } };
+    assert.equal(body.registration.provider, "fcm");
+    assert.equal(body.registration.env, "production");
+
+    const [row] = await getDb().select().from(pushRegistrations).where(and(
+      eq(pushRegistrations.installationId, "android-install-1"),
+      eq(pushRegistrations.provider, "fcm"),
+    ));
+    assert.equal(row?.deviceToken, fcmToken);
+    assert.equal(row?.userId, owner.id);
+  } finally {
+    await close();
+  }
+});
+
+test("push delivery status reports per server whether this installation gets FCM pushes", async () => {
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  try {
+    const owner = await seedVerifiedUser("push-status-owner@slock.test", "push-status-owner");
+    const other = await seedVerifiedUser("push-status-other@slock.test", "push-status-other");
+    const serverA = await createServer("Push Status A", "push-status-a", owner.id);
+    const serverB = await createServer("Push Status B", "push-status-b", owner.id);
+    const foreign = await createServer("Push Status Foreign", "push-status-foreign", other.id);
+    const ownerToken = await login(baseUrl, owner.email);
+    const status = async (installationId: string | null) => {
+      const query = installationId === null ? "" : `?installationId=${encodeURIComponent(installationId)}`;
+      return fetch(`${baseUrl}/api/push/delivery-status${query}`, { headers: { Authorization: `Bearer ${ownerToken}` } });
+    };
+    const servers = async (installationId: string) => {
+      const res = await status(installationId);
+      assert.equal(res.status, 200, await res.clone().text());
+      return (await res.json() as { servers: Record<string, { fcmActive: boolean }> }).servers;
+    };
+    const setFlag = (key: string, values: { defaultEnabled?: boolean; killSwitch?: boolean }) =>
+      getDb().update(featureFlags).set(values).where(eq(featureFlags.key, key));
+
+    assert.equal((await fetch(`${baseUrl}/api/push/delivery-status?installationId=a`)).status, 401);
+    assert.equal((await status(null)).status, 400);
+    assert.equal((await status("bad id with spaces")).status, 400);
+
+    __setFcmAccessTokenSourceForTests({ projectId: "raft-test", getAccessToken: async () => "test-token" });
+    await setFlag(MOBILE_PUSH_FCM_FEATURE_FLAG_KEY, { defaultEnabled: true });
+
+    // Not registered yet: every server the user belongs to, none active, other servers absent.
+    assert.deepEqual(await servers("android-status-1"), {
+      [serverA.id]: { fcmActive: false },
+      [serverB.id]: { fcmActive: false },
+    });
+    assert.equal(Object.hasOwn(await servers("android-status-1"), foreign.id), false);
+
+    const register = await fetch(`${baseUrl}/api/push/registrations`, {
+      method: "POST",
+      headers: headers(ownerToken, serverA.id),
+      body: JSON.stringify({
+        installationId: "android-status-1",
+        provider: "fcm",
+        env: "production",
+        topic: "build.raft.app",
+        deviceToken: "android-status-fid",
+      }),
+    });
+    assert.equal(register.status, 200, await register.clone().text());
+
+    // Registered while bound to server A, but delivery is per user: both servers are covered.
+    assert.deepEqual(await servers("android-status-1"), {
+      [serverA.id]: { fcmActive: true },
+      [serverB.id]: { fcmActive: true },
+    });
+    assert.deepEqual(await servers("android-status-other-install"), {
+      [serverA.id]: { fcmActive: false },
+      [serverB.id]: { fcmActive: false },
+    }, "another installation has no registration");
+
+    await setFlag(RETIRED_MOBILE_PUSH_DELIVERY_FLAG_KEY, { killSwitch: true });
+    assert.equal((await servers("android-status-1"))[serverA.id]?.fcmActive, true, "the retired master switch no longer gates FCM");
+
+    await getDb().delete(featureFlags).where(eq(featureFlags.key, RETIRED_MOBILE_PUSH_DELIVERY_FLAG_KEY));
+    assert.equal((await servers("android-status-1"))[serverA.id]?.fcmActive, true, "removing the retired row keeps FCM active");
+
+    await setFlag(MOBILE_PUSH_FCM_FEATURE_FLAG_KEY, { defaultEnabled: false });
+    assert.equal((await servers("android-status-1"))[serverA.id]?.fcmActive, false);
+    await setFlag(MOBILE_PUSH_FCM_FEATURE_FLAG_KEY, { defaultEnabled: true });
+
+    __setFcmAccessTokenSourceForTests(null);
+    assert.equal((await servers("android-status-1"))[serverA.id]?.fcmActive, false, "FCM not configured");
+    __resetFcmTransportForTests();
+    __setFcmAccessTokenSourceForTests({ projectId: "raft-test", getAccessToken: async () => "test-token" });
+
+    await getDb().update(pushRegistrations)
+      .set({ revokedAt: new Date(), userId: null, serverId: null })
+      .where(eq(pushRegistrations.installationId, "android-status-1"));
+    assert.equal((await servers("android-status-1"))[serverA.id]?.fcmActive, false, "revoked registration");
+  } finally {
+    __resetFcmTransportForTests();
+    await close();
+  }
+});
+
 test("family revoke capability is unauthenticated, idempotent for 30 days, and terminal-invalid after retention", async () => {
   const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
   try {
@@ -313,6 +446,58 @@ test("online logout marks the entire push family dead while retaining idempotent
     });
     assert.equal(capabilityAck.status, 204);
   } finally {
+    await close();
+  }
+});
+
+test("web push subscribe stores only public HTTPS endpoints", async () => {
+  const { baseUrl, close } = await openTestApp("pglite://", 0, { humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
+  __setWebPushRuntimeForTests({ enabled: true });
+  try {
+    const owner = await seedVerifiedUser("push-subscribe@slock.test", "push-subscribe");
+    const token = await login(baseUrl, owner.email);
+    const keys = { p256dh: "BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQtUbVlUls0VJXg7A8u-Ts1XbjhazAkj7I99e8QcYP7DkM", auth: "tBHItJI5svbpez7KI4CCXg" };
+    const subscribe = (endpoint: unknown) => fetch(`${baseUrl}/api/push/subscribe`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ endpoint, keys }),
+    });
+
+    const rejected = [
+      "http://fcm.googleapis.com/fcm/send/plain-http",
+      "https://8.8.8.8/push/ip-literal",
+      "https://127.0.0.1:8080/push/loopback",
+      "https://[::1]/push/loopback-v6",
+      "https://10.0.0.5/push/private-range",
+      "https://169.254.169.254/latest/meta-data",
+      "https://localhost/push",
+      "https://printer.local/push",
+      "https://vault.internal/push",
+      "https://user:secret@fcm.googleapis.com/fcm/send/userinfo",
+      "not a url",
+      ["https://fcm.googleapis.com/fcm/send/array"],
+    ];
+    for (const endpoint of rejected) {
+      const res = await subscribe(endpoint);
+      assert.equal(res.status, 400, `${JSON.stringify(endpoint)} must be refused`);
+    }
+    assert.equal((await getDb().select().from(pushSubscriptions)).length, 0, "refused endpoints store nothing");
+
+    const accepted = [
+      "https://fcm.googleapis.com/fcm/send/abc",
+      "https://updates.push.services.mozilla.com/wpush/v2/abc",
+      "https://web.push.apple.com/abc",
+      "https://db5p.notify.windows.com/w/?token=abc",
+    ];
+    for (const endpoint of accepted) {
+      const res = await subscribe(endpoint);
+      assert.equal(res.status, 200, `${endpoint} must be accepted: ${await res.clone().text()}`);
+    }
+    const stored = (await getDb().select({ endpoint: pushSubscriptions.endpoint }).from(pushSubscriptions)
+      .where(eq(pushSubscriptions.userId, owner.id))).map((row) => row.endpoint).sort();
+    assert.deepEqual(stored, [...accepted].sort());
+  } finally {
+    __resetWebPushRuntimeForTests();
     await close();
   }
 });

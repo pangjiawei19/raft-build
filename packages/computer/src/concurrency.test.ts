@@ -3,10 +3,9 @@ import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { test } from "vitest";
 
-import { withComputerMutationLock, withMutationLock } from "./concurrency.js";
-import { CliExit } from "./output.js";
+import { releaseHeldComputerMutationLock, withComputerMutationLock, withMutationLock } from "./concurrency";
+import { CliExit } from "./output";
 
 // PR-H §3.2 regression guard — concurrency lock.
 
@@ -155,7 +154,7 @@ test("withComputerMutationLock: external lock deletion becomes typed process fai
     await writeFile(agentSentinel, '{"agent":"unchanged"}\n', "utf8");
 
     const fixture = join(import.meta.dirname, "test-fixtures", "mutationLockCompromiseChild.ts");
-    const child = spawn(process.execPath, ["--import", "tsx", fixture, home], {
+    const child = spawn(process.execPath, ["--import", "@oxc-node/core/register", fixture, home], {
       stdio: ["pipe", "pipe", "pipe"],
     });
     let stdout = "";
@@ -211,4 +210,27 @@ test("withComputerMutationLock: external lock deletion becomes typed process fai
     assert.equal(await readFile(runnerSentinel, "utf8"), '{"runner":"unchanged"}\n');
     assert.equal(await readFile(agentSentinel, "utf8"), '{"agent":"unchanged"}\n');
   });
+});
+
+
+// task #917: a foreground start releases the command's lock early so a
+// concurrent stop/start is not refused for the service's whole lifetime.
+test("task #917: releaseHeldComputerMutationLock lets another command acquire while the first is still running", async () => {
+  const home = await mkdtemp(join(tmpdir(), "raft-computer-lock-early-release-"));
+  try {
+    assert.equal(await releaseHeldComputerMutationLock(home), false, "nothing held yet");
+    let secondAcquired = false;
+    await withComputerMutationLock(home, async () => {
+      assert.equal(await releaseHeldComputerMutationLock(home), true);
+      assert.equal(await releaseHeldComputerMutationLock(home), false, "idempotent");
+      // Still inside the first command: a second command must get the lock now.
+      await withComputerMutationLock(home, async () => { secondAcquired = true; }, { staleMs: 60_000 });
+    });
+    assert.equal(secondAcquired, true);
+    // The outer finally must not throw on an already-released lock, and the
+    // lock is free afterwards.
+    await withComputerMutationLock(home, async () => undefined);
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
 });

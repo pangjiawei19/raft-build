@@ -2,7 +2,18 @@
 // Ported from packages/daemon/src/proxy.ts — only the fetch dispatcher
 // parts; WebSocket proxy is not needed in the CLI.
 
-import { ProxyAgent, type Dispatcher } from "undici";
+import type { Dispatcher } from "undici";
+
+// undici is loaded on first use, not at startup: a managed agent's `raft` call
+// talks to the loopback agent proxy through Node's built-in fetch and never
+// needs it, and loading it costs every call ~11 MiB and ~0.15 s of CPU.
+let undiciModule: Promise<typeof import("undici")> | undefined;
+function loadUndici(): Promise<typeof import("undici")> {
+  return (undiciModule ??= import("undici"));
+}
+
+/** undici's `fetch`, loading undici on the first call. */
+export const undiciFetch: typeof import("undici").fetch = async (...args) => (await loadUndici()).fetch(...args);
 
 const fetchDispatcherCache = new Map<string, Dispatcher>();
 
@@ -15,7 +26,48 @@ export interface FetchTransportDiagnostics {
   proxyUsed: boolean;
 }
 
-type ProxyAwareRequestInit = RequestInit & { dispatcher?: Dispatcher };
+type ProxyAwareRequestInit = RequestInit & { dispatcher?: Dispatcher; duplex?: "half" };
+
+// Keep fetch and its dispatcher on the same undici version. Node 26's built-in
+// fetch (undici 8) drops response headers when paired with an undici 7 ProxyAgent,
+// leaving gzip compressed and hiding the service callback's Set-Cookie headers.
+const packageFetch: typeof fetch = (input, init) => undiciFetch(
+  input as Parameters<typeof undiciFetch>[0],
+  init as Parameters<typeof undiciFetch>[1],
+) as unknown as Promise<Response>;
+let canonicalFetchImpl = packageFetch;
+
+/** Test-only transport seam; does not replace the process-global fetch. */
+export function setCanonicalFetchImplForTests(impl: typeof fetch): typeof fetch {
+  const previous = canonicalFetchImpl;
+  canonicalFetchImpl = impl;
+  return previous;
+}
+
+// A native Request belongs to Node's fetch implementation, so undici cannot
+// consume it directly. Apply overrides with the native constructor, then pass
+// the URL and standard request fields across the implementation boundary.
+function packageFetchArgs(input: string | URL | Request, init: ProxyAwareRequestInit): [string | URL, ProxyAwareRequestInit] {
+  if (typeof input === "string" || input instanceof URL) return [input, init];
+  const { dispatcher, ...requestInit } = init;
+  const request = new Request(input, requestInit);
+  return [request.url, {
+    method: request.method,
+    headers: request.headers,
+    body: request.body,
+    signal: request.signal,
+    redirect: request.redirect,
+    credentials: request.credentials,
+    cache: request.cache,
+    mode: request.mode,
+    referrer: request.referrer,
+    referrerPolicy: request.referrerPolicy,
+    integrity: request.integrity,
+    keepalive: request.keepalive,
+    ...(request.body ? { duplex: "half" as const } : {}),
+    dispatcher,
+  }];
+}
 
 export class CanonicalFetchTransportError extends Error {
   readonly diagnostics: FetchTransportDiagnostics;
@@ -100,6 +152,12 @@ function nestedErrorMessage(error: unknown): string {
     .toLowerCase();
 }
 
+/** Any failed name lookup is DNS, whatever code the resolver chose (some return EBUSY or EAI_FAIL, not ENOTFOUND). */
+function isNameLookupFailure(error: unknown): boolean {
+  return errorChain(error).some((item) =>
+    typeof item === "object" && item !== null && (item as { syscall?: unknown }).syscall === "getaddrinfo");
+}
+
 function classifyFetchTransportFailure(input: {
   url: string;
   cause: unknown;
@@ -124,7 +182,14 @@ function classifyFetchTransportFailure(input: {
     || /\b(?:tls|certificate|ssl)\b/.test(message)
   ) {
     causeClass = "tls";
-  } else if (code === "ENOTFOUND" || code === "EAI_AGAIN" || /\bdns\b/.test(message)) {
+  } else if (
+    code === "ENOTFOUND"
+    || code === "EAI_AGAIN"
+    || isNameLookupFailure(input.cause)
+    || /\bdns\b/.test(message)
+  ) {
+    // Before the proxy check: a lookup message names the host, and a host such
+    // as `proxy-only.invalid` must not read as a proxy failure.
     causeClass = "dns";
   } else if (code.includes("PROXY") || /\bproxy\b/.test(message)) {
     causeClass = "proxy";
@@ -181,10 +246,10 @@ export function shouldBypassProxy(targetUrl: string, env: NodeJS.ProcessEnv): bo
     });
 }
 
-export function buildFetchDispatcher(
+export async function buildFetchDispatcher(
   targetUrl: string,
   env: NodeJS.ProcessEnv = process.env,
-): Dispatcher | undefined {
+): Promise<Dispatcher | undefined> {
   const proxyUrl = getProxyUrlForTarget(targetUrl, env);
   if (!proxyUrl) return undefined;
   if (shouldBypassProxy(targetUrl, env)) return undefined;
@@ -192,7 +257,13 @@ export function buildFetchDispatcher(
   const cached = fetchDispatcherCache.get(proxyUrl);
   if (cached) return cached;
 
-  const dispatcher = new ProxyAgent(proxyUrl);
+  const { ProxyAgent } = await loadUndici();
+  const dispatcher = new ProxyAgent({
+    uri: proxyUrl,
+    // undici 8 forwards plain-http requests to the proxy without CONNECT
+    // unless asked; keep 7.x's tunnel-everything behavior (as the daemon does).
+    proxyTunnel: true,
+  });
   fetchDispatcherCache.set(proxyUrl, dispatcher);
   return dispatcher;
 }
@@ -206,7 +277,7 @@ export async function fetchWithCanonicalProxy(
   const proxyConfigured = Boolean(getProxyUrlForTarget(targetUrl, env)) && !shouldBypassProxy(targetUrl, env);
   let dispatcher: Dispatcher | undefined;
   try {
-    dispatcher = buildFetchDispatcher(targetUrl, env);
+    dispatcher = await buildFetchDispatcher(targetUrl, env);
   } catch (cause) {
     throw new CanonicalFetchTransportError({ url: targetUrl, cause, proxyUsed: proxyConfigured });
   }
@@ -214,7 +285,8 @@ export async function fetchWithCanonicalProxy(
   const proxyAwareInit: ProxyAwareRequestInit = { ...init };
   if (dispatcher) proxyAwareInit.dispatcher = dispatcher;
   try {
-    return await fetch(input, proxyAwareInit);
+    const [url, packageInit] = packageFetchArgs(input, proxyAwareInit);
+    return await canonicalFetchImpl(url, packageInit);
   } catch (cause) {
     throw new CanonicalFetchTransportError({ url: targetUrl, cause, proxyUsed: Boolean(dispatcher) });
   }

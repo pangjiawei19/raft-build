@@ -16,7 +16,6 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import test from "node:test";
 import {
   aggregateFindings,
   collectCurrentFindings,
@@ -313,7 +312,7 @@ test("collectCurrentFindings: temp root without en.ts stays GREEN via catalogMes
   }
 });
 
-test("real corpus: catalog MessageId filter drops exact 24 keys/33 hits (billing+workspace-grid+settings)", () => {
+test("real corpus: catalog MessageId filter drops exact 6 keys/6 hits (billing+settings+agent profile)", () => {
   const catalog = loadCatalogMessageIdsFromPath(EN_CATALOG);
   const baseline = JSON.parse(readFileSync(BASELINE_PATH, "utf8")) as Array<{
     path: string;
@@ -344,11 +343,20 @@ test("real corpus: catalog MessageId filter drops exact 24 keys/33 hits (billing
     target: "src",
   });
 
-  assert.equal(droppedAgg.length, 24, `expected 24 filtered keys; got ${droppedAgg.length}`);
+  // Wiki retirement removes settingsNavigation SETTINGS_TABS label/title
+  // "wiki.settings": one aggregated key, two hits (24/33 -> 23/31).
+  // Agent profile edit dialogs (task #672) title each field through a MessageId
+  // map; "agent.detail.editDescription" is a catalog id there, not copy (24/32).
+  // messageStore's focused-context failure now picks its catalog id through a
+  // ternary (not-found vs beyond-history, task #14) instead of two object
+  // literal `contextLoadError:` values, retiring that key/2 hits (23/30).
+  // Removing the Workspace grid layout deleted workspaceGridUrlState.ts and its
+  // 17 catalog-id object literals (24 hits), leaving 6/6.
+  assert.equal(droppedAgg.length, 6, `expected 6 filtered keys; got ${droppedAgg.length}`);
   assert.equal(
     droppedAgg.reduce((n, e) => n + e.count, 0),
-    33,
-    "expected 33 filtered hits",
+    6,
+    "expected 6 filtered hits",
   );
   assert.equal(
     droppedAgg.filter((e) => e.path === "src/components/agent/AgentScopesPanel.tsx").length,
@@ -359,12 +367,8 @@ test("real corpus: catalog MessageId filter drops exact 24 keys/33 hits (billing
     5,
   );
   assert.equal(
-    droppedAgg.filter((e) => e.path === "src/components/workspace/workspaceGridUrlState.ts").length,
-    17,
-  );
-  assert.equal(
     droppedAgg.filter((e) => e.path === "src/components/settings/settingsNavigation.ts").length,
-    1,
+    0,
   );
   for (const entry of droppedAgg) {
     assert.equal(entry.rule, "formatjs/no-literal-string-in-object");
@@ -385,10 +389,43 @@ test("real corpus: catalog MessageId filter drops exact 24 keys/33 hits (billing
   // became a raft-ui <Input> for per-row invite roles, so its audited
   // `name@company.com` placeholder stopped being reported — the same intrinsic-only
   // effect recorded above for RuntimeConfigFields, ratcheting DOWN again.
-  assert.equal(current.length, 153, `final disposition baseline keys; got ${current.length}`);
+  // ReleaseNotesPanel's eight owner-managed literals moved into the catalogs.
+  // 180 -> 179 hits: MachineDetailPanel lost its raw-daemon version row (the
+  // standalone daemon has no release line any more), so one audited `v` prefix
+  // literal stopped being reported.
+  // ReleaseNotesPanel's owner-managed strings moved into the message catalogs (143/171),
+  // and the wave-2 title→Tooltip migration deleted HumanDetailPanel's redundant handle-span title
+  // `` `@${human.name}` `` (title == visible text), ratcheting down to 142 keys / 170 hits.
+  // 2026-09-24: 142 -> 138 keys / 170 -> 166 hits. 11fc52292 removed the dormant
+  // PostHog integration, deleting src/analytics/flagRegistry.ts ("Chat grid
+  // layout", "Sync-core messages", "Auto", "Feature flags") and two App.tsx
+  // entries. The baseline was pruned in that commit; only these counts were left.
+  // Task #41 deleted the separate Provider-connection select and its duplicate
+  // item literals; the one Provider selector now owns both saved and direct
+  // choices. Net after staging's own moves the corpus holds at 138 keys / 166 hits.
+  // 138 -> 137 keys / 166 -> 165 hits: the Computer upgrade copy rework renders
+  // the target inside the catalogued "Upgrade to v{version}" button label, so
+  // MachineDetailPanel's audited `(v` version-marker literal left the source.
+  // 137 -> 136 keys / 165 -> 164 hits: MachineDetailPanel's `~/.slock/agents/`
+  // workspace path moved out of JSX into a helper (the daemon now reports
+  // `~/.raft` paths on new machines; slock#9190).
+  // 136 -> 110 keys / 164 -> 132 hits: removing the Workspace grid layout
+  // deleted its panel-title protocol literals (#channel / @name / task #N) in
+  // MainLayout, Sidebar, member rows, MessageSearchPage and src/components/workspace.
+  // 132 -> 130 hits: the Sidebar channel row's two `"99+"` caps moved out of
+  // JSX into one helper shared by the badge's message and thread segments.
+  // 110 -> 108 keys / 130 -> 127 hits: ActionCard's `@` / `#` prefixes left
+  // JSX for template strings in useActionCardDetail (task #752).
+  // 108 -> 98 keys / 127 -> 117 hits: the Raft Design System rewrite redrew
+  // PaletteAuditPage on DS tokens, retiring ten legacy-palette research
+  // literals (`brutal-pink`, `bg-palette-lavender/40`, `#E08585`, …).
+  // 117 -> 116 hits: the Sidebar DM and pinned-agent rows draw through one
+  // SidebarPeerRowBody, so their two `"99+"` caps are one.
+  assert.equal(current.length, 98, `final disposition baseline keys; got ${current.length}`);
   assert.equal(
     current.reduce((n, e) => n + e.count, 0),
-    182,
+    116,
+
     "final disposition baseline hits",
   );
   assert.equal(
@@ -407,7 +444,8 @@ test("real corpus: catalog MessageId filter drops exact 24 keys/33 hits (billing
     }),
   );
 
-  assert.equal(baseline.length, 153);
+  assert.equal(baseline.length, 98); // 108 -> 98: see the PaletteAuditPage note above
+
   assert.equal(
     baseline.filter((e) => e.path === "src/components/agent/AgentScopesPanel.tsx").length,
     0,
@@ -441,7 +479,7 @@ test("boundary: @/#/99+/technical/object English stay; safe glue leaves baseline
     "safe translated template glue must be filtered",
   );
   assert.ok(
-    bySource((s) => s === "@theme" || s === "#E08585" || s.includes("bg-brutal-lavender"))
+    bySource((s) => s === "@theme" || s === "file:line" || s === "packages/web/src/index.css")
       .length >= 3,
     "technical-token research bucket must remain",
   );

@@ -2,13 +2,13 @@
 // → POST /internal/agent-api/channels/:channelId/join
 
 import type { Command } from "commander";
-import { joinRaftChannelByTarget } from "@botiverse/raft-shared";
+import { joinRaftChannelByTarget } from "@botiverse/raft-shared/src/agentCliSurface";
 
-import { createAgentApiContractSurfaceClient } from "../../agentApiPath.js";
-import { defineCommand, registerCliCommand } from "../../core/command.js";
-import type { CommandRuntimeOptions } from "../../core/context.js";
-import { CliError } from "../../core/errors.js";
-import { writeText, adoptCliReplyText } from "../../core/renderer.js";
+import { createAgentApiContractSurfaceClient } from "../../agentApiPath";
+import { defineCommand, registerCliCommand } from "../../core/command";
+import type { CommandRuntimeOptions } from "../../core/context";
+import { CliError } from "../../core/errors";
+import { writeText, adoptCliReplyText } from "../../core/renderer";
 
 interface JoinOpts {
   target?: string;

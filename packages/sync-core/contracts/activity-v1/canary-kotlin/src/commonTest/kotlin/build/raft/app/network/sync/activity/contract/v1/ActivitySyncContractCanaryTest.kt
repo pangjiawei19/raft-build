@@ -145,6 +145,11 @@ class ActivitySyncContractCanaryTest {
             ActivityFixtureEnvelope.serializer(),
             ACTIVITY_SYNC_BEHAVIOR_SEED_JSONL.trim(),
         )
+        // The contract identity the client compares with the server's
+        // X-Raft-Contract header. Equality with revisions.json is enforced
+        // repo-side by tools/verify-contract.mjs.
+        assertEquals(ACTIVITY_SYNC_CONTRACT, envelope.contract)
+        assertTrue(ACTIVITY_SYNC_CONTRACT_REVISION >= 2, "revision 1 is the untracked pre-ledger shape")
         val ingresses = envelope.steps
             .filterIsInstance<IngestFixtureStep>()
             .map(IngestFixtureStep::ingress)

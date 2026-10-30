@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
-import type { APIRequestContext } from "@playwright/test";
+import type { APIRequestContext, Locator, Page } from "@playwright/test";
 import { loginViaApi } from "../../fixtures/auth";
+import { expectCssColor } from "../../fixtures/colorAssertions";
 import { waitForSeedState } from "../../fixtures/seedState";
 import type { PlaywrightSeedState } from "../../fixtures/seedState";
 
@@ -28,6 +29,26 @@ async function dismissOwnerOnboarding(
   }
 }
 
+// Raft DS › TabBar: the selected tab's icon sits in a yellow sticker (56×30)
+// that wraps only the icon; the cell itself stays on the bar's surface (the
+// whole-cell yellow was the product's look before the DS). The sticker is the
+// item's ::before.
+async function expectSelectedTabSticker(page: Page, tab: Locator) {
+  await expect(tab).toHaveAttribute("data-selected", "true");
+  const paint = await tab.evaluate((el) => {
+    const sticker = getComputedStyle(el, "::before");
+    return {
+      cell: getComputedStyle(el).backgroundColor,
+      sticker: sticker.backgroundColor,
+      stickerWidth: sticker.width,
+      stickerHeight: sticker.height,
+    };
+  });
+  await expectCssColor(page, paint.sticker, "#FFD440", 1);
+  expect({ width: paint.stickerWidth, height: paint.stickerHeight }).toEqual({ width: "56px", height: "30px" });
+  await expectCssColor(page, paint.cell, "rgba(0, 0, 0, 0)");
+}
+
 // Regression for #255: on the server homepage, switching MobileTabBar
 // Home → Members → Home used to leave the sidebar stuck on the Members
 // surface. Root cause was Sidebar's URL→state effect ignoring the
@@ -50,7 +71,10 @@ test.describe("mobile tab bar — home ↔ members switching", () => {
     // Tap Members in the bottom tab bar.
     await page.getByRole("button", { name: "Members" }).click();
     await expect(page).toHaveURL(new RegExp(`/s/${seedState.server.slug}/members$`));
-    await expect(page.getByRole("button", { name: "Members" })).toHaveClass(/bg-soft-signal/);
+    // Selected tab is highlighted: `data-selected` marks it and its icon sits
+    // in the yellow sticker.
+    const membersTab = page.getByRole("button", { name: "Members" });
+    await expectSelectedTabSticker(page, membersTab);
 
     // Tap Home — sidebar must flip back to the chat surface, not stay on members.
     await page.getByRole("button", { name: "Home" }).click();
@@ -65,7 +89,9 @@ test.describe("mobile tab bar — home ↔ members switching", () => {
     await dismissOwnerOnboarding(request, seedState, login.accessToken);
 
     await page.goto(`/s/${seedState.server.slug}/members`);
-    await expect(page.getByRole("button", { name: "Members" })).toHaveClass(/bg-soft-signal/);
+    // Same selected-tab contract as the navigation test above.
+    const membersTabCold = page.getByRole("button", { name: "Members" });
+    await expectSelectedTabSticker(page, membersTabCold);
 
     await page.getByRole("button", { name: "Home" }).click();
     await expect(page).toHaveURL(new RegExp(`/s/${seedState.server.slug}/?$`));

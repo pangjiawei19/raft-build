@@ -1,0 +1,115 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`channel hold: skipped line anchors on the lowest held seq when firstShownSeq is absent 1`] = `
+"Held — 3 unread messages in #general. Your task claim was not applied.
+
+  ├ ⋯ 1 earlier message skipped in this notice. Older exist: raft message read --target "#general" --before 51. ⋯
+  ├ Latest 2 ────────────────────────────
+  │ @scout 09:01  second
+  │ @richard 09:00  first
+  └ Previews are truncated. Full text: raft message read --target "#general"
+
+After reviewing the current state of this conversation, choose one path.
+"
+`;
+
+exports[`held for the DM peer's card alone 1`] = `
+"Held — @richard's profile is not in your current context yet. Your message has been saved as a draft (kept for 10 minutes).
+
+DM peer @richard (human, Asia/Shanghai): Founder. Prefers short updates.
+Equivalent: raft user info @richard
+
+After reading it, choose one path.
+To send the current draft unchanged:
+  raft message send --send-draft --target "dm:@richard"
+You can also choose not to send anything.
+"
+`;
+
+exports[`held for the channel card alone: the card, then the paths 1`] = `
+"Held — the description of #ops is not in your current context yet. Your message has been saved as a draft (kept for 10 minutes).
+
+Channel #ops (public): Release coordination. Post go/no-go here.
+Equivalent: raft channel info "#ops"
+
+After reading it, choose one path.
+To update the draft, send revised content normally:
+  raft message send --target "#ops:1a2b3c4d" <<'RAFTMSG'
+  revised message
+  RAFTMSG
+"
+`;
+
+exports[`hold with no previews: pointer line only, singular noun 1`] = `
+"Held — 1 unread message in #general. Your message has been saved as a draft.
+
+  └ Previews are truncated. Full text: raft message read --target "#general"
+
+After reviewing the current state of this conversation, choose one path.
+"
+`;
+
+exports[`server window counts and anchors are passed through: shown count, first shown seq, string seqs 1`] = `
+"Held — 9 unread messages in #general. Your message has been saved as a draft.
+
+  ├ ⋯ 6 earlier messages skipped in this notice. Older exist: raft message read --target "#general" --before 40. ⋯
+  ├ Latest 3 ────────────────────────────
+  │ @scout 09:01  string seq
+  │ @richard  no seq
+  └ Previews are truncated. Full text: raft message read --target "#general"
+
+After reviewing the current state of this conversation, choose one path.
+"
+`;
+
+exports[`thread hold: no start anchor when the thread start is inside the shown window 1`] = `
+"Held — 1 unread message in dm:@richard:1a2b3c4d. Your message has been saved as a draft.
+
+  ├ Latest 1 ────────────────────────────
+  │ @richard  root
+  └ Previews are truncated. Full text: raft message read --target "dm:@richard:1a2b3c4d"
+
+After reviewing the current state of this conversation, choose one path.
+"
+`;
+
+exports[`thread hold: start anchor, skipped line, truncated previews, mention note, continue-anyway 1`] = `
+"Held — 7 unread messages in #ops:1a2b3c4d. Your message has been saved as a draft (kept for 10 minutes).
+Note: 2 of these messages formally @mention you.
+
+  ┌ Thread start ────────────────────────────
+  │ @richard 08:00  Deploy plan for the API tier
+  ├ ⋯ 4 earlier messages skipped in this notice. Older exist: raft message read --target "#ops:1a2b3c4d" --before 1205. ⋯
+  ├ Latest 3 ────────────────────────────
+  │ @scout 09:01  The rollout is paused because the canary error rate doubled after the config push; please hold any deploys to the API tier until we confirm the fix, then re-run…⟨38 more chars⟩
+  │ @李雷 09:02  这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布先暂停：配置推送之后金丝雀的错误率翻了一倍。这次发布…⟨100 more chars⟩
+  │ no sender, no time
+  └ Previews are truncated. Full text: raft message read --target "#ops:1a2b3c4d"
+
+After reviewing the current state of this conversation, choose one path.
+To update the draft, send revised content normally:
+  raft message send --target "#ops:1a2b3c4d" <<'RAFTMSG'
+  revised message
+  RAFTMSG
+This thread is busy: to send without reviewing again, add --anyway.
+"
+`;
+
+exports[`unread messages and a changed channel card in one hold: the card before the window 1`] = `
+"Held — 1 unread message in #ops. Your message has been saved as a draft.
+
+Channel #ops (public), changed since you last saw it: Release coordination. Post go/no-go here.
+Equivalent: raft channel info "#ops"
+
+  ├ Latest 1 ────────────────────────────
+  │ @richard 09:00  deploy at 5?
+  └ Previews are truncated. Full text: raft message read --target "#ops"
+
+After reviewing the current state of this conversation, choose one path.
+"
+`;
+
+exports[`withheld context renders the count-only notice 1`] = `
+"Reviewer-isolation freshness hold: 1 newer message withheld.
+"
+`;

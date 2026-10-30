@@ -3,78 +3,47 @@
 // format (the MCP chat-bridge it originally mirrored has been removed) —
 // an AX contract, not an implementation detail. Pinned by `_format.test.ts`.
 
-import { T, UUID_A, UUID_B, UUID_C, sampleMessage, sampleMessageChannelThread, sampleMessageDm, sampleMessageDmThread } from "../_axExampleFixtures.js";
-import { axSurface } from "../../core/renderer.js";
-import {
-  formatUtcTimestamp,
-  formatAgentReplyAffordanceSuffix,
-  renderThirdPartyInertJson,
-  type RaftTargetString,
+import { T, UUID_A, UUID_B, UUID_C, sampleMessage, sampleMessageChannelThread, sampleMessageDm, sampleMessageDmThread } from "../_axExampleFixtures";
+import { axSurface } from "../../core/renderer";
+import type {
+  AgentMessageLike,
+  AgentMessageTaskCurrentProjectionLike,
+  AgentSearchContinueFilters,
+  AgentSearchData,
+  AgentSearchResultLike,
+  RaftTargetString,
+  ChannelCard,
+  PeerCard,
+  SendAttachment,
 } from "@botiverse/raft-shared";
+import {
+  AGENT_API_MESSAGE_SEARCH_DEFAULT_LIMIT,
+  AGENT_API_MESSAGE_SEARCH_MAX_LIMIT,
+  formatAgentAttachmentSuffix,
+  formatAgentInboxHint,
+  formatAgentMessageLine,
+  formatAgentMessages,
+  formatAgentMessageTarget,
+  formatAgentSenderHandle,
+  formatAgentTaskAssigneeSuffix,
+  formatAgentTaskCurrentProjection,
+  formatAgentSearchResults,
+  formatUtcTimestamp,
+  formatSenderHandleText,
+  indentAgentBodyContinuationLines,
+  neutralizeAgentRaftRefLiterals,
+  renderAgentSearchPreviewText,
+  renderChannelCard,
+  renderPeerCard,
+  renderSendAttachment,
+} from "@botiverse/raft-shared/src/agentCliSurface";
+import type { AgentApiMessageSearchResponse } from "@botiverse/raft-shared";
 
-interface TaskCurrentProjectionLike {
-  title?: string;
-  description?: string | null;
-  revision?: number;
-  superseded?: boolean;
-  amendedAt?: string | null;
-  amended_at?: string | null;
-  amendedByType?: string | null;
-  amended_by_type?: string | null;
-  amendedByName?: string | null;
-  amended_by_name?: string | null;
-  source?: string;
-}
-
-export interface MessageLike {
-  channel_type?: string;
-  channel_name?: string;
-  parent_channel_type?: string;
-  parent_channel_name?: string;
-  message_id?: string;
-  timestamp?: string;
-  sender_type?: string;
-  sender_name?: string;
-  sender_description?: string | null;
-  content?: string;
-  attachments?: Array<{ id: string; filename: string }>;
-  task_status?: string | null;
-  task_number?: number | null;
-  task_assignee_id?: string | null;
-  task_assignee_type?: string | null;
-  task_assignee_name?: string | null;
-  task_current_projection?: TaskCurrentProjectionLike | null;
-  non_member_mention?: boolean;
-  third_party_event?: {
-    id: string;
-    kind: string;
-    client_id: string;
-    client_name: string;
-    external_event_id?: string | null;
-    payload_hash: string;
-    payload?: Record<string, unknown>;
-    expires_at: string;
-    source?: {
-      client_id?: string;
-      client_name?: string;
-      oauth_client_id?: string;
-      access_token_id_hash?: string | null;
-      resource?: string;
-    };
-  };
-  [key: string]: unknown;
-}
-
-function toLocalTimeWithOffset(iso: string): string {
-  const d = new Date(iso);
-  if (isNaN(d.getTime())) return iso;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const offsetMinutes = -d.getTimezoneOffset();
-  const sign = offsetMinutes >= 0 ? "+" : "-";
-  const absOffset = Math.abs(offsetMinutes);
-  const offset = `${sign}${pad(Math.floor(absOffset / 60))}:${pad(absOffset % 60)}`;
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${offset}`;
-}
+// The message-like shapes and the canonical header line live in
+// `@botiverse/raft-shared` (`agentMessageText.ts`) so the SDK renders the same
+// bytes; this file keeps the `axSurface` registrations and CLI-only formatters.
+export type TaskCurrentProjectionLike = AgentMessageTaskCurrentProjectionLike;
+export type MessageLike = AgentMessageLike;
 
 // Return type is the structured wire form (not opaque string): a dropped `@`,
 // a missing sigil, or a malformed thread suffix in any branch below is now a
@@ -82,88 +51,24 @@ function toLocalTimeWithOffset(iso: string): string {
 // Structured target shape, not a reply surface: consumed inside other
 // formatters and by command routing; typed as RaftTargetString.
 export function formatTarget(m: MessageLike): RaftTargetString {
-  if (m.third_party_event) {
-    return `agent-event:${m.third_party_event.id.slice(0, 8)}` as RaftTargetString;
-  }
-  if (m.channel_type === "thread" && m.parent_channel_name) {
-    const shortId = m.channel_name?.startsWith("thread-") ? m.channel_name.slice(7) : m.channel_name;
-    if (m.parent_channel_type === "dm") {
-      return `dm:@${m.parent_channel_name}:${shortId}` as RaftTargetString;
-    }
-    return `#${m.parent_channel_name}:${shortId}` as RaftTargetString;
-  }
-  if (m.channel_type === "dm") {
-    return `dm:@${m.channel_name}` as RaftTargetString;
-  }
-  return `#${m.channel_name}` as RaftTargetString;
+  return formatAgentMessageTarget(m);
 }
 
-function formatSenderHandle(m: MessageLike): string {
-  const name = m.sender_name ?? "unknown";
-  const desc = m.sender_description ?? null;
-  return desc ? `@${name} — ${desc}` : `@${name}`;
-}
-
-function formatAttachmentSuffix(attachments: Array<{ id: string; filename: string }> | undefined): string {
-  if (!attachments?.length) return "";
-  return ` [${attachments.length} attachment${attachments.length > 1 ? "s" : ""}: ${attachments.map((a) => `${a.filename} (id:${a.id})`).join(", ")} — use raft attachment view to download]`;
-}
-
-function formatTaskAssigneeSuffix(assigneeId?: string | null, assigneeName?: string | null): string {
-  if (!assigneeId) return "";
-  return assigneeName ? ` assignee=@${assigneeName}` : " assignee=<unresolved>";
-}
+const formatSenderHandle = formatAgentSenderHandle;
+const formatAttachmentSuffix = formatAgentAttachmentSuffix;
+const formatTaskAssigneeSuffix = formatAgentTaskAssigneeSuffix;
 
 function formatTaskCurrentProjection(
   projection: TaskCurrentProjectionLike | null | undefined,
   taskNumber?: number | null,
   neutralizeRefs = false,
 ): string {
-  if (!projection?.superseded) return "";
-  const revision = Number.isInteger(projection.revision) ? projection.revision : "?";
-  const source = projection.source ?? "tasks_current_projection";
-  const actorName = projection.amendedByName ?? projection.amended_by_name ?? null;
-  const actorType = projection.amendedByType ?? projection.amended_by_type ?? null;
-  const actor = actorName
-    ? neutralizeRefs ? `user:${actorName}` : `@${actorName}`
-    : actorType === "system" ? "system" : "<unresolved>";
-  const amendedAt = projection.amendedAt ?? projection.amended_at ?? null;
-  const lines = [
-    `[${taskNumber ? `task #${taskNumber} ` : "task "}superseded: current projection rev=${revision} source=${source} actor=${actor} time=${amendedAt ? formatUtcTimestamp(amendedAt) : "-"}]`,
-    `Current title: ${neutralizeRefs ? renderPreviewText(projection.title ?? "") : projection.title ?? ""}`,
-  ];
-  if (projection.description != null) {
-    lines.push(`Current description: ${neutralizeRefs ? renderPreviewText(projection.description) : projection.description}`);
-  }
-  return `\n${lines.join("\n")}`;
+  return formatAgentTaskCurrentProjection(projection, taskNumber, neutralizeRefs ? renderAgentSearchPreviewText : undefined);
 }
 
 export const formatMessageLine = axSurface(
   "One received-message line: header bracket + sender + content + suffixes.",
-  (m: MessageLike): string => {
-  if (m.third_party_event) {
-    const msgId = m.message_id ? m.message_id.slice(0, 8) : m.third_party_event.id.slice(0, 8);
-    const time = m.timestamp ? formatUtcTimestamp(m.timestamp) : "-";
-    const event = m.third_party_event;
-    const content = m.content ?? "";
-    const source = event.source;
-    const sourceSuffix = source?.resource
-      ? `; resource=${source.resource}${source.access_token_id_hash ? `; access_token_id_hash=${source.access_token_id_hash}` : ""}`
-      : "";
-    const provenance = `kind=${event.kind}; payload_hash=${event.payload_hash}${sourceSuffix}`;
-    return (`[target=agent-event:${event.id.slice(0, 8)} msg=${msgId} time=${time} type=third_party_app] @${event.client_id} — ${event.client_name}: ${provenance}\n${content}${event.payload ? `\npayload:\n${renderThirdPartyInertJson(event.payload)}` : ""}`);
-  }
-  const target = formatTarget(m);
-  const msgId = m.message_id ? m.message_id.slice(0, 8) : "-";
-  const time = m.timestamp ? formatUtcTimestamp(m.timestamp) : "-";
-  const senderType = ` type=${m.sender_type}`;
-  const content = m.content ?? "";
-  const attachSuffix = formatAttachmentSuffix(m.attachments);
-  const taskSuffix = m.task_status
-    ? ` [task #${m.task_number} status=${m.task_status}${formatTaskAssigneeSuffix(m.task_assignee_id, m.task_assignee_name)}]`
-    : "";
-  return (`[target=${target} msg=${msgId} time=${time}${senderType}] ${formatSenderHandle(m)}: ${content}${attachSuffix}${taskSuffix}${formatAgentReplyAffordanceSuffix(m)}${formatTaskCurrentProjection(m.task_current_projection)}`);
-},
+  (m: MessageLike): string => formatAgentMessageLine(m),
   {
     // All four target shapes (@xxchan 8/31): channel, channel thread, dm, dm thread.
     examples: [
@@ -177,12 +82,33 @@ export const formatMessageLine = axSurface(
 
 export const formatMessages = axSurface(
   "Batch of received-message lines (message check output).",
-  (messages: MessageLike[]): string => {
-  if (messages.length === 0) return ("No new inbox messages.");
-  return (messages.map(formatMessageLine).join("\n"));
-},
+  (messages: MessageLike[]): string => formatAgentMessages(messages),
   {
     examples: [{ title: "batch incl. agent sender + task bracket + all target shapes", args: [[sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, sender_type: "agent", sender_name: "Alice", sender_description: "example agent role", content: "hi there", task_status: "in_progress", task_number: 42, task_assignee_id: "a-1", task_assignee_type: "agent" }, { ...sampleMessageChannelThread, seq: 1202 }, { ...sampleMessageDm, message_id: UUID_A, seq: 1203 }, { ...sampleMessageDmThread, seq: 1204 }]] }],
+  },
+);
+
+/**
+ * `message check` hands over a bounded batch, oldest first per conversation;
+ * the server reports how many conversations still have unread after it.
+ */
+export const formatInboxHint = axSurface(
+  "Still-unread line appended to message check when conversations remain unread beyond the returned batch.",
+  (hint: { unread_conversations: number }): string => formatAgentInboxHint(hint),
+  {
+    examples: [{ args: [{ unread_conversations: 12 }] }, { title: "singular", args: [{ unread_conversations: 1 }] }],
+  },
+);
+
+/**
+ * App items come from a Raft daemon's inbox; an external agent has no daemon.
+ * Said explicitly so an absent pending-app-items line is not read as "none".
+ */
+export const formatAppItemsUnavailable = axSurface(
+  "message check line for external agents: app items are not available (no Raft daemon).",
+  (): string => "App items: not available for external agents.",
+  {
+    examples: [{ args: [] }],
   },
 );
 
@@ -214,11 +140,22 @@ export interface HistoryMessage {
   [key: string]: unknown;
 }
 
+// Match the server's `parseChannelRef`: only the LAST colon can introduce a
+// thread suffix, and that suffix must be exactly 8 hex characters. Parent
+// channel/DM names may themselves contain colons, so `[^:]+` is incorrect.
+function isThreadTargetRef(channel: string): boolean {
+  const prefixLength = channel.startsWith("#")
+    ? 1
+    : /^dm:@/i.test(channel) ? 4 : -1;
+  if (prefixLength < 0) return false;
+  const targetRest = channel.slice(prefixLength);
+  const lastColon = targetRest.lastIndexOf(":");
+  return lastColon > 0 && /^[0-9a-f]{8}$/i.test(targetRest.slice(lastColon + 1));
+}
+
 function buildReplyTarget(channel: string, messageId: string | undefined): string | null {
   if (!messageId) return null;
-  const isThreadTarget = /^#[^:]+:[0-9a-f]{8}$/i.test(channel)
-    || /^dm:@[^:]+:[0-9a-f]{8}$/i.test(channel);
-  if (isThreadTarget) return null;
+  if (isThreadTargetRef(channel)) return null;
   return `${channel}:${messageId.slice(0, 8)}`;
 }
 
@@ -235,7 +172,10 @@ function formatHistoryMessageLine(channel: string, m: HistoryMessage, index: num
     `time=${createdAt ? formatUtcTimestamp(createdAt) : "-"}`,
   ];
   if (senderType) headerParts.push(`type=${senderType}`);
-  if (m.threadId) headerParts.push(`threadId=${m.threadId}`);
+  // No `threadId=`: the thread channel's own id is a second address for the
+  // same thread, and agents replied to it instead of `replyTarget` (the root
+  // message's short id), which the daemon then recorded as a different target
+  // (2026-10-14). `replyTarget` is the one address to use.
   if ((m.replyCount ?? 0) > 0) headerParts.push(`replyCount=${m.replyCount}`);
   const replyTarget = buildReplyTarget(channel, messageId);
   if (replyTarget) headerParts.push(`replyTarget=${replyTarget}`);
@@ -245,8 +185,9 @@ function formatHistoryMessageLine(channel: string, m: HistoryMessage, index: num
   const taskSuffix = m.taskStatus
     ? ` [task #${m.taskNumber} status=${m.taskStatus}${formatTaskAssigneeSuffix(m.taskAssigneeId, assigneeName)}]`
     : "";
-  const handle = senderDescription ? `@${senderName} — ${senderDescription}` : `@${senderName}`;
-  return `[${headerParts.join(" ")}] ${handle}: ${m.content ?? ""}${attachSuffix}${taskSuffix}${formatTaskCurrentProjection(m.taskCurrentProjection)}`;
+  const senderTimezone = typeof m.senderTimezone === "string" ? m.senderTimezone : typeof m.sender_timezone === "string" ? m.sender_timezone : null;
+  const handle = formatSenderHandleText(senderName, senderDescription, senderTimezone);
+  return `[${headerParts.join(" ")}] ${handle}: ${indentAgentBodyContinuationLines(m.content ?? "")}${attachSuffix}${taskSuffix}${formatTaskCurrentProjection(m.taskCurrentProjection)}`;
 }
 
 export interface HistoryData {
@@ -257,6 +198,9 @@ export interface HistoryData {
   historyLimited?: boolean;
   historyLimitMessage?: string;
   last_read_seq?: number | null;
+  unread_after_seq?: number | null;
+  read_through_seq?: number | null;
+  model_seen_up_to_seq?: number | null;
 }
 
 function seqBoundary(messages: HistoryMessage[], edge: "first" | "last"): number | string {
@@ -291,14 +235,80 @@ export function historyCursorText(
   return `${label} exist: ${command}.`;
 }
 
+export const formatChannelCard = axSurface(
+  "Channel card printed before a read: the first read of the channel (or of a thread in it) in this model context, or the first after the card changed.",
+  (card: ChannelCard, changed: boolean): string => `${renderChannelCard(card, { changed }).join("\n")}\n\n`,
+  {
+    examples: [
+      { title: "first read in this context", args: [{ id: "c-1", name: "general", type: "channel", description: "Company-wide announcements. Post release notes here; questions go to #help." }, false] },
+      { title: "after the description changed", args: [{ id: "c-1", name: "general", type: "channel", description: "Company-wide announcements only." }, true] },
+      { title: "archived private channel without a description", args: [{ id: "c-2", name: "incident-42", type: "private", archived: true }, false] },
+    ],
+  },
+);
+
+export const formatSentChannelCard = axSurface(
+  "Channel card after a sent message: the send named a card version other than the channel's current one (changed since this context saw it, or sent with --anyway before seeing it).",
+  (card: ChannelCard, changed: boolean): string => `\n${renderChannelCard(card, { changed }).join("\n")}\n`,
+  {
+    examples: [
+      { title: "the card changed since this context saw it", args: [{ id: "c-1", name: "general", type: "channel", description: "Company-wide announcements only." }, true] },
+    ],
+  },
+);
+
+export const formatPeerCard = axSurface(
+  "DM peer card printed before a DM read: this model context has seen nothing of the peer yet (no card, no message from them).",
+  (card: PeerCard): string => `${renderPeerCard(card).join("\n")}\n\n`,
+  {
+    examples: [
+      { title: "a human peer", args: [{ kind: "human", name: "richard", description: "Founder. Prefers short updates.", timezone: "Asia/Shanghai" }] },
+      { title: "an agent peer", args: [{ kind: "agent", name: "Scout", description: "Bug triage worker." }] },
+    ],
+  },
+);
+
+export const formatSentPeerCard = axSurface(
+  "DM peer card after a sent message: sent with --anyway before this context saw the peer.",
+  (card: PeerCard): string => `\n${renderPeerCard(card).join("\n")}\n`,
+  {
+    examples: [{ args: [{ kind: "human", name: "richard", description: "Founder. Prefers short updates.", timezone: "Asia/Shanghai" }] }],
+  },
+);
+
+export const formatSendAttachment = axSurface(
+  "Context shown after every sent message for a runtime that does not report context compaction: not part of the message; the conversation's cards and latest messages before it, within 2000 characters.",
+  (attachment: SendAttachment): string | null => {
+    const lines = renderSendAttachment(attachment);
+    return lines.length > 0 ? `\n${lines.join("\n")}\n` : null;
+  },
+  {
+    examples: [{
+      args: [{
+        target: "#ops",
+        channelCard: { id: "c-ops", name: "ops", type: "channel", description: "Release coordination. Post go/no-go here." },
+        messages: [
+          { seq: 40, sender: "richard", timestamp: "2026-10-15T09:00:00.000Z", content: "deploy at 5?" },
+          { seq: 41, sender: "scout", timestamp: "2026-10-15T09:02:00.000Z", content: "canary is green" },
+        ],
+      }],
+    }],
+  },
+);
+
 export const formatHistory = axSurface(
   "Read window: header with seq range/cursors, numbered lines, end-of-window footer.",
   (
   channel: string,
   data: HistoryData,
-  opts?: { around?: string; after?: string | number; before?: string | number },
+  opts?: { around?: string; after?: string | number; before?: string | number; unread?: boolean; alreadyShownSeqs?: ReadonlySet<number> },
 ): string => {
-  if (!data.messages || data.messages.length === 0) return ("No messages in this channel.");
+  const isThreadTarget = isThreadTargetRef(channel);
+  const coverage = isThreadTarget
+    ? "Coverage: this thread target only."
+    : "Coverage: top-level messages in this target only; thread replies are excluded and must be read from their thread targets.";
+  if (opts?.unread) return formatUnreadWindow(channel, data, coverage, opts.alreadyShownSeqs);
+  if (!data.messages || data.messages.length === 0) return (`${coverage}\n\nNo messages in this target.`);
 
   const messages = data.messages;
   const count = messages.length;
@@ -317,6 +327,7 @@ export const formatHistory = axSurface(
 
   const headerLines = [
     `Read window: ${count} returned, seq ${seqRange(messages)}, oldest to newest. ${historyCursorText("Older", hasOlder, "before", minSeq)} ${historyCursorText("Newer", hasNewer, "after", maxSeq)}`,
+    coverage,
   ];
   if (opts?.around) {
     headerLines.push(`Around: ${opts.around}.`);
@@ -333,219 +344,84 @@ export const formatHistory = axSurface(
   {
     // Window examples cover all four target shapes (@xxchan 8/31); the dm
     // window also shows the replyTarget affordance, which thread windows omit.
-    examples: [{ title: "channel window with unread cursor", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1200 }] }, { title: "channel thread window (--around anchor)", args: ["#general:00000000", { messages: [sampleMessage], has_older: true, has_newer: true }, { around: "00000000" }] }, { title: "dm window with a threaded reply", args: ["dm:@richard", { messages: [{ ...sampleMessage, content: "hey, can you help?", replyCount: 2 }], has_older: false, has_newer: false }] }, { title: "dm thread window", args: ["dm:@richard:00000000", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "DM thread reply" }], has_older: false, has_newer: false }] }],
+    examples: [{ title: "unread window (--unread), more unread remain", args: ["#general:00000000", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: true, last_read_seq: 1199, unread_after_seq: 1199, model_seen_up_to_seq: 1201 }, { unread: true }] }, { title: "unread window (--unread), newest message too recent to mark read", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1199, unread_after_seq: 1199, read_through_seq: 1200, model_seen_up_to_seq: 1201 }, { unread: true }] }, { title: "unread window (--unread), a message already shown last time is folded", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1199, unread_after_seq: 1199, read_through_seq: 1201, model_seen_up_to_seq: 1201 }, { unread: true, alreadyShownSeqs: new Set([1200]) }] }, { title: "unread window (--unread), nothing unread", args: ["#general", { messages: [], has_older: true, has_newer: false, last_read_seq: 1201, unread_after_seq: 1201 }, { unread: true }] }, { title: "channel window with unread cursor", args: ["#general", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "second message" }], has_older: true, has_newer: false, last_read_seq: 1200 }] }, { title: "channel thread window (--around anchor)", args: ["#general:00000000", { messages: [sampleMessage], has_older: true, has_newer: true }, { around: "00000000" }] }, { title: "dm window with a threaded reply", args: ["dm:@richard", { messages: [{ ...sampleMessage, content: "hey, can you help?", replyCount: 2 }], has_older: false, has_newer: false }] }, { title: "dm thread window", args: ["dm:@richard:00000000", { messages: [sampleMessage, { ...sampleMessage, message_id: UUID_B, seq: 1201, content: "DM thread reply" }], has_older: false, has_newer: false }] }],
   },
 );
 
+/**
+ * `raft message read --unread`: what is unread in one conversation, starting
+ * right after the agent's read position. Reading moves that position, so the
+ * continuation is the same command again, never a seq that can go stale.
+ */
+function formatUnreadWindow(
+  channel: string,
+  data: HistoryData,
+  coverage: string,
+  alreadyShownSeqs: ReadonlySet<number> = new Set(),
+): string {
+  const readThrough = data.unread_after_seq ?? data.last_read_seq ?? 0;
+  const messages = data.messages ?? [];
+  if (messages.length === 0) {
+    return `${coverage}\n\nNo unread messages in ${channel}. You have read through seq ${readThrough}.`;
+  }
+  // Messages this agent was already shown (they came back because they were
+  // too recent to mark read last time) are folded into one line, so a repeat
+  // is not mistaken for a new message and answered twice.
+  const folded = messages.filter((m) => typeof m.seq === "number" && alreadyShownSeqs.has(m.seq));
+  const shown = messages.filter((m) => !folded.includes(m));
+  const newPosition = typeof data.read_through_seq === "number" ? data.read_through_seq : data.model_seen_up_to_seq;
+  const shownCount = messages.length - folded.length;
+  const movedTo = shownCount > 0 && typeof newPosition === "number" && newPosition > readThrough
+    ? `Read position: seq ${readThrough} → ${newPosition}. To re-read these: raft message read --target "${channel}" --after ${readThrough}`
+    : null;
+  // The re-read command is printed once: on the read-position line when there
+  // is one, otherwise here.
+  const foldNote = folded.length > 0
+    ? `${folded.length} message${folded.length === 1 ? "" : "s"} you were already shown (seq ${seqRange(folded)}) ${folded.length === 1 ? "is" : "are"} not repeated.${movedTo ? "" : ` To see ${folded.length === 1 ? "it" : "them"} again: raft message read --target "${channel}" --after ${readThrough}`}`
+    : null;
+  const footer = data.has_newer
+    ? `More unread remain. Next: raft message read --target "${channel}" --unread`
+    : null;
+  if (shown.length === 0) {
+    return `${coverage}\n\nNo new unread messages in ${channel}. ${foldNote}${footer ? `\n${footer}` : ""}`;
+  }
+  const count = shown.length;
+  const formatted = shown
+    .map((m, index) => formatHistoryMessageLine(channel, {
+      ...m,
+      senderName: m.senderName ?? m.sender_name ?? "unknown",
+      senderDescription: m.senderDescription ?? m.sender_description ?? null,
+    }, index, count))
+    .join("\n");
+  const header = `Unread window: ${count} returned, seq ${seqRange(shown)}, oldest to newest, starting after your read position (seq ${readThrough}).`;
+  // Rows newer than the read position were too recent to mark read (seq order
+  // is not commit order); say so, or the agent reads them as new next time.
+  const unsettled = typeof newPosition === "number"
+    ? shown.filter((m) => typeof m.seq === "number" && m.seq > newPosition).length
+    : 0;
+  const settleNote = unsettled > 0
+    ? `${unsettled} newest message${unsettled === 1 ? " is" : "s are"} too recent to mark read; ${unsettled === 1 ? "it" : "they"} will come back on your next --unread, folded into one line.`
+    : null;
+  const end = footer ?? (unsettled > 0 ? null : "No more unread in this target.");
+  return `${header}\n${coverage}\n\n${[foldNote, formatted].filter(Boolean).join("\n")}\n\n${[movedTo, settleNote, end].filter(Boolean).join("\n")}`;
+}
+
 // --- Search result rendering (agent-facing AX readout) ---
+// The text lives in `@botiverse/raft-shared` (`agentText/search.ts`) so the
+// SDK renders the same bytes; this file keeps the axSurface registration.
 
-interface SearchResult {
-  id: string;
-  seq: number;
-  createdAt?: string;
-  channelType?: string;
-  channelName?: string;
-  parentChannelType?: string;
-  parentChannelName?: string;
-  senderName?: string;
-  senderType?: string;
-  content?: string;
-  snippet?: string;
-  threadId?: string;
-  taskStatus?: string | null;
-  taskNumber?: number | null;
-  taskCurrentProjection?: TaskCurrentProjectionLike | null;
-  [key: string]: unknown;
-}
-
-function renderSearchSource(result: SearchResult): string {
-  if (result.channelType === "thread") {
-    const shortId = typeof result.channelName === "string" && result.channelName.startsWith("thread-")
-      ? result.channelName.slice(7)
-      : (typeof result.threadId === "string" && result.threadId ? result.threadId.slice(0, 8) : result.channelName);
-    if (result.parentChannelType === "dm") {
-      return `dm:${neutralizeRaftRefLiterals(result.parentChannelName ?? "unknown")}:${shortId}`;
-    }
-    return `thread:${neutralizeRaftRefLiterals(result.parentChannelName ?? "unknown")}:${shortId}`;
-  }
-  if (result.channelType === "dm") {
-    return `dm:${neutralizeRaftRefLiterals(result.channelName ?? "unknown")}`;
-  }
-  return `channel:${neutralizeRaftRefLiterals(result.channelName ?? "unknown")}`;
-}
-
-interface SearchData {
-  results?: SearchResult[];
-}
-
-const PREVIEW_BEFORE_CHARS = 80;
-const PREVIEW_AFTER_CHARS = 120;
-const PREVIEW_FALLBACK_CHARS = PREVIEW_BEFORE_CHARS + PREVIEW_AFTER_CHARS;
-
-interface SearchMatchRange {
-  start: number;
-  end: number;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function findSearchMatch(content: string, query: string): SearchMatchRange | null {
-  const normalizedQuery = query.trim();
-  if (!normalizedQuery) return null;
-
-  const exactIndex = content.toLowerCase().indexOf(normalizedQuery.toLowerCase());
-  if (exactIndex >= 0) {
-    return { start: exactIndex, end: exactIndex + normalizedQuery.length };
-  }
-
-  const terms = normalizedQuery.match(/"([^"]+)"|\S+/g) ?? [];
-  for (const rawTerm of terms) {
-    const term = rawTerm.replace(/^"|"$/g, "").trim();
-    if (!term) continue;
-    const match = new RegExp(escapeRegExp(term), "i").exec(content);
-    if (match?.index !== undefined) {
-      return { start: match.index, end: match.index + match[0].length };
-    }
-  }
-
-  return null;
-}
-
-function* findRaftRefLiteralRanges(content: string): Generator<SearchMatchRange> {
-  for (const match of content.matchAll(/\bdm:@[A-Za-z0-9][A-Za-z0-9_-]*/g)) {
-    if (match.index !== undefined) yield { start: match.index, end: match.index + match[0].length };
-  }
-  for (const match of content.matchAll(/\btask #[0-9]+\b/g)) {
-    if (match.index !== undefined) yield { start: match.index, end: match.index + match[0].length };
-  }
-  for (const match of content.matchAll(/(^|[\n\s([{"'`;])(@[A-Za-z0-9][A-Za-z0-9_-]*)/g)) {
-    if (match.index === undefined) continue;
-    const prefix = match[1] ?? "";
-    const ref = match[2] ?? "";
-    yield { start: match.index + prefix.length, end: match.index + prefix.length + ref.length };
-  }
-  for (const match of content.matchAll(/(^|[\n\s([{"'`;])(#[A-Za-z][A-Za-z0-9_-]*)/g)) {
-    if (match.index === undefined) continue;
-    const prefix = match[1] ?? "";
-    const ref = match[2] ?? "";
-    yield { start: match.index + prefix.length, end: match.index + prefix.length + ref.length };
-  }
-}
-
-function expandSearchMatchToRefLiteral(content: string, match: SearchMatchRange): SearchMatchRange {
-  for (const refRange of findRaftRefLiteralRanges(content)) {
-    if (match.start < refRange.end && match.end > refRange.start) {
-      return {
-        start: Math.min(match.start, refRange.start),
-        end: Math.max(match.end, refRange.end),
-      };
-    }
-  }
-  return match;
-}
-
-function trimPreviewWindow(content: string, start: number, end: number): { start: number; end: number } {
-  let trimmedStart = start;
-  let trimmedEnd = end;
-  while (trimmedStart > 0 && /\s/.test(content[trimmedStart] ?? "")) trimmedStart += 1;
-  while (trimmedEnd < content.length && /\s/.test(content[trimmedEnd - 1] ?? "")) trimmedEnd -= 1;
-  return {
-    start: Math.max(0, Math.min(trimmedStart, content.length)),
-    end: Math.max(0, Math.min(trimmedEnd, content.length)),
-  };
-}
-
-function escapeSearchComponentLiterals(text: string): string {
-  return text.replace(/<\/?(?:result|preview|match)\b[^>]*>|<omit\s*\/>/gi, (tag) => tag
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;"));
-}
-
-function neutralizeRaftRefLiterals(text: string): string {
-  return text
-    .replace(/\bdm:@([A-Za-z0-9][A-Za-z0-9_-]*)/g, "dm:user:$1")
-    .replace(/\btask #([0-9]+)\b/g, "task:$1")
-    .replace(/(^|[\n\s([{"'`;])@([A-Za-z0-9][A-Za-z0-9_-]*)/g, "$1user:$2")
-    .replace(/(^|[\n\s([{"'`;])#([A-Za-z][A-Za-z0-9_-]*)/g, "$1channel:$2");
-}
-
-function renderPreviewText(text: string): string {
-  return neutralizeRaftRefLiterals(escapeSearchComponentLiterals(text));
-}
-
-function renderSearchPreview(content: string, query: string): string {
-  const foundMatch = findSearchMatch(content, query);
-  const match = foundMatch ? expandSearchMatchToRefLiteral(content, foundMatch) : null;
-
-  let start = 0;
-  let end = Math.min(content.length, PREVIEW_FALLBACK_CHARS);
-  if (match) {
-    start = Math.max(0, match.start - PREVIEW_BEFORE_CHARS);
-    end = Math.min(content.length, match.end + PREVIEW_AFTER_CHARS);
-  }
-  ({ start, end } = trimPreviewWindow(content, start, end));
-
-  const leadingOmit = start > 0 ? "<omit />" : "";
-  const trailingOmit = end < content.length ? "<omit />" : "";
-
-  if (!match || match.end <= start || match.start >= end) {
-    return `${leadingOmit}${renderPreviewText(content.slice(start, end))}${trailingOmit}`;
-  }
-
-  const before = content.slice(start, match.start);
-  const matched = content.slice(match.start, match.end);
-  const after = content.slice(match.end, end);
-  return [
-    leadingOmit,
-    renderPreviewText(before),
-    "<match>",
-    renderPreviewText(matched),
-    "</match>",
-    renderPreviewText(after),
-    trailingOmit,
-  ].join("");
-}
+type SearchResult = AgentSearchResultLike;
+type SearchData = AgentSearchData;
+type _DeclaredKeys<T> = keyof { [K in keyof T as string extends K ? never : number extends K ? never : K]: T[K] };
+type _UnmodelledSearchTopLevelFields = Exclude<_DeclaredKeys<AgentApiMessageSearchResponse>, keyof SearchData>;
+const _searchDataModelsContractTopLevel: [_UnmodelledSearchTopLevelFields] extends [never] ? true : never = true;
+void _searchDataModelsContractTopLevel;
+export type { SearchResult, SearchData };
 
 export const formatSearchResults = axSurface(
   "Search results with <match>/<omit /> preview markup.",
-  (query: string, data: SearchData): string => {
-  if (!data.results || data.results.length === 0) return ("No search results.");
-  const trimmedQuery = query.trim();
-
-  const formatted = data.results.map((result, index) => {
-    const ref = `msg:${result.id}`;
-    const content = result.content ?? result.snippet ?? "";
-    const sender = neutralizeRaftRefLiterals(result.senderName ?? "unknown");
-    const senderType = result.senderType ? ` (${result.senderType})` : "";
-    const taskProjection = formatTaskCurrentProjection(result.taskCurrentProjection, result.taskNumber, true).trimStart();
-    return [
-      `<result ref="${ref}">`,
-      `Source: ${renderSearchSource(result)}`,
-      `Sender: ${sender}${senderType}`,
-      `Time: ${result.createdAt ? toLocalTimeWithOffset(result.createdAt) : "-"}`,
-      ...(taskProjection ? [taskProjection] : []),
-      "",
-      "<preview>",
-      renderSearchPreview(content, trimmedQuery),
-      "</preview>",
-      "</result>",
-    ].join("\n");
-  }).join("\n\n");
-
-  const resultLabel = data.results.length === 1 ? "result" : "results";
-  return ([
-    trimmedQuery
-      ? `Search results for: "${trimmedQuery}" (${data.results.length} ${resultLabel})`
-      : `Filtered message results (${data.results.length} ${resultLabel})`,
-    "",
-    formatted,
-    "",
-    "If a result may be relevant but its preview is not enough, read the surrounding context for that result before answering.",
-  ].join("\n"));
-},
+  (query: string, data: SearchData, offset?: number, sort?: string, limit?: number, filters?: AgentSearchContinueFilters): string =>
+    formatAgentSearchResults(query, data, offset, sort, limit, "cli", filters),
   {
     // Results cover all four source shapes (@xxchan 8/31): channel, channel
     // thread, dm, dm thread — each renders a distinct Source: line.
@@ -554,7 +430,7 @@ export const formatSearchResults = axSurface(
       { id: UUID_B, seq: 1201, createdAt: T, channelType: "thread", channelName: "thread-00000000", parentChannelType: "channel", parentChannelName: "general", senderName: "Alice", senderType: "agent", content: "deploy checklist is green, ready when you are", match: { start: 0, end: 6 } },
       { id: UUID_C, seq: 1202, createdAt: T, channelType: "dm", channelName: "richard", senderName: "richard", senderType: "human", content: "can you own the deploy tomorrow?", match: { start: 16, end: 22 } },
       { id: UUID_A, seq: 1203, createdAt: T, channelType: "thread", channelName: "thread-55555555", parentChannelType: "dm", parentChannelName: "richard", senderName: "Alice", senderType: "agent", content: "deploy done, readback posted", match: { start: 0, end: 6 } },
-    ] }] }],
+    ], hasMore: false }] }],
   },
 );
 
@@ -576,34 +452,43 @@ export const formatSendDraftStdinDeadlineDiagnostic = axSurface(
   },
 );
 
-export const DRAFT_REPLACED_EXCERPT_LIMIT = 400;
+export const DRAFT_REPLACED_EXCERPT_LIMIT = 160;
+
+function replacedDraftRecoveryLine(recoveryFilePath: string | null): string {
+  return recoveryFilePath
+    ? `Recovery file: ${JSON.stringify(recoveryFilePath)}`
+    : "Recovery copy: unavailable (local save failed; sending continued).";
+}
 
 /**
- * A target holds exactly ONE draft — the slot is keyed `(agentId, target)` both
- * locally and server-side — so sending new content discards whatever was there.
- *
- * The discarded body is printed on purpose: after this point it exists nowhere
- * else, and this line is the last copy. It is the sender's own text going back
- * to the sender's own terminal. Deliberately NOT suggesting `--send-draft` as a
- * recovery: by the time this prints, the slot already belongs to the new
- * content, so that command would send the replacement rather than the thing
- * just lost.
+ * A target holds exactly ONE active draft. Before normal send replaces that
+ * slot, the previous body is archived best-effort in local agent-state. The
+ * terminal only gets a bounded excerpt plus the archive path; a local archive
+ * failure is reported honestly but never blocks delivery.
  */
 export const formatDraftReplacedWarning = axSurface(
-  "Draft-replaced warning carrying the last copy of the discarded body.",
-  (target: string, previousContent: string): string => {
-  const trimmed = previousContent.trim();
-  const excerpt = trimmed.length > DRAFT_REPLACED_EXCERPT_LIMIT
-    ? `${trimmed.slice(0, DRAFT_REPLACED_EXCERPT_LIMIT)}… (${trimmed.length} chars total, truncated)`
-    : trimmed;
-  return ([
-    `Warning: replacing an unsent draft for ${target}.`,
-    `One draft is kept per target, so the previous body is now discarded.`,
-    `Discarded draft (last copy):`,
-    excerpt,
-  ].join("\n"));
-},
+  "Draft-replaced warning with a bounded excerpt and local recovery file.",
+  (target: string, previousContent: string, recoveryFilePath: string | null): string => {
+    const compact = previousContent.trim().replace(/\s+/gu, " ");
+    const excerpt = compact.length > DRAFT_REPLACED_EXCERPT_LIMIT
+      ? `${compact.slice(0, DRAFT_REPLACED_EXCERPT_LIMIT)}…`
+      : compact;
+    return ([
+      `Warning: replacing an unsent draft for ${target}.`,
+      `Previous draft excerpt (${previousContent.length} chars): ${excerpt}`,
+      replacedDraftRecoveryLine(recoveryFilePath),
+    ].join("\n"));
+  },
   {
-    examples: [{ args: ["#general", "the previously drafted body that is being discarded"] }],
+    examples: [{ args: ["#general", "the previously drafted body", "/home/agent/replaced-drafts/draft.txt"] }],
+  },
+);
+
+export const formatDraftReplacedSuccess = axSurface(
+  "Successful send receipt line for a replaced draft and its local recovery file.",
+  (recoveryFilePath: string | null): string =>
+    `Replaced an unsent draft. ${replacedDraftRecoveryLine(recoveryFilePath)}`,
+  {
+    examples: [{ args: ["/home/agent/replaced-drafts/draft.txt"] }],
   },
 );

@@ -1,4 +1,4 @@
-export const ARCHIVED_CHANNEL_TEXT_CLASS = "text-black/45";
-export const ARCHIVED_CHANNEL_MUTED_TEXT_CLASS = "text-black/30";
-export const ARCHIVED_CHANNEL_ICON_CLASS = "border-black/40 bg-black/5 text-black/45";
-export const ARCHIVED_CHANNEL_BADGE_CLASS = "border border-black/40 bg-black/5 px-1 py-0.5 text-[9px] font-bold leading-none text-black/45";
+// An archived channel keeps the neutral channel tile (DS ChannelIcon); only its
+// glyph recedes to ink-3. Its title and subtitle use the rows' own `muted`
+// state, so the text treatment stays with the row recipe.
+export const ARCHIVED_CHANNEL_ICON_CLASS = "text-foreground-hint";

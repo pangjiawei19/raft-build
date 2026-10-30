@@ -1,62 +1,50 @@
 import { expect, test } from "@playwright/test";
 
 /**
- * Computed field metrics for the Create Agent dialog, in both themes.
+ * Computed field metrics for the Create Agent dialog.
  *
  * Why this exists separately from createAgentFieldGeometry.spec.ts:
  *
  * That file already asserts font-size/weight on each field's control — and it
  * passes. It queries `button[data-slot]`, i.e. the select *trigger*. But the
- * trigger is not what a user reads: the text lives in a child slot, and the
- * themes style that child directly:
+ * trigger is not what a user reads: the text lives in a child slot, and a rule
+ * that targets that child (`[&_[data-slot='select-value']]:font-medium`,
+ * `[&_[data-slot='select-item-text']]:font-bold` — both shipped once) beats a
+ * `font-field` on the parent outright: the parent measures a correct 400 while
+ * the text above it renders 500/700. Measuring the trigger and reporting
+ * "weight is correct" is exactly the mistake that kept this bug alive for two
+ * days, so these assertions target the text-bearing descendants instead.
  *
- *   elegant trigger: [&_[data-slot='select-value']]:font-medium
- *   brutal option:   [&_[data-slot='select-item-text']]:font-bold
+ * Two contracts, both checked:
+ *  - the field metric tokens resolve to the DS input type (TextField: 16/24 at
+ *    the body weight, 400), and
+ *  - every text-bearing node reads those tokens AND carries the field-axis
+ *    classes, so a correct number that does not come from the axis fails.
+ * Field labels read the DS label type (TextField: 13/18 600).
  *
- * A rule on the child beats a `font-field` on the parent outright — the parent
- * measures a correct 400 while the text above it renders 500/700. Measuring the
- * trigger and reporting "weight is correct" is exactly the mistake that kept
- * this bug alive for two days, so these assertions target the text-bearing
- * descendants instead.
+ * Known divergence, not settled here: the DS's own Select types its trigger
+ * 15/20 600 (`rf-select`) and its options 14/20 500 (`rf-menu__item`), while
+ * this dialog keeps both on the field axis with its inputs. The selects below
+ * are held to the field axis because that is the product's contract today;
+ * which of the two moves is a design-system decision.
  *
- * Values are read from the field tokens at runtime rather than pinned as
- * literals, so the contract is "the field metric axis wins", not "it is 16px".
- * Brutal and elegant disagree on every number (16/24 vs 14/20); a pinned
- * literal could only ever encode one of them.
- *
- * Expected state: RED until raft-ui 0.5.3 lands D1 (merge-order) and D2 (the
- * descendant overrides). A tooth that is green before the fix it guards would
- * not have caught the bug it exists for.
- *
- * KNOWN BLIND SPOT — the Description textarea is not covered here.
- * raft-ui's textarea recipe carries no field metrics at all (its base slot has no
- * font-size; the elegant variant hardcodes `text-sm`, the brutal variant declares
- * nothing). It is simply not on the field axis, so "computed === token" has nothing
- * to assert against and the textarea is deliberately excluded from these counts.
- *
- * Why that is worth writing down rather than leaving implicit: elegant's `text-sm`
- * happens to equal elegant's field token exactly, 14px/20px including line-height.
- * So the textarea looks correct today for a reason that is a coincidence, not a
- * contract. If design ever moves the elegant field size off 14px, the Input follows
- * the token and the textarea stays at 14 — and nothing in this file will go red,
- * because the textarea was never on the axis being asserted.
- * Whether a textarea belongs on the field axis is a design-system decision
- * (raised with @cindyz), not one this spec should quietly assume either way.
+ * The Description textarea is covered by createAgentTextareaFieldAxis.spec.ts.
  */
 
-type Theme = "brutal" | "elegant";
+type Metrics = { fontSize: string; fontWeight: string; lineHeight: string };
 
-/**
- * 3 selects, one select-value each. Measured in both themes.
- *
- * This read 6 until the duplicate-control bug was fixed, and I had written a
- * plausible-sounding justification for it ("visible trigger text plus a hidden node
- * the component keeps for form state"). There was no such second node — it was the
- * adopted control being rendered twice. A denominator taken from broken state is
- * still a wrong denominator; what saved it was the count assertion failing loudly
- * when the structure changed, rather than silently measuring whatever remained.
- */
-const SELECT_VALUE_COUNT = 3;
+/** DS TextField: input text is 16/24, at the body weight. */
+const RAFT_FIELD: Metrics = { fontSize: "16px", fontWeight: "400", lineHeight: "24px" };
+/** DS TextField: the label is 13/18 600 (`text-footnote`). */
+const RAFT_LABEL: Metrics = { fontSize: "13px", fontWeight: "600", lineHeight: "18px" };
+/** DS Select / Menu: the checked option is bold (`rf-menu__item.is-checked`). */
+const CHECKED_OPTION_WEIGHT = "700";
+
+// Computer and Runtime remain selects; Model is now a searchable combobox.
+// Pin both counts so dropping either kind cannot silently shrink coverage.
+const SELECT_VALUE_COUNT = 2;
+const MODEL_INPUT = '[data-slot="combobox-input"]';
+const MODEL_INPUT_COUNT = 1;
 /**
  * The dialog's one free-text input (Name); Description is a textarea.
  *
@@ -67,24 +55,22 @@ const SELECT_VALUE_COUNT = 3;
  */
 const INPUT_COUNT = 1;
 const REAL_INPUT = 'input[data-slot="field-control"]';
-/** Options in the opened Computer select — the fixture provides 2. Measured. */
+/** Options in the opened Computer select — the fixture provides 2, one of them current. Measured. */
 const OPTION_COUNT = 2;
-type Metrics = { fontSize: string; fontWeight: string; lineHeight: string };
+/** Computer, Name, Description, Runtime, Model. */
+const LABEL_COUNT = 5;
 
-const CASE = (id: string, theme: Theme) =>
-  `/visual-testing.html?case=components.members.create-agent.${id}` +
-  (theme === "elegant" ? "&theme=elegant" : "");
+const CASE = "/visual-testing.html?case=components.members.create-agent.dialog";
 
 const settle = async (page: import("@playwright/test").Page) => {
   await page.waitForSelector('[data-slot="field"]');
   await page.waitForTimeout(600);
 };
 
-/** The field metric tokens as the browser actually resolves them for this theme. */
+/** The field metric tokens as the browser actually resolves them. */
 async function fieldTokens(page: import("@playwright/test").Page): Promise<Metrics> {
   return page.evaluate(() => {
-    const root = document.querySelector("[data-theme]") ?? document.documentElement;
-    const s = getComputedStyle(root);
+    const s = getComputedStyle(document.documentElement);
     const px = (v: string) => `${parseFloat(v.trim())}px`;
     return {
       fontSize: px(s.getPropertyValue("--field-font-size")),
@@ -106,19 +92,16 @@ async function metrics(page: import("@playwright/test").Page, selector: string) 
 /**
  * Right value for the RIGHT REASON.
  *
- * Under elegant on published 0.5.2 the trigger reads 14px — which happens to equal
- * elegant's own field token, because the theme's `text-sm` is also 14px. A computed
- * check alone therefore goes GREEN while the field contract is not applied at all,
- * and the weight is still 500. Three separate coincidences of this exact shape have
- * already appeared on this workstream (brutal input 16 == default 16; brutal token
- * 16 == root fallback 16; and this one), so the class presence is asserted alongside
- * the computed value: the number must be right AND it must come from the field axis.
+ * A computed value can equal the token without the field contract being applied
+ * at all — inherited 16px equals the 16px token, and the root fallback is 16px
+ * too. Three coincidences of this exact shape appeared on this workstream, so the
+ * class presence is asserted alongside the computed value: the number must be
+ * right AND it must come from the field axis.
  */
 async function expectFieldAxisApplied(
   page: import("@playwright/test").Page,
   selector: string,
   what: string,
-  theme: Theme,
   expectedCount: number,
 ) {
   // EVERY match, not the first. An earlier draft of this helper used
@@ -136,69 +119,102 @@ async function expectFieldAxisApplied(
       };
     });
   }, selector);
-  // The DENOMINATOR, not just "more than zero". Asserting every match answers
-  // "are the ones present correct?" but not "are they all still there?" — if a
-  // select stops rendering, a >0 check keeps passing on the survivors. The count
-  // is measured, not guessed: the Create Agent dialog renders 3 selects, each
-  // emitting two select-value nodes (visible trigger text + the hidden node the
-  // component keeps for form state) = 6, identical in both themes.
-  // (@Bugen, same shape as the empty-scan bug in rui #6839: no denominator.)
-  expect(applied.length, `${theme}: ${what} — expected all 6 select-value nodes`).toBe(expectedCount);
+  // Pin each expected control, not merely a non-empty set.
+  expect(applied.length, `${what} — expected exactly ${expectedCount} text node(s)`).toBe(expectedCount);
   for (const a of applied) {
-    expect(a.hasTextField, `${theme}: ${what} "${a.text}" must carry text-field — a correct number that does not come from the field axis is a coincidence, not a pass`).toBe(true);
-    expect(a.hasFontField, `${theme}: ${what} "${a.text}" must carry font-field`).toBe(true);
+    expect(a.hasTextField, `${what} "${a.text}" must carry text-field — a correct number that does not come from the field axis is a coincidence, not a pass`).toBe(true);
+    expect(a.hasFontField, `${what} "${a.text}" must carry font-field`).toBe(true);
   }
 }
 
-function expectMatchesTokens(found: Metrics[], tokens: Metrics, what: string, theme: Theme, expected: number) {
+function expectMatchesTokens(found: Metrics[], tokens: Metrics, what: string, expected: number) {
   // Assert the set is non-empty before asserting its contents: an empty
   // NodeList satisfies every expectation inside a for-loop.
-  expect(found.length, `${theme}: ${what} — expected exactly ${expected} node(s), got ${found.length}`).toBe(expected);
+  expect(found.length, `${what} — expected exactly ${expected} node(s), got ${found.length}`).toBe(expected);
   for (const m of found) {
-    expect(m.fontSize, `${theme}: ${what} font-size must equal --field-font-size`).toBe(tokens.fontSize);
-    expect(m.fontWeight, `${theme}: ${what} font-weight must equal --field-font-weight`).toBe(tokens.fontWeight);
-    expect(m.lineHeight, `${theme}: ${what} line-height must equal --field-line-height`).toBe(tokens.lineHeight);
+    expect(m.fontSize, `${what} font-size must equal --field-font-size`).toBe(tokens.fontSize);
+    expect(m.fontWeight, `${what} font-weight must equal --field-font-weight`).toBe(tokens.fontWeight);
+    expect(m.lineHeight, `${what} line-height must equal --field-line-height`).toBe(tokens.lineHeight);
   }
 }
 
-for (const theme of ["brutal", "elegant"] as Theme[]) {
-  test(`${theme}: the text inside a select trigger obeys the field metrics, not the button's`, async ({ page }) => {
-    await page.goto(CASE("dialog", theme));
-    await settle(page);
-    const tokens = await fieldTokens(page);
-    // Sanity-check the token read itself, so a failed custom-property lookup
-    // cannot turn into a vacuously satisfiable "NaNpx === NaNpx" comparison.
-    expect(tokens.fontWeight, `${theme}: --field-font-weight resolves`).toMatch(/^\d+$/);
-    expect(tokens.fontSize, `${theme}: --field-font-size resolves`).toMatch(/^\d+(\.\d+)?px$/);
-
-    expectMatchesTokens(await metrics(page, '[data-slot="select-value"]'), tokens, "select-value", theme, SELECT_VALUE_COUNT);
-    await expectFieldAxisApplied(page, '[data-slot="select-value"]', "select trigger", theme, SELECT_VALUE_COUNT);
-  });
-
-  test(`${theme}: text inputs obey the field metrics`, async ({ page }) => {
-    await page.goto(CASE("dialog", theme));
-    await settle(page);
-    const tokens = await fieldTokens(page);
-    // NOT '[data-slot="field"] input': a Select renders a hidden native input for
-    // form submission, and that one matches first. It carries no classes and reads
-    // a 16px default, so measuring it reports a failure that has nothing to do with
-    // the visible field. Target the real text input by its slot.
-    expectMatchesTokens(await metrics(page, REAL_INPUT), tokens, "input", theme, INPUT_COUNT);
-  });
-
-  test(`${theme}: the text inside an open select option obeys the field metrics`, async ({ page }) => {
-    await page.goto(CASE("dialog", theme));
-    await settle(page);
-    const tokens = await fieldTokens(page);
-
-    // The popup renders in a portal, so its text is only measurable while open.
-    // The trigger renders as a Button (data-slot="button"), not a "select-trigger"
-    // slot — which is itself why the Button's own text-sm competes with the field
-    // metrics here. Select it by the value slot it wraps.
-    await page.locator('[data-slot="button"]:has([data-slot="select-value"])').first().click();
-    await page.waitForSelector('[data-slot="select-item-text"]', { timeout: 5000 });
-    await page.waitForTimeout(300);
-
-    expectMatchesTokens(await metrics(page, '[data-slot="select-item-text"]'), tokens, "select-item-text", theme, OPTION_COUNT);
-  });
+/** Read the tokens and hold them to the DS before anything is compared with them. */
+async function raftFieldTokens(page: import("@playwright/test").Page): Promise<Metrics> {
+  const tokens = await fieldTokens(page);
+  // Also guards the read itself: a failed custom-property lookup cannot turn
+  // into a vacuously satisfiable "NaNpx === NaNpx" comparison.
+  expect(tokens, "the field axis resolves to the DS input type, 16/24 400").toEqual(RAFT_FIELD);
+  return tokens;
 }
+
+test("select and model-combobox text obey the field metrics", async ({ page }) => {
+  await page.goto(CASE);
+  await settle(page);
+  const tokens = await raftFieldTokens(page);
+
+  expectMatchesTokens(await metrics(page, '[data-slot="select-value"]'), tokens, "select-value", SELECT_VALUE_COUNT);
+  await expectFieldAxisApplied(page, '[data-slot="select-value"]', "select trigger", SELECT_VALUE_COUNT);
+  expectMatchesTokens(await metrics(page, MODEL_INPUT), tokens, "model combobox input", MODEL_INPUT_COUNT);
+  await expectFieldAxisApplied(page, MODEL_INPUT, "model combobox input", MODEL_INPUT_COUNT);
+});
+
+test("text inputs obey the field metrics", async ({ page }) => {
+  await page.goto(CASE);
+  await settle(page);
+  const tokens = await raftFieldTokens(page);
+  // NOT '[data-slot="field"] input': a Select renders a hidden native input for
+  // form submission, and that one matches first. It carries no classes and reads
+  // a 16px default, so measuring it reports a failure that has nothing to do with
+  // the visible field. Target the real text input by its slot.
+  expectMatchesTokens(await metrics(page, REAL_INPUT), tokens, "input", INPUT_COUNT);
+});
+
+test("field labels read the DS label type", async ({ page }) => {
+  await page.goto(CASE);
+  await settle(page);
+  const labels = await metrics(page, '[data-slot="field-label"]');
+  expect(labels.length, `expected exactly ${LABEL_COUNT} field labels`).toBe(LABEL_COUNT);
+  for (const m of labels) expect(m, "label 13/18 600").toEqual(RAFT_LABEL);
+});
+
+test("the text inside an open select option obeys the field metrics", async ({ page }) => {
+  await page.goto(CASE);
+  await settle(page);
+  const tokens = await raftFieldTokens(page);
+
+  // The popup renders in a portal, so its text is only measurable while open.
+  // The trigger renders as a Button (data-slot="button"), not a "select-trigger"
+  // slot — which is itself why the Button's own type competes with the field
+  // metrics here. Select it by the value slot it wraps.
+  await page.locator('[data-slot="button"]:has([data-slot="select-value"])').first().click();
+  await page.waitForSelector('[data-slot="select-item-text"]', { timeout: 5000 });
+  await page.waitForTimeout(300);
+
+  const options = await page.evaluate(() =>
+    [...document.querySelectorAll('[data-slot="select-item-text"]')].map((el) => {
+      const s = getComputedStyle(el);
+      const item = el.closest('[role="option"]');
+      return {
+        text: (el.textContent ?? "").trim().slice(0, 24),
+        checked: item?.getAttribute("aria-selected") === "true" || item?.hasAttribute("data-selected") === true,
+        fontSize: s.fontSize,
+        fontWeight: s.fontWeight,
+        lineHeight: s.lineHeight,
+      };
+    }));
+
+  // Denominator first, then exactly one current value: the bold below is the
+  // DS's mark for it, and it must not spread to every option.
+  expect(options.length, `expected exactly ${OPTION_COUNT} options`).toBe(OPTION_COUNT);
+  expect(options.filter((o) => o.checked).length, "exactly one option is the current value").toBe(1);
+  for (const o of options) {
+    expect(o.fontSize, `"${o.text}" font-size must equal --field-font-size`).toBe(tokens.fontSize);
+    expect(o.lineHeight, `"${o.text}" line-height must equal --field-line-height`).toBe(tokens.lineHeight);
+    expect(
+      o.fontWeight,
+      o.checked
+        ? `"${o.text}" is the current value — the DS marks it bold`
+        : `"${o.text}" font-weight must equal --field-font-weight — a rule that bolds every option is the regression`,
+    ).toBe(o.checked ? CHECKED_OPTION_WEIGHT : tokens.fontWeight);
+  }
+});

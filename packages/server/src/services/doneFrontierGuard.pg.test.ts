@@ -1,10 +1,10 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
+import { dbTest as test } from "../test/integration/dbTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 
 import { and, eq, inArray, sql } from "drizzle-orm";
 
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   channelHumans,
   channels,
@@ -20,23 +20,23 @@ import {
   userChannelInboxStates,
   userChannelReadCursors,
   users,
-} from "../db/schema.js";
+} from "../db/schema";
 import {
   getInboxItems,
   markChannelInboxActive,
   markChannelInboxDone,
   markThreadDone,
-} from "./channelService.js";
+} from "./channelService";
 import {
   DoneFrontierAboveInt4AuthorityError,
   DoneFrontierBeyondLatestError,
   DoneFrontierRequiredError,
-} from "./inboxSuppressionWriters.js";
+} from "./inboxSuppressionWriters";
 import {
   admitReadMutation,
   claimNextReadMutation,
   executeReadMutationClaim,
-} from "./readMutationSequencer.js";
+} from "./readMutationSequencer";
 
 
 async function seedFixture() {
@@ -95,7 +95,7 @@ async function readDoneThroughExact(channelId: string, userId: string): Promise<
   return (result.rows[0] as { doneThroughSeq?: string } | undefined)?.doneThroughSeq ?? null;
 }
 
-test("0216 keeps the superset shape check unvalidated while enforcing every new row", async ({ db }) => {
+test("0216 and 0358 keep the superset shape check unvalidated while enforcing every new row", async ({ db }) => {
   const { owner, server, withMessages } = await seedFixture();
   const constraint = await getDb().execute(sql`
     SELECT convalidated
@@ -106,7 +106,7 @@ test("0216 keeps the superset shape check unvalidated while enforcing every new 
   assert.deepEqual(
     constraint.rows,
     [{ convalidated: false }],
-    "0216 deliberately avoids a historical-table validation scan in the deploy transaction",
+    "0216 and 0358 (which re-adds the check) deliberately avoid a historical-table validation scan in the deploy transaction",
   );
 
   await assert.rejects(

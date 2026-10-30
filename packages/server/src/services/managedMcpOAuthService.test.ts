@@ -1,28 +1,27 @@
-import { dbTest as test } from "../test/integration/dbTest.js";
-import { closeTestDatabase, openTestDatabase } from "../test/integration/database.js";
+import { dbTest as test } from "../test/integration/dbTest";
+import { closeTestDatabase, openTestDatabase } from "../test/integration/database";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { afterEach, beforeEach } from "vitest";
 import { eq } from "drizzle-orm";
 import { auth } from "@modelcontextprotocol/sdk/client/auth.js";
-import { getDb } from "../db/index.js";
+import { getDb } from "../db/index";
 import {
   managedMcpCredentials,
   managedMcpOAuthAttempts,
   managedMcpServers,
   users,
-} from "../db/schema.js";
-import { createServer } from "./serverService.js";
+} from "../db/schema";
+import { createServer } from "./serverService";
 import {
   __refreshManagedMcpCatalogWithLoaderForTest,
   createManagedMcpServer,
   ManagedMcpServiceError,
   updateManagedMcpServer,
-} from "./managedMcpService.js";
+} from "./managedMcpService";
 import {
   decryptManagedMcpSecret,
   encryptManagedMcpSecret,
-} from "./managedMcpCredentialService.js";
+} from "./managedMcpCredentialService";
 import {
   consumeManagedMcpOAuthAttempt,
   completeManagedMcpOAuthConnection,
@@ -31,12 +30,12 @@ import {
   ManagedMcpOAuthError,
   replacePendingManagedMcpOAuthAttempt,
   withManagedMcpOAuth,
-} from "./managedMcpOAuthService.js";
+} from "./managedMcpOAuthService";
 import {
   ManagedMcpGatewayError,
   normalizeManagedMcpClientError,
-} from "./managedMcpGateway.js";
-import type { ManagedMcpOAuthStorage } from "./managedMcpOAuthProvider.js";
+} from "./managedMcpGateway";
+import type { ManagedMcpOAuthStorage } from "./managedMcpOAuthProvider";
 
 
 const originalCredentialKey = process.env.SLOCK_MCP_CREDENTIAL_KEY;
@@ -346,7 +345,7 @@ test("revoked refresh tokens require reconnect while transient requests keep the
           },
         });
       } catch (error) {
-        throw normalizeManagedMcpClientError(error, false);
+        throw normalizeManagedMcpClientError(error, false, "oauth");
       }
     }),
     ManagedMcpGatewayError,
@@ -376,7 +375,7 @@ test("revoked refresh tokens require reconnect while transient requests keep the
           }), { status: 503, headers: { "Content-Type": "application/json" } }),
         });
       } catch (error) {
-        throw normalizeManagedMcpClientError(error, false);
+        throw normalizeManagedMcpClientError(error, false, "oauth");
       }
     }),
     ManagedMcpGatewayError,
@@ -389,7 +388,7 @@ test("revoked refresh tokens require reconnect while transient requests keep the
   assert.equal(storedConnection.lastCheckError, "MCP request failed; retry without reconnecting");
 });
 
-test("managed MCP OAuth operations serialize across concurrent Server workers", async () => {
+test("managed MCP OAuth tool calls on one connector run concurrently, outside the credential lease", async () => {
   const { server, connection } = await seedOAuthConnection();
   const events: string[] = [];
   let releaseFirst!: () => void;
@@ -408,14 +407,210 @@ test("managed MCP OAuth operations serialize across concurrent Server workers", 
     events.push("first-end");
   });
   await firstStartedPromise;
-  const second = withManagedMcpOAuth(server.id, connection.id, async () => {
-    events.push("second-start");
+  // While the first call is still in flight, the credential lease is free and
+  // a second call on the same connector runs to completion.
+  const [during] = await getDb()
+    .select()
+    .from(managedMcpCredentials)
+    .where(eq(managedMcpCredentials.mcpServerId, connection.id));
+  assert.equal(during.leaseOwner, null);
+  await withManagedMcpOAuth(server.id, connection.id, async () => {
+    events.push("second");
   });
-  await new Promise((resolve) => setTimeout(resolve, 50));
-  assert.deepEqual(events, ["first-start"]);
+  assert.deepEqual(events, ["first-start", "second"]);
   releaseFirst();
-  await Promise.all([first, second]);
-  assert.deepEqual(events, ["first-start", "first-end", "second-start"]);
+  await first;
+  assert.deepEqual(events, ["first-start", "second", "first-end"]);
+});
+
+function rotatingTokenEndpoint() {
+  let issued = 0;
+  return {
+    issued: () => issued,
+    fetchFn: async (_input: unknown, init?: RequestInit) => {
+      const params = new URLSearchParams(String(init?.body));
+      // Rotating refresh tokens: only the latest refresh token is accepted.
+      if (params.get("refresh_token") !== (issued === 0 ? "durable-refresh-token" : `rotated-refresh-${issued}`)) {
+        return new Response(JSON.stringify({ error: "invalid_grant" }), {
+          status: 400,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      issued += 1;
+      return new Response(JSON.stringify({
+        access_token: `rotated-access-${issued}`,
+        refresh_token: `rotated-refresh-${issued}`,
+        token_type: "Bearer",
+        expires_in: 3600,
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    },
+  };
+}
+
+function gate() {
+  let open!: () => void;
+  const opened = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { open, opened };
+}
+
+test("a refresh that lost a rotating refresh token to a concurrent call keeps the winner's grant", async () => {
+  const { server, connection } = await seedRefreshableOAuthConnection();
+  const serverUrl = new URL("https://mcp.linear.app/mcp");
+  const endpoint = rotatingTokenEndpoint();
+  const loserRead = gate();
+  const winnerDone = gate();
+
+  // The loser read the stored (expired) credentials before the winner
+  // refreshed; its own refresh then spends a refresh token that is no longer
+  // valid. Its invalidation must not wipe the winner's tokens: the SDK picks
+  // up the stored grant and carries on.
+  const loser = withManagedMcpOAuth(server.id, connection.id, async (_managed, provider) => {
+    assert.equal(provider.tokens()?.access_token, "expired-access-token");
+    loserRead.open();
+    await winnerDone.opened;
+    return auth(provider, { serverUrl, fetchFn: endpoint.fetchFn });
+  });
+  await loserRead.opened;
+  await withManagedMcpOAuth(server.id, connection.id, async (_managed, provider) => {
+    assert.equal(await auth(provider, { serverUrl, fetchFn: endpoint.fetchFn }), "AUTHORIZED");
+  });
+  winnerDone.open();
+
+  assert.equal(await loser, "AUTHORIZED");
+  const [credential] = await getDb()
+    .select()
+    .from(managedMcpCredentials)
+    .where(eq(managedMcpCredentials.mcpServerId, connection.id));
+  const stored = decryptManagedMcpSecret(credential.encryptedOAuth!) as ManagedMcpOAuthStorage;
+  assert.equal(stored.tokens?.refresh_token, `rotated-refresh-${endpoint.issued()}`);
+  assert.equal(stored.tokens?.access_token, `rotated-access-${endpoint.issued()}`);
+  assert.equal(credential.leaseOwner, null);
+  const [storedConnection] = await getDb()
+    .select()
+    .from(managedMcpServers)
+    .where(eq(managedMcpServers.id, connection.id));
+  assert.equal(storedConnection.oauthStatus, "connected");
+});
+
+test("a refresh that wins after a concurrent loser marked the connection expired restores it to connected", async () => {
+  const { server, connection } = await seedRefreshableOAuthConnection();
+  const winnerRead = gate();
+  const loserDone = gate();
+
+  // Order the other way round from the test above: the winner read the same
+  // credentials, the loser's invalidation lands first and it marks the
+  // connection expired, then the winner's newly issued grant is saved.
+  const winner = withManagedMcpOAuth(server.id, connection.id, async (_managed, provider) => {
+    winnerRead.open();
+    await loserDone.opened;
+    await provider.saveTokens({
+      access_token: "winner-access",
+      refresh_token: "winner-refresh",
+      token_type: "Bearer",
+    });
+    return "ok";
+  });
+  await winnerRead.opened;
+  await assert.rejects(
+    () => withManagedMcpOAuth(server.id, connection.id, async (_managed, provider) => {
+      await provider.invalidateCredentials("tokens");
+      throw new ManagedMcpGatewayError("MCP OAuth authorization expired; reconnect from Settings", "managed_mcp_oauth_required");
+    }),
+    ManagedMcpGatewayError,
+  );
+  let [storedConnection] = await getDb()
+    .select()
+    .from(managedMcpServers)
+    .where(eq(managedMcpServers.id, connection.id));
+  assert.equal(storedConnection.oauthStatus, "error");
+  loserDone.open();
+
+  assert.equal(await winner, "ok");
+  [storedConnection] = await getDb()
+    .select()
+    .from(managedMcpServers)
+    .where(eq(managedMcpServers.id, connection.id));
+  assert.equal(storedConnection.oauthStatus, "connected");
+  assert.equal(storedConnection.lastCheckError, null);
+  const [credential] = await getDb()
+    .select()
+    .from(managedMcpCredentials)
+    .where(eq(managedMcpCredentials.mcpServerId, connection.id));
+  assert.equal((decryptManagedMcpSecret(credential.encryptedOAuth!) as ManagedMcpOAuthStorage).tokens?.access_token, "winner-access");
+});
+
+test("a call rejected as unauthorized after a concurrent refresh runs once more on the new tokens, not marking the connection expired", async () => {
+  const { server, connection } = await seedRefreshableOAuthConnection();
+  const serverUrl = new URL("https://mcp.linear.app/mcp");
+  const endpoint = rotatingTokenEndpoint();
+  const firstRead = gate();
+  const refreshed = gate();
+  const seen: Array<string | undefined> = [];
+
+  const call = withManagedMcpOAuth(server.id, connection.id, async (_managed, provider) => {
+    seen.push(provider.tokens()?.access_token);
+    if (seen.length > 1) return "ok";
+    firstRead.open();
+    await refreshed.opened;
+    throw new ManagedMcpGatewayError("MCP OAuth authorization expired; reconnect from Settings", "managed_mcp_oauth_required");
+  });
+  await firstRead.opened;
+  await withManagedMcpOAuth(server.id, connection.id, async (_managed, provider) => {
+    await auth(provider, { serverUrl, fetchFn: endpoint.fetchFn });
+  });
+  refreshed.open();
+
+  assert.equal(await call, "ok");
+  assert.deepEqual(seen, ["expired-access-token", "rotated-access-1"]);
+  const [storedConnection] = await getDb()
+    .select()
+    .from(managedMcpServers)
+    .where(eq(managedMcpServers.id, connection.id));
+  assert.equal(storedConnection.oauthStatus, "connected");
+});
+
+test("a reconnect verdict from stale credentials does not overwrite a newer grant saved meanwhile", async () => {
+  const { server, connection } = await seedRefreshableOAuthConnection();
+  let saves = 0;
+  const saveNewerGrant = () => withManagedMcpOAuth(server.id, connection.id, async (_managed, provider) => {
+    saves += 1;
+    await provider.saveTokens({ access_token: `newer-access-${saves}`, refresh_token: `newer-refresh-${saves}`, token_type: "Bearer" });
+  });
+  let attempts = 0;
+  // Each attempt is rejected as unauthorized after another call saved a newer
+  // grant: the first is retried, the second gives up, but its verdict came
+  // from credentials that are no longer the stored ones, so it must not mark
+  // the connection expired.
+  await assert.rejects(
+    () => withManagedMcpOAuth(server.id, connection.id, async () => {
+      attempts += 1;
+      await saveNewerGrant();
+      throw new ManagedMcpGatewayError("MCP OAuth authorization expired; reconnect from Settings", "managed_mcp_oauth_required");
+    }),
+    ManagedMcpGatewayError,
+  );
+  assert.equal(attempts, 2);
+  const [storedConnection] = await getDb()
+    .select()
+    .from(managedMcpServers)
+    .where(eq(managedMcpServers.id, connection.id));
+  assert.equal(storedConnection.oauthStatus, "connected");
+  assert.equal(storedConnection.lastCheckError, null);
+});
+
+test("a call that fails for a reason other than reconnect is not repeated", async () => {
+  const { server, connection } = await seedOAuthConnection();
+  let calls = 0;
+  await assert.rejects(
+    () => withManagedMcpOAuth(server.id, connection.id, async () => {
+      calls += 1;
+      throw new ManagedMcpGatewayError("MCP server could not be reached", "managed_mcp_unreachable");
+    }),
+    ManagedMcpGatewayError,
+  );
+  assert.equal(calls, 1);
 });
 
 test("OAuth token persistence cannot revive connection A after an identity update to B", async () => {

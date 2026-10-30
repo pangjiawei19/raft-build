@@ -34,11 +34,25 @@ export const AGENT_MIGRATION_USER_ERROR_CODES = [
   "TARGET_COMPUTER_MATCHES_SOURCE",
   "COMPUTER_CAPABILITY_INSUFFICIENT",
   "TARGET_COMPUTER_OFFLINE",
+  /** task #1268: the target is still detecting (or never probed) the agent's runtime; retryable. */
+  "TARGET_RUNTIME_DETECTION_PENDING",
   "MIGRATION_ALREADY_IN_PROGRESS",
   "MIGRATION_PRO_PLAN_REQUIRED",
   "MIGRATION_TRANSPORT_NOT_PROVISIONED",
   "MIGRATION_TRANSPORT_PROVISION_FAILED",
   "MIGRATION_RESUMABLE_CAPABILITY_REQUIRED",
+  /** Raft hosted is not enabled or configured for this server, or its import limits could not be read. */
+  "HOSTED_TARGET_UNAVAILABLE",
+  /** This agent already has a hosted runtime record (the provider keys hosted agents by Raft agent id). */
+  "HOSTED_TARGET_ALREADY_USED",
+  /** The hosted model picked for the migration is not one this server may use. */
+  "HOSTED_TARGET_MODEL_INVALID",
+  /** The hosted migration is not waiting for the user's confirmation (not built yet, already switched, or ended). */
+  "HOSTED_REVIEW_NOT_READY",
+  /** The workspace has a MEMORY.md the hosted import could not keep (too large, not text, or refused by the provider). */
+  "HOSTED_IMPORT_MEMORY_UNIMPORTABLE",
+  /** A hosted migration that already switched cannot be canceled: the agent runs at the provider. */
+  "MIGRATION_NOT_CANCELABLE",
   ...AGENT_MIGRATION_TERMINAL_FAILURE_CODES,
   "MIGRATION_REF_INVALID",
   "MIGRATION_REVISION_INVALID",

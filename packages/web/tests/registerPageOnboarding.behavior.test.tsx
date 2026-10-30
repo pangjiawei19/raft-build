@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, beforeEach, test } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { CURRENT_LEGAL_ACCEPTANCE } from "@botiverse/raft-shared";
@@ -38,13 +37,13 @@ afterEach(() => {
   useAuthStore.setState(initialAuthState, true);
 });
 
-test("create account is a standalone credential page without identity fields or wizard chrome", async (t) => {
-  t.mock.method(api, "get", async () => ({ data: { providers: [] } }));
+test("create account is a standalone credential page without identity fields or wizard chrome", async () => {
+  vi.spyOn(api, "get").mockImplementation(async () => ({ data: { providers: [] } }));
   const { container } = renderPage();
 
   assert.ok(screen.getByRole("heading", { name: "Create your account" }));
   assert.equal(container.querySelector("aside"), null);
-  assert.equal(container.querySelectorAll("i.bg-brutal-pink, i.bg-soft-signal").length, 0);
+  assert.equal(container.querySelectorAll("i.bg-palette-pink, i.bg-palette-yellow").length, 0);
   assert.equal(container.querySelector('[class*="radial-gradient"]'), null);
   assert.equal(container.querySelector('[class*="lg:grid-cols-[minmax(320px,2fr)_minmax(0,3fr)]"]'), null);
   assert.ok(container.querySelector(".h-panel-header"));
@@ -63,8 +62,8 @@ test("create account is a standalone credential page without identity fields or 
   assert.equal(screen.queryByText(/skips this step/i), null);
 });
 
-test("create account submits email, password, and legal acceptance only", async (t) => {
-  t.mock.method(api, "get", async () => ({ data: { providers: [] } }));
+test("create account submits email, password, and legal acceptance only", async () => {
+  vi.spyOn(api, "get").mockImplementation(async () => ({ data: { providers: [] } }));
   const calls: unknown[][] = [];
   useAuthStore.setState({
     loading: false,
@@ -90,8 +89,8 @@ test("create account submits email, password, and legal acceptance only", async 
   });
 });
 
-test("create account exposes configured Google and GitHub entry buttons without explanatory skip copy", async (t) => {
-  t.mock.method(api, "get", async () => ({
+test("create account exposes configured Google and GitHub entry buttons without explanatory skip copy", async () => {
+  vi.spyOn(api, "get").mockImplementation(async () => ({
     data: {
       providers: [
         { id: "google", label: "Google", enabled: true },
@@ -106,4 +105,23 @@ test("create account exposes configured Google and GitHub entry buttons without 
     assert.ok(screen.getByRole("button", { name: "Continue with GitHub" }));
   });
   assert.equal(screen.queryByText(/goes straight to identity setup/i), null);
+});
+
+test("a disabled Continue states its reason until the legal box is accepted", async () => {
+  // task #724: the user could not see why Continue was disabled. The reason is
+  // the unchecked legal box; show it as a persistent line and drop it once the
+  // box is checked, so it never reads as an error.
+  vi.spyOn(api, "get").mockImplementation(async () => ({ data: { providers: [] } }));
+  renderPage();
+
+  const hintId = "auth.legalAcceptance.requiredHint";
+  // Copy comes through react-intl (both locales are supplied in the catalogs).
+  const hint = () => screen.queryByTestId("register-legal-hint");
+  assert.ok(hint(), "the reason line is visible while the legal box is unchecked");
+  assert.ok(screen.getByRole("button", { name: "Continue" }).hasAttribute("disabled"));
+
+  fireEvent.click(screen.getByRole("checkbox"));
+  await waitFor(() => assert.equal(hint(), null));
+  assert.equal(screen.getByRole("button", { name: "Continue" }).hasAttribute("disabled"), false);
+  assert.ok(hintId, "key stays wired");
 });

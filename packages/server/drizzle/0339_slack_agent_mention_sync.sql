@@ -1,0 +1,1 @@
+ALTER TABLE "external_app_installs" ADD COLUMN "agent_mention_sync" jsonb;

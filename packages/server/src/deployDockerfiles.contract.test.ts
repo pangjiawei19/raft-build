@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
-import { test } from "vitest";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "../../..");
@@ -16,28 +15,82 @@ const rootLockfileDockerfiles = [
   "packages/web/Dockerfile",
 ];
 
-test.skipIf(inSourceSnapshot)("every root-lockfile Docker build supplies declared patches before installing", () => {
+// pnpm 11+ reads its settings from pnpm-workspace.yaml and ignores the `pnpm`
+// field in package.json, so patches are declared there. The block is read
+// line by line (the server package has no YAML parser) and anything it cannot
+// read fails the test rather than counting as "no patches".
+function declaredDependencyPatches(): string[] {
   const rootPkg = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf8"));
-  const patches = Object.values(rootPkg.pnpm?.patchedDependencies ?? {}) as string[];
+  assert.equal(
+    rootPkg.pnpm,
+    undefined,
+    "package.json has a `pnpm` field; pnpm 11+ ignores it, move the settings to pnpm-workspace.yaml",
+  );
+  const lines = readFileSync(resolve(repoRoot, "pnpm-workspace.yaml"), "utf8").split("\n");
+  const blocks = lines.flatMap((line, index) => (/^patchedDependencies\s*:/.test(line) ? [index] : []));
+  if (!blocks.length) return [];
+  assert.equal(blocks.length, 1, "pnpm-workspace.yaml declares patchedDependencies more than once");
+  assert.match(lines[blocks[0]], /^patchedDependencies:\s*(#.*)?$/, "patchedDependencies must be a block mapping");
+  const patches: string[] = [];
+  for (const line of lines.slice(blocks[0] + 1)) {
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    if (!/^\s/.test(line)) break;
+    const entry = /^\s+(?:"[^"]+"|'[^']+'|[^\s:"'#]+):\s+(?:"([^"]+)"|'([^']+)'|([^\s"'#]+))\s*(#.*)?$/.exec(line);
+    assert.ok(entry, `unreadable patchedDependencies entry: ${line}`);
+    patches.push(entry[1] ?? entry[2] ?? entry[3]);
+  }
+  return patches;
+}
+
+/**
+ * Two-sided on purpose. The one-sided form ("if patches are declared, the
+ * Dockerfile must COPY them") stayed green on 2026-09-13 when the last patch
+ * was retired: the directory vanished, every Dockerfile still ran
+ * `COPY patches/ patches/`, and the staging image build failed at that line.
+ * A guard that only fires in one state cannot report the other state.
+ */
+test.skipIf(inSourceSnapshot)("root-lockfile Docker builds copy patches exactly when patches are declared", () => {
+  const patches = declaredDependencyPatches();
   for (const patch of patches) assert.ok(existsSync(resolve(repoRoot, patch)), `missing ${patch}`);
-  for (const dockerfile of [...rootLockfileDockerfiles, "scripts/agent-migration-e2e/Dockerfile"]) {
+  if (!patches.length) {
+    assert.equal(
+      existsSync(resolve(repoRoot, "patches")),
+      false,
+      "patches/ must not linger once no patchedDependencies are declared",
+    );
+  }
+  for (const dockerfile of rootLockfileDockerfiles) {
     const source = readFileSync(resolve(repoRoot, dockerfile), "utf8");
     const installIndex = source.indexOf("RUN pnpm install --frozen-lockfile");
     assert.ok(installIndex >= 0);
+    const copyIndex = source.indexOf("COPY patches/ patches/");
     if (patches.length) {
-      const copyIndex = source.indexOf("COPY patches/ patches/");
       assert.ok(copyIndex >= 0 && copyIndex < installIndex, `${dockerfile} must supply patches before install`);
+    } else {
+      assert.equal(
+        copyIndex,
+        -1,
+        `${dockerfile} copies patches/ but no patchedDependencies are declared; the directory does not exist and the image build fails at COPY`,
+      );
     }
   }
 });
 
-test.skipIf(inSourceSnapshot)("AWS image cache keys cover dependency patches and Dockerfile", () => {
+test.skipIf(inSourceSnapshot)("AWS image cache keys hash dependency patches exactly when patches are declared", () => {
+  const patches = declaredDependencyPatches();
   for (const [script, dockerfile] of [
     ["scripts/deploy/aws-build-push-server-image.sh", "packages/server/Dockerfile"],
     ["scripts/deploy/aws-build-push-trace-upload-image.sh", "packages/trace-upload-worker/Dockerfile"],
   ]) {
     const source = readFileSync(resolve(repoRoot, script), "utf8");
-    assert.ok(source.includes('"patches"'), `${script} must hash patch contents`);
+    const hashesPatches = source.includes('"patches"');
+    if (patches.length) {
+      assert.ok(hashesPatches, `${script} must hash patch contents`);
+    } else {
+      // hash_git_inputs resolves each input with `git rev-parse HEAD:<path>`,
+      // which fails for a path that is not in the tree.
+      assert.equal(hashesPatches, false, `${script} hashes patches/ but the directory no longer exists`);
+    }
     assert.ok(source.includes(`"${dockerfile}"`));
   }
 });
@@ -167,6 +220,21 @@ for (const image of RUNTIME_IMAGES) {
   });
 
   if (image.cacheKeyScript) {
+    test.skipIf(inSourceSnapshot)(`deploy-aws-staging.yml redeploys ${image.entry} when any package in its closure changes`, () => {
+      // Third half of the same contract: the staging deploy only runs on
+      // pushes that touch its `paths:` filter. A closure package missing from
+      // that filter means a merge that changes only that package builds no
+      // image at all, and staging keeps serving the old code.
+      const workflow = readFileSync(resolve(repoRoot, ".github/workflows/deploy-aws-staging.yml"), "utf8");
+      const paths = workflow.split("\n    paths:\n")[1]?.split("\n\n")[0] ?? "";
+      for (const dep of [image.entry, ...workspaceClosure(image.entry)]) {
+        assert.ok(
+          paths.includes(`- "${dep}/**"`),
+          `deploy-aws-staging.yml paths must include "${dep}/**" — otherwise a ${dep}-only merge does not redeploy ${image.entry}`,
+        );
+      }
+    });
+
     test.skipIf(inSourceSnapshot)(`${image.cacheKeyScript} hashes its whole workspace dependency closure`, () => {
       // Copying a dependency into the image is only half the contract: if the
       // dependency is not a hash input, a release that changes ONLY that

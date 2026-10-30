@@ -1,5 +1,12 @@
 import type { HTMLAttributes, ReactNode } from "react";
+import { Card } from "@botiverse/raft-ui";
 
+/** An item on its own card surface (raft-ui Card: the card fill, a hairline,
+ *  the container radius, no shadow): a reminder, a connected app, a form, the
+ *  channel files card. A list ROW is not this — rows are raft-ui `ListRow`
+ *  inside a `ListRowGroup` (Raft Design System › ListRow `rf-list--inset`).
+ *  Content, so no ink line and no lift; an interactive card lays the pressed
+ *  wash on hover and press, and a selected one is the cyan-soft selection. */
 export default function SurfaceListItem({
   children,
   selected = false,
@@ -12,20 +19,18 @@ export default function SurfaceListItem({
   interactive?: boolean;
 }) {
   return (
-    <div
+    <Card
+      variant="default"
       className={[
-        "border-2 px-4 py-3 transition-colors",
-        selected
-          ? "border-black bg-brutal-cyan/15 shadow-brutal-sm"
-          : [
-              "border-black/30 bg-white",
-              interactive ? "hover:border-black hover:shadow-brutal-sm" : "",
-            ].join(" "),
+        "min-w-0 w-full px-4 py-3 transition-colors",
+        selected ? "bg-info-soft" : "bg-layer-card",
+        interactive && !selected ? "hover:press-overlay active:press-overlay" : "",
         className,
       ].join(" ")}
       {...props}
+      data-selected={selected ? "true" : undefined}
     >
       {children}
-    </div>
+    </Card>
   );
 }

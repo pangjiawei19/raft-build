@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import "./helpers/domSetup";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -165,8 +164,9 @@ test("the archived-name-collision response renders its zh-cn recovery state", as
   );
   fireEvent.click(screen.getByRole("button", { name: "创建频道" }));
 
+  // The collision sentence is the warning Banner's title (DS Banner).
   assert.ok(await screen.findByText((_, element) =>
-    element?.tagName === "P"
+    element?.getAttribute("data-slot") === "banner-title"
       && element.textContent === "名称 #旧频道 已被一个已归档的频道占用。"));
   assert.ok(screen.getByText(zh["channel.create.archivedCanManage"]));
   assert.ok(screen.getByRole("button", { name: zh["channel.create.unarchive"] }));

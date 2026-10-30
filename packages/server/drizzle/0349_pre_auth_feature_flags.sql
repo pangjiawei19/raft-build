@@ -1,0 +1,1 @@
+ALTER TABLE "feature_flags" ADD COLUMN "pre_auth_evaluable" boolean DEFAULT false NOT NULL;

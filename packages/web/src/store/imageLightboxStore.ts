@@ -13,6 +13,9 @@ export { type MessageAttachment };
 export type LightboxImage = MessageAttachment & {
   /** Pre-resolved image URL. When set, the lightbox skips the attachment fetch. */
   directUrl?: string;
+  /** Pre-resolved download URL for a `directUrl` image (e.g. a public page's
+   *  `?download=1` route); defaults to `directUrl`. */
+  directDownloadUrl?: string;
 };
 
 /**

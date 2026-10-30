@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { clearClockTimeout, getMachineRuntimeDisplayOptions, getSetupRuntimeOptions, setClockTimeout } from "@botiverse/raft-shared";
@@ -8,9 +8,10 @@ import type { ServerSetupRuntimeStatus } from "./serverSetupProjection";
 import { formatRelativeTime } from "../../utils/relativeTime";
 import ComputerCommandGuide from "../machine/ComputerCommandGuide";
 import Banner from "../ui/Banner";
-import Button from "../ui/Button";
-import Spinner from "../ui/Spinner";
+import SectionEyebrow from "../ui/SectionEyebrow";
+import { Badge, Button, Card, CardDescription, CardHeader, CardTitle, DialogSurface, Separator, Spinner, Status } from "@botiverse/raft-ui";
 import TextLink from "../ui/TextLink";
+import Tooltip from "../ui/Tooltip";
 import SetupSessionFooter from "./SetupSessionFooter";
 
 const RECOMMENDED_RUNTIME_IDS = ["claude", "codex"] as const;
@@ -95,6 +96,8 @@ export type ServerSetupRuntimeCatalogEntry = RuntimeInfo & {
 export type ServerSetupComputerRuntimeStepProps = {
   computer: ServerSetupComputer | null;
   computerInstallCommand?: string;
+  /** mac/Linux one-paste install + setup; see `ComputerCommands.installAndSetup`. */
+  computerInstallAndSetupCommand?: string | null;
   /**
    * The server's verdict, from `ServerSetupProjection`. Not derived in the browser — and
    * NOT a boolean: "we have not been told yet" (`checking`/`unknown`) is a different thing
@@ -124,12 +127,8 @@ export type ServerSetupComputerRuntimeStepProps = {
   loading?: boolean;
   error?: string;
   setupCommand?: string | null;
-  macLinuxDaemonCommand?: string;
   windowsComputerInstallCommand?: string;
   windowsComputerSetupCommand?: string | null;
-  windowsDaemonCommand?: string;
-  onRequestWindowsDaemonCommand?: () => void;
-  windowsDaemonCommandPending?: boolean;
   onCopyInstallCommand?: (runtimeId: string, command: string) => void;
   onOpenApiKeySettings?: () => void;
   /**
@@ -186,24 +185,23 @@ function getDetectedRuntimeNames(runtimeOptions: readonly RuntimeSelectionOption
     .map((runtime) => runtime.displayName);
 }
 
+const NO_OFFLINE_COMPUTERS: NonNullable<ServerSetupComputerRuntimeStepProps["offlineComputers"]> = [];
+
 export default function ServerSetupComputerRuntimeStep({
   computer,
   runtimeStatus,
   runtimeOptions = [],
   hasConnectedComputer = false,
-  offlineComputers = [],
+  offlineComputers = NO_OFFLINE_COMPUTERS,
   serverSlug = null,
   showOwnApiKey = true,
   loading = false,
   error = "",
   setupCommand = null,
   computerInstallCommand = "",
-  macLinuxDaemonCommand = "",
+  computerInstallAndSetupCommand = null,
   windowsComputerInstallCommand = "",
   windowsComputerSetupCommand = null,
-  windowsDaemonCommand = "",
-  onRequestWindowsDaemonCommand,
-  windowsDaemonCommandPending = false,
   onCopyInstallCommand,
   onOpenApiKeySettings,
   canReset = false,
@@ -261,6 +259,15 @@ export default function ServerSetupComputerRuntimeStep({
   // The computer has ANSWERED the runtime question (whatever the answer was) — per the
   // server, not per whatever the store happens to be holding.
   const runtimesReported = runtimeAnswered || ready;
+  const recoveryComputers = useMemo(() => (offlineComputers.length > 0
+    ? offlineComputers
+    : computer
+      ? [{ id: computer.id, name: computer.name, lastHeartbeat: null, isComputer: computer.isComputer }]
+      : []), [computer, offlineComputers]);
+  const toggleExpandedRuntime = useCallback((runtimeId: string) => {
+    setExpandedRuntimeId(activeExpandedRuntimeId === runtimeId ? "" : runtimeId);
+  }, [activeExpandedRuntimeId]);
+  const toggleOwnApiKey = useCallback(() => toggleExpandedRuntime("own-api-key"), [toggleExpandedRuntime]);
 
   useEffect(() => {
     const wasOnline = previousComputerOnlineRef.current;
@@ -279,15 +286,16 @@ export default function ServerSetupComputerRuntimeStep({
   }, [computerOnline]);
 
   return (
-    <section className="flex w-full max-w-[960px] flex-col border-2 border-black bg-white shadow-brutal md:h-[min(720px,calc(100dvh-3rem))] md:min-h-[520px] md:overflow-hidden">
-      <header className="shrink-0 border-b-2 border-black px-6 pb-4 pt-6 sm:px-9">
-        <p className="font-mono text-[10px] font-bold uppercase tracking-wide text-black/55">
+    <DialogSurface render={<section />} className="w-full max-w-[960px] md:h-[min(720px,calc(100dvh-3rem))] md:min-h-[520px]">
+      <header className="shrink-0 border-b border-line-seam px-6 pb-4 pt-6 sm:px-9">
+        {/* The onboarding step label: Space Mono 12, sentence case. */}
+        <p className="font-mono text-mono-meta text-foreground-hint">
           {formatMessage({ id: "onboarding.computerRuntime.eyebrow" })}
         </p>
         {/* Do not ask a returning user who they are. "Connect a computer" is the right
             question only for someone who has never connected one; for someone whose machine
             is merely asleep it is the product saying it does not remember them. */}
-        <h1 className="mt-2 text-xl font-bold">
+        <h1 className="mt-1 text-title text-foreground">
           {/* Three independent sentences, one id each — not a composed string.
               zh does not keep this clause order. */}
           {formatMessage({
@@ -298,7 +306,7 @@ export default function ServerSetupComputerRuntimeStep({
                 : "onboarding.computerRuntime.titleConnect",
           })}
         </h1>
-        <p className="mt-1 text-xs leading-5 text-black/60">
+        <p className="mt-1.5 text-callout text-foreground-muted">
           {formatMessage({
             id: recoveringMany
               ? "onboarding.computerRuntime.bodyRecoverMany"
@@ -310,7 +318,7 @@ export default function ServerSetupComputerRuntimeStep({
       </header>
 
       <div className="space-y-3 px-5 py-4 sm:px-9 md:min-h-0 md:flex-1 md:overflow-y-auto">
-        {error ? <Banner intent="warning" density="sm" className="font-bold">{error}</Banner> : null}
+        {error ? <Banner intent="warning" density="sm">{error}</Banner> : null}
 
         {/* The connect step is one linear flow, not a collapsible section: its
             title is already the modal's heading, and wrapping it in a second
@@ -331,16 +339,12 @@ export default function ServerSetupComputerRuntimeStep({
               Windows path that disagrees with the Computer page. */}
           {recovering ? (
             <OfflineComputerRecovery
-              computers={offlineComputers.length > 0
-                ? offlineComputers
-                : computer
-                  ? [{ id: computer.id, name: computer.name, lastHeartbeat: null, isComputer: computer.isComputer }]
-                  : []}
+              computers={recoveryComputers}
               serverSlug={serverSlug ?? null}
-              macLinuxDaemonCommand={macLinuxDaemonCommand}
-              windowsDaemonCommand={windowsDaemonCommand}
-              onRequestWindowsDaemonCommand={onRequestWindowsDaemonCommand}
-              windowsDaemonCommandPending={windowsDaemonCommandPending}
+              setupCommand={setupCommand}
+              computerInstallCommand={computerInstallCommand}
+              windowsComputerSetupCommand={windowsComputerSetupCommand}
+              windowsComputerInstallCommand={windowsComputerInstallCommand}
               canReset={canReset}
               onStartOver={onStartOver}
             />
@@ -350,18 +354,10 @@ export default function ServerSetupComputerRuntimeStep({
               <ComputerCommandGuide
                 computerCommand={setupCommand}
                 computerInstallCommand={computerInstallCommand}
+                computerInstallAndSetupCommand={computerInstallAndSetupCommand}
                 windowsComputerCommand={windowsComputerSetupCommand}
                 windowsComputerInstallCommand={windowsComputerInstallCommand}
-                macLinuxDaemonCommand={macLinuxDaemonCommand}
-                windowsDaemonCommand={windowsDaemonCommand}
                 onPlatformChange={setPlatform}
-                onRequestWindowsDaemonCommand={onRequestWindowsDaemonCommand}
-                windowsDaemonCommandPending={windowsDaemonCommandPending}
-                // #5254 / task #197: setup must not offer the legacy daemon path. It creates
-                // only a raw `machines` row, which can never satisfy the managed `computers`
-                // attachment this projection gates on — so here it is not an alternative, it is
-                // a route that cannot finish. The Computers page keeps it (default true).
-                showLegacyDaemon={false}
               />
               {/* Instructions are for someone who has not run it yet; once the computer is
                   online they are just history. The log takes over. */}
@@ -392,16 +388,17 @@ export default function ServerSetupComputerRuntimeStep({
             made it appear and vanish again the moment the list landed. The log's
             "Detecting runtime…" spinner is the honest thing to show while we wait. */}
         {runtimeVisible && !ready && runtimeAnswered ? (
-        <div
-          className={`border-2 border-black ${connectionMotionPhase === "handoff" ? "onboarding-runtime-reveal" : ""}`}
+        <Card
+          variant="inset"
+          className={connectionMotionPhase === "handoff" ? "onboarding-runtime-reveal" : undefined}
           data-motion-state={connectionMotionPhase}
         >
-          <div className="px-4 py-3">
-            <h2 className="text-sm font-bold">{formatMessage({ id: "onboarding.computerRuntime.noRuntimeTitle" })}</h2>
-            <p className="mt-1 text-xs text-black/55">
+          <CardHeader>
+            <CardTitle render={<h2>{formatMessage({ id: "onboarding.computerRuntime.noRuntimeTitle" })}</h2>} className="text-subhead font-bold" />
+            <CardDescription render={<p />}>
               {formatMessage({ id: "onboarding.computerRuntime.noRuntimeBody" })}
-            </p>
-          </div>
+            </CardDescription>
+          </CardHeader>
 
           <div>
           <RuntimeGroupLabel note={formatMessage({ id: "onboarding.computerRuntime.recommendedNote" })}>
@@ -413,11 +410,12 @@ export default function ServerSetupComputerRuntimeStep({
               runtime={runtime}
               computerName={computer?.name ?? null}
               expanded={activeExpandedRuntimeId === runtime.id}
-              onToggle={() => setExpandedRuntimeId(activeExpandedRuntimeId === runtime.id ? "" : runtime.id)}
+              onToggle={toggleExpandedRuntime}
               onCopyInstallCommand={onCopyInstallCommand}
             />
           ))}
 
+          <Separator />
           <RuntimeGroupLabel>{formatMessage({ id: "onboarding.computerRuntime.allSupported" })}</RuntimeGroupLabel>
           {catalog.supported.map((runtime) => (
             <RuntimeRow
@@ -425,7 +423,7 @@ export default function ServerSetupComputerRuntimeStep({
               runtime={runtime}
               computerName={computer?.name ?? null}
               expanded={activeExpandedRuntimeId === runtime.id}
-              onToggle={() => setExpandedRuntimeId(activeExpandedRuntimeId === runtime.id ? "" : runtime.id)}
+              onToggle={toggleExpandedRuntime}
               onCopyInstallCommand={onCopyInstallCommand}
               quiet={!runtime.detected}
             />
@@ -433,25 +431,25 @@ export default function ServerSetupComputerRuntimeStep({
           {showOwnApiKey ? (
             <OwnApiKeyRow
               expanded={activeExpandedRuntimeId === "own-api-key"}
-              onToggle={() => setExpandedRuntimeId(activeExpandedRuntimeId === "own-api-key" ? "" : "own-api-key")}
+              onToggle={toggleOwnApiKey}
               onOpenSettings={onOpenApiKeySettings}
             />
           ) : null}
           </div>
-        </div>
+        </Card>
         ) : null}
       </div>
 
-      <footer className="flex shrink-0 flex-col-reverse gap-3 border-t-2 border-black px-5 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-9">
+      <footer className="flex shrink-0 flex-col-reverse gap-3 border-t border-line-seam px-5 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-9">
         <div className="flex min-w-0 items-center gap-3">
-          <SetupSessionFooter disabled={loading} />
+          <SetupSessionFooter disabled={loading} showServerSettings />
         </div>
         <Button
           type="button"
           onClick={onNext}
           disabled={loading || !ready}
           size="lg"
-          tone="pink"
+          variant="accent"
           className="w-full sm:w-auto"
         >
           {formatMessage({
@@ -459,7 +457,7 @@ export default function ServerSetupComputerRuntimeStep({
           })}
         </Button>
       </footer>
-    </section>
+    </DialogSurface>
   );
 }
 
@@ -496,23 +494,27 @@ function RecoveryCommandRow({
   onCopy: (command: string) => void;
 }) {
   const { formatMessage } = useIntl();
+  const handleCopy = useCallback(() => onCopy(command), [command, onCopy]);
   return (
     <div className="flex items-center gap-2">
       <code
-        className="min-w-0 flex-1 border-2 border-black bg-black px-3 py-2 font-mono text-xs text-brutal-lime shadow-brutal-sm break-all"
+        className="min-h-10 min-w-0 flex-1 rounded-control border border-line-hairline bg-layer-code px-3 py-2.5 font-mono text-mono-code text-foreground break-all"
         data-testid={testId}
       >
         {command}
       </code>
-      <button
-        type="button"
-        onClick={() => onCopy(command)}
-        className="btn-brutal-sm shrink-0 bg-white px-2 py-1.5"
-        title={formatMessage({ id: "onboarding.computerRuntime.copyCommand" }, { command })}
-        aria-label={formatMessage({ id: "onboarding.computerRuntime.copyCommand" }, { command })}
-      >
-        {copied === command ? <Check size={14} /> : <Copy size={14} />}
-      </button>
+      <Tooltip content={formatMessage({ id: "onboarding.computerRuntime.copyCommand" }, { command })}>
+        <Button
+          type="button"
+          onClick={handleCopy}
+          size="icon-sm"
+          variant="outline"
+          className="shrink-0"
+          aria-label={formatMessage({ id: "onboarding.computerRuntime.copyCommand" }, { command })}
+        >
+          {copied === command ? <Check size={14} /> : <Copy size={14} />}
+        </Button>
+      </Tooltip>
     </div>
   );
 }
@@ -520,29 +522,29 @@ function RecoveryCommandRow({
 function OfflineComputerRecovery({
   computers,
   serverSlug,
-  macLinuxDaemonCommand,
-  windowsDaemonCommand,
-  onRequestWindowsDaemonCommand,
-  windowsDaemonCommandPending = false,
+  setupCommand,
+  computerInstallCommand,
+  windowsComputerSetupCommand,
+  windowsComputerInstallCommand,
   canReset = false,
   onStartOver,
 }: {
   computers: ReadonlyArray<{ id: string; name: string; lastHeartbeat: string | null; isComputer?: boolean }>;
   serverSlug: string | null;
-  macLinuxDaemonCommand: string;
-  windowsDaemonCommand: string;
-  onRequestWindowsDaemonCommand?: () => void;
-  windowsDaemonCommandPending?: boolean;
+  setupCommand: string | null;
+  computerInstallCommand: string;
+  windowsComputerSetupCommand: string | null;
+  windowsComputerInstallCommand: string;
   canReset?: boolean;
   onStartOver?: () => void;
 }) {
   const { formatMessage, locale } = useIntl();
   const [copied, setCopied] = useState<string | null>(null);
-  const copy = (command: string) => {
+  const copy = useCallback((command: string) => {
     void navigator.clipboard?.writeText(command);
     setCopied(command);
     setClockTimeout(() => setCopied(null), 1_500);
-  };
+  }, []);
 
   const many = computers.length > 1;
   // `raft-computer start` is the SAME command on every one of their machines, and the
@@ -550,13 +552,16 @@ function OfflineComputerRecovery({
   // would be turning our implementation detail into their homework. It is a LIST: we tell
   // them what they have (name, last seen) and they decide which one they can actually
   // reach. Which machine is easiest to switch on lives in their head, not in our database.
+  // A row connected with the retired standalone daemon has no `raft-computer`
+  // on that box, so "start" cannot bring it back: it gets the Computer
+  // install + setup commands instead.
   const anyLegacyDaemon = computers.some((c) => c.isComputer === false);
 
   return (
     <div className="space-y-4" data-testid="onboarding-offline-recovery">
       <div className="flex items-center gap-2">
-        <Terminal size={16} className="text-black" />
-        <p className="font-mono text-[10px] font-bold uppercase tracking-wide text-black/55">
+        <Terminal size={18} className="shrink-0 text-foreground-muted" />
+        <p className="text-subhead font-bold text-foreground">
           {many
             ? formatMessage({ id: "onboarding.computerRuntime.titleRecoverMany" })
             : formatMessage(
@@ -571,12 +576,12 @@ function OfflineComputerRecovery({
           {computers.map((c) => {
             const lastSeen = formatRelativeTime(c.lastHeartbeat, locale);
             return (
-              <li key={c.id} className="flex items-center gap-3 border-2 border-black bg-white px-3 py-2">
-                <Monitor size={16} className="shrink-0 text-black/60" />
+              <Card key={c.id} render={<li />} className="flex-row items-center gap-3 px-3 py-2.5">
+                <Monitor size={20} className="shrink-0 text-foreground-muted" />
                 <div className="min-w-0">
-                  <p className="truncate text-xs font-bold">{c.name}</p>
+                  <p className="truncate font-mono text-mono-code font-bold text-foreground">{c.name}</p>
                   {/* Only what we actually know. No last-seen row rather than a made-up one. */}
-                  <p className="text-[11px] text-black/50">
+                  <p className="text-caption text-foreground-hint">
                     {/* `lastSeen` is app-locale correct: task #53 (#5848) gave
                         formatRelativeTime an explicit locale parameter, and this
                         call site passes the one from useIntl. */}
@@ -585,7 +590,7 @@ function OfflineComputerRecovery({
                       : formatMessage({ id: "onboarding.computerRuntime.offline" })}
                   </p>
                 </div>
-              </li>
+              </Card>
             );
           })}
         </ul>
@@ -593,22 +598,20 @@ function OfflineComputerRecovery({
 
       {anyLegacyDaemon ? (
         <div data-testid="onboarding-recovery-legacy-daemon">
-          <p className="mb-2 text-xs leading-5 text-black/60">
+          <p className="mb-2 text-callout text-foreground-muted">
             {formatMessage({ id: "onboarding.computerRuntime.legacyDaemon" })}
           </p>
           <ComputerCommandGuide
-            computerCommand={null}
-            computerInstallCommand={null}
-            macLinuxDaemonCommand={macLinuxDaemonCommand}
-            windowsDaemonCommand={windowsDaemonCommand}
-            onRequestWindowsDaemonCommand={onRequestWindowsDaemonCommand}
-            windowsDaemonCommandPending={windowsDaemonCommandPending}
+            computerCommand={setupCommand}
+            computerInstallCommand={computerInstallCommand || null}
+            windowsComputerCommand={windowsComputerSetupCommand}
+            windowsComputerInstallCommand={windowsComputerInstallCommand || null}
           />
         </div>
       ) : (
         <>
           <div>
-            <p className="mb-2 text-xs leading-5 text-black/60">
+            <p className="mb-2 text-callout text-foreground-muted">
               {many
                 ? formatMessage({ id: "onboarding.computerRuntime.recoverManyHint" })
                 : formatMessage(
@@ -620,7 +623,7 @@ function OfflineComputerRecovery({
           </div>
 
           <div>
-            <p className="mb-2 text-xs leading-5 text-black/60">
+            <p className="mb-2 text-callout text-foreground-muted">
               {/* REUSED from the Computer detail page rather than minted again: it is the
                   same prompt, and this whole recovery card exists because
                   MachineDetailPanel worked the problem out first (see the note at
@@ -645,7 +648,7 @@ function OfflineComputerRecovery({
         "throw this away and start again". One question, one answer, in the same place.
       */}
       {!canReset ? null : (
-        <div className="flex flex-wrap items-baseline gap-x-1 text-sm">
+        <div className="flex flex-wrap items-baseline gap-x-1 text-callout text-foreground-muted">
           <span data-testid="onboarding-recovery-start-over-description">
             {formatMessage({
               id: many
@@ -742,7 +745,7 @@ function ConnectProgressLog({
 
   return (
     <ol
-      className="space-y-1.5 font-mono text-xs leading-5"
+      className="space-y-1.5 font-mono text-mono-meta"
       aria-live="polite"
       data-testid="onboarding-connect-log"
     >
@@ -755,18 +758,18 @@ function ConnectProgressLog({
         >
           <span className="mt-0.5 flex size-4 shrink-0 items-center justify-center" aria-hidden="true">
             {line.done ? (
-              <span className="flex size-4 items-center justify-center border-2 border-black bg-brutal-lime">
-                <Check size={10} strokeWidth={4} />
+              <span className="flex size-4 items-center justify-center rounded-sticker border-[1.5px] border-sticker-ink bg-success text-sticker-ink">
+                <Check size={10} strokeWidth={3} />
               </span>
             ) : line.failed ? (
-              <span className="flex size-4 items-center justify-center border-2 border-black bg-brutal-orange">
-                <X size={10} strokeWidth={4} />
+              <span className="flex size-4 items-center justify-center rounded-sticker border-[1.5px] border-sticker-ink bg-warning text-sticker-ink">
+                <X size={10} strokeWidth={3} />
               </span>
             ) : line.pending ? (
-              <Spinner size="sm" />
+              <Spinner size="sm"  aria-label={formatMessage({ id: "common.loadingLabel" })} />
             ) : null}
           </span>
-          <span className={line.done || line.failed ? "font-bold text-black" : "text-black/60"}>{line.text}</span>
+          <span className={line.done || line.failed ? "font-bold text-foreground" : "text-foreground-muted"}>{line.text}</span>
         </li>
       ))}
     </ol>
@@ -801,7 +804,7 @@ function ConnectComputerInstructions({ platform }: { platform: "mac-linux" | "wi
 
   return (
     <ol
-      className="space-y-1.5 text-xs leading-5 text-black/65"
+      className="space-y-2 text-callout text-foreground-muted"
       aria-label={formatMessage({ id: "onboarding.computerRuntime.instructionsAria" })}
       data-testid="onboarding-computer-instructions"
     >
@@ -809,7 +812,7 @@ function ConnectComputerInstructions({ platform }: { platform: "mac-linux" | "wi
         <li key={label} className="flex gap-2">
           <span
             aria-hidden="true"
-            className="mt-px flex size-4 shrink-0 items-center justify-center border border-black/30 font-mono text-[9px] font-bold text-black/60"
+            className="flex size-5 shrink-0 items-center justify-center rounded-sticker border border-line-seam font-mono text-mono-meta text-foreground-hint"
           >
             {index + 1}
           </span>
@@ -823,9 +826,9 @@ function ConnectComputerInstructions({ platform }: { platform: "mac-linux" | "wi
 
 function RuntimeGroupLabel({ children, note }: { children: ReactNode; note?: string }) {
   return (
-    <div className="border-t border-black/15 px-3.5 pb-1 pt-2.5 first:border-t-0">
-      <span className="font-mono text-[10px] font-bold uppercase tracking-widest text-black/45">{children}</span>
-      {note ? <span className="ml-2 text-[10px] text-black/40">{note}</span> : null}
+    <div className="px-3.5 pb-1 pt-3">
+      <SectionEyebrow>{children}</SectionEyebrow>
+      {note ? <span className="ml-2 text-caption text-foreground-hint">{note}</span> : null}
     </div>
   );
 }
@@ -841,39 +844,45 @@ function RuntimeRow({
   runtime: ServerSetupRuntimeCatalogEntry;
   computerName: string | null;
   expanded: boolean;
-  onToggle: () => void;
+  onToggle: (runtimeId: string) => void;
   onCopyInstallCommand?: (runtimeId: string, command: string) => void;
   quiet?: boolean;
 }) {
   const { formatMessage } = useIntl();
   const command = RUNTIME_INSTALL_COMMANDS[runtime.id];
+  const runtimeId = runtime.id;
+  const handleToggle = useCallback(() => onToggle(runtimeId), [onToggle, runtimeId]);
   // Says so where the click happened, instead of throwing a toast across the screen.
   const [copied, setCopied] = useState(false);
   return (
-    <div className={`border-t border-black/10 ${expanded ? "bg-soft-signal/20" : ""}`}>
+    <>
+    <Separator />
+    <div className={expanded ? "bg-info-soft" : ""}>
       <button
         type="button"
-        className={`flex w-full items-center gap-2.5 px-3.5 py-2 text-left ${quiet ? "text-black/50" : ""}`}
+        className={`flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2 text-left outline-none hover:bg-fill-pressed focus-visible:shadow-[inset_0_0_0_2px_var(--foreground)] ${quiet ? "text-foreground-hint" : "text-foreground"}`}
         aria-expanded={expanded}
-        onClick={onToggle}
+        onClick={handleToggle}
       >
-        <span className={`flex shrink-0 items-center justify-center border-2 border-black bg-white font-mono text-[9px] font-bold ${runtime.recommended ? "size-7" : "size-6"}`}>
+        <span className={`flex shrink-0 items-center justify-center rounded-sticker bg-fill-muted font-mono text-mono-meta font-bold text-foreground-muted ${runtime.recommended ? "size-[27px]" : "size-6"}`}>
           {runtime.abbreviation}
         </span>
-        <span className={`min-w-0 flex-1 font-bold ${runtime.recommended ? "text-[13px]" : "text-xs"}`}>
+        <span className={`min-w-0 flex-1 font-semibold ${runtime.recommended ? "text-callout" : "text-footnote"}`}>
           {runtime.displayName}
         </span>
-        <span className={`shrink-0 border-2 px-2 py-0.5 font-mono text-[9px] font-bold uppercase ${runtime.detected ? "border-black bg-brutal-lime text-black" : "border-black/20 bg-white text-black/40"}`}>
+        {/* DS StatusChip: a soft wash, a square pixel, one word. */}
+        <Badge variant={runtime.detected ? "success" : "muted"} appearance="soft" className="shrink-0">
+          <Status variant={runtime.detected ? "success" : "default"} aria-hidden="true" />
           {formatMessage({
             id: runtime.detected
               ? "onboarding.computerRuntime.detected"
               : "onboarding.computerRuntime.notDetected",
           })}
-        </span>
-        <ChevronRight size={15} className={`shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`} />
+        </Badge>
+        <ChevronRight size={16} className={`shrink-0 text-foreground-muted transition-transform ${expanded ? "rotate-90" : ""}`} />
       </button>
       {expanded ? (
-        <div className="px-3.5 pb-3 pl-12 text-[11px] leading-5 text-black/65">
+        <div className="px-3.5 pb-3 pl-12 text-footnote text-foreground-muted">
           {runtime.detected ? (
             <p>
               {/* Was a sentence plus a leading-space fragment concatenated in JSX.
@@ -887,7 +896,7 @@ function RuntimeRow({
                 },
                 {
                   computer: computerName ?? formatMessage({ id: "onboarding.computerRuntime.yourComputer" }),
-                  b: (chunks: ReactNode) => <strong key="b" className="text-black">{chunks}</strong>,
+                  b: (chunks: ReactNode) => <strong key="b" className="text-foreground">{chunks}</strong>,
                 },
               )}
             </p>
@@ -898,7 +907,7 @@ function RuntimeRow({
                   { id: "onboarding.computerRuntime.runtimeInstallHint" },
                   {
                     runtime: runtime.displayName,
-                    b: (chunks: ReactNode) => <strong key="b" className="text-black">{chunks}</strong>,
+                    b: (chunks: ReactNode) => <strong key="b" className="text-foreground">{chunks}</strong>,
                   },
                 )}
               </p>
@@ -910,7 +919,7 @@ function RuntimeRow({
                     setCopied(true);
                     setClockTimeout(() => setCopied(false), 2_000);
                   }}
-                  className="inline-flex items-center gap-1 font-bold text-black underline underline-offset-2"
+                  className="inline-flex items-center gap-1 rounded-control font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus"
                 >
                   {copied ? <Check size={12} strokeWidth={3} /> : <Copy size={12} />}
                   {formatMessage({
@@ -925,6 +934,7 @@ function RuntimeRow({
         </div>
       ) : null}
     </div>
+    </>
   );
 }
 
@@ -939,31 +949,34 @@ function OwnApiKeyRow({
 }) {
   const { formatMessage } = useIntl();
   return (
-    <div className={`border-t border-black/10 ${expanded ? "bg-soft-signal/20" : ""}`}>
-      <button type="button" className="flex w-full items-center gap-2.5 px-3.5 py-2 text-left" aria-expanded={expanded} onClick={onToggle}>
-        <span className="flex size-6 shrink-0 items-center justify-center border-2 border-black bg-white">
-          <KeyRound size={13} />
+    <>
+    <Separator />
+    <div className={expanded ? "bg-info-soft" : ""}>
+      <button type="button" className="flex min-h-11 w-full items-center gap-2.5 px-3.5 py-2 text-left text-foreground outline-none hover:bg-fill-pressed focus-visible:shadow-[inset_0_0_0_2px_var(--foreground)]" aria-expanded={expanded} onClick={onToggle}>
+        <span className="flex size-6 shrink-0 items-center justify-center rounded-sticker bg-fill-muted text-foreground-muted">
+          <KeyRound size={14} />
         </span>
-        <span className="min-w-0 flex-1 text-xs font-bold">
+        <span className="min-w-0 flex-1 text-footnote font-semibold">
           {formatMessage({ id: "onboarding.computerRuntime.ownApiKey" })}
         </span>
-        <span className="shrink-0 border-2 border-black/20 bg-white px-2 py-0.5 font-mono text-[9px] font-bold uppercase text-black/40">
+        <Badge variant="muted" appearance="soft" className="shrink-0">
           {formatMessage({ id: "onboarding.computerRuntime.notSet" })}
-        </span>
-        <ChevronRight size={15} className={`shrink-0 transition-transform ${expanded ? "rotate-90" : ""}`} />
+        </Badge>
+        <ChevronRight size={16} className={`shrink-0 text-foreground-muted transition-transform ${expanded ? "rotate-90" : ""}`} />
       </button>
       {expanded ? (
-        <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 pb-3 pl-12 text-[11px] leading-5 text-black/65">
+        <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 pb-3 pl-12 text-footnote text-foreground-muted">
           <p>
             {formatMessage({ id: "onboarding.computerRuntime.ownApiKeyHint" })}
           </p>
           {onOpenSettings ? (
-            <button type="button" onClick={onOpenSettings} className="font-bold text-black underline underline-offset-2">
+            <button type="button" onClick={onOpenSettings} className="rounded-control font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus">
               {formatMessage({ id: "onboarding.computerRuntime.addApiKey" })}
             </button>
           ) : null}
         </div>
       ) : null}
     </div>
+    </>
   );
 }

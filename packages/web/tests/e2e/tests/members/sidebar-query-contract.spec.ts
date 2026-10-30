@@ -85,6 +85,15 @@ function assertScopedMembersContract(page: Page, expectedAgentTab: "activity" | 
     });
 }
 
+// The Members rail item stays the selected rail entry. Raft draws a selected
+// rail item as a sticker (white in the light yellow frame, yellow in dark);
+// assert the selection state the rail exposes, not the sticker's colour class.
+async function expectMembersRailSelected(page: Page) {
+  const members = page.getByRole("button", { name: "Members" });
+  await expect(members).toHaveAttribute("aria-pressed", "true");
+  await expect(members).toHaveAttribute("data-selected", "true");
+}
+
 test.describe("Sidebar query contract", () => {
   test("members sidebar stays active when agent detail tabs change", async ({ page, request }) => {
     const { seedState, login } = await getSeedAndLogin(request);
@@ -93,15 +102,15 @@ test.describe("Sidebar query contract", () => {
     const agent = await createAgentFixture(request, seedState, login.accessToken, agentName);
 
     await page.goto(`/s/${seedState.server.slug}/agent/${agent.id}?sidebarTab=members`);
-    await expect(page.getByRole("button", { name: "Members" })).toHaveClass(/bg-white/);
+    await expectMembersRailSelected(page);
 
     await page.getByTestId("panel-tab-activity").click();
     await assertScopedMembersContract(page, "activity");
-    await expect(page.getByRole("button", { name: "Members" })).toHaveClass(/bg-white/);
+    await expectMembersRailSelected(page);
 
     await page.getByTestId("panel-tab-workspace").click();
     await assertScopedMembersContract(page, "workspace");
-    await expect(page.getByRole("button", { name: "Members" })).toHaveClass(/bg-white/);
+    await expectMembersRailSelected(page);
   });
 
   test("legacy tab=machines links still load members and normalize to sidebarTab on interaction", async ({
@@ -114,10 +123,10 @@ test.describe("Sidebar query contract", () => {
     const agent = await createAgentFixture(request, seedState, login.accessToken, agentName);
 
     await page.goto(`/s/${seedState.server.slug}/agent/${agent.id}?tab=machines`);
-    await expect(page.getByRole("button", { name: "Members" })).toHaveClass(/bg-white/);
+    await expectMembersRailSelected(page);
     await page.getByTestId("panel-tab-activity").click();
 
     await assertScopedMembersContract(page, "activity");
-    await expect(page.getByRole("button", { name: "Members" })).toHaveClass(/bg-white/);
+    await expectMembersRailSelected(page);
   });
 });

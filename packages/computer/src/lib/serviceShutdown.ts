@@ -1,5 +1,5 @@
 import { currentTimeMs, setClockTimeout } from "@botiverse/raft-shared";
-import type { RunnerRecord } from "./runnerStateMachine.js";
+import type { RunnerRecord } from "./runnerStateMachine";
 
 const SHUTDOWN_CHILD_WAIT_TIMEOUT_MS = 10_000;
 
@@ -16,10 +16,19 @@ export function evaluateShutdownBarrier(
 
 export interface ShutdownServiceDeps {
   runners: Map<string, RunnerRecord>;
+  /** Runs just before a child gets SIGTERM, so the child can tell who stopped it. */
+  beforeSignal?: (rec: RunnerRecord, pid: number) => void;
   closeIpc: () => void | Promise<void> | undefined;
   isProcessAlive: (pid: number) => boolean;
   clearServicePidfile: () => Promise<void>;
   restartRequested: boolean;
+  /**
+   * Exit code once the children are gone. Default 0. A service handing
+   * itself to an external supervisor exits with
+   * SUPERVISED_RELAUNCH_EXIT_CODE so the supervisor's restart policy
+   * relaunches it (task #917).
+   */
+  exitCode?: number;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
   writeWarning?: (message: string) => void;
@@ -28,10 +37,12 @@ export interface ShutdownServiceDeps {
 
 export async function shutdownService({
   runners,
+  beforeSignal,
   closeIpc,
   isProcessAlive,
   clearServicePidfile,
   restartRequested,
+  exitCode = 0,
   now = currentTimeMs,
   sleep = (ms) => new Promise<void>((resolve) => setClockTimeout(resolve, ms)),
   writeWarning = (message) => process.stderr.write(message),
@@ -40,6 +51,7 @@ export async function shutdownService({
   for (const rec of runners.values()) {
     if (!rec.child) continue;
     rec.stopping = true;
+    if (rec.child.pid !== undefined) beforeSignal?.(rec, rec.child.pid);
     try {
       rec.child.kill("SIGTERM");
     } catch {
@@ -79,5 +91,5 @@ export async function shutdownService({
   // The incumbent must not unlink that successor identity during its tail
   // shutdown. Operator stop has no successor and still clears normally.
   if (!restartRequested) await clearServicePidfile();
-  exit(0);
+  exit(exitCode);
 }

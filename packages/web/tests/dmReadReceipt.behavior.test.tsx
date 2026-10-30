@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { afterEach, test as nodeTest } from "node:test";
+import { test as nodeTest } from "vitest";
 import "./helpers/domSetup";
 import { cleanup, render } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -14,6 +14,12 @@ import api from "../src/api/client";
  * (correct for channels: it fired on messages with no @agent at all, and on
  * large-summary scopes) silently left DMs with NO read indicator whatsoever.
  *
+ * artin (option C): the DM read state is ONE status line under the DM's last
+ * message (ChatPanel passes `showDmReadStatus` to that message only), never a
+ * per-message footer chip — the footer chip created a footer row the moment the
+ * peer read a message, so read messages jumped ~26px and every earlier message
+ * repeated "Read".
+ *
  * The restored chip is scoped to DMs ONLY, because that is the one surface
  * where it was never ambiguous: a DM has a single exposed peer, so "Read"
  * cannot quietly mean "some unrelated agent read the channel". The channel
@@ -22,7 +28,7 @@ import api from "../src/api/client";
  */
 
 const test = ((name: string, fn: Parameters<typeof nodeTest>[1]) =>
-  nodeTest(name, { concurrency: false }, fn)) as typeof nodeTest;
+  nodeTest(name,  fn)) as typeof nodeTest;
 
 const originalPost = api.post.bind(api);
 
@@ -33,6 +39,7 @@ async function renderMessage(opts: {
   senderIsViewer?: boolean;
   hydrate?: boolean;
   reactions?: Record<string, unknown>[];
+  showDmReadStatus?: boolean;
 }) {
   const {
     channelType,
@@ -41,6 +48,7 @@ async function renderMessage(opts: {
     senderIsViewer = true,
     hydrate = true,
     reactions = [],
+    showDmReadStatus = true,
   } = opts;
 
   const { default: MessageItem } = await import("../src/components/message/MessageItem");
@@ -103,6 +111,7 @@ async function renderMessage(opts: {
             reactions,
           } as never}
           mentionMap={new Map()}
+          showDmReadStatus={showDmReadStatus}
           // ChatPanel passes `useChannelStore(s => s.channels)` — which never
           // contains DMs. Passing the DM here would fake a shape the app cannot
           // produce, which is exactly how the original defect stayed green.
@@ -118,6 +127,10 @@ async function renderMessage(opts: {
   return view;
 }
 
+// raft-ui MessageItemFooter's slot: the row that, when created on read, made
+// the message jump.
+const FOOTER = "[data-slot='message-item-footer']";
+
 function hasReadChip(view: { container: HTMLElement }): boolean {
   return view.container.querySelector("[data-message-affordance='read-receipt']") !== null;
 }
@@ -132,16 +145,21 @@ test("#693 a DM shows the read chip once the agent peer has read the message", a
   assert.equal(hasReadChip(view), true, "a DM is the one surface with an unambiguous single peer");
 });
 
-test("#693 the DM chip sits at the far right of the message row", async () => {
+test("#693 option C: only the message ChatPanel marks as the DM's last shows the status", async () => {
+  // The read watermark makes every earlier own message "read" too; repeating
+  // the status on each of them was half of artin's complaint.
+  const view = await renderMessage({ channelType: "dm", peerMaxReadSeq: 10, messageSeq: 5, showDmReadStatus: false });
+  assert.equal(hasReadChip(view), false, "a read message that is not the DM's last shows nothing");
+});
+
+test("#693 option C: the status is its own right-aligned line, never in the footer", async () => {
   const view = await renderMessage({ channelType: "dm", peerMaxReadSeq: 10, messageSeq: 5 });
   const chip = view.container.querySelector("[data-message-affordance='read-receipt']");
   assert.ok(chip);
-  const footer = chip!.parentElement;
-  assert.ok(footer);
-  // artin specified the far right. Asserting it is the LAST child of the flex
-  // footer row is structural: it stays true if the chip's classes are
-  // restyled, and goes false if someone inserts another chip after it.
-  assert.equal(footer!.lastElementChild, chip, "the read chip must be the right-most footer element");
+  const line = view.container.querySelector("[data-testid='dm-read-status']");
+  assert.ok(line, "the status renders as its own line");
+  assert.ok(line!.contains(chip), "the chip lives in the status line");
+  assert.equal(line!.className.includes("justify-end"), true, "the status line is right-aligned");
 });
 
 test("#693 a DM shows nothing while the peer has not reached this message", async () => {
@@ -167,13 +185,18 @@ test("#693 an un-hydrated scope renders nothing rather than implying unread", as
   assert.equal(hasReadChip(view), false);
 });
 
-test("#693 the DM chip stays right-most when the footer also has reactions", async () => {
-  // The original "far right" tooth rendered a message with an EMPTY footer, so
-  // "the chip is the last child" was true no matter where it was emitted. It
-  // passed while the chip was rendered before the reactions/thread chips and
-  // therefore sat to their LEFT in any real message that had them. `ml-auto`
-  // right-aligns, but it does not reorder. Give the row other content, which is
-  // the only condition under which the ordering is observable at all.
+test("#693 option C: a read message with no other footer content gets no footer row", async () => {
+  // The jump artin saw: the chip alone used to be enough to create the footer.
+  const view = await renderMessage({ channelType: "dm", peerMaxReadSeq: 10, messageSeq: 5 });
+  const chip = view.container.querySelector("[data-message-affordance='read-receipt']");
+  assert.ok(chip);
+  assert.ok(
+    view.container.querySelector(FOOTER) === null,
+    "the read state alone must not create the footer row",
+  );
+});
+
+test("#693 option C: with reactions the status still sits below the footer, not in it", async () => {
   const view = await renderMessage({
     channelType: "dm",
     peerMaxReadSeq: 10,
@@ -185,14 +208,13 @@ test("#693 the DM chip stays right-most when the footer also has reactions", asy
       reactorNames: ["Bob"],
     }],
   });
-  const chip = view.container.querySelector("[data-message-affordance='read-receipt']");
-  assert.ok(chip, "the chip must still render when the footer has other affordances");
-  const footer = chip!.parentElement;
-  assert.ok(footer);
-  assert.ok(footer!.childElementCount > 1, "this tooth is vacuous unless the row has other content");
-  assert.equal(
-    footer!.lastElementChild,
-    chip,
-    "artin asked for the far right: the chip must follow every other footer affordance",
+  const line = view.container.querySelector("[data-testid='dm-read-status']");
+  assert.ok(line, "the status must still render when the message has reactions");
+  const footer = view.container.querySelector(FOOTER);
+  assert.ok(footer, "precondition: the reaction footer exists");
+  assert.equal(footer!.contains(line), false, "the status is not part of the footer");
+  assert.ok(
+    footer!.compareDocumentPosition(line!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    "the status line comes after the footer",
   );
 });

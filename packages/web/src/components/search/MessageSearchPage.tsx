@@ -1,10 +1,70 @@
+import { getEffectiveLimits } from "@botiverse/raft-shared";
+import type { ServerPlan } from "@botiverse/raft-shared";
 import { Component, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
+import type { ChangeEvent as ReactChangeEvent, CompositionEvent as ReactCompositionEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
-import { ArrowDownUp, AtSign, CalendarRange, ChevronDown, Clock3, FolderOpen, Hash, MessageSquare, Monitor, Search, Star, UserCircle2, X } from "lucide-react";
-import { Kbd } from "raft-ui";
+import { ArrowDownUp, AtSign, CalendarRange, ChevronDown, Clock3, FolderOpen, Hash, Search, Star, UserCircle2, X } from "lucide-react";
+import {
+  Badge,
+  Button,
+  Combobox,
+  ComboboxClear,
+  ComboboxContent,
+  ComboboxEmpty,
+  ComboboxHeader,
+  ComboboxInput,
+  ComboboxInputGroup,
+  ComboboxItem,
+  ComboboxItemIndicator,
+  ComboboxLabel,
+  ComboboxList,
+  ComboboxSeparator,
+  ComboboxTrigger,
+  ComboboxTriggerIndicator,
+  ContextMenuPopup,
+  InputGroup,
+  InputGroupAddon,
+  InputGroupInput,
+  Kbd,
+  PickerTriggerButton,
+  SearchEntityResult,
+  SearchEntityResultContent,
+  SearchEntityResultDescription,
+  SearchEntityResultHeader,
+  SearchEntityResultIcon,
+  SearchEntityResultLeading,
+  SearchEntityResultTitle,
+  SearchMessageResultMatch,
+  SearchResultsList,
+  SearchResultsSection,
+  SearchResultsSectionHeading,
+  SearchResultsSummary,
+  SearchShellFilters,
+  SearchShellRoot,
+  SearchShellViewport,
+  SearchThreadResult,
+  SearchThreadResultHeader,
+  SearchThreadResultMessages,
+  SearchThreadResultMeta,
+  SearchThreadResultTimestamp,
+  SearchThreadResultTitle,
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectGroupLabel,
+  SelectIcon,
+  SelectItem,
+  SelectItemIndicator,
+  SelectItemText,
+  SelectList,
+  SelectSeparator,
+  SelectTrigger,
+  Skeleton,
+  ThreadIcon,
+} from "@botiverse/raft-ui";
+import type { ComboboxProps } from "@botiverse/raft-ui";
 import { useLocation, useNavigate } from "react-router-dom";
 import api from "../../api/client";
 import { useAuthStore } from "../../store/authStore";
@@ -19,23 +79,17 @@ import {
   getSearchEntityUsageScopeKey,
   useSearchEntityUsageStore,
 } from "../../store/searchEntityUsageStore";
+import { conversationChannelIdFromPath } from "./recentConversations";
+import { useRecentConversationEntities, useSearchEntityCatalog } from "./useRecentConversationEntities";
 import { useAppNavigate, useMobileBack } from "../../hooks/useAppNavigate";
 import { useLiveSearchParams } from "../../hooks/useLiveSearchParams";
-import AgentActivityDot from "../agent/AgentActivityDot";
 import PanelHeader from "../ui/PanelHeader";
-import Skeleton from "../ui/Skeleton";
-import SectionEyebrow from "../ui/SectionEyebrow";
 import AvatarSlot from "../ui/AvatarSlot";
+import AppBanner from "../ui/Banner";
+import AppEmptyState from "../ui/EmptyState";
+import TextLink from "../ui/TextLink";
 import DismissBackdrop from "../ui/DismissBackdrop";
-import SelectionPopover from "../ui/SelectionPopover";
 import MenuItem from "../ui/MenuItem";
-import {
-  ARCHIVED_CHANNEL_BADGE_CLASS,
-  ARCHIVED_CHANNEL_ICON_CLASS,
-  ARCHIVED_CHANNEL_MUTED_TEXT_CLASS,
-  ARCHIVED_CHANNEL_TEXT_CLASS,
-} from "../channel/channelArchiveVisual";
-import { ChannelKindIcon } from "../channel/channelKindIcon";
 import { resolveMessageSenderMemberFromList } from "../../utils/messageSenderMember";
 import {
   buildTimeRangeParams,
@@ -59,14 +113,13 @@ import { getGlobalSearchShortcutLabel } from "../../utils/keyboardShortcuts";
 import { useRankedComposerSuggestions } from "../../hooks/useRankedComposerSuggestions";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
 import { placeContextMenu } from "../ui/contextMenuPosition";
-import type { WorkspacePanelRef } from "../workspace/workspaceGridDemoConfig";
 import {
-  buildSearchEntityEntries,
   buildSearchEntityEntriesWhenQueryPresent,
   filterSearchEntityEntriesForQuery,
+  findExactDestination,
 } from "./searchEntities";
 import type {
-  SearchEntityResult,
+  SearchEntityResult as SearchEntityRecord,
   SearchEntitySubtitle,
 } from "./searchEntities";
 import {
@@ -87,11 +140,42 @@ import {
   searchParamsHaveExplicitState,
   selectFrequentSearchEntities,
 } from "./searchHome";
+import { EntityResultRow } from "./EntityResultRow";
+import { MessageHitRow } from "./MessageHitRow";
+import { SearchHomeEntityRow } from "./SearchHomeEntityRow";
+import { fullPageSearchHopState, resolveSearchOverlayBackground, SEARCH_PRESENTATION_PAGE, SEARCH_PRESENTATION_PARAM } from "./searchOverlayLocation";
 
-const MAX_ENTITY_RESULTS = 5;
+// Server entities (channels, people, agents, machines) are a ranked list, not a
+// preview: show every reasonable match and let the list scroll (≈5 rows tall,
+// see ENTITY_RESULTS_SCROLL_CLASS) instead of silently dropping matches past 5.
+const MAX_ENTITY_RESULTS = 50;
+// ≈5.5 entity rows: the half row peeking at the bottom signals the list scrolls.
+// Rows run edge to edge (DS ListRow) and draw their keyboard ring inside, so
+// the scroll container needs no padding to keep it from being clipped.
+const ENTITY_RESULTS_SCROLL_CLASS = "max-h-[24rem] overflow-y-auto overscroll-contain";
+// Desktop ⌘K overlay (task #102, Slack model): the overlay is a suggestion layer,
+// not the results page — it previews a handful of message hits and hands
+// "everything" to the full results page through the "view all results" row.
+const OVERLAY_MESSAGE_PREVIEW_LIMIT = 5;
+const OVERLAY_ALL_RESULTS_KEY = "action:view-all-results";
+// Return-key glyph for the overlay's "view all results" row (not translatable copy).
+export const RETURN_KEY_GLYPH = "↵";
+
+type SelectableSearchResult =
+  | { key: string; kind: "entity"; result: SearchEntityRecord }
+  | { key: string; kind: "message"; result: MessageSearchResult }
+  | { key: string; kind: "allResults" };
+
+const OVERLAY_ALL_RESULTS_ROW: SelectableSearchResult = { key: OVERLAY_ALL_RESULTS_KEY, kind: "allResults" };
+
+function isSelectableRow(row: SelectableSearchResult | null): row is SelectableSearchResult {
+  return row !== null;
+}
 const PAGE_SIZE = 20;
 const SEARCH_HOME_TOUCH_QUERY = "(max-width: 767px)";
 const SEARCH_SCOPE_OPTIONS = ["mentioned", "humans", "agents"] as const satisfies readonly SearchScope[];
+const SEARCH_TIME_RANGES = ["any", "today", "7d", "30d"] as const satisfies readonly SearchTimeRange[];
+const SEARCH_SORTS = ["relevance", "recent"] as const satisfies readonly SearchSort[];
 const EMPTY_SEARCH_ENTITY_USAGE = {};
 type SearchFailureKind = "request_failed" | "query_too_broad" | "search_timeout";
 
@@ -121,13 +205,51 @@ function classifySearchFailure(error: unknown): SearchFailureKind {
 // 2026-05-28 "还是会闪"). Re-keying on the exact params (q + filters + sort)
 // means the cache only short-circuits when the next mount asks for the same
 // query; any different query falls through to the normal fetch path.
+//
+// The snapshot is also keyed by the server it was fetched from. MainLayout is
+// keyed by server id, so a server switch remounts this page — but the module
+// variable survives. Without the server key, re-opening search with the same
+// query on another server would seed and short-circuit on the previous
+// server's results; clicking one of those hits then resolves its ids against
+// the *current* server's X-Server-Id and 404s (task #14: a thread hit opened
+// an empty "No replies yet" panel).
 interface SearchResultsSnapshot {
+  serverId: string | null;
   paramsKey: string;
   query: string;
   results: MessageSearchResult[];
   hasMore: boolean;
+  continuation: SearchContinuation;
+}
+
+/**
+ * Recent-sort text search can stop at the server's scan budget before a page
+ * fills (`incomplete`): the results so far are not all the matches, and the
+ * search continues from `nextCursor`. The cursor also pages a complete page.
+ */
+interface SearchContinuation {
+  nextCursor: string | null;
+  incomplete: boolean;
+  searchedThrough: string | null;
+}
+const NO_SEARCH_CONTINUATION: SearchContinuation = Object.freeze({ nextCursor: null, incomplete: false, searchedThrough: null });
+
+function readSearchContinuation(data: { nextCursor?: unknown; incomplete?: unknown; searchedThrough?: unknown }): SearchContinuation {
+  const nextCursor = typeof data.nextCursor === "string" && data.nextCursor ? data.nextCursor : null;
+  if (!nextCursor) return NO_SEARCH_CONTINUATION;
+  return {
+    nextCursor,
+    incomplete: data.incomplete === true,
+    searchedThrough: typeof data.searchedThrough === "string" ? data.searchedThrough : null,
+  };
 }
 let cachedSearchSnapshot: SearchResultsSnapshot | null = null;
+
+function readSearchSnapshotForServer(serverId: string | null | undefined): SearchResultsSnapshot | null {
+  return cachedSearchSnapshot && cachedSearchSnapshot.serverId === (serverId ?? null)
+    ? cachedSearchSnapshot
+    : null;
+}
 
 function serializeSearchParams(params: Record<string, string | number>): string {
   // Stable key — drop `offset` since the cache only covers the first page.
@@ -151,15 +273,19 @@ function getScopeOptionLabelId(scope: SearchScope): "search.scopeMe" | "search.s
   }
 }
 
-function getScopeChipLabel(scopes: readonly SearchScope[], formatMessage: IntlShape["formatMessage"]): string {
+// An applied filter carries its count in machine type (DS `rf-filter__count`).
+function getScopeChipLabel(scopes: readonly SearchScope[], formatMessage: IntlShape["formatMessage"]): ReactNode {
   return scopes.length > 0
-    ? formatMessage({ id: "search.scopeChip" }, { count: scopes.length })
+    ? formatMessage(
+        { id: "search.scopeChip" },
+        { count: <span key="count" className="font-mono text-mono-meta font-bold">{scopes.length}</span> },
+      )
     : formatMessage({ id: "search.scope" });
 }
 
 // Localize an entity-result subtitle descriptor at render time (real @handles /
 // descriptions pass through as-is; fallback labels format with the app locale).
-function formatEntitySubtitle(subtitle: SearchEntitySubtitle, formatMessage: IntlShape["formatMessage"]): string {
+export function formatEntitySubtitle(subtitle: SearchEntitySubtitle, formatMessage: IntlShape["formatMessage"]): string {
   switch (subtitle.kind) {
     case "channel":
       return formatMessage({ id: "search.channel" });
@@ -183,7 +309,7 @@ function getExclusiveSenderTypeScope(scopes: readonly SearchScope[]): "user" | "
   return hasHumans ? "user" : "agent";
 }
 
-interface MessageSearchResult {
+export interface MessageSearchResult {
   id: string;
   channelId: string;
   threadId: string | null;
@@ -269,7 +395,7 @@ function getTimeRangeLabelId(range: SearchTimeRange): "search.timeToday" | "sear
   }
 }
 
-function SearchHighlight({ text, query }: { text: string; query: string }) {
+export function SearchHighlight({ text, query }: { text: string; query: string }) {
   const tokens = useMemo(() => {
     const parts = query
       .trim()
@@ -294,9 +420,9 @@ function SearchHighlight({ text, query }: { text: string; query: string }) {
       {parts.map((part, index) => {
         const matched = tokens.some((token) => token.toLowerCase() === part.toLowerCase());
         return matched ? (
-          <mark key={`${part}-${index}`} className="bg-soft-signal px-0.5 font-bold text-black">
+          <SearchMessageResultMatch key={`${part}-${index}`}>
             {part}
-          </mark>
+          </SearchMessageResultMatch>
         ) : (
           <span key={`${part}-${index}`}>{part}</span>
         );
@@ -305,19 +431,22 @@ function SearchHighlight({ text, query }: { text: string; query: string }) {
   );
 }
 
+// Loading keeps the hit layout (DS Loading: a known layout gets a skeleton):
+// the 27px identity column, the who/where/time line and two excerpt lines.
 function SearchSkeleton() {
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col">
       {Array.from({ length: 5 }, (_, index) => (
-        <div key={index} className="border-2 border-black/30 bg-white p-3">
+        <div key={index} className="grid grid-cols-[27px_minmax(0,1fr)] gap-x-3 px-4 py-3">
+          <Skeleton variant="block" className="row-span-2 size-[27px]" />
           <div className="mb-2 flex gap-2">
-            <Skeleton variant="line" className="w-24" />
-            <Skeleton variant="line" className="w-20" />
-            <Skeleton variant="line" className="w-16" />
+            <Skeleton variant="line" className="h-3 w-24" />
+            <Skeleton variant="line" className="h-3 w-20" />
+            <Skeleton variant="line" className="ml-auto h-3 w-12" />
           </div>
           <div className="space-y-2">
-            <Skeleton variant="line" className="w-full" />
-            <Skeleton variant="line" className="w-4/5" />
+            <Skeleton variant="line" className="h-3 w-full" />
+            <Skeleton variant="line" className="h-3 w-4/5" />
           </div>
         </div>
       ))}
@@ -340,20 +469,27 @@ interface SearchResultsBoundaryState {
 // (it mounts inside the app's IntlProvider like any other component).
 function SearchResultsBoundaryFallback({ onRetry }: { onRetry: () => void }) {
   const { formatMessage } = useIntl();
+  // A problem is orange (DS Banner warning): what broke, and the one way out.
   return (
-    <div className="border-2 border-black bg-white p-4 text-left shadow-brutal-sm">
-      <div className="mb-2 text-sm font-bold text-black">{formatMessage({ id: "search.boundaryTitle" })}</div>
-      <div className="mb-3 text-xs text-black/60">
-        {formatMessage({ id: "search.boundaryBody" })}
-      </div>
-      <button
-        type="button"
-        onClick={onRetry}
-        className="btn-brutal-sm bg-white px-3 py-1.5 text-xs"
-      >
-        {formatMessage({ id: "search.retry" })}
-      </button>
-    </div>
+    <AppBanner
+      intent="warning"
+      live={false}
+      withIcon
+      className="mx-4 text-left"
+      title={formatMessage({ id: "search.boundaryTitle" })}
+      actions={(
+        <Button
+          variant="outline"
+          size="sm"
+          type="button"
+          onClick={onRetry}
+        >
+          {formatMessage({ id: "search.retry" })}
+        </Button>
+      )}
+    >
+      {formatMessage({ id: "search.boundaryBody" })}
+    </AppBanner>
   );
 }
 
@@ -384,9 +520,35 @@ class SearchResultsBoundary extends Component<SearchResultsBoundaryProps, Search
   }
 }
 
-export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
-  onOpenPanelRef?: (ref: WorkspacePanelRef, source?: { title?: string; subtitle?: string }) => void;
-  onDragPanelRef?: (event: React.DragEvent<HTMLButtonElement>, ref: WorkspacePanelRef, source?: { title?: string; subtitle?: string }) => void;
+export type SearchSenderMember = ReturnType<typeof resolveMessageSenderMemberFromList>;
+
+// Focus the context menu's first item when it mounts, so keyboard users land
+// inside the menu they just opened.
+function focusFirstMenuButton(node: HTMLDivElement | null) {
+  node?.querySelector<HTMLButtonElement>("button")?.focus();
+}
+
+// Keep presses inside the context menu from reaching the dismiss backdrop.
+function stopMouseDownPropagation(event: ReactMouseEvent) {
+  event.stopPropagation();
+}
+
+export default function MessageSearchPage({ activateResultsInChat = false, overlayChrome = false }: {
+  /**
+   * Overlay mode (desktop ⌘K search overlay): a SINGLE click on a result jumps
+   * straight to it in chat (openResultInChat) instead of opening the col-3
+   * master/detail preview — there is no col-3 in the overlay. Navigating away
+   * clears the overlay's backgroundLocation, so the overlay closes itself. When
+   * false (the default, i.e. the full /search page) behavior is unchanged.
+   */
+  activateResultsInChat?: boolean;
+  /**
+   * Command-palette chrome for the desktop ⌘K overlay: a slim header (the input
+   * IS the top bar, search icon inline) instead of the full PanelHeader with its
+   * mobile-back button + icon badge, plus tighter filter/empty-state spacing.
+   * Purely presentational and gated so the full /search page (Web) is unchanged.
+   */
+  overlayChrome?: boolean;
 } = {}) {
   const intl = useIntl();
   const { formatMessage } = intl;
@@ -407,7 +569,6 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
   const nav = useAppNavigate();
   const serverId = useServerStore((s) => s.current?.id);
   const slug = useServerStore((s) => s.current?.slug);
-  const hiddenSearchDmIds = useServerStore((s) => s.sidebarOrder.hiddenDmIds);
   const searchShortcutSource = getSearchShortcutSource(location.state, slug);
   const searchEntry = getSearchEntry(location.state);
   const railSearchSource = searchEntry === "rail" ? getValidSearchSource(location.state, slug) : null;
@@ -416,6 +577,14 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
   const openDM = useChannelStore((s) => s.openDM);
   const openUserDM = useChannelStore((s) => s.openUserDM);
   const members = useServerStore((s) => s.members);
+  const serverPlan = useServerStore((s) => (s.billing?.plan || s.current?.plan || "free") as ServerPlan);
+  // Free-plan search keeps returning hits older than the plan's history range
+  // (product decision, task #14); flag them so opening one isn't a surprise.
+  // Stryker disable next-line all: the cutoff date math mirrors planService.getHistoryCutoff and is covered by the badge DOM test.
+  const historyCutoffMs = useMemo(() => {
+    const days = getEffectiveLimits(serverPlan).messageHistoryDays;
+    return days === -1 ? null : Date.now() - days * 24 * 60 * 60 * 1000;
+  }, [serverPlan]);
   const agents = useAgentStore((s) => s.agents);
   const machines = useMachineStore((s) => s.machines);
   const currentUser = useAuthStore((s) => s.user);
@@ -448,14 +617,10 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     : searchParams;
   const closeThread = useThreadStore((s) => s.closeThread);
   const inputRef = useRef<HTMLInputElement>(null);
-  const timeMenuRef = useRef<HTMLDivElement>(null);
-  const channelMenuRef = useRef<HTMLDivElement>(null);
-  const senderMenuRef = useRef<HTMLDivElement>(null);
-  const scopeMenuRef = useRef<HTMLDivElement>(null);
-  const sortMenuRef = useRef<HTMLDivElement>(null);
+  const filtersPortalRef = useRef<HTMLDivElement>(null);
   const resultClickTimerRef = useRef<number | null>(null);
   const entityResultClickTimerRef = useRef<number | null>(null);
-  const pendingEntityResultRef = useRef<SearchEntityResult | null>(null);
+  const pendingEntityResultRef = useRef<SearchEntityRecord | null>(null);
   const shortcutHint = getGlobalSearchShortcutLabel(undefined, formatMessage);
 
   const initialQuery = visibleSearchParams.get("q") ?? "";
@@ -470,24 +635,23 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
   // Seed results/hasMore from the module-level snapshot so a remount caused by
   // the col-2↔col-3 swap on slot-open re-renders the previous list instantly
   // instead of flashing through "no results" while the debounced re-fetch lands.
-  const [results, setResults] = useState<MessageSearchResult[]>(() => cachedSearchSnapshot?.results ?? []);
-  const [resultsSearchQuery, setResultsSearchQuery] = useState<string>(() => cachedSearchSnapshot?.query ?? "");
+  const [results, setResults] = useState<MessageSearchResult[]>(() => readSearchSnapshotForServer(serverId)?.results ?? []);
+  const [resultsSearchQuery, setResultsSearchQuery] = useState<string>(() => readSearchSnapshotForServer(serverId)?.query ?? "");
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
-  const [hasMore, setHasMore] = useState<boolean>(() => cachedSearchSnapshot?.hasMore ?? false);
+  const [hasMore, setHasMore] = useState<boolean>(() => readSearchSnapshotForServer(serverId)?.hasMore ?? false);
+  const [continuation, setContinuation] = useState<SearchContinuation>(
+    () => readSearchSnapshotForServer(serverId)?.continuation ?? NO_SEARCH_CONTINUATION,
+  );
   const [searchError, setSearchError] = useState<SearchFailureKind | null>(null);
   const [loadMoreError, setLoadMoreError] = useState(false);
   const [searchNonce, setSearchNonce] = useState(0);
   const [isComposing, setIsComposing] = useState(false);
   const [selectedResultIdentity, setSelectedResultIdentity] = useState<string | null>(null);
   const selectedIndexHintRef = useRef(0);
-  const [timeMenuOpen, setTimeMenuOpen] = useState(false);
-  const [channelMenuOpen, setChannelMenuOpen] = useState(false);
-  const [senderMenuOpen, setSenderMenuOpen] = useState(false);
-  const [scopeMenuOpen, setScopeMenuOpen] = useState(false);
-  const [sortMenuOpen, setSortMenuOpen] = useState(false);
+  const [openFilterMenu, setOpenFilterMenu] = useState<"from" | "scope" | "channel" | "time" | "sort" | null>(null);
   const [channelContextMenu, setChannelContextMenu] = useState<{
-    result: SearchEntityResult;
+    result: SearchEntityRecord;
     x: number;
     y: number;
   } | null>(null);
@@ -522,7 +686,13 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     timeRange,
     scopes,
   });
+  // oxlint-disable-next-line react-doctor/no-event-handler -- YMNNE-family taint via task #102's render-derived overlay rows (no Effect, no setState-in-Effect added); the boolean itself is unchanged.
   const hasSearchIntent = Boolean(query.trim() || (hasActiveFilters && !deferUntilQuery));
+  // Desktop ⌘K overlay with nothing typed (task #113, Slack): the palette's
+  // empty state is "recent conversations" (switch back), not the full page's
+  // history + frequent sections; filters wait until there is a query.
+  // oxlint-disable-next-line react-doctor/no-event-handler -- same YMNNE-family taint as hasSearchIntent above (it is derived from it); a render-time boolean, no Effect, no setState.
+  const overlayHome = overlayChrome && !hasSearchIntent;
   useEffect(() => {
     if (!location.pathname.endsWith("/search")) return;
     if (skipNextSearchStateRestoreRef.current) {
@@ -608,6 +778,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
   // instead; desktop keeps the hover affordance untouched.
   const isTouchSearchHome = useMediaQuery(SEARCH_HOME_TOUCH_QUERY);
   const [searchHistoryEditRequested, setSearchHistoryEditRequested] = useState(false);
+  const toggleSearchHistoryEdit = useCallback(() => setSearchHistoryEditRequested((editing) => !editing), []);
   // Edit mode only exists where it is reachable: a desktop viewport keeps the
   // hover affordance and never enters it, and an empty list has nothing to
   // edit. Both are derived here rather than synchronized by an Effect.
@@ -717,67 +888,6 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     return () => document.removeEventListener(SEARCH_FOCUS_REQUEST_EVENT, focusSearchInput);
   }, []);
 
-  useEffect(() => {
-    if (!timeMenuOpen) return;
-    const onPointerDown = (event: MouseEvent) => {
-      if (!timeMenuRef.current?.contains(event.target as Node)) {
-        setTimeMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [timeMenuOpen]);
-
-  useEffect(() => {
-    if (!channelMenuOpen) return;
-    setChannelFilterQuery("");
-    const onPointerDown = (event: MouseEvent) => {
-      if (!channelMenuRef.current?.contains(event.target as Node)) {
-        setChannelMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown);
-    };
-  }, [channelMenuOpen]);
-
-  useEffect(() => {
-    if (!senderMenuOpen) return;
-    setSenderFilterQuery("");
-    const onPointerDown = (event: MouseEvent) => {
-      if (!senderMenuRef.current?.contains(event.target as Node)) {
-        setSenderMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => {
-      document.removeEventListener("mousedown", onPointerDown);
-    };
-  }, [senderMenuOpen]);
-
-  useEffect(() => {
-    if (!scopeMenuOpen) return;
-    const onPointerDown = (event: MouseEvent) => {
-      if (!scopeMenuRef.current?.contains(event.target as Node)) {
-        setScopeMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [scopeMenuOpen]);
-
-  useEffect(() => {
-    if (!sortMenuOpen) return;
-    const onPointerDown = (event: MouseEvent) => {
-      if (!sortMenuRef.current?.contains(event.target as Node)) {
-        setSortMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onPointerDown);
-    return () => document.removeEventListener("mousedown", onPointerDown);
-  }, [sortMenuOpen]);
-
   const updateSearchParam = useCallback((key: string, value?: string | null) => {
     skipNextSearchStateRestoreRef.current = true;
     setSearchParams((prev) => {
@@ -801,33 +911,12 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
       next.delete("channelId");
       return next;
     }, { replace: true, state: location.state });
-    setTimeMenuOpen(false);
-    setSenderMenuOpen(false);
-    setScopeMenuOpen(false);
   }, [location.state, setSearchParams]);
 
-  const allEntitySearchEntries = useMemo(
-    () => buildSearchEntityEntries({
-      channels,
-      members,
-      agents,
-      machines,
-      currentUser,
-      dmChannels,
-    }),
-    [agents, channels, currentUser, dmChannels, machines, members],
-  );
-  const eligibleFrequentEntityKeys = useMemo(() => {
-    const hiddenDmIdSet = new Set(hiddenSearchDmIds);
-    return new Set(allEntitySearchEntries
-      .map((entry) => entry.suggestion)
-      .filter((entity) => {
-        if (entity.type === "computer") return false;
-        if (entity.type === "channel") return true;
-        return !entity.channelId || !hiddenDmIdSet.has(entity.channelId);
-      })
-      .map((entity) => entity.key));
-  }, [allEntitySearchEntries, hiddenSearchDmIds]);
+  // Destination catalog + eligibility shared with the desktop History menu
+  // (useRecentConversationEntities): one resolution of "what is a conversation".
+  const searchEntityCatalog = useSearchEntityCatalog();
+  const { entries: allEntitySearchEntries, eligibleEntityKeys: eligibleFrequentEntityKeys } = searchEntityCatalog;
   const frequentSearchEntities = useMemo(
     () => selectFrequentSearchEntities({
       entities: allEntitySearchEntries.map((entry) => entry.suggestion),
@@ -838,6 +927,20 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     [allEntitySearchEntries, currentUser?.id, eligibleFrequentEntityKeys, searchEntityUsage],
   );
   const hasSearchHomeContent = searchHistory.length > 0 || frequentSearchEntities.length > 0;
+  // The conversation behind the overlay: resolved the same way MainLayout
+  // decides what to float over (explicit backgroundLocation → searchFrom →
+  // remembered location → server home), so entries without explicit state
+  // (rail, "search this channel", deep links — task #96) exclude it too.
+  const currentConversationId = conversationChannelIdFromPath(resolveSearchOverlayBackground(location)?.pathname);
+  const recentConversationEntities = useRecentConversationEntities({
+    catalog: searchEntityCatalog,
+    enabled: overlayHome,
+    excludeChannelId: currentConversationId,
+  });
+  const recentConversationRows = useMemo<SelectableSearchResult[]>(
+    () => recentConversationEntities.map((result) => ({ key: result.key, kind: "entity" as const, result })),
+    [recentConversationEntities],
+  );
 
   const hasEntityQuery = query.trim().length > 0;
   const entitySearchEntries = useMemo(
@@ -937,31 +1040,12 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     [senderIdParam, senderOptions],
   );
 
-  const toggleScopeFilter = useCallback((scopeToToggle: SearchScope) => {
+  const setSenderFilter = useCallback((sender: SenderFilterOption | null) => {
     skipNextSearchStateRestoreRef.current = true;
-    setSearchParams((prev) => {
-      const next = new URLSearchParams(prev);
-      const currentScopes = new Set(normalizeSearchScopes(next.getAll("scope")));
-      if (currentScopes.has(scopeToToggle)) {
-        currentScopes.delete(scopeToToggle);
-      } else {
-        currentScopes.add(scopeToToggle);
-      }
-      next.delete("scope");
-      const normalizedScopes = SEARCH_SCOPE_OPTIONS.filter((mode) => currentScopes.has(mode));
-      for (const mode of normalizedScopes) next.append("scope", mode);
-      const currentSenderId = next.get("senderId");
-      const currentSender = currentSenderId ? senderOptions.find((option) => option.id === currentSenderId) : null;
-      const exclusiveSenderTypeScope = getExclusiveSenderTypeScope(normalizedScopes);
-      if (currentSender && exclusiveSenderTypeScope && currentSender.type !== exclusiveSenderTypeScope) {
-        next.delete("senderId");
-      }
-      return next;
-    }, { replace: true, state: location.state });
-  }, [location.state, senderOptions, setSearchParams]);
-
-  const setSenderFilter = useCallback((sender: SenderFilterOption) => {
-    skipNextSearchStateRestoreRef.current = true;
+    if (!sender) {
+      updateSearchParam("senderId", null);
+      return;
+    }
     setSearchParams((prev) => {
       const next = new URLSearchParams(prev);
       next.set("senderId", sender.id);
@@ -977,7 +1061,24 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
       }
       return next;
     }, { replace: true, state: location.state });
-  }, [location.state, setSearchParams]);
+  }, [location.state, setSearchParams, updateSearchParam]);
+
+  const setScopeFilters = useCallback((nextScopes: SearchScope[]) => {
+    skipNextSearchStateRestoreRef.current = true;
+    setSearchParams((prev) => {
+      const next = new URLSearchParams(prev);
+      next.delete("scope");
+      const normalizedScopes = SEARCH_SCOPE_OPTIONS.filter((mode) => nextScopes.includes(mode));
+      for (const mode of normalizedScopes) next.append("scope", mode);
+      const currentSenderId = next.get("senderId");
+      const currentSender = currentSenderId ? senderOptions.find((option) => option.id === currentSenderId) : null;
+      const exclusiveSenderTypeScope = getExclusiveSenderTypeScope(normalizedScopes);
+      if (currentSender && exclusiveSenderTypeScope && currentSender.type !== exclusiveSenderTypeScope) {
+        next.delete("senderId");
+      }
+      return next;
+    }, { replace: true, state: location.state });
+  }, [location.state, senderOptions, setSearchParams]);
 
   // oxlint-disable-next-line react-doctor/no-effect-chain -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
   useEffect(() => {
@@ -1074,6 +1175,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
       setLoading(false);
       setLoadingMore(false);
       setHasMore(false);
+      setContinuation(NO_SEARCH_CONTINUATION);
       setSearchError(null);
       setLoadMoreError(false);
       cachedSearchSnapshot = null;
@@ -1084,7 +1186,8 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     // initial state seeded from the snapshot is already what we'd refetch —
     // skip the network round-trip (and the loading flash) entirely.
     const paramsKey = serializeSearchParams(params);
-    if (cachedSearchSnapshot && cachedSearchSnapshot.paramsKey === paramsKey) {
+    const snapshotServerId = serverId ?? null;
+    if (readSearchSnapshotForServer(snapshotServerId)?.paramsKey === paramsKey) {
       setSearchError(null);
       setLoadMoreError(false);
       return;
@@ -1102,14 +1205,18 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
         if (!cancelled) {
           const nextResults: MessageSearchResult[] = Array.isArray(data.results) ? data.results : [];
           const nextHasMore = Boolean(data.hasMore);
+          const nextContinuation = readSearchContinuation(data);
           setResults(nextResults);
           setResultsSearchQuery(typeof params.q === "string" ? params.q : "");
           setHasMore(nextHasMore);
+          setContinuation(nextContinuation);
           cachedSearchSnapshot = {
+            serverId: snapshotServerId,
             paramsKey,
             query: typeof params.q === "string" ? params.q : "",
             results: nextResults,
             hasMore: nextHasMore,
+            continuation: nextContinuation,
           };
         }
       } catch (error: any) {
@@ -1118,6 +1225,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
         }
         if (!cancelled) {
           setHasMore(false);
+          setContinuation(NO_SEARCH_CONTINUATION);
           setSearchError(classifySearchFailure(error));
         }
       } finally {
@@ -1132,12 +1240,19 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [buildMessageSearchParams, searchNonce]);
+  }, [buildMessageSearchParams, searchNonce, serverId]);
 
   const loadMoreResults = useCallback(async () => {
     if (loadingMore) return;
-    const params = buildMessageSearchParams(results.length);
-    if (!params) return;
+    // A cursor continues exactly below what was shown; an offset would restart
+    // the server's scan from the newest message.
+    const base = buildMessageSearchParams(continuation.nextCursor ? 0 : results.length);
+    if (!base) return;
+    let params: Record<string, string | number> = base;
+    if (continuation.nextCursor) {
+      const { offset: _offset, ...rest } = base;
+      params = { ...rest, cursor: continuation.nextCursor };
+    }
     setLoadingMore(true);
     setLoadMoreError(false);
     try {
@@ -1145,6 +1260,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
       const nextResults = Array.isArray(data.results) ? data.results as MessageSearchResult[] : [];
       setResults((prev) => [...prev, ...nextResults]);
       setHasMore(Boolean(data.hasMore));
+      setContinuation(readSearchContinuation(data));
     } catch {
       // Preserve both the current page and the continuation state so the failed
       // page is visibly retryable instead of looking like the end of results.
@@ -1152,7 +1268,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     } finally {
       setLoadingMore(false);
     }
-  }, [buildMessageSearchParams, loadingMore, results.length]);
+  }, [buildMessageSearchParams, continuation.nextCursor, loadingMore, results.length]);
 
   const handleBack = useMobileBack(searchShortcutSource ?? railSearchSource ?? (slug ? `/s/${slug}` : "/"));
   const handleSearchEscape = useCallback(() => {
@@ -1170,6 +1286,27 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     }
     handleBack();
   }, [channelIdParam, deferUntilQuery, handleBack, navigate, queryParam, railSearchSource, searchShortcutSource, slug]);
+
+  // Task #102 (Slack "Search for: … → results page"): hand the current query and
+  // filters to the full results page (list + col-3 context preview). Replaces the
+  // overlay's history entry so Back returns to the conversation, not to a
+  // re-opened overlay. `?presentation=page` in the URL is what lets the desktop
+  // render the page instead of the overlay (resolveSearchOverlayBackground); it is
+  // a URL param — not history state — because the page's other URL writers
+  // (preview open, thread sync) replace without state.
+  const openAllResults = useCallback(() => {
+    rememberCurrentSearchQuery();
+    const params = new URLSearchParams(visibleSearchParams);
+    params.delete("defer");
+    const committedQuery = query.trim();
+    if (committedQuery) params.set("q", committedQuery);
+    else params.delete("q");
+    params.set(SEARCH_PRESENTATION_PARAM, SEARCH_PRESENTATION_PAGE);
+    navigate(
+      { pathname: location.pathname, search: `?${params.toString()}` },
+      { replace: true, state: fullPageSearchHopState(location.state) },
+    );
+  }, [location.pathname, location.state, navigate, query, rememberCurrentSearchQuery, visibleSearchParams]);
 
   // task #311 stdrc msg=b61ab472: clicking a result opens the picked entity
   // in col 3 of the /search master/detail layout (not navigate-away). The
@@ -1216,11 +1353,15 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
         // openThread() returns a Promise we don't need to await — it sets
         // panel-open state synchronously before the network round-trip.
         // Stryker disable all: typed thread payload shape is covered by openThread payload/source contracts.
+        // The hit already carries the thread channel's own id — hand it over
+        // so the panel loads the thread directly instead of re-resolving it
+        // through the parent-message lookup (task #14).
         void useThreadStore
           .getState()
           .openThread({
             parentChannelId: result.parentChannelId,
             parentMessageId: result.parentMessageId,
+            threadChannelId: result.channelId,
             focusedMessageId: result.id,
           });
         // Stryker restore all
@@ -1243,7 +1384,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     rememberOpenedChannel(result.channelId, kind);
   }, [closeThread, openSearchContent, rememberMessageResultsSearchQuery, rememberOpenedChannel, slug, slot, syncSelectedKey]);
 
-  const openEntityResult = useCallback(async (result: SearchEntityResult) => {
+  const openEntityResult = useCallback(async (result: SearchEntityRecord) => {
     if (!slug) return;
     rememberCurrentSearchQuery();
     syncSelectedKey(result.key);
@@ -1331,7 +1472,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     rememberOpenedChannel(result.channelId, "channel");
   }, [closeSearchContent, closeThread, nav, openResult, rememberMessageResultsSearchQuery, rememberOpenedChannel, slug, syncSelectedKey]);
 
-  const openEntityResultInChat = useCallback(async (result: SearchEntityResult) => {
+  const openEntityResultInChat = useCallback(async (result: SearchEntityRecord) => {
     if (!slug) return;
     rememberCurrentSearchQuery();
     syncSelectedKey(result.key);
@@ -1373,76 +1514,11 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     }
   }, [closeSearchContent, closeThread, nav, openDM, openUserDM, rememberCurrentSearchQuery, rememberSearchEntityOpen, slug, syncSelectedKey]);
 
-  const openEntityResultFromDoubleClick = useCallback((result: SearchEntityResult) => {
-    if (!onOpenPanelRef) {
-      void openEntityResultInChat(result);
-      return;
-    }
-    rememberCurrentSearchQuery();
-    if (result.type === "channel" && result.channelId) {
-      onOpenPanelRef(
-        { kind: "channel", id: result.channelId },
-        { title: result.title, subtitle: formatEntitySubtitle(result.subtitle, formatMessageRef.current) },
-      );
-      rememberSearchEntityOpen(result.key);
-      return;
-    }
-    if (result.type === "computer" && result.machineId) {
-      onOpenPanelRef(
-        { kind: "machine", id: result.machineId },
-        { title: result.title, subtitle: formatEntitySubtitle(result.subtitle, formatMessageRef.current) },
-      );
-      return;
-    }
-    const openWorkspaceDm = async () => {
-      try {
-        const channelId = result.channelId
-          ?? (result.type === "agentDm" && result.agentId
-            ? (await openDM(result.agentId)).id
-            : result.type === "humanDm" && result.userId
-              ? (await openUserDM(result.userId)).id
-              : null);
-        if (channelId) {
-          onOpenPanelRef(
-            { kind: "dm", id: channelId },
-            { title: result.title, subtitle: formatEntitySubtitle(result.subtitle, formatMessageRef.current) },
-          );
-          rememberSearchEntityOpen(result.key);
-        }
-      } catch {
-        const detailRef = result.type === "agentDm" && result.agentId
-          ? { kind: "agent", id: result.agentId } as const
-          : result.type === "humanDm" && result.userId
-            ? { kind: "human", id: result.userId } as const
-            : null;
-        if (detailRef) {
-          onOpenPanelRef(detailRef, { title: result.title, subtitle: formatEntitySubtitle(result.subtitle, formatMessageRef.current) });
-        }
-      }
-    };
-    void openWorkspaceDm();
-  }, [onOpenPanelRef, openDM, openEntityResultInChat, openUserDM, rememberCurrentSearchQuery, rememberSearchEntityOpen]);
-
   const handleMessageResultClick = useCallback((event: ReactMouseEvent<HTMLButtonElement>, result: MessageSearchResult) => {
-    if (onOpenPanelRef) {
-      rememberMessageResultsSearchQuery();
-      if (result.channelType === "thread" && result.parentChannelId && result.parentMessageId) {
-        onOpenPanelRef(
-          {
-            kind: "thread",
-            channelId: result.parentChannelId,
-            threadRootId: result.parentMessageId,
-            threadChannelId: result.channelId,
-          },
-          { title: formatMessageRef.current({ id: "search.panelThreadTitle" }, { id: result.parentMessageId.slice(0, 8) }), subtitle: result.parentChannelName },
-        );
-        return;
-      }
-      onOpenPanelRef(
-        { kind: result.channelType === "dm" ? "dm" : "channel", id: result.channelId },
-        { title: result.channelType === "dm" ? `@${result.channelName}` : `#${result.channelName}`, subtitle: formatMessageRef.current({ id: "search.panelSubtitle" }) },
-      );
-      rememberOpenedChannel(result.channelId, result.channelType === "dm" ? "dm" : "channel");
+    // Overlay mode: a single click jumps to the message in chat (there is no col-3
+    // preview to open). No double-click affordance / 220ms disambiguation needed.
+    if (activateResultsInChat) {
+      void openResultInChat(result);
       return;
     }
     if (event.detail >= 2) {
@@ -1460,11 +1536,12 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
       resultClickTimerRef.current = null;
       void openResult(result);
     }, 220);
-  }, [onOpenPanelRef, openResult, openResultInChat, rememberMessageResultsSearchQuery, rememberOpenedChannel]);
+  }, [activateResultsInChat, openResult, openResultInChat]);
 
-  const handleEntityResultClick = useCallback((event: ReactMouseEvent<HTMLButtonElement>, result: SearchEntityResult) => {
-    if (onOpenPanelRef) {
-      openEntityResultFromDoubleClick(result);
+  const handleEntityResultClick = useCallback((event: ReactMouseEvent<HTMLButtonElement>, result: SearchEntityRecord) => {
+    // Overlay mode: a single click jumps to the entity in chat (no col-3 preview).
+    if (activateResultsInChat) {
+      void openEntityResultInChat(result);
       return;
     }
     if (event.detail >= 2) {
@@ -1473,7 +1550,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
         entityResultClickTimerRef.current = null;
       }
       pendingEntityResultRef.current = null;
-      openEntityResultFromDoubleClick(result);
+      void openEntityResultInChat(result);
       return;
     }
     if (entityResultClickTimerRef.current !== null) {
@@ -1494,11 +1571,11 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
         void openEntityResult(pendingResult);
       }
     }, 220);
-  }, [onOpenPanelRef, openEntityResult, openEntityResultFromDoubleClick]);
+  }, [activateResultsInChat, openEntityResult, openEntityResultInChat]);
 
   const handleChannelResultContextMenu = useCallback((
     event: ReactMouseEvent,
-    result: SearchEntityResult,
+    result: SearchEntityRecord,
   ) => {
     event.preventDefault();
     event.stopPropagation();
@@ -1515,53 +1592,26 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     });
   }, []);
 
-  const handleMessageResultDrag = useCallback((event: React.DragEvent<HTMLButtonElement>, result: MessageSearchResult) => {
-    if (!onDragPanelRef) return;
-    if (result.channelType === "thread" && result.parentChannelId && result.parentMessageId) {
-      onDragPanelRef(
-        event,
-        {
-          kind: "thread",
-          channelId: result.parentChannelId,
-          threadRootId: result.parentMessageId,
-          threadChannelId: result.channelId,
-        },
-        { title: formatMessageRef.current({ id: "search.panelThreadTitle" }, { id: result.parentMessageId.slice(0, 8) }), subtitle: result.parentChannelName },
-      );
-      return;
-    }
-    onDragPanelRef(
-      event,
-      { kind: result.channelType === "dm" ? "dm" : "channel", id: result.channelId },
-      { title: result.channelType === "dm" ? `@${result.channelName}` : `#${result.channelName}`, subtitle: formatMessageRef.current({ id: "search.panelSubtitle" }) },
-    );
-  }, [onDragPanelRef]);
-
-  const handleEntityResultDrag = useCallback((event: React.DragEvent<HTMLButtonElement>, result: SearchEntityResult) => {
-    if (!onDragPanelRef) return;
-    if (result.type === "channel" && result.channelId) {
-      onDragPanelRef(event, { kind: "channel", id: result.channelId }, { title: result.title, subtitle: formatEntitySubtitle(result.subtitle, formatMessageRef.current) });
-      return;
-    }
-    if (result.type === "computer" && result.machineId) {
-      onDragPanelRef(event, { kind: "machine", id: result.machineId }, { title: result.title, subtitle: formatEntitySubtitle(result.subtitle, formatMessageRef.current) });
-      return;
-    }
-    if (result.channelId) {
-      onDragPanelRef(event, { kind: "dm", id: result.channelId }, { title: result.title, subtitle: formatEntitySubtitle(result.subtitle, formatMessageRef.current) });
-      return;
-    }
-    if (result.type === "agentDm" && result.agentId) {
-      onDragPanelRef(event, { kind: "agent", id: result.agentId }, { title: result.title, subtitle: formatEntitySubtitle(result.subtitle, formatMessageRef.current) });
-    } else if (result.type === "humanDm" && result.userId) {
-      onDragPanelRef(event, { kind: "human", id: result.userId }, { title: result.title, subtitle: formatEntitySubtitle(result.subtitle, formatMessageRef.current) });
-    }
-  }, [onDragPanelRef]);
-
-  const groupedMessageResults = useMemo(
-    () => groupMessageSearchResults(results),
-    [results]
+  // Overlay mode previews only the first few hits (Slack "Recent messages"); the
+  // full list, Load More and the col-3 preview live on the results page.
+  const messagePreviewLimit = activateResultsInChat ? OVERLAY_MESSAGE_PREVIEW_LIMIT : Number.POSITIVE_INFINITY;
+  const visibleMessageResults = useMemo(
+    // oxlint-disable-next-line react-doctor/no-event-handler -- render-derived preview cap (task #102); the only downstream Effect is the pre-existing selection reconciliation.
+    () => results.slice(0, messagePreviewLimit),
+    [messagePreviewLimit, results],
   );
+  const groupedMessageResults = useMemo(
+    () => groupMessageSearchResults(visibleMessageResults),
+    [visibleMessageResults]
+  );
+  // The server stopped at its scan budget: what is shown is not every match.
+  const searchIncomplete = continuation.incomplete && continuation.nextCursor !== null;
+  const incompleteSearchNote = continuation.searchedThrough
+    ? formatMessage(
+      { id: "search.incompleteSearchedThrough" },
+      { time: intl.formatDate(new Date(continuation.searchedThrough), { dateStyle: "medium", timeStyle: "short" }) },
+    )
+    : formatMessage({ id: "search.incompleteSearchedPart" });
   const retrySearch = useCallback(() => {
     // Retry must clear the last crashing result set before the debounced fetch starts,
     // otherwise the boundary can immediately trip again on the same data.
@@ -1574,18 +1624,46 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     setLoading(reset.loading);
     setLoadingMore(reset.loadingMore);
     setHasMore(reset.hasMore);
+    setContinuation(NO_SEARCH_CONTINUATION);
     setSearchError(reset.searchError);
     setLoadMoreError(false);
     setSearchNonce((prev) => prev + 1);
   }, []);
 
-  const selectableResults = useMemo(
+  // Overlay (task #102, Slack model): an exact destination match ranks above the
+  // "view all results" row (Return enters that channel / DM); otherwise that row is
+  // first (Return opens the full results page). Remaining destinations and the
+  // message preview follow. Full page: unchanged order, no action row.
+  // oxlint-disable-next-line react-doctor/no-event-handler -- render-derived row visibility (task #102): composes the overlay's selectable rows, no Effect or setState-in-Effect involved.
+  const showAllResultsAction = activateResultsInChat && hasSearchIntent;
+  // Searched over the FULL ranked list (not the MAX_ENTITY_RESULTS slice): the
+  // looser ranking score can place a punctuation-different sibling first, and a
+  // strict match may sit past the display cut. See findExactDestination.
+  const exactDestinationCandidate = useMemo(
+    () => findExactDestination(query, rankedEntityResults),
+    [query, rankedEntityResults],
+  );
+  const exactDestination = showAllResultsAction ? exactDestinationCandidate : null;
+  const allResultsRow = showAllResultsAction ? OVERLAY_ALL_RESULTS_ROW : null;
+  const exactDestinationRow = useMemo<SelectableSearchResult | null>(
+    () => (exactDestination === null ? null : { key: exactDestination.key, kind: "entity", result: exactDestination }),
+    [exactDestination],
+  );
+  const remainingEntityResults = useMemo(
+    () => (exactDestination ? entityResults.filter((result) => result.key !== exactDestination.key) : entityResults),
+    [entityResults, exactDestination],
+  );
+  const selectableResults = useMemo<SelectableSearchResult[]>(
     () => [
-      ...entityResults.map((result) => ({ key: result.key, kind: "entity" as const, result })),
+      // Overlay empty state: the recent-conversation rows are the keyboard rail
+      // (↑↓ + Return, first row active by default like Slack).
+      ...recentConversationRows,
+      ...[exactDestinationRow, allResultsRow].filter(isSelectableRow),
+      ...remainingEntityResults.map((result) => ({ key: result.key, kind: "entity" as const, result })),
       // oxlint-disable-next-line react-doctor/no-event-handler -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
-      ...results.map((result) => ({ key: `message:${result.id}`, kind: "message" as const, result })),
+      ...visibleMessageResults.map((result) => ({ key: `message:${result.id}`, kind: "message" as const, result })),
     ],
-    [entityResults, results]
+    [allResultsRow, exactDestinationRow, recentConversationRows, remainingEntityResults, visibleMessageResults]
   );
   selectableResultsRef.current = selectableResults;
 
@@ -1594,15 +1672,34 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
   // to whichever row currently occupies its numeric index. Preserve that key
   // across refreshes; if the selected result disappeared, stay at the nearest
   // surviving position instead of surprising the user by jumping to the top.
+  // Overlay (task #102): a palette's cursor returns to the top row whenever the
+  // query changes (or an exact destination surfaces from a later rerank), so Return
+  // always means "the first row for what I just typed" — the exact destination if
+  // any, else "view all results". Adjusted during render (same-component setState),
+  // and a cleared identity maps to row 0 here instead of the nearest-survivor hint.
+  // Full page keeps the nearest-survivor behaviour untouched.
+  const overlayCursorEpoch = activateResultsInChat ? `${query}\u0000${exactDestination?.key ?? ""}` : null;
+  const [seenOverlayCursorEpoch, setSeenOverlayCursorEpoch] = useState(overlayCursorEpoch);
+  if (overlayCursorEpoch !== seenOverlayCursorEpoch) {
+    setSeenOverlayCursorEpoch(overlayCursorEpoch);
+    if (overlayCursorEpoch !== null && selectedResultIdentity !== null) setSelectedResultIdentity(null);
+  }
   const identityIndex = selectedResultIdentity
     ? selectableResults.findIndex((entry) => entry.key === selectedResultIdentity)
     : -1;
   const selectedIndex = identityIndex >= 0
     ? identityIndex
     : selectableResults.length > 0
-      ? Math.min(selectedIndexHintRef.current, selectableResults.length - 1)
+      ? (activateResultsInChat ? 0 : Math.min(selectedIndexHintRef.current, selectableResults.length - 1))
       : 0;
   const selectedResultKey = selectableResults[selectedIndex]?.key;
+  const entityResultsListRef = useRef<HTMLDivElement>(null);
+  // The entity list scrolls on its own; keep the keyboard-selected row visible
+  // inside it (↑↓ past the fifth row would otherwise select an off-screen row).
+  useEffect(() => {
+    const activeRow = entityResultsListRef.current?.querySelector<HTMLElement>("[data-active=\"true\"]");
+    activeRow?.scrollIntoView({ block: "nearest" });
+  }, [selectedResultKey]);
   useEffect(() => {
     selectedIndexHintRef.current = selectedIndex;
     const nextIdentity = selectableResults[selectedIndex]?.key ?? null;
@@ -1615,6 +1712,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     setSelectedResultIdentity(nextIdentity);
   }, [selectableResults, selectedIndex, selectedResultIdentity]);
 
+
   // Search-rail keyboard handler. Scoped to the rail container via React
   // onKeyDown on the root <div>, so it only fires when focus is inside the
   // rail (search input, filter buttons, or a result card). When the col-3
@@ -1626,18 +1724,14 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
   // and a regression in any of those guards would close the slot from
   // anywhere on the page. Scoping by DOM subtree removes the whole
   // attack surface: focus location is the source of truth.
-  const handleRailKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+  const handleRailKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
     if (isSearchKeyboardComposing(event)) return;
     if (event.key === "Escape") {
-      if (channelMenuOpen || senderMenuOpen || scopeMenuOpen || timeMenuOpen || sortMenuOpen) {
-        event.preventDefault();
-        setChannelMenuOpen(false);
-        setSenderMenuOpen(false);
-        setScopeMenuOpen(false);
-        setTimeMenuOpen(false);
-        setSortMenuOpen(false);
-        return;
-      }
+      // Overlay mode: SearchOverlay owns Escape-to-dismiss. A plain Escape (no
+      // filter menu open) must bubble to it — don't preventDefault and don't run
+      // the page's slot-close / back-navigation here, or the overlay would either
+      // never close (we swallowed the event) or double-act with its onClose.
+      if (activateResultsInChat) return;
       event.preventDefault();
       if (slotOpen) {
         closeSearchContent();
@@ -1665,14 +1759,20 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
       const selected = selectableResults[selectedIndex];
       if (selected) {
         event.preventDefault();
+        if (selected.kind === "allResults") {
+          openAllResults();
+          return;
+        }
+        // Overlay mode: keyboard activation matches a mouse click — jump to the
+        // hit in chat (no col-3 preview in the overlay), which closes the overlay.
         if (selected.kind === "entity") {
-          void openEntityResult(selected.result);
+          void (activateResultsInChat ? openEntityResultInChat(selected.result) : openEntityResult(selected.result));
         } else {
-          void openResult(selected.result);
+          void (activateResultsInChat ? openResultInChat(selected.result) : openResult(selected.result));
         }
       }
     }
-  };
+  }, [activateResultsInChat, closeSearchContent, handleSearchEscape, openAllResults, openEntityResult, openEntityResultInChat, openResult, openResultInChat, selectableResults, selectedIndex, slotOpen]);
 
   const totalResults = entityResults.length + results.length;
   const boundaryKey = `${queryParam}|${senderIdParam}|${scopes.join(",")}|${timeRange}|${sort}|${searchNonce}|${channelIdParam}`;
@@ -1697,6 +1797,7 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
         const expectedKind = r.channelType === "dm" ? "dm" : "channel";
         return slot.kind === expectedKind && slot.messageId === r.id;
       }
+      if (entry.kind !== "entity") return false;
       const e = entry.result;
       if (e.type === "channel") {
         return slot.kind === "channel" && slot.id === e.channelId && !slot.messageId;
@@ -1752,58 +1853,21 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     const member = result.senderType === "user"
       ? resolveMessageSenderMemberFromList(result, members, currentUser)
       : null;
-    const sourceLabel = getSourceLabel(result);
-    const resultKey = `message:${result.id}`;
-
     return (
-      <button
+      <MessageHitRow
         key={result.id}
-        type="button"
-        draggable={!!onDragPanelRef}
-        onDragStart={(event) => handleMessageResultDrag(event, result)}
-        onClick={(event) => handleMessageResultClick(event, result)}
-        className={`w-full text-left transition-colors bg-white ${
-          nested
-            ? `border-t-2 px-3 py-3 ${selectedResultKey === resultKey ? "border-black bg-[#fff4bf]" : "border-black/10 hover:bg-black/[0.03]"}`
-            : `border-2 p-3 ${selectedResultKey === resultKey ? "border-black shadow-brutal-sm" : "border-black/30 hover:border-black hover:shadow-brutal-sm active:border-black active:shadow-brutal-sm"}`
-        }`}
-      >
-        <div className="mb-1 flex flex-wrap items-center gap-2 text-xs">
-          <span className="font-bold text-black/50">{sourceLabel}</span>
-          {result.channelType === "thread" && (
-            <span className="inline-flex items-center gap-1 font-bold text-black/40">
-              <MessageSquare size={10} />
-              {formatMessage({ id: "search.threadInline" })}
-            </span>
-          )}
-          {(result.channelType === "thread"
-            ? result.parentChannelArchivedAt
-            : result.channelArchivedAt) && (
-            <span className="inline-flex items-center gap-1 border border-black bg-brutal-orange/30 px-1.5 py-0.5 text-[10px] font-bold uppercase tracking-wide">
-              {formatMessage({ id: "search.archived" })}
-            </span>
-          )}
-          <span className="inline-flex items-center gap-1 font-bold text-black">
-            {result.senderType === "agent" ? (
-              <AvatarSlot context="preview-mini" type="agent" agentAvatarUrl={agent?.avatarUrl ?? null} />
-            ) : result.senderType === "external_projection" ? (
-              <AvatarSlot context="preview-mini" type="app" appAvatarUrl={result.senderAvatarUrl} appInitials={result.senderName} />
-            ) : (
-              <AvatarSlot context="preview-mini" type="human" humanAvatarUrl={member?.avatarUrl} gravatarHash={member?.gravatarHash} />
-            )}
-            <span>{result.senderName}</span>
-          </span>
-          <span className="font-mono text-black/40">{(() => {
-            const parts = getSearchRelativeTimeParts(result.createdAt);
-            return parts ? formatRelativeTimeParts(parts.value, parts.unit, intl.locale) : formatMessage({ id: "search.grpUnknownTime" });
-          })()}</span>
-        </div>
-        <div className="line-clamp-2 text-sm leading-relaxed text-black/70">
-          <SearchHighlight text={result.snippet} query={query} />
-        </div>
-      </button>
+        result={result}
+        nested={nested}
+        selected={selectedResultKey === `message:${result.id}`}
+        sourceLabel={getSourceLabel(result)}
+        agentAvatarUrl={agent?.avatarUrl ?? null}
+        senderMember={member}
+        historyCutoffMs={historyCutoffMs}
+        query={query}
+        onResultClick={handleMessageResultClick}
+      />
     );
-  }, [agents, currentUser, formatMessage, getSourceLabel, handleMessageResultClick, handleMessageResultDrag, intl, members, onDragPanelRef, query, selectedResultKey]);
+  }, [agents, currentUser, getSourceLabel, handleMessageResultClick, historyCutoffMs, members, query, selectedResultKey]);
 
   const chooseSearchHistoryEntry = useCallback((historyQuery: string) => {
     setQuery(historyQuery);
@@ -1813,399 +1877,567 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
     });
   }, []);
 
-  const renderSearchHomeEntity = useCallback((result: SearchEntityResult) => (
-    <button
+  // Same activation contract as the result list and the keyboard path: in the
+  // ⌘K overlay (activateResultsInChat) a click must jump to the entity in chat —
+  // openEntityResult only fills the col-3 content slot, which the overlay does
+  // not render, so the click looked dead (task #95).
+  const activateSearchHomeEntity = useCallback((result: SearchEntityRecord) => {
+    void (activateResultsInChat ? openEntityResultInChat(result) : openEntityResult(result));
+  }, [activateResultsInChat, openEntityResult, openEntityResultInChat]);
+
+  const renderSearchHomeEntity = useCallback((result: SearchEntityRecord) => (
+    <SearchHomeEntityRow
       key={result.key}
-      type="button"
-      data-testid={`search-common-${result.key}`}
-      onClick={() => {
-        void openEntityResult(result);
-      }}
-      className="flex min-w-0 items-center gap-3 border-2 border-black/30 bg-white p-3 text-left transition-colors hover:border-black hover:shadow-brutal-sm active:border-black active:shadow-brutal-sm"
-    >
-      <div className="relative flex shrink-0">
-        {result.type === "channel" ? (
-          <div className="flex size-8 items-center justify-center border-2 border-black bg-soft-signal">
-            <ChannelKindIcon type={result.channelType ?? "channel"} />
-          </div>
-        ) : result.type === "computer" ? (
-          <div className="flex size-8 items-center justify-center border-2 border-black bg-brutal-lime">
-            <Monitor size={14} />
-          </div>
-        ) : result.type === "agentDm" ? (
-          <AvatarSlot
-            context="surface-list"
-            type="agent"
-            agentAvatarUrl={result.agentId
-              ? agents.find((entry) => entry.id === result.agentId)?.avatarUrl ?? null
-              : null}
-            badge={result.agentId ? <AgentActivityDot agentId={result.agentId} /> : undefined}
-          />
-        ) : (
-          (() => {
-            const member = resolveUserMember(result.userId);
-            return (
-              <AvatarSlot
-                context="surface-list"
-                type="human"
-                humanAvatarUrl={member?.avatarUrl}
-                gravatarHash={member?.gravatarHash}
-              />
-            );
-          })()
-        )}
-      </div>
-      <div className="min-w-0 flex-1">
-        <div className="truncate text-sm font-bold text-black">{result.title}</div>
-        <div className="truncate text-xs text-black/50">
-          {formatEntitySubtitle(result.subtitle, formatMessage)}
-        </div>
-      </div>
-    </button>
-  ), [agents, formatMessage, openEntityResult, resolveUserMember]);
+      result={result}
+      agentAvatarUrl={result.agentId
+        ? agents.find((entry) => entry.id === result.agentId)?.avatarUrl ?? null
+        : null}
+      humanMember={resolveUserMember(result.userId)}
+      onActivate={activateSearchHomeEntity}
+    />
+  ), [activateSearchHomeEntity, agents, resolveUserMember]);
+
+  // The query input + clear button + Esc hint, shared by both the full-page
+  // PanelHeader and the slim overlay header so the field behavior is identical.
+  // Overlay: no ⌘K hint inside the field you just opened with ⌘K (Slack's
+  // "Channels, people, files, and more").
+  const handleQueryChange = useCallback((event: ReactChangeEvent<HTMLInputElement>) => {
+    setQuery(event.target.value);
+  }, []);
+  const handleQueryCompositionStart = useCallback(() => {
+    setIsComposing(true);
+  }, []);
+  const handleQueryCompositionEnd = useCallback((event: ReactCompositionEvent<HTMLInputElement>) => {
+    setQuery(event.currentTarget.value);
+    setIsComposing(false);
+  }, []);
+  const clearQuery = useCallback(() => setQuery(""), []);
+
+  const searchPlaceholder = overlayChrome
+    ? formatMessage({ id: "search.overlay.placeholder" })
+    : formatMessage({ id: "search.placeholder" }, { shortcutHint });
+  // DS Search field (`rf-search`): one 44px ink-bordered control with the
+  // search glyph inside it, the clear button and the Esc hint at its end.
+  const searchFieldInner = (
+    <InputGroup className="min-w-0 flex-1">
+      <InputGroupAddon align="inline-start">
+        <Search aria-hidden="true" />
+      </InputGroupAddon>
+      <InputGroupInput
+        ref={inputRef}
+        value={query}
+        onChange={handleQueryChange}
+        onCompositionStart={handleQueryCompositionStart}
+        onCompositionEnd={handleQueryCompositionEnd}
+        placeholder={searchPlaceholder}
+        aria-label={searchPlaceholder}
+        data-testid="message-search-input"
+      />
+      <InputGroupAddon align="inline-end">
+        {query ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            onClick={clearQuery}
+            aria-label={formatMessage({ id: "search.clearSearch" })}
+          >
+            <X aria-hidden size={18} />
+          </Button>
+        ) : null}
+        <Kbd className="hidden sm:inline-flex">
+          Esc
+        </Kbd>
+      </InputGroupAddon>
+    </InputGroup>
+  );
+
+  const renderEntityResultRow = (result: SearchEntityRecord, options: { returnHint?: boolean } = {}) => {
+    const hasOpenChannelContextMenu = result.type === "channel"
+      && !!result.channelId
+      && channelContextMenu?.result.channelId === result.channelId;
+    return (
+      <EntityResultRow
+        key={result.key}
+        result={result}
+        returnHint={options.returnHint ?? false}
+        selected={selectedResultKey === result.key || hasOpenChannelContextMenu}
+        agentAvatarUrl={result.agentId
+          ? agents.find((entry) => entry.id === result.agentId)?.avatarUrl ?? null
+          : null}
+        humanMember={resolveUserMember(result.userId)}
+        onResultContextMenu={handleChannelResultContextMenu}
+        onResultClick={handleEntityResultClick}
+      />
+    );
+  };
+
+  const mobileBackProps = useMemo(
+    () => ({ "data-testid": "search-mobile-back", title: formatMessage({ id: "search.back" }) }),
+    [formatMessage],
+  );
+
+  // Filter menus render into the filters bar so they stay inside the overlay.
+  const filtersPortalProps = useMemo(() => ({ container: filtersPortalRef }), []);
+  const handleFromMenuOpenChange = useCallback((open: boolean) => setOpenFilterMenu(open ? "from" : null), []);
+  const handleScopeMenuOpenChange = useCallback((open: boolean) => setOpenFilterMenu(open ? "scope" : null), []);
+  const handleChannelMenuOpenChange = useCallback((open: boolean) => setOpenFilterMenu(open ? "channel" : null), []);
+  const handleTimeMenuOpenChange = useCallback((open: boolean) => setOpenFilterMenu(open ? "time" : null), []);
+  const handleSortMenuOpenChange = useCallback((open: boolean) => setOpenFilterMenu(open ? "sort" : null), []);
+
+  const senderItemIds = useMemo(() => filteredSenderOptions.map((item) => item.id), [filteredSenderOptions]);
+  const senderItemLabel = useCallback(
+    (id: string) => senderOptions.find((item) => item.id === id)?.label ?? id,
+    [senderOptions],
+  );
+  const handleSenderInputChange: NonNullable<ComboboxProps<string>["onInputValueChange"]> = useCallback((nextValue, details) => {
+    if (details.reason !== "item-press") setSenderFilterQuery(nextValue);
+  }, []);
+  const handleSenderChange = useCallback((nextValue: string | null) => {
+    const sender = senderOptions.find((item) => item.id === nextValue) ?? null;
+    setSenderFilter(sender);
+  }, [senderOptions, setSenderFilter]);
+  const clearSenderFilter = useCallback(() => updateSearchParam("senderId", null), [updateSearchParam]);
+
+  const scopeItems = useMemo(
+    () => SEARCH_SCOPE_OPTIONS.map((mode) => ({
+      label: formatMessage({ id: getScopeOptionLabelId(mode) }),
+      value: mode,
+    })),
+    [formatMessage],
+  );
+  const scopeValue = useMemo(() => [...scopes], [scopes]);
+
+  const clearChannelFilter = useCallback(() => updateSearchParam("channelId", null), [updateSearchParam]);
+  const channelItemIds = useMemo(() => filteredChannels.map((ch) => ch.id), [filteredChannels]);
+  const channelItemLabel = useCallback(
+    (id: string) => channels.find((ch) => ch.id === id)?.name ?? id,
+    [channels],
+  );
+  const handleChannelInputChange: NonNullable<ComboboxProps<string>["onInputValueChange"]> = useCallback((nextValue, details) => {
+    if (details.reason !== "item-press") setChannelFilterQuery(nextValue);
+  }, []);
+  const handleChannelChange = useCallback((nextValue: string | null) => {
+    if (nextValue) updateSearchParam("channelId", nextValue);
+  }, [updateSearchParam]);
+
+  const timeRangeItems = useMemo(
+    () => SEARCH_TIME_RANGES.map((range) => ({
+      label: formatMessage({ id: getTimeRangeLabelId(range) }),
+      value: range,
+    })),
+    [formatMessage],
+  );
+  const handleTimeRangeChange = useCallback((nextValue: SearchTimeRange | null) => {
+    if (nextValue) {
+      updateSearchParam("range", nextValue === "any" ? null : nextValue);
+    }
+  }, [updateSearchParam]);
+
+  const sortItems = useMemo(
+    () => SEARCH_SORTS.map((mode) => ({
+      label: mode === "relevance" ? formatMessage({ id: "search.sortRelevant" }) : formatMessage({ id: "search.sortRecent" }),
+      value: mode,
+    })),
+    [formatMessage],
+  );
+  const handleSortChange = useCallback((nextValue: SearchSort | null) => {
+    if (nextValue) {
+      updateSearchParam("sort", nextValue === "relevance" ? null : nextValue);
+    }
+  }, [updateSearchParam]);
+  const sortByRecent = useCallback(() => updateSearchParam("sort", "recent"), [updateSearchParam]);
+
+  const closeChannelContextMenu = useCallback(() => setChannelContextMenu(null), []);
+  const channelContextMenuStyle = useMemo(
+    () => (channelContextMenu ? { left: channelContextMenu.x, top: channelContextMenu.y } : undefined),
+    [channelContextMenu],
+  );
+  const handleChannelContextMenuKeyDown = useCallback((event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      setChannelContextMenu(null);
+    }
+  }, []);
+  const openChannelFromContextMenu = useCallback(() => {
+    if (!channelContextMenu) return;
+    void openEntityResultInChat(channelContextMenu.result);
+    setChannelContextMenu(null);
+  }, [channelContextMenu, openEntityResultInChat]);
+
+  // An applied filter is the cyan-soft filter chip (DS `rf-filter.is-applied`);
+  // PickerTriggerButton draws it from `data-has-value`. Comboboxes set the
+  // attribute from their own value; selects and the sort chip say it here.
+  const appliedFilterProps = (applied: boolean) => (applied ? { "data-has-value": "" } : {});
+
+  const centeredEmptyState = (
+    <AppEmptyState
+      className="h-full justify-center"
+      data-testid="search-home"
+      icon={<Search size={36} aria-hidden="true" />}
+      title={formatMessage({ id: "search.emptyTitle" })}
+      description={formatMessage({ id: "search.emptyBody" })}
+    />
+  );
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col bg-white" onKeyDown={handleRailKeyDown}>
-      <PanelHeader
-        onMobileBack={handleBack}
-        mobileBackProps={{ "data-testid": "search-mobile-back", title: formatMessage({ id: "search.back" }) }}
-        titleSlot={
-          <div className="flex items-center gap-3">
-            {/* Search icon — always visible on this surface (unlike other
-                panel headers where icon is desktop-only) since search
-                identity matters at every viewport. */}
-            <div className="flex size-icon-header shrink-0 items-center justify-center border-2 border-black bg-soft-signal">
-              <Search size={18} />
+    <SearchShellRoot className="flex min-h-0 flex-1 flex-col" onKeyDown={handleRailKeyDown}>
+      {overlayChrome ? (
+        /* Slim command-palette header (desktop ⌘K overlay): the input IS the top
+           bar with the search icon inline — no PanelHeader, mobile-back, or icon
+           badge. */
+        <div className="flex shrink-0 items-center border-b border-line-seam px-3 py-3">
+          {searchFieldInner}
+        </div>
+      ) : (
+        <PanelHeader
+          onMobileBack={handleBack}
+          mobileBackProps={mobileBackProps}
+          titleSlot={
+            /* The field carries the search glyph itself (DS Search), so the
+               header needs no separate icon tile at any viewport. */
+            <div className="flex min-w-0 flex-1 items-center">
+              {searchFieldInner}
             </div>
-            <div className="flex min-w-0 flex-1 items-center gap-2 border-2 border-black bg-white px-3 py-2 shadow-brutal-sm focus-within:shadow-brutal">
-              <input
-                ref={inputRef}
-                value={query}
-                onChange={(event) => {
-                  setQuery(event.target.value);
-                }}
-                onCompositionStart={() => {
-                  setIsComposing(true);
-                }}
-                onCompositionEnd={(event) => {
-                  setQuery(event.currentTarget.value);
-                  setIsComposing(false);
-                }}
-                placeholder={formatMessage({ id: "search.placeholder" }, { shortcutHint })}
-                className="min-w-0 flex-1 bg-transparent text-sm font-display font-medium outline-none placeholder:text-black/40"
-              />
-              {query && (
-                <button type="button" onClick={() => setQuery("")} className="btn-brutal-sm bg-white p-1" aria-label={formatMessage({ id: "search.clearSearch" })}>
-                  <X size={12} />
-                </button>
-              )}
-              <Kbd className="hidden sm:inline text-[10px] font-bold uppercase text-black/50">
-                Esc
-              </Kbd>
-            </div>
-          </div>
-        }
-      />
+          }
+        />
+      )}
 
-      <div className="shrink-0 border-b-2 border-black bg-white px-4 py-3">
+      {overlayHome ? null : (
+      <SearchShellFilters ref={filtersPortalRef} className={overlayChrome ? "px-3" : undefined}>
         <div className="flex flex-wrap items-center gap-2">
-          <div ref={senderMenuRef} className="relative">
-            <button
-              type="button"
-              onClick={() => setSenderMenuOpen((prev) => !prev)}
-              className={`inline-flex items-center gap-2 border-2 px-3 py-1.5 text-xs font-bold transition-colors ${
-                senderIdParam
-                  ? "border-black bg-soft-signal text-black shadow-brutal-sm"
-                  : "border-black/30 bg-white text-black/70 hover:border-black"
-              }`}
+          <Combobox<string>
+            autoHighlight
+            open={openFilterMenu === "from"}
+            onOpenChange={handleFromMenuOpenChange}
+            inputValue={senderFilterQuery}
+            items={senderItemIds}
+            itemToStringLabel={senderItemLabel}
+            value={senderIdParam || null}
+            onInputValueChange={handleSenderInputChange}
+            onValueChange={handleSenderChange}
+          >
+            <ComboboxTrigger
+              aria-label={formatMessage({ id: "search.from" })}
+              render={<PickerTriggerButton {...appliedFilterProps(Boolean(senderIdParam))} />}
             >
-              <UserCircle2 size={14} />
-              <span>{selectedSender ? formatMessage({ id: "search.fromWithName" }, { name: selectedSender.isSelf ? formatMessage({ id: "search.fromMe" }) : selectedSender.label }) : formatMessage({ id: "search.from" })}</span>
-              <ChevronDown size={12} />
-            </button>
-
-            {senderMenuOpen && (
-              <SelectionPopover
-                title={formatMessage({ id: "search.from" })}
-                searchable
-                search={senderFilterQuery}
-                onSearchChange={setSenderFilterQuery}
-                options={filteredSenderOptions.map((sender) => ({
-                  key: sender.key,
-                  checked: sender.id === senderIdParam,
-                  onClick: () => {
-                    setSenderFilter(sender);
-                    setSenderMenuOpen(false);
-                  },
-                  label: sender.isSelf ? formatMessage({ id: "search.fromMe" }) : sender.label,
-                  reserveLeadingSlot: true,
-                  avatar: (
-                    <AvatarSlot
-                      context="compact-list"
-                      type={sender.type === "agent" ? "agent" : "human"}
-                      agentAvatarUrl={sender.type === "agent" ? sender.avatarUrl ?? null : null}
-                      humanAvatarUrl={sender.type === "user" ? sender.avatarUrl ?? null : null}
-                      gravatarHash={sender.type === "user" ? sender.gravatarHash ?? null : null}
-                      email={sender.type === "user" ? sender.email ?? null : null}
-                    />
-                  ),
-                }))}
-                showClear={Boolean(senderIdParam)}
-                onClear={() => {
-                  updateSearchParam("senderId", null);
-                  setSenderMenuOpen(false);
-                }}
-                onInputKeyDown={(event, options) => {
-                  if (event.key === "Escape") {
-                    event.preventDefault();
-                    setSenderMenuOpen(false);
-                    return;
-                  }
-                  if (event.key === "Enter" && options[0]) {
-                    event.preventDefault();
-                    options[0].onClick();
-                  }
-                }}
-              />
-            )}
-          </div>
-
-          <div ref={scopeMenuRef} className="relative">
-            <button
-              type="button"
-              onClick={() => setScopeMenuOpen((prev) => !prev)}
-              className={`inline-flex items-center gap-2 border-2 px-3 py-1.5 text-xs font-bold transition-colors ${
-                scopes.length > 0
-                  ? "border-black bg-soft-signal text-black shadow-brutal-sm"
-                  : "border-black/30 bg-white text-black/70 hover:border-black"
-              }`}
+              <UserCircle2 aria-hidden size={14} />
+              <span>
+                {selectedSender
+                  ? formatMessage(
+                      { id: "search.fromWithName" },
+                      { name: selectedSender.isSelf ? formatMessage({ id: "search.fromMe" }) : selectedSender.label },
+                    )
+                  : formatMessage({ id: "search.from" })}
+              </span>
+              <ComboboxTriggerIndicator>
+                <ChevronDown aria-hidden size={12} />
+              </ComboboxTriggerIndicator>
+            </ComboboxTrigger>
+            <ComboboxContent
+              align="start"
+              finalFocus={false}
+              initialFocus={false}
+              portalProps={filtersPortalProps}
             >
-              <AtSign size={14} />
+              <ComboboxHeader>
+                <ComboboxLabel>{formatMessage({ id: "search.from" })}</ComboboxLabel>
+                {senderIdParam && (
+                  <ComboboxClear onClick={clearSenderFilter}>
+                    {formatMessage({ id: "ui.selectionPopover.clear" })}
+                  </ComboboxClear>
+                )}
+              </ComboboxHeader>
+              <ComboboxSeparator />
+              <ComboboxInputGroup>
+                <ComboboxInput
+                  aria-label={formatMessage({ id: "search.from" })}
+                  placeholder={formatMessage({ id: "ui.selectionPopover.searchPlaceholder" })}
+                  suppressPasswordManager
+                />
+              </ComboboxInputGroup>
+              <ComboboxList>
+                {filteredSenderOptions.map((sender) => (
+                  <ComboboxItem key={sender.id} value={sender.id}>
+                    <span className="flex min-w-0 items-center gap-2">
+                      <span className="flex size-5 shrink-0 items-center justify-center">
+                        <AvatarSlot
+                          context="compact-list"
+                          type={sender.type === "agent" ? "agent" : "human"}
+                          agentAvatarUrl={sender.type === "agent" ? sender.avatarUrl ?? null : null}
+                          humanAvatarUrl={sender.type === "user" ? sender.avatarUrl ?? null : null}
+                          gravatarHash={sender.type === "user" ? sender.gravatarHash ?? null : null}
+                          email={sender.type === "user" ? sender.email ?? null : null}
+                        />
+                      </span>
+                      <span className="truncate">{sender.isSelf ? formatMessage({ id: "search.fromMe" }) : sender.label}</span>
+                    </span>
+                    <ComboboxItemIndicator />
+                  </ComboboxItem>
+                ))}
+              </ComboboxList>
+              <ComboboxEmpty>{formatMessage({ id: "ui.selectionPopover.emptyLabel" })}</ComboboxEmpty>
+            </ComboboxContent>
+          </Combobox>
+
+          <Select<SearchScope, true>
+            multiple
+            open={openFilterMenu === "scope"}
+            onOpenChange={handleScopeMenuOpenChange}
+            items={scopeItems}
+            value={scopeValue}
+            onValueChange={setScopeFilters}
+          >
+            <SelectTrigger
+              aria-label={formatMessage({ id: "search.scope" })}
+              render={<PickerTriggerButton {...appliedFilterProps(scopes.length > 0)} />}
+            >
+              <AtSign aria-hidden size={14} />
               <span>{getScopeChipLabel(scopes, formatMessage)}</span>
-              <ChevronDown size={12} />
-            </button>
+              <SelectIcon>
+                <ChevronDown aria-hidden size={12} />
+              </SelectIcon>
+            </SelectTrigger>
+            <SelectContent align="start" portalProps={filtersPortalProps}>
+              <SelectList>
+                <SelectGroup>
+                  <SelectGroupLabel>{formatMessage({ id: "search.scope" })}</SelectGroupLabel>
+                  <SelectSeparator />
+                  {SEARCH_SCOPE_OPTIONS.map((mode) => (
+                    <SelectItem key={mode} value={mode}>
+                      <SelectItemText>{formatMessage({ id: getScopeOptionLabelId(mode) })}</SelectItemText>
+                      <SelectItemIndicator />
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectList>
+            </SelectContent>
+          </Select>
 
-            {scopeMenuOpen && (
-              <SelectionPopover
-                title={formatMessage({ id: "search.scope" })}
-                options={SEARCH_SCOPE_OPTIONS.map((mode) => ({
-                  key: mode,
-                  checked: scopeSet.has(mode),
-                  label: formatMessage({ id: getScopeOptionLabelId(mode) }),
-                  onClick: () => {
-                    toggleScopeFilter(mode);
-                  },
-                }))}
-                showClear={scopes.length > 0}
-                onClear={() => {
-                  updateSearchParam("scope", null);
-                  setScopeMenuOpen(false);
-                }}
-              />
-            )}
-          </div>
-
-          {channelIdParam && (() => {
+          {channelIdParam ? (() => {
             const ch = channels.find((c) => c.id === channelIdParam) ?? dmChannels.find((c) => c.id === channelIdParam);
             const label = ch ? `#${ch.name}` : `#${formatMessage({ id: "search.channel" })}`;
             return (
-              <button
+              <PickerTriggerButton
                 type="button"
-                onClick={() => updateSearchParam("channelId", null)}
-                className="inline-flex items-center gap-2 border-2 border-black bg-soft-signal px-3 py-1.5 text-xs font-bold shadow-brutal-sm"
+                data-has-value=""
+                onClick={clearChannelFilter}
               >
-                <Hash size={12} />
-                {label}
-                <X size={10} />
-              </button>
+                <Hash aria-hidden size={14} />
+                <span>{label}</span>
+                <X aria-hidden size={14} />
+              </PickerTriggerButton>
             );
-          })()}
-
-          {!channelIdParam && (
-            <div ref={channelMenuRef} className="relative">
-              <button
-                type="button"
+          })() : (
+            <Combobox<string>
+              autoHighlight
+              open={openFilterMenu === "channel"}
+              onOpenChange={handleChannelMenuOpenChange}
+              inputValue={channelFilterQuery}
+              items={channelItemIds}
+              itemToStringLabel={channelItemLabel}
+              value={null}
+              onInputValueChange={handleChannelInputChange}
+              onValueChange={handleChannelChange}
+            >
+              <ComboboxTrigger
                 aria-label={formatMessage({ id: "search.openChannelFilter" })}
-                aria-expanded={channelMenuOpen}
-                onClick={() => setChannelMenuOpen((prev) => !prev)}
-                className={`inline-flex items-center gap-2 border-2 px-3 py-1.5 text-xs font-bold transition-colors border-black/30 bg-white text-black/70 hover:border-black`}
+                render={<PickerTriggerButton />}
               >
-                <Hash size={14} />
+                <Hash aria-hidden size={14} />
                 <span>{formatMessage({ id: "search.channel" })}</span>
-                <ChevronDown size={12} />
-              </button>
-
-              {channelMenuOpen && (
-                <SelectionPopover
-                  title={formatMessage({ id: "search.channels" })}
-                  searchable
-                  search={channelFilterQuery}
-                  onSearchChange={setChannelFilterQuery}
-                  options={filteredChannels.map((ch) => ({
-                    key: ch.id,
-                    checked: false,
-                    onClick: () => {
-                      updateSearchParam("channelId", ch.id);
-                      setChannelMenuOpen(false);
-                    },
-                    label: `#${ch.name}`,
-                    leading: <Hash size={12} className="text-black/50" />,
-                  }))}
-                  onInputKeyDown={(event, options) => {
-                    if (event.key === "Escape") {
-                      event.preventDefault();
-                      setChannelMenuOpen(false);
-                      return;
-                    }
-                    if (event.key === "Enter" && options[0]) {
-                      event.preventDefault();
-                      options[0].onClick();
-                    }
-                  }}
-                />
-              )}
-            </div>
+                <ComboboxTriggerIndicator>
+                  <ChevronDown aria-hidden size={12} />
+                </ComboboxTriggerIndicator>
+              </ComboboxTrigger>
+              <ComboboxContent
+                align="start"
+                finalFocus={false}
+                initialFocus={false}
+                portalProps={filtersPortalProps}
+              >
+                <ComboboxHeader>
+                  <ComboboxLabel>{formatMessage({ id: "search.channels" })}</ComboboxLabel>
+                </ComboboxHeader>
+                <ComboboxSeparator />
+                <ComboboxInputGroup>
+                  <ComboboxInput
+                    aria-label={formatMessage({ id: "search.channels" })}
+                    placeholder={formatMessage({ id: "ui.selectionPopover.searchPlaceholder" })}
+                    suppressPasswordManager
+                  />
+                </ComboboxInputGroup>
+                <ComboboxList>
+                  {filteredChannels.map((ch) => (
+                    <ComboboxItem key={ch.id} value={ch.id}>
+                      <span className="flex size-5 shrink-0 items-center justify-center">
+                        <Hash aria-hidden size={12} />
+                      </span>
+                      <span>#{ch.name}</span>
+                      <ComboboxItemIndicator />
+                    </ComboboxItem>
+                  ))}
+                </ComboboxList>
+                <ComboboxEmpty>{formatMessage({ id: "ui.selectionPopover.emptyLabel" })}</ComboboxEmpty>
+              </ComboboxContent>
+            </Combobox>
           )}
 
-          <div ref={timeMenuRef} className="relative">
-            <button
-              type="button"
-              onClick={() => setTimeMenuOpen((prev) => !prev)}
-              className={`inline-flex items-center gap-2 border-2 px-3 py-1.5 text-xs font-bold transition-colors ${
-                timeRange !== "any"
-                  ? "border-black bg-soft-signal text-black shadow-brutal-sm"
-                  : "border-black/30 bg-white text-black/70 hover:border-black"
-              }`}
+          <Select<SearchTimeRange>
+            open={openFilterMenu === "time"}
+            onOpenChange={handleTimeMenuOpenChange}
+            items={timeRangeItems}
+            value={timeRange}
+            onValueChange={handleTimeRangeChange}
+          >
+            <SelectTrigger
+              aria-label={formatMessage({ id: "search.time" })}
+              render={<PickerTriggerButton {...appliedFilterProps(timeRange !== "any")} />}
             >
-              <CalendarRange size={14} />
+              <CalendarRange aria-hidden size={14} />
               <span>{formatMessage({ id: getTimeRangeLabelId(timeRange) })}</span>
-              <ChevronDown size={12} />
-            </button>
-
-            {timeMenuOpen && (
-              <SelectionPopover
-                title={formatMessage({ id: "search.time" })}
-                options={(["any", "today", "7d", "30d"] as SearchTimeRange[]).map((range) => ({
-                  key: range,
-                  checked: timeRange === range,
-                  label: formatMessage({ id: getTimeRangeLabelId(range) }),
-                  onClick: () => {
-                    updateSearchParam("range", range === "any" ? null : range);
-                    setTimeMenuOpen(false);
-                  },
-                }))}
-              />
-            )}
-          </div>
+              <SelectIcon>
+                <ChevronDown aria-hidden size={12} />
+              </SelectIcon>
+            </SelectTrigger>
+            <SelectContent align="start" portalProps={filtersPortalProps}>
+              <SelectList>
+                <SelectGroup>
+                  <SelectGroupLabel>{formatMessage({ id: "search.time" })}</SelectGroupLabel>
+                  <SelectSeparator />
+                  {SEARCH_TIME_RANGES.map((range) => (
+                    <SelectItem key={range} value={range}>
+                      <SelectItemText>{formatMessage({ id: getTimeRangeLabelId(range) })}</SelectItemText>
+                      <SelectItemIndicator />
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectList>
+            </SelectContent>
+          </Select>
 
           {/* Sort chip — same shape as From / Channel / Time per stdrc
               #proj-uiux:c2313b1d msg=da1194bd (2026-05-26): replaces the
               prior Relevant/Recent segmented toggle with a Sort dropdown
-              positioned after the existing filter chips. Chip is "active"
-              (yellow) when sort != default (relevance), matching the
-              time-chip pattern (active when timeRange != "any"). Conceptually
+              positioned after the existing filter chips. Chip reads as
+              applied (cyan-soft) when sort != default (relevance), matching
+              the time-chip pattern (applied when timeRange != "any"). Conceptually
               sort isn't a filter, so it's NOT included in `hasActiveFilters`
               and `clearAllFilters` does NOT reset it — only the visual
               treatment matches. */}
-          <div ref={sortMenuRef} className="relative">
-            <button
-              type="button"
-              onClick={() => setSortMenuOpen((prev) => !prev)}
-              disabled={!query.trim()}
-              className={`inline-flex items-center gap-2 border-2 px-3 py-1.5 text-xs font-bold transition-colors disabled:cursor-not-allowed disabled:opacity-50 ${
-                sort !== "relevance"
-                  ? "border-black bg-soft-signal text-black shadow-brutal-sm"
-                  : "border-black/30 bg-white text-black/70 hover:border-black"
-              }`}
+          <Select<SearchSort>
+            disabled={!query.trim()}
+            open={openFilterMenu === "sort"}
+            onOpenChange={handleSortMenuOpenChange}
+            items={sortItems}
+            value={sort}
+            onValueChange={handleSortChange}
+          >
+            <SelectTrigger
+              aria-label={formatMessage({ id: "search.sort" })}
               data-testid="search-sort-chip"
+              render={<PickerTriggerButton {...appliedFilterProps(sort !== "relevance")} />}
             >
-              <ArrowDownUp size={14} />
+              <ArrowDownUp aria-hidden size={14} />
               <span>{sort === "recent" ? formatMessage({ id: "search.sortRecent" }) : formatMessage({ id: "search.sortRelevant" })}</span>
-              <ChevronDown size={12} />
-            </button>
-
-            {sortMenuOpen && (
-              <SelectionPopover
-                title={formatMessage({ id: "search.sort" })}
-                options={(["relevance", "recent"] as SearchSort[]).map((mode) => ({
-                  key: mode,
-                  checked: sort === mode,
-                  label: mode === "relevance" ? formatMessage({ id: "search.sortRelevant" }) : formatMessage({ id: "search.sortRecent" }),
-                  onClick: () => {
-                    updateSearchParam("sort", mode === "relevance" ? null : mode);
-                    setSortMenuOpen(false);
-                  },
-                }))}
-              />
-            )}
-          </div>
+              <SelectIcon>
+                <ChevronDown aria-hidden size={12} />
+              </SelectIcon>
+            </SelectTrigger>
+            <SelectContent align="start" portalProps={filtersPortalProps}>
+              <SelectList>
+                <SelectGroup>
+                  <SelectGroupLabel>{formatMessage({ id: "search.sort" })}</SelectGroupLabel>
+                  <SelectSeparator />
+                  {SEARCH_SORTS.map((mode) => (
+                    <SelectItem key={mode} value={mode}>
+                      <SelectItemText>{mode === "relevance" ? formatMessage({ id: "search.sortRelevant" }) : formatMessage({ id: "search.sortRecent" })}</SelectItemText>
+                      <SelectItemIndicator />
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectList>
+            </SelectContent>
+          </Select>
 
           {hasActiveFilters && (
-            <button
+            <Button
               type="button"
+              variant="ghost"
+              size="sm"
               onClick={clearAllFilters}
-              className="inline-flex items-center gap-2 border border-black bg-white px-2.5 py-1 text-[11px] font-bold text-black/60 hover:text-black"
             >
               {formatMessage({ id: "search.clearAll" })}
-            </button>
+            </Button>
           )}
         </div>
-      </div>
+      </SearchShellFilters>
+      )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto bg-white">
-        {!hasSearchIntent && (!hasSearchHomeContent ? (
-          <div className="flex h-full flex-col items-center justify-center text-center" data-testid="search-home">
-            <Search size={48} className="mb-3 text-black/20" />
-            <p className="text-sm font-bold text-black/50">{formatMessage({ id: "search.emptyTitle" })}</p>
-            <p className="mt-1 text-xs text-black/40">
-              {formatMessage({ id: "search.emptyBody" })}
-            </p>
-          </div>
-        ) : (
-          <div className="p-4" data-testid="search-home">
+      <SearchShellViewport className="min-h-0 flex-1 overflow-y-auto">
+        {!hasSearchIntent && (overlayHome ? (
+          recentConversationEntities.length > 0 ? (
+            /* Overlay empty state (task #113, Slack): the conversations you were
+               in most recently, as the same destination rows the results use. */
+            <div data-testid="search-overlay-recent">
+              <SearchResultsSectionHeading>
+                <Clock3 size={14} aria-hidden="true" />
+                <span>{formatMessage({ id: "search.overlay.recentConversations" })}</span>
+              </SearchResultsSectionHeading>
+              <SearchResultsList>
+                {recentConversationEntities.map((result) => renderEntityResultRow(result, { returnHint: true }))}
+              </SearchResultsList>
+            </div>
+          ) : centeredEmptyState
+        ) : !hasSearchHomeContent ? centeredEmptyState : (
+          <div data-testid="search-home">
             {searchHistory.length > 0 ? (
-              <section className="mb-6" aria-labelledby="search-history-heading">
-                <div className="mb-2 flex items-center justify-between gap-3 px-1">
-                  <SectionEyebrow as="div" className="flex items-center gap-1.5">
-                    <Clock3 size={12} aria-hidden="true" />
+              <section aria-labelledby="search-history-heading">
+                <div className="flex items-center justify-between gap-3 pr-4">
+                  <SearchResultsSectionHeading>
+                    <Clock3 size={14} aria-hidden="true" />
                     <span id="search-history-heading">{formatMessage({ id: "search.history" })}</span>
-                  </SectionEyebrow>
-                  <div className="flex items-center gap-3">
+                  </SearchResultsSectionHeading>
+                  {/* Section actions are underlined ink text buttons (DS rf-section__action). */}
+                  <div className="flex items-center gap-4 pt-5 pb-2">
                     {isTouchSearchHome ? (
-                      <button
-                        type="button"
-                        onClick={() => setSearchHistoryEditRequested((editing) => !editing)}
-                        className="text-[11px] font-bold text-black/45 hover:text-black"
+                      <TextLink
+                        variant="primary"
+                        onClick={toggleSearchHistoryEdit}
+                        className="text-footnote"
                         data-testid="search-history-edit-toggle"
                       >
                         {formatMessage({
                           id: searchHistoryEditing ? "search.doneEditHistory" : "search.editHistory",
                         })}
-                      </button>
+                      </TextLink>
                     ) : null}
-                    <button
-                      type="button"
+                    <TextLink
+                      variant="primary"
                       onClick={clearSearchHistory}
-                      className="text-[11px] font-bold text-black/45 hover:text-black"
+                      className="text-footnote"
                     >
                       {formatMessage({ id: "search.clearHistory" })}
-                    </button>
+                    </TextLink>
                   </div>
                 </div>
-                <div className="flex flex-wrap gap-2" data-testid="search-history-tags">
+                <div className="flex flex-wrap gap-1.5 px-4" data-testid="search-history-tags">
                   {searchHistory.map((historyQuery) => (
-                    <div
+                    <Badge
                       key={historyQuery.toLocaleLowerCase()}
-                      className="group inline-flex min-w-0 max-w-full items-center border border-black/20 bg-white transition-colors hover:border-black/35 hover:bg-black/[0.03] focus-within:border-black/35 focus-within:bg-black/[0.03]"
+                      render={<div />}
+                      appearance="soft"
+                      className="group relative hover:press-overlay focus-within:shadow-focus"
                       data-testid="search-history-tag"
                     >
                       <button
                         type="button"
                         onClick={() => chooseSearchHistoryEntry(historyQuery)}
-                        className="flex min-w-0 items-center gap-1.5 py-1.5 pl-2.5 pr-1 text-left"
+                        className="flex min-w-0 items-center gap-1 text-left outline-none after:absolute after:inset-0"
                       >
-                        <Clock3 size={12} className="shrink-0 text-black/35" aria-hidden="true" />
-                        <span className="truncate text-xs font-medium text-black">{historyQuery}</span>
+                        <Clock3 size={14} aria-hidden="true" />
+                        <span className="truncate">{historyQuery}</span>
                       </button>
                       {shouldRenderSearchHistoryRemove({
                         isTouchViewport: isTouchSearchHome,
@@ -2215,213 +2447,178 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
                           type="button"
                           onClick={() => forgetSearchQuery(historyQuery)}
                           className={searchHistoryEditing
-                            ? "mr-1 flex size-5 shrink-0 items-center justify-center text-black/45 transition-colors hover:bg-black/10 hover:text-black/70 focus-visible:outline focus-visible:outline-1 focus-visible:outline-black/50"
-                            : "pointer-events-none mr-1 flex size-5 shrink-0 items-center justify-center text-black/30 opacity-0 transition-colors transition-opacity group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:bg-black/10 hover:text-black/70 focus:pointer-events-auto focus:opacity-100 focus-visible:outline focus-visible:outline-1 focus-visible:outline-black/50"}
+                            ? "relative z-10 -my-1 -mr-1 flex size-5.5 shrink-0 items-center justify-center rounded-sticker text-foreground-hint hover:bg-fill-pressed"
+                            : "pointer-events-none relative z-10 -my-1 -mr-1 flex size-5.5 shrink-0 items-center justify-center rounded-sticker text-foreground-hint opacity-0 hover:bg-fill-pressed group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 focus:pointer-events-auto focus:opacity-100"}
                           aria-label={formatMessage({ id: "search.removeHistory" }, { query: historyQuery })}
                         >
-                          <X size={12} />
+                          <X size={14} aria-hidden="true" />
                         </button>
                       ) : null}
-                    </div>
+                    </Badge>
                   ))}
                 </div>
               </section>
             ) : null}
 
             <section aria-labelledby="search-frequent-heading">
-              <SectionEyebrow as="div" className="mb-2 flex items-center gap-1.5 px-1">
-                <Star size={12} aria-hidden="true" />
+              <SearchResultsSectionHeading>
+                <Star size={14} aria-hidden="true" />
                 <span id="search-frequent-heading">{formatMessage({ id: "search.frequent" })}</span>
-              </SectionEyebrow>
+              </SearchResultsSectionHeading>
               {frequentSearchEntities.length > 0 ? (
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+                <SearchResultsList>
                   {frequentSearchEntities.map(renderSearchHomeEntity)}
-                </div>
+                </SearchResultsList>
               ) : (
-                <div className="border-2 border-dashed border-black/20 px-3 py-4 text-xs text-black/40">
+                <p className="px-4 py-2 text-callout text-foreground-hint">
                   {formatMessage({ id: "search.frequentEmpty" })}
-                </div>
+                </p>
               )}
             </section>
           </div>
         ))}
 
         {hasSearchIntent && (
-          <div className="p-4">
-            <div className="mb-3 px-1">
-              <SectionEyebrow>
+          <div>
+            {showAllResultsAction ? (
+              /* Overlay head (task #102, Slack): exact destination first when the
+                 query names one, then the "view all results" row. */
+              <SearchResultsList className="pt-2" data-testid="search-overlay-head">
+                {exactDestination ? renderEntityResultRow(exactDestination) : null}
+                <SearchEntityResult
+                  type="button"
+                  data-testid="search-view-all-results"
+                  data-active={selectedResultKey === OVERLAY_ALL_RESULTS_KEY ? "true" : undefined}
+                  selected={selectedResultKey === OVERLAY_ALL_RESULTS_KEY}
+                  onClick={openAllResults}
+                >
+                  <SearchEntityResultLeading>
+                    <SearchEntityResultIcon>
+                      <Search size={14} aria-hidden="true" />
+                    </SearchEntityResultIcon>
+                  </SearchEntityResultLeading>
+                  <SearchEntityResultContent>
+                    <SearchEntityResultHeader>
+                      <SearchEntityResultTitle>
+                        {query.trim()
+                          ? formatMessage({ id: "search.overlay.searchFor" }, { query: query.trim() })
+                          : formatMessage({ id: "search.overlay.viewAllResults" })}
+                      </SearchEntityResultTitle>
+                    </SearchEntityResultHeader>
+                    <SearchEntityResultDescription>
+                      {formatMessage({ id: "search.overlay.viewAllResultsHint" })}
+                    </SearchEntityResultDescription>
+                  </SearchEntityResultContent>
+                  <Kbd aria-hidden="true">{RETURN_KEY_GLYPH}</Kbd>
+                </SearchEntityResult>
+              </SearchResultsList>
+            ) : (
+              <SearchResultsSummary>
                 {loading ? formatMessage({ id: "search.searching" }) : formatMessage({ id: "search.resultsCount" }, { count: totalResults })}
-              </SectionEyebrow>
-            </div>
+              </SearchResultsSummary>
+            )}
 
             {!loading && totalResults === 0 && !searchError ? (
-              <div className="flex flex-col items-center justify-center py-20 text-center">
-                <Search size={48} className="mb-3 text-black/20" />
-                <p className="text-sm font-bold text-black/50">
-                  {query.trim() ? formatMessage({ id: "search.noResultsForQuery" }, { query: query.trim() }) : formatMessage({ id: "search.noMatchingMessages" })}
-                </p>
-                <p className="mt-1 text-xs text-black/40">
-                  {query.trim() ? formatMessage({ id: "search.tryDifferentKeywords" }) : formatMessage({ id: "search.tryDifferentFilters" })}
-                </p>
-              </div>
+              /* DS EmptyState: say why it is empty and how to widen the search;
+                 at most one ink-bordered small button. */
+              <AppEmptyState
+                className="py-16"
+                icon={<Search size={36} aria-hidden="true" />}
+                title={searchIncomplete
+                  ? formatMessage({ id: "search.incompleteNoMatchesYet" })
+                  : query.trim() ? formatMessage({ id: "search.noResultsForQuery" }, { query: query.trim() }) : formatMessage({ id: "search.noMatchingMessages" })}
+                description={searchIncomplete
+                  ? incompleteSearchNote
+                  : query.trim() ? formatMessage({ id: "search.tryDifferentKeywords" }) : formatMessage({ id: "search.tryDifferentFilters" })}
+                action={searchIncomplete ? (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={loadMoreResults}
+                    disabled={loadingMore}
+                  >
+                    {loadingMore ? formatMessage({ id: "common.loading" }) : formatMessage({ id: "search.continueSearching" })}
+                  </Button>
+                ) : undefined}
+              />
             ) : (
               <>
-                {entityResults.length > 0 && (
-                  <div className="mb-3">
-                    <div className="px-1 py-2 text-[10px] font-mono font-bold uppercase tracking-[0.2em] text-black/50">
+                {remainingEntityResults.length > 0 && (
+                  <SearchResultsSection>
+                    <SearchResultsSectionHeading>
                       {formatMessage({ id: "search.serverEntities" })}
-                    </div>
-                    <div className="flex flex-col gap-2">
-                      {entityResults.map((result) => {
-                        const channelPinnedRef = result.type === "channel" && result.channelId
-                          ? { kind: "channel", id: result.channelId } as const
-                          : null;
-                        const isArchivedChannelResult = result.type === "channel" && !!result.archivedAt;
-                        const hasOpenChannelContextMenu = channelPinnedRef !== null
-                          && channelContextMenu?.result.channelId === channelPinnedRef.id;
-                        return (
-                          <div
-                            key={result.key}
-                            data-testid={channelPinnedRef ? `search-channel-result-${channelPinnedRef.id}` : undefined}
-                            onContextMenu={
-                              channelPinnedRef && !result.archivedAt
-                                ? (event) => handleChannelResultContextMenu(event, result)
-                                : undefined
-                            }
-                            className={`flex w-full items-stretch border-2 bg-white text-left transition-colors ${
-                              selectedResultKey === result.key
-                                || hasOpenChannelContextMenu
-                                ? "border-black shadow-brutal-sm"
-                                : "border-black/30 hover:border-black hover:shadow-brutal-sm active:border-black active:shadow-brutal-sm"
-                            }`}
-                          >
-                            <button
-                              type="button"
-                              draggable={!!onDragPanelRef}
-                              onDragStart={(event) => handleEntityResultDrag(event, result)}
-                              onClick={(event) => handleEntityResultClick(event, result)}
-                              className="min-w-0 flex-1 p-3 text-left"
-                            >
-                              <div className="flex items-center gap-3">
-                                <div className="relative flex shrink-0">
-                                  {result.type === "channel" ? (
-                                    <div
-                                      className={`flex size-8 items-center justify-center overflow-hidden border-2 ${
-                                        isArchivedChannelResult
-                                          ? ARCHIVED_CHANNEL_ICON_CLASS
-                                          : "border-black bg-soft-signal text-black"
-                                      }`}
-                                    >
-                                      <ChannelKindIcon type={result.channelType ?? "channel"} />
-                                    </div>
-                                  ) : result.type === "computer" ? (
-                                    <div className="flex size-8 items-center justify-center overflow-hidden border-2 border-black bg-brutal-lime">
-                                      <Monitor size={14} />
-                                    </div>
-                                  ) : result.type === "agentDm" ? (
-                                    result.agentId ? (
-                                      <AvatarSlot
-                                        context="surface-list"
-                                        type="agent"
-                                        agentAvatarUrl={agents.find((entry) => entry.id === result.agentId)?.avatarUrl ?? null}
-                                        badge={<AgentActivityDot agentId={result.agentId} />}
-                                      />
-                                    ) : (
-                                      <AvatarSlot context="surface-list" type="agent" agentAvatarUrl={null} />
-                                    )
-                                  ) : result.userId ? (
-                                    (() => {
-                                      const member = resolveUserMember(result.userId);
-                                      return (
-                                        <AvatarSlot
-                                          context="surface-list"
-                                          type="human"
-                                          humanAvatarUrl={member?.avatarUrl}
-                                          gravatarHash={member?.gravatarHash}
-                                        />
-                                      );
-                                    })()
-                                  ) : (
-                                    <AvatarSlot context="surface-list" type="human" humanPlaceholder />
-                                  )}
-                                </div>
-                                <div className="min-w-0 flex-1">
-                                  <div className="flex items-center gap-2">
-                                    <span className={`truncate text-sm font-bold ${isArchivedChannelResult ? ARCHIVED_CHANNEL_TEXT_CLASS : "text-black"}`}>
-                                      {result.title}
-                                    </span>
-                                    <span
-                                      className={
-                                        isArchivedChannelResult
-                                          ? `${ARCHIVED_CHANNEL_BADGE_CLASS} uppercase`
-                                          : "border border-black bg-white px-1 py-0.5 text-[9px] font-bold uppercase leading-none text-black/60"
-                                      }
-                                    >
-                                      {result.type === "channel" ? formatMessage({ id: "search.channel" }) : result.type === "computer" ? formatMessage({ id: "search.badgeComputer" }) : result.type === "agentDm" ? formatMessage({ id: "search.badgeAgent" }) : formatMessage({ id: "search.badgeHuman" })}
-                                    </span>
-                                    {result.archivedAt && (
-                                      <span className={`${isArchivedChannelResult ? ARCHIVED_CHANNEL_BADGE_CLASS : "border border-black bg-brutal-orange/30 px-1 py-0.5 text-[9px] font-bold leading-none text-black"} uppercase`}>
-                                        {formatMessage({ id: "search.archived" })}
-                                      </span>
-                                    )}
-                                  </div>
-                                  <div className={`truncate text-xs ${isArchivedChannelResult ? ARCHIVED_CHANNEL_MUTED_TEXT_CLASS : "text-black/50"}`}>
-                                    {formatEntitySubtitle(result.subtitle, formatMessage)}
-                                  </div>
-                                </div>
-                              </div>
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
+                      <span className="font-mono text-mono-meta font-normal">{remainingEntityResults.length}</span>
+                    </SearchResultsSectionHeading>
+                    <SearchResultsList
+                      ref={entityResultsListRef}
+                      data-testid="search-entity-results"
+                      className={ENTITY_RESULTS_SCROLL_CLASS}
+                    >
+                      {remainingEntityResults.map((result) => renderEntityResultRow(result))}
+                    </SearchResultsList>
+                  </SearchResultsSection>
                 )}
 
-                <div>
+                <SearchResultsSection>
                   {((loading && !searchError) || groupedMessageResults.length > 0) && (
-                    <div className="px-1 py-2 text-[10px] font-mono font-bold uppercase tracking-[0.2em] text-black/50">
+                    <SearchResultsSectionHeading>
                       {formatMessage({ id: "search.messages" })}
-                    </div>
+                      {!loading && totalResults > 0 ? (
+                        <span className="font-mono text-mono-meta font-normal">{totalResults}</span>
+                      ) : null}
+                    </SearchResultsSectionHeading>
                   )}
                   {showInitialSkeleton ? (
                     <SearchSkeleton />
                   ) : searchError && totalResults === 0 ? (
-                    <div className="border-2 border-black bg-white p-4 shadow-brutal-sm">
-                      <div className="mb-2 text-sm font-bold text-black">
-                        {formatMessage({
-                          id: searchError === "query_too_broad"
-                            ? "search.queryTooBroad"
-                            : searchError === "search_timeout"
-                              ? "search.searchTimedOut"
-                              : "search.searchFailed",
-                        })}
-                      </div>
-                      <div className="mb-3 text-xs text-black/60">
-                        {formatMessage({
-                          id: searchError === "query_too_broad"
-                            ? "search.queryTooBroadBody"
-                            : searchError === "search_timeout"
-                              ? "search.searchTimedOutBody"
-                              : "search.searchFailedBody",
-                        })}
-                      </div>
-                      {searchError !== "query_too_broad" ? (
-                        <button
+                    <AppBanner
+                      intent="warning"
+                      live={false}
+                      withIcon
+                      className="mx-4"
+                      title={formatMessage({
+                        id: searchError === "query_too_broad"
+                          ? "search.queryTooBroad"
+                          : searchError === "search_timeout"
+                            ? "search.searchTimedOut"
+                            : "search.searchFailed",
+                      })}
+                      actions={searchError !== "query_too_broad" ? (
+                        <Button
                           type="button"
+                          variant="outline"
+                          size="sm"
                           onClick={retrySearch}
-                          className="btn-brutal-sm bg-white px-3 py-1.5 text-xs"
                         >
                           {formatMessage({ id: "search.retry" })}
-                        </button>
-                      ) : null}
-                    </div>
+                        </Button>
+                      ) : sort !== "recent" ? (
+                        // Recent sort is never rejected as too broad: one click reruns the same search newest first.
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={sortByRecent}
+                        >
+                          {formatMessage({ id: "search.queryTooBroadSortRecent" })}
+                        </Button>
+                      ) : undefined}
+                    >
+                      {formatMessage({
+                        id: searchError === "query_too_broad"
+                          ? "search.queryTooBroadBody"
+                          : searchError === "search_timeout"
+                            ? "search.searchTimedOutBody"
+                            : "search.searchFailedBody",
+                      })}
+                    </AppBanner>
                   ) : (
                     <SearchResultsBoundary
                       resetKey={boundaryKey}
                       onRetry={retrySearch}
                     >
-                      <div className="flex flex-col gap-2">
+                      <SearchResultsList>
                         {groupedMessageResults.map((group) => {
                           if (group.kind === "message") {
                             return renderMessageHit(group.result);
@@ -2429,72 +2626,76 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
 
                           const firstResult = group.results[0];
                           const sourceLabel = firstResult ? getSourceLabel(firstResult) : formatMessage({ id: "search.unknownSource" });
-                          // Group container participates in the same selected-state machine as
-                          // single hits — without this, every thread group renders as if active
-                          // because `border-2 border-black shadow-brutal-sm` matches the selected
-                          // single-hit treatment, breaking the "only one card looks active" rule.
                           const groupHasSelected = group.results.some((r) => selectedResultKey === `message:${r.id}`);
 
                           return (
-                            <div
+                            <SearchThreadResult
                               key={group.key}
-                              className={`overflow-hidden border-2 bg-white transition-colors ${
-                                groupHasSelected
-                                  ? "border-black shadow-brutal-sm"
-                                  : "border-black/30 hover:border-black hover:shadow-brutal-sm"
-                              }`}
+                              selected={groupHasSelected}
                             >
-                              <div className="border-b-2 border-black bg-[#ffeefb] px-3 py-2">
-                                <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] font-bold uppercase tracking-wide text-black/70">
-                                  <span className="inline-flex items-center gap-1 border border-black bg-white px-1.5 py-0.5">
-                                    <MessageSquare size={11} />
+                              <SearchThreadResultHeader>
+                                <div className="mb-0.5 flex min-w-0 flex-wrap items-center gap-1.5">
+                                  <Badge appearance="outline">
+                                    <ThreadIcon width={12} height={12} />
                                     {formatMessage({ id: "search.threadBadge" })}
-                                  </span>
-                                  <span className="normal-case">{sourceLabel}</span>
-                                  <span>{formatMessage({ id: "search.hitsCount" }, { count: group.hitCount })}</span>
-                                  <span className="font-mono normal-case text-black/50">{(() => {
+                                  </Badge>
+                                  <SearchThreadResultMeta>{sourceLabel}</SearchThreadResultMeta>
+                                  <span className="font-mono text-mono-meta text-foreground-hint">{formatMessage({ id: "search.hitsCount" }, { count: group.hitCount })}</span>
+                                  <SearchThreadResultTimestamp>{(() => {
                                     const parts = getSearchRelativeTimeParts(group.latestCreatedAt);
                                     return parts ? formatRelativeTimeParts(parts.value, parts.unit, intl.locale) : formatMessage({ id: "search.grpUnknownTime" });
-                                  })()}</span>
+                                  })()}</SearchThreadResultTimestamp>
                                 </div>
-                                <div className="text-sm font-bold text-black">{group.title || formatMessage({ id: "search.grpThreadDiscussion" })}</div>
-                              </div>
-                              <div className="flex flex-col [&>*:first-child]:border-t-0">
+                                <SearchThreadResultTitle>{group.title || formatMessage({ id: "search.grpThreadDiscussion" })}</SearchThreadResultTitle>
+                              </SearchThreadResultHeader>
+                              <SearchThreadResultMessages>
                                 {group.results.map((result) => renderMessageHit(result, true))}
-                              </div>
-                            </div>
+                              </SearchThreadResultMessages>
+                            </SearchThreadResult>
                           );
                         })}
-                      </div>
+                      </SearchResultsList>
                     </SearchResultsBoundary>
                   )}
-                </div>
+                </SearchResultsSection>
 
-                {hasMore && (
-                  <div className="flex justify-center py-4">
+                {(hasMore || searchIncomplete) && !activateResultsInChat && (
+                  <div className="flex flex-col items-center gap-2 px-4 py-4">
+                    {searchIncomplete && !loadMoreError && (
+                      <p className="text-center text-caption text-foreground-hint">{incompleteSearchNote}</p>
+                    )}
                     {loadMoreError ? (
-                      <div role="alert" className="flex items-center gap-3 border-2 border-black bg-white px-3 py-2 shadow-brutal-sm">
-                        <span className="text-xs font-bold text-black">
-                          {formatMessage({ id: "search.loadMoreFailed" })}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={loadMoreResults}
-                          className="btn-brutal-sm bg-white px-3 py-1 text-xs"
-                          disabled={loadingMore}
-                        >
-                          {loadingMore ? formatMessage({ id: "common.loading" }) : formatMessage({ id: "search.retry" })}
-                        </button>
-                      </div>
+                      <AppBanner
+                        intent="warning"
+                        role="alert"
+                        withIcon
+                        className="w-full"
+                        actions={(
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            onClick={loadMoreResults}
+                            disabled={loadingMore}
+                          >
+                            {loadingMore ? formatMessage({ id: "common.loading" }) : formatMessage({ id: "search.retry" })}
+                          </Button>
+                        )}
+                      >
+                        {formatMessage({ id: "search.loadMoreFailed" })}
+                      </AppBanner>
                     ) : (
-                      <button
+                      <Button
                         type="button"
+                        variant="outline"
+                        size="sm"
                         onClick={loadMoreResults}
-                        className="btn-brutal-sm bg-white px-4 py-1.5 text-xs"
                         disabled={loadingMore}
                       >
-                        {loadingMore ? formatMessage({ id: "common.loading" }) : formatMessage({ id: "search.loadMore" })}
-                      </button>
+                        {loadingMore
+                          ? formatMessage({ id: "common.loading" })
+                          : formatMessage({ id: searchIncomplete ? "search.continueSearching" : "search.loadMore" })}
+                      </Button>
                     )}
                   </div>
                 )}
@@ -2502,38 +2703,29 @@ export default function MessageSearchPage({ onOpenPanelRef, onDragPanelRef }: {
             )}
           </div>
         )}
-      </div>
+      </SearchShellViewport>
       {channelContextMenu && createPortal(
         <>
-          <DismissBackdrop onDismiss={() => setChannelContextMenu(null)} trapContextMenu />
-          <div
-            ref={(node) => node?.querySelector<HTMLButtonElement>("button")?.focus()}
+          <DismissBackdrop onDismiss={closeChannelContextMenu} trapContextMenu />
+          <ContextMenuPopup
+            ref={focusFirstMenuButton}
             role="menu"
             aria-label={formatMessage({ id: "search.channelMenuAria" }, { title: channelContextMenu.result.title })}
-            className="fixed z-50 card-brutal w-48 overflow-hidden select-none"
-            style={{ left: channelContextMenu.x, top: channelContextMenu.y }}
-            onMouseDown={(event) => event.stopPropagation()}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                event.preventDefault();
-                event.stopPropagation();
-                setChannelContextMenu(null);
-              }
-            }}
+            className="fixed z-50 w-48 select-none"
+            style={channelContextMenuStyle}
+            onMouseDown={stopMouseDownPropagation}
+            onKeyDown={handleChannelContextMenuKeyDown}
           >
             <MenuItem
               icon={<FolderOpen size={14} />}
-              onClick={() => {
-                openEntityResultFromDoubleClick(channelContextMenu.result);
-                setChannelContextMenu(null);
-              }}
+              onClick={openChannelFromContextMenu}
             >
               {formatMessage({ id: "search.open" })}
             </MenuItem>
-          </div>
+          </ContextMenuPopup>
         </>,
         document.body,
       )}
-    </div>
+    </SearchShellRoot>
   );
 }

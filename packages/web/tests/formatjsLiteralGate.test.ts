@@ -26,7 +26,6 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import test from "node:test";
 import {
   aggregateFindings,
   assertAcceptedOxlintStatus,
@@ -219,7 +218,7 @@ test("isIgnorableStructuralLiteral: keep protocol, B markers, prose, MessageId, 
     '"agent.scopes.group.action.label"',
     "@theme",
     "#E08585",
-    "bg-brutal-lavender/40",
+    "bg-palette-lavender/40",
     "`${formatMessage({ id: \"channel.edit.thisServer\" })} · ${email}`",
     "` · ${formatMessage({ id: \"channel.edit.thisServer\" })}`",
     "`${getAdminPrincipalLabel(principal, formatMessage)} · ${principal.email}`",
@@ -2269,8 +2268,8 @@ test("CLI exits 2 on forbidden formatjs disable directive before baseline compar
 });
 
 test("real corpus: structural, catalog-id, and template-glue filters remove audited keys only", () => {
-  // Applies the same predicate used before aggregate. Audited C-sub-batch was
-  // 72 space/punct/count keys; exact safe shapes must filter all 72.
+  // Applies the same predicate used before aggregate. Audited C-sub-batch is
+  // 71 space/punct/count keys; exact safe shapes must filter all 71.
   const baselinePath = resolve(WEB_ROOT, "scripts/i18n-literal-baseline.json");
   const current = collectCurrentFindings({
     root: WEB_ROOT,
@@ -2331,19 +2330,87 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
   // The Dev tools header intentionally removed its inline hyphen/space when
   // the environment and signed-in identity became separate rows, reducing
   // this audited structural total by two.
-  assert.equal(filteredKeys, 73, `audited structural key count; got ${filteredKeys}`);
+  // HandoffCreateFlow (formerly HandoffPanel) adds one structural `"-"` placeholder
+  // for absent cwd/model metadata — punctuation, not user copy.
+  // VerifiedOnRow (provider probe shadow UI) adds one structural `" "` spacer
+  // between the "Verified on" label and the Computer name in a chip —
+  // layout glue, not user copy.
+  // The RUI themed-surface migration (c9f42e5d2) removed one structural
+  // literal, so the merged tree audits one fewer than staging's 80.
+  // The wave-2 title→Tooltip migration deleted PaletteAuditPage's redundant
+  // `title="100%"` and `title={`${t}%`}` swatch duplicates (rule: title ==
+  // visible text), removing two more structural findings.
+  // B5's Textarea migration moved the pre-join counter/error markup onto RUI's
+  // TextareaCounter/Field shapes, retiring one structural literal with the old
+  // shell: 80 -> 76.
+  // Create Agent's "Start from" options (task #104, #8024) moved the handoff
+  // surface into HandoffCreateFlow.tsx and render the selected session's tool
+  // row as bare JSX text `{tool} · {cwd}` — the middot is a separator between
+  // two dynamic values, layout glue rather than user copy: 76 -> 77.
+  // Removing WikiPanel retires JSX structural keys ":", "·", "—", "→"
+  // (2, 4, 1, 1 hits respectively), lowering 77 keys to 73.
+  // Agent profile edits moved into per-field dialogs (task #672); the inline
+  // description editor's `{length}/{max}` counter and its "/" glue went with it:
+  // 73 -> 72. Splitting the agent's computer status and version into their own
+  // rows retired the "· " glue between them: 72 -> 71.
+  // Joint channel limits v0.3 (task #25) removed CreateJointChannelDialog's
+  // free-host paywall, and with it that file's only `{" "}` spacer: 71 -> 70.
+  // One extracted component per file (task #709) moved two rows out of files
+  // that keep a literal of the same kind: AgentDetailPanel's `=` (2 hits) is
+  // now split with EnvVarEntryRow, and SettingsPanel's `/` (6 hits) with
+  // PlanSectionContent. Keys are per file, so 70 -> 72; no literal was added
+  // and the hit total is unchanged.
+  // AnnouncementDialog replaces the paginated Modal, retiring its JSX
+  // `{pageIndex + 1} / {totalPages}` separator: 72 -> 71.
+  // MachineDetailPanel's workspace path left JSX for a helper (slock#9190),
+  // taking its `/` template glue with it: 71 -> 70.
+  // AttachmentMetaText moved out of MessageItem into its own module so the
+  // public read-only attachment list can reuse it; its `·` separator is now a
+  // key in that file as well. Keys are per file, so 70 -> 71; no literal was
+  // added and the hit total is unchanged.
+  // ActionCard's field rows moved out of JSX into useActionCardDetail (task
+  // #752, raft-ui MessageActionCard), dropping one audited key in
+  // ActionCard.tsx: 71 -> 70.
+  // RaftBench's overview has three audited per-file delimiter keys
+  // (RaftBenchPage's JSX space and middle dot, ManagerOverview's cost slash);
+  // TaskOverview and CostOverview are gone. The Raft Design System rewrite
+  // drops five structural keys (the inline replies' ` ›` chevron, the thread
+  // header's `—`, the channel overflow's `+` and the palette audit's `/` and
+  // `100` swatch labels) and adds three (the channel header's `·` and the
+  // thread header's `" "` and `" · "` subtitle glue). No business text is
+  // exempted.
+  assert.equal(filteredKeys, 71, `audited structural key count; got ${filteredKeys}`);
   assert.ok(filteredHits > 100, `hits must exceed prior 100; got ${filteredHits}`);
+  // HandoffCreateFlow's `· ${session.model}` suffix is dynamic metadata glue, the
+  // same shape as EditChannelDialog's `· ${…}` suffixes.
+  // VerifiedOnRow's chip title `` `${runtime} · ${model} · ${verifiedAt}` `` is
+  // the same dynamic-metadata glue shape: coordinates, not user copy.
+  // 18 -> 16 glue keys/hits (2026-09-16): the title= -> RUI Tooltip migration
+  // moved `${key}=${value}` (env-var reveal) and `${human.displayName || human.name}`
+  // (sidebar human row) from intrinsic-element title attributes into <Tooltip>
+  // content props — and formatjs/no-literal-string-in-jsx only flags intrinsic
+  // elements, the same intrinsic-only effect recorded above for RuntimeConfigFields.
+  // The literals remain in source; they simply leave the audited surface.
+  // 16 -> 15 (2026-09-16): the same migration DELETED HumanDetailPanel's redundant
+  // handle-span title `` `@${human.name}` `` (title == visible text); the surviving
+  // occurrence lives on the PanelHeader component prop, also outside the intrinsic
+  // surface.
+  // 15 -> 14 (2026-10-04): #8831 deleted the fresh-install upgrade block, and with it
+  // MachineDetailPanel's `` ` ${formatMessage(pinnedVersion)}` `` suffix glue.
+  // 14 -> 15 (2026-10-14): channelKindIcon's sr-only `` `${label}, ` `` (#9826): a
+  // translated sentence plus the comma that keeps it a separate spoken phrase
+  // before the channel name. Glue, not user copy.
   assert.equal(
     glueFilteredOut.length,
-    17,
+    15,
     `audited dynamic/translated template-glue key count; got ${JSON.stringify(glueFilteredOut)}`,
   );
   assert.equal(
     glueFilteredOut.reduce((n, e) => n + e.count, 0),
-    17,
+    15,
     "each audited glue key currently occurs once",
   );
-  // Structural drops 73 (including the two compatibility source paths);
+  // Structural drops 75 (including the two compatibility source paths);
   // catalog MessageIds drop N; template glue drops 17 (the compatibility
   // settings source repeats the existing channel-server suffix).
   const catalogIdDrops = rawAgg.length - filteredKeys - glueFilteredOut.length - current.length;
@@ -2353,19 +2420,25 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
     "collectCurrentFindings must drop structural, template-glue, and catalog MessageId keys",
   );
   // The retired AgentScopesPanel contributed 37 catalog keys.
-  assert.ok(catalogIdDrops >= 24, `catalog MessageId drops should stay >= 24; got ${catalogIdDrops}`);
+  // Removing settingsNavigation's "wiki.settings" entry lowers 24 to 23.
+  // Removing the Workspace grid layout deleted workspaceGridUrlState.ts and its
+  // 17 catalog-id keys, lowering 23 to 6.
+  assert.ok(catalogIdDrops >= 6, `catalog MessageId drops should stay >= 6; got ${catalogIdDrops}`);
   // Direction matters. Removing a literal lowers these numbers; that is the only
   // legitimate reason they move. RAISING them silences a failure instead of fixing
   // it — and the diff looks almost identical to a legitimate lowering, just with the
   // sign flipped. Treat any upward edit here as a red flag and demand the literal it
   // corresponds to. (Raised by @Bugen: the pins catch drift, not someone editing the
   // pin to make red go away.)
-  assert.equal(current.length, 153, `corpus keys after ellipsis/trim widen; got ${current.length}`);
-  assert.equal(
-    current.reduce((n, e) => n + e.count, 0),
-    182,
-    "corpus hits after ellipsis/trim widen",
-  );
+  // ReleaseNotesPanel's owner-managed strings moved into the message catalogs (143/171),
+  // and the wave-2 title→Tooltip migration removes the HumanDetailPanel handle-span
+  // protocol literal (redundant title deletion): 143 -> 142 keys / 171 -> 170 hits.
+  // The corpus-size totals that used to be pinned here (142 keys / 170 hits) are
+  // gone for the same reason as the baseline totals below: the compare.ok
+  // assertion above already requires `current` to match the baseline finding for
+  // finding, so the size of `current` is implied. Pinning it again only meant
+  // editing two more numbers whenever a literal was legitimately removed.
+  assert.ok(current.length > 0, "current corpus must not be empty");
 
   for (const entry of filteredOut) {
     assert.equal(
@@ -2389,8 +2462,14 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
   const formerGapFiltered = filteredOut.filter((e) => formerGapSources.has(e.source));
   assert.equal(
     formerGapFiltered.length,
-    14,
-    `expected 14 former-gap keys filtered; got ${JSON.stringify(formerGapFiltered)}`,
+    // WikiPanel's removed "→" was one former-gap key; #8831 removed the Sidebar
+    // row's "→ v{targetVersion}" arrow literal (2026-10-04): 13 -> 12.
+    // Task #709 moved one of AgentDetailPanel's two "=" into EnvVarEntryRow;
+    // keys are per file, so the same two hits are now two keys: 12 -> 13.
+    // The Raft Design System replies summary drops its `" ›"` chevron (the DS
+    // `rf-replies` block has none): 13 -> 12.
+    12,
+    `expected 13 former-gap keys filtered; got ${JSON.stringify(formerGapFiltered)}`,
   );
 
   // B examples + technical tokens remain; catalog MessageIds and safe glue are gone.
@@ -2400,7 +2479,6 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
   assert.ok(bySource((s) => s === "#").length >= 1, "B # must remain");
   assert.ok(bySource((s) => s === '"99+"').length >= 1, "B 99+ must remain");
   assert.ok(bySource((s) => s.includes("→ v")).length >= 1, "B → v must remain");
-  assert.ok(bySource((s) => s.includes("⌘W")).length >= 1, "B ⌘W must remain");
   assert.equal(
     bySource((s) => /^"[a-z]+(?:\.[a-zA-Z0-9_]+)+"$/.test(s)).length,
     0,
@@ -2412,7 +2490,7 @@ test("real corpus: structural, catalog-id, and template-glue filters remove audi
     "translated punctuation-only template glue must be filtered",
   );
   assert.ok(
-    bySource((s) => s === "@theme" || s === "#E08585" || s.includes("bg-brutal-lavender")).length >= 3,
+    bySource((s) => s === "@theme" || s === "file:line" || s === "packages/web/src/index.css").length >= 3,
     "technical-token research bucket must remain",
   );
 });
@@ -2451,7 +2529,7 @@ test("reactionSpriteManifest label debts are baselined, not suppressed by disabl
   );
 });
 
-test("PaletteAuditPage keeps exactly nine reviewed technical literals with reasons", () => {
+test("PaletteAuditPage keeps exactly three reviewed technical literals with reasons", () => {
   const baseline = JSON.parse(
     readFileSync(resolve(WEB_ROOT, "scripts/i18n-literal-baseline.json"), "utf8"),
   ) as Array<{
@@ -2464,14 +2542,8 @@ test("PaletteAuditPage keeps exactly nine reviewed technical literals with reaso
   assert.deepEqual(
     technical.map((entry) => entry.source).sort(),
     [
-      "#E08585",
       "@theme",
-      "MentionLink.tsx:27",
-      "bg-brutal-lavender/40",
-      "brutal-pink",
-      "brutal-red",
       "file:line",
-      "getActivityDotClass()",
       "packages/web/src/index.css",
     ].sort(),
   );
@@ -2490,8 +2562,8 @@ test("PaletteAuditPage keeps exactly nine reviewed technical literals with reaso
  * Recovery layer 3 completes messaging core, agent/onboarding, and workspace
  * localization. Flag-off compatibility adds two source-path instances of
  * already-reviewed protocol literals (99+ and #channel); debt/brand stay zero.
- * total = 153 keys / 182 hits (retired TaskItem/lightbox literals and Dev tools copy were removed;
- * 2026-09-08: InviteHumanDialog's email placeholder left with its move to raft-ui <Input>).
+ * ReleaseNotesPanel's eight owner-managed literals were retired into the
+ * message catalogs by the dynamic release-notes read-path cutover.
  */
 test("baseline disposition counts match reviewed exception decisions", () => {
   const baseline = JSON.parse(
@@ -2509,19 +2581,46 @@ test("baseline disposition counts match reviewed exception decisions", () => {
     brand: { keys: 0, hits: 0 },
     // 2026-08-19: the isolated flag-off member/settings surfaces repeat two
     // existing protocol literals under their own auditable source paths.
-    protocol: { keys: 72, hits: 89 },
+    // 2026-09-16: -1 key / -1 hit. Wave-2 title→Tooltip migration deleted the
+    // redundant `@${human.name}` handle-span title in HumanDetailPanel; the
+    // audited protocol literal left the baseline with it.
+    // 2026-10-04: -1 key / -1 hit. #8831 moved MachineDetailPanel's "(v" version marker
+    // into the catalogued "Upgrade to v{version}" label; its baseline entry was removed.
+    // 2026-10-10: -26 keys / -32 hits. Removing the Workspace grid layout deleted its
+    // panel-title protocol literals (#channel / @name / task #N) across MainLayout,
+    // Sidebar, member rows, MessageSearchPage and src/components/workspace.
+    // 2026-10-14: -2 hits. The Sidebar channel row's two "99+" caps moved out of
+    // JSX into one helper (thread-unread badge segments).
+    // 2026-10-15: -2 keys / -3 hits. ActionCard's `@` and `#` prefixes moved from JSX
+    // into template strings in useActionCardDetail (task #752).
+    // 2026-10-18: -1 hit. The Sidebar DM and pinned-agent rows draw through one
+    // SidebarPeerRowBody, so their two "99+" unread caps are one.
+    protocol: { keys: 40, hits: 46 },
     // 2026-08-24: -7 keys / -9 hits. RuntimeConfigFields' ten legacy inputs moved to
     // raft-ui <Input>; the jsx literal rule only sees intrinsic elements, so those
     // placeholders (sk-..., gateway URLs, claude) left the baseline entirely.
     // 2026-09-08: -1 key / -1 hit. InviteHumanDialog's email box moved to raft-ui
     // <Input> for per-row invite roles; the jsx literal rule only sees intrinsic
     // elements, so `name@company.com` left the baseline the same way.
-    code_example: { keys: 9, hits: 9 },
+    // 2026-10-08: -1 key / -1 hit. MachineDetailPanel's `~/.slock/agents/`
+    // workspace path moved out of JSX into a helper (slock#9190).
+    // 2026-10-18: -3 keys / -3 hits. PaletteAuditPage was rebuilt to audit the
+    // Raft DS tokens; its brutal-palette Notes section (and the quoted
+    // "destructive" / "CTA" / "@mentioned" asides in it) is gone.
+    code_example: { keys: 5, hits: 5 },
     user_data_example: { keys: 4, hits: 4 },
-    internal_dev: { keys: 29, hits: 29 },
+    // 2026-09-24: -4 keys / -4 hits. 11fc52292 removed the dormant PostHog
+    // integration, taking src/analytics/flagRegistry.ts ("Chat grid layout",
+    // "Sync-core messages", "Auto", "Feature flags") and two App.tsx entries.
+    // The baseline was pruned in that commit; only this count was missed.
+    // 2026-10-18: -1 key / -1 hit, and technical -6 / -6. The PaletteAuditPage
+    // Raft DS rebuild dropped the brutal-palette Notes section ("The …",
+    // getActivityDotClass(), MentionLink.tsx:27, bg-palette-lavender/40,
+    // brutal-pink, brutal-red, #E08585).
+    internal_dev: { keys: 24, hits: 24 },
     legacy: { keys: 22, hits: 34 },
-    technical: { keys: 9, hits: 9 },
-    owner_managed: { keys: 8, hits: 8 },
+    technical: { keys: 3, hits: 3 },
+    owner_managed: { keys: 0, hits: 0 },
   };
 
   const keysBy = new Map<string, number>();
@@ -2550,12 +2649,13 @@ test("baseline disposition counts match reviewed exception decisions", () => {
   // sign flipped. Treat any upward edit here as a red flag and demand the literal it
   // corresponds to. (Raised by @Bugen: the pins catch drift, not someone editing the
   // pin to make red go away.)
-  assert.equal(baseline.length, 153, "baseline key total");
-  assert.equal(
-    baseline.reduce((n, e) => n + e.count, 0),
-    182,
-    "baseline hit total",
-  );
+  // The totals that used to be pinned here (142 keys / 170 hits) are not asserted
+  // any more, and deliberately: `actual` above is derived from the same baseline
+  // and compared class-by-class against EXPECTED, so the totals are already
+  // implied by that comparison. Copying them added a second place to update and
+  // nothing else -- they drifted on every legitimate removal without catching
+  // anything the per-class comparison would not.
+  assert.ok(Object.keys(EXPECTED).length > 0, "disposition table must not be empty");
   assert.equal(keysBy.get("debt") ?? 0, 0, "debt keys must be zero");
   assert.equal(hitsBy.get("debt") ?? 0, 0, "debt hits must be zero");
   assert.equal(keysBy.get("brand") ?? 0, 0, "brand keys must be zero");
@@ -2567,31 +2667,17 @@ test("baseline disposition counts match reviewed exception decisions", () => {
   );
 
   const ownerManaged = baseline.filter((e) => e.classification === "owner_managed");
-  assert.equal(ownerManaged.length, 8, "exactly eight owner_managed entries");
-  assert.ok(
-    ownerManaged.every((e) => e.path === "src/components/settings/ReleaseNotesPanel.tsx"),
-    `all owner_managed entries must be ReleaseNotesPanel.tsx; got ${JSON.stringify(ownerManaged)}`,
-  );
-  assert.ok(
-    ownerManaged.every((e) => /\bEric\b/.test(e.reason ?? "")),
-    `all owner_managed reasons must cite Eric ownership; got ${JSON.stringify(ownerManaged.map((e) => e.reason))}`,
-  );
+  assert.equal(ownerManaged.length, 0, "owner-managed literal debt must stay retired");
 
   const technical = baseline.filter((e) => e.classification === "technical");
   assert.deepEqual(
     technical.map((e) => e.source).sort(),
     [
-      "#E08585",
       "@theme",
-      "MentionLink.tsx:27",
-      "bg-brutal-lavender/40",
-      "brutal-pink",
-      "brutal-red",
       "file:line",
-      "getActivityDotClass()",
       "packages/web/src/index.css",
     ].sort(),
-    "technical must be exactly the approved nine PaletteAudit identifiers",
+    "technical must be exactly the approved three PaletteAudit identifiers",
   );
   assert.ok(
     technical.every((e) => e.path === "src/pages/PaletteAuditPage.tsx"),
@@ -2703,20 +2789,7 @@ test("baseline disposition identities pin reviewed edge-case classifications", (
   const releaseNotes = baseline.filter(
     (e) => e.path === "src/components/settings/ReleaseNotesPanel.tsx",
   );
-  assert.equal(releaseNotes.length, 8, "ReleaseNotesPanel must have exactly eight baseline entries");
-  assert.ok(
-    releaseNotes.every((e) => e.classification === "owner_managed"),
-    `all ReleaseNotesPanel entries must be owner_managed; got ${JSON.stringify(releaseNotes)}`,
-  );
-  assert.ok(
-    releaseNotes.every((e) => /\bEric\b/.test(e.reason ?? "")),
-    `ReleaseNotesPanel owner_managed reasons must cite Eric; got ${JSON.stringify(releaseNotes.map((e) => e.reason))}`,
-  );
-  assert.equal(
-    baseline.filter((e) => e.classification === "owner_managed").length,
-    releaseNotes.length,
-    "owner_managed must be exactly the ReleaseNotesPanel set",
-  );
+  assert.equal(releaseNotes.length, 0, "ReleaseNotesPanel must remain fully localized");
 
   assert.equal(
     classificationOf("src/pages/PaletteAuditPage.tsx", "quoted message contents"),
@@ -2736,14 +2809,8 @@ test("baseline disposition identities pin reviewed edge-case classifications", (
   assert.deepEqual(
     technical,
     [
-      "#E08585",
       "@theme",
-      "MentionLink.tsx:27",
-      "bg-brutal-lavender/40",
-      "brutal-pink",
-      "brutal-red",
       "file:line",
-      "getActivityDotClass()",
       "packages/web/src/index.css",
     ].sort(),
   );

@@ -1,12 +1,13 @@
-import { createApiTest } from "../test/integration/apiTest.js";
+import { createApiTest } from "../test/integration/apiTest";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { eq } from "drizzle-orm";
 
-import { getDb } from "../db/index.js";
-import { managedMcpServers, users } from "../db/schema.js";
-import { createAgent } from "../services/agentService.js";
-import { mintAgentCredential } from "../services/agentCredentialService.js";
-import { createServer } from "../services/serverService.js";
+import { getDb } from "../db/index";
+import { managedMcpServers, users } from "../db/schema";
+import { createAgent } from "../services/agentService";
+import { mintAgentCredential } from "../services/agentCredentialService";
+import { createServer } from "../services/serverService";
 
 const test = createApiTest({ humanActivityMuteFlagDefaultEnabled: true, onboardingOpenerFlagDefaultEnabled: false });
 
@@ -67,4 +68,35 @@ test("agent-api managed MCP snapshot is credential-bound and capability-gated", 
     body: JSON.stringify({ mcpServerId: "not-a-uuid", toolName: "search", arguments: {} }),
   });
   assert.equal(invalidCall.status, 400);
+});
+
+test("agent-api managed MCP: a disconnected connector is listed as unavailable, and a stale call reads as an agent can act on", async ({ app }) => {
+  const fixture = await seed();
+  const headers = { Authorization: `Bearer ${fixture.mcpKey}`, "X-Slock-Agent-Active-Capabilities": "mcp", "Content-Type": "application/json" };
+  const [docs] = await getDb().select().from(managedMcpServers).where(eq(managedMcpServers.id, fixture.mcpServerId));
+  const [notion] = await getDb().insert(managedMcpServers).values({
+    serverId: docs!.serverId,
+    name: "Notion",
+    provider: "notion",
+    authMode: "oauth",
+    oauthStatus: "error",
+    endpointUrl: "https://mcp.notion.com/mcp",
+    toolCatalog: [{ name: "search", inputSchema: { type: "object" } }],
+    catalogVersion: 1,
+  }).returning();
+
+  const tools = await fetch(`${app.baseUrl}/internal/agent-api/mcp/tools`, { headers });
+  assert.equal(tools.status, 200);
+  const body = await tools.json() as { tools: Array<{ serverName: string }>; unavailable?: unknown };
+  assert.deepEqual(body.tools.map((t) => t.serverName), ["Docs"], "the disconnected connector contributes no tools");
+  assert.deepEqual(body.unavailable, [{ mcpServerId: notion!.id, serverName: "Notion", status: "reconnect_required" }], "survives response validation");
+
+  const stale = await fetch(`${app.baseUrl}/internal/agent-api/mcp/call`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ mcpServerId: fixture.mcpServerId, toolName: "search", arguments: {}, expectedConfigVersion: 999, expectedAssignmentVersion: 1 }),
+  });
+  assert.equal(stale.status, 409);
+  const staleText = "\"search\" is no longer offered by \"Docs\"; don't call it again. If you still need it, tell the person who asked.";
+  assert.deepEqual(await stale.json(), { code: "managed_mcp_config_stale", error: staleText, suggestedNextAction: staleText }, "raft-sdk shows suggestedNextAction");
 });

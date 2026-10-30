@@ -9,7 +9,7 @@ import type { InboxScopeReadFrontier } from "@botiverse/raft-shared";
 // braces, not the load-bearing part — it keeps the startup path's dependency
 // explicit so a future heavy addition to the barrel cannot quietly re-enter
 // this closure.
-import { isUInt64String } from "@botiverse/raft-sync-core/src/uint64.js";
+import { isUInt64String } from "@botiverse/raft-sync-core/src/uint64";
 import { registerServerReset } from "./serverResetRegistry";
 
 // #632 C0 — read-state ingress FAILURE OBSERVABILITY. Deliberately nothing more.
@@ -104,6 +104,8 @@ export type ReadStateUpdate = {
   scopeId: string;
   maxReadSeq: number;
   readStateVersion: number;
+  /** Unread left after the read, when the server computed it (older servers omit it). */
+  unreadCount?: number;
 };
 
 export type ReadStateApplyResult = "accepted" | "stale";
@@ -167,7 +169,11 @@ function normalizeReadStateScope(payload: unknown): ReadStateScope | null {
   if (!isNonNegativeSafeInteger(readStateVersion)) {
     return reportReadStateIngressCorrupt("readStateVersion", "read_state_version_invalid");
   }
-  return { scopeId, maxReadSeq, readStateVersion };
+  // Optional hint: a malformed count is dropped, never the read fact it rides on.
+  const { unreadCount } = payload as Record<string, unknown>;
+  return isNonNegativeSafeInteger(unreadCount)
+    ? { scopeId, maxReadSeq, readStateVersion, unreadCount }
+    : { scopeId, maxReadSeq, readStateVersion };
 }
 
 export function normalizeReadStateUpdated(payload: unknown): ReadStateUpdate | null {

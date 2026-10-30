@@ -1,0 +1,1 @@
+ALTER TABLE "daemons" ADD COLUMN "first_connected_at" timestamp with time zone;

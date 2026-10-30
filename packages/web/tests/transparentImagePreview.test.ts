@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
-import { imageGalleryBackgroundClass, transparentImageBackgroundClass } from "../src/utils/imagePreviewStyles.js";
+import { imageGalleryBackgroundClass, transparentImageBackgroundClass } from "../src/utils/imagePreviewStyles";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const srcRoot = resolve(repoRoot, "src");
@@ -44,14 +43,29 @@ test("image preview surfaces opt into the transparency background", () => {
 
 test("message gallery uses a quiet background instead of checkerboard", () => {
   const source = readSource("src/components/message/MessageItem.tsx");
+  // The gallery tile lives in its own file since task #709.
+  const gallerySource = readSource("src/components/message/GalleryImageItem.tsx");
   const css = readSource("src/index.css");
 
   assert.equal(imageGalleryBackgroundClass, "image-gallery-bg");
-  assert.match(source, /imageGalleryBackgroundClass/);
+  // MessageItem's gallery no longer paints the quiet background itself: it
+  // rides the shared raft-ui item layout (`[&_img]:bg-white`), so the local
+  // class must not come back here or in the extracted gallery tile.
+  assert.match(source, /layout=\{item\}/);
+  assert.match(gallerySource, /layout=\{layout\}/);
+  assert.doesNotMatch(source, /imageGalleryBackgroundClass/);
+  assert.doesNotMatch(gallerySource, /imageGalleryBackgroundClass/);
   assert.doesNotMatch(source, /transparentImageBackgroundClass/);
-  assert.match(source, /bg-brutal-cream\/60/);
+  assert.doesNotMatch(gallerySource, /transparentImageBackgroundClass/);
+  // The tile surface (DS media frame: hairline + sunken fill) is the recipe's.
+  assert.doesNotMatch(gallerySource, /bg-palette-cream/);
   assert.doesNotMatch(source, /border-2 border-black bg-transparent/);
-  assert.match(source, /const imageBackgroundClass = fitClass === "object-contain" \? imageGalleryBackgroundClass : "";/);
+  assert.doesNotMatch(gallerySource, /border-2 border-black bg-transparent/);
+  // The channel files surface still paints the class on its own image.
+  assert.match(
+    readSource("src/components/message/ChannelFileVisual.tsx"),
+    /imageGalleryBackgroundClass/,
+  );
   assert.match(css, /\.image-gallery-bg\s*\{[\s\S]*?background:\s*#fff;/);
 });
 

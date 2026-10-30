@@ -1,4 +1,3 @@
-import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parse, TYPE } from "@formatjs/icu-messageformat-parser";
 import type { MessageFormatElement } from "@formatjs/icu-messageformat-parser";
@@ -111,9 +110,52 @@ test("Activity and notification batch messages parse and keep placeholder parity
 
   // 88 after the current Activity sidebar added DM/channel, saved/done, and
   // header search/sort copy without reviving the retired Activity v2 message set.
+  // 90 after task #1116 added the two `activity.status.deliveryUnconsumed*`
+  // ids (typed "deliveries written, runtime not consuming" projection).
+  // 92 after task #1119 added the two `activity.status.wakeCrashLoopBlocked*`
+  // ids (automatic wake paused after consecutive early exits).
+  // 93 after task #1123 added `activity.status.modelNotFound` (typed
+  // spawn-failure reason: the configured model is not available).
+  // 91 after the standalone daemon release was retired: the two
+  // `layout.systemNotifications.machineOutdated*` ids went with the
+  // raw-daemon "outdated" notice (docs/operations/computer-release-version.md).
+  // 94 after task #641 added feedbackRepliesTitle/Body/View for the
+  // existing notification center.
+  // 95 after external-agent presence added `activity.status.lastActive`
+  // ("Last active {time}" for an external agent not seen in the last 2 min).
+  // 97 after joint channel limits v0.3 (task #25) added
+  // `layout.systemNotifications.jointOverLimitTitle` / `jointOverLimitLockedTitle`
+  // for the admin over-limit notice.
+  // 98 after RFC 071 (task #1223) added `activity.status.terminalFailurePaused`
+  // (automatic wake paused / needs manual start after a terminal runtime failure).
+  // 100 after the Computer low-disk warning added
+  // `layout.systemNotifications.machineDiskLowTitle` / `machineDiskLowBody`
+  // for the person who added the Computer.
+  // 101 after the start-failure pause added `activity.status.autoRestartPaused`
+  // (automatic restarts paused after a start failure, and how to lift it).
+  // 103 after the Activity DMs view (#wg-dms-view:5aaf5090) added
+  // `activity.current.emptyDms` / `emptyDmsDescription`.
+  // 104 after task #10 added `activity.status.sessionNeedsReset` (a session
+  // stuck on context compaction points to Reset Session).
+  // 107 after task #1284 added the usage-limit attention title/body/action
+  // messages to the existing notification center.
+  // 110 after RFC 075 phase 2 added `layout.systemNotifications.jointInvite*`
+  // (title/body/accept) for pending joint invites in the notification center.
+  // 169 after task #17 added the Activity Overview's 59 `activity.overview.*`
+  // ids (view toggle, turn header/outcome/actions/problems/reply, empty states).
+  // 170 after `activity.status.runtimeUnavailablePaused` (a start paused
+  // because the computer does not have the runtime says how to lift it).
+  // 175 after the Activity conversation list (#10066) added
+  // `activity.list.*` (mentionedYou, taskNumber, threadChannel, pinned,
+  // allConversations).
+  // 155 after the Activity sidebar inbox (activity_sidebar_inbox_v0) was
+  // retired: its 20 `activity.current.*` / `activity.channelFilter.*` ids for
+  // the Saved/DMs/Done views, source list, search and sort went with it.
+  // 154 after the Activity list dropped `activity.list.mentionedYou` for the
+  // sidebar's @ sticker.
   // An intentional id removal/addition updates this count with the reason;
   // silent drift still goes red.
-  assert.equal(ids.length, 88, "current i18n batch should cover exactly the known 88 message ids");
+  assert.equal(ids.length, 154, "current i18n batch should cover exactly the known 154 message ids");
 
   for (const id of ids) {
     assert.deepEqual(

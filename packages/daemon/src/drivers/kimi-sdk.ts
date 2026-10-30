@@ -1,19 +1,67 @@
 import { randomUUID } from "node:crypto";
+import { ambientProcessEnv } from "../processEnvPatch";
 import { EventEmitter } from "node:events";
 import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
-import {
+import { homedir } from "node:os";
+import type {
   Session as KimiSession,
   createKimiHarness,
-  resolveKimiHome,
   LocalKaos,
-  type Event as KimiSdkEvent,
-  type GoalToolResult,
-  type KimiHarness,
+  Event as KimiSdkEvent,
+  GoalToolResult,
+  KimiHarness,
 } from "@botiverse/kimi-code-sdk";
 
+import {
+  RuntimeConfigInvalidError,
+  RuntimeLoginRequiredError,
+  RuntimeModelNotConfiguredError,
+} from "../spawnFailureErrors";
+
 const requireFromHere = createRequire(import.meta.url);
+
+type KimiSdk = typeof import("@botiverse/kimi-code-sdk");
+
+// The SDK is loaded on the first Kimi launch, not at daemon startup: importing
+// it builds ~8k zod schemas (~75 MB of heap) that every runner otherwise
+// carries whether or not any agent on the machine uses Kimi. Model detection
+// stays SDK-free (see resolveKimiHome below).
+let kimiSdk: KimiSdk | null = null;
+let kimiSdkLoading: Promise<KimiSdk> | null = null;
+
+export function loadKimiSdk(): Promise<KimiSdk> {
+  kimiSdkLoading ??= import("@botiverse/kimi-code-sdk").then((sdk) => (kimiSdk = sdk));
+  return kimiSdkLoading;
+}
+
+/**
+ * Load the SDK the way a Kimi launch does and check its entry point exists.
+ * The SEA build ships it as a separate asset (computer native build), so the
+ * release smoke runs this instead of waiting for a user's first Kimi agent.
+ */
+export async function verifyBundledKimiSdk(): Promise<void> {
+  const sdk = await loadKimiSdk();
+  if (typeof sdk.createKimiHarness !== "function" || typeof sdk.LocalKaos !== "function") {
+    throw new Error("bundled kimi SDK is missing createKimiHarness/LocalKaos");
+  }
+}
+
+/** A KimiError can only exist once the SDK has been loaded. */
+function isKimiError(error: unknown): error is import("@botiverse/kimi-code-sdk").KimiError {
+  return kimiSdk?.isKimiError(error) ?? false;
+}
+
+/**
+ * The SDK's `resolveKimiHome`, without loading the SDK: an explicit home, else
+ * `KIMI_CODE_HOME`, else `~/.kimi-code`. Model detection and session launch
+ * both use this one resolver so they cannot read different homes;
+ * kimi-sdk.test.ts pins it to the SDK's.
+ */
+export function resolveKimiHome(homeDir?: string): string {
+  return homeDir ?? process.env.KIMI_CODE_HOME ?? path.join(homedir(), ".kimi-code");
+}
 
 /**
  * Canonical `kimi-code-cli` UA product — the same product string upstream
@@ -63,8 +111,13 @@ import {
   type RuntimeModelSourceOutcome,
   type AxSurfaceText,
 } from "@botiverse/raft-shared";
-import { buildCliTransportSystemPrompt, prepareCliTransport, SLOCK_AGENT_LAUNCH_DIR_ENV, SLOCK_CLI_TRANSPORT_DIR_ENV } from "./cliTransport.js";
-import { prepareManagedMcpRuntimeProxy } from "../managedMcpRuntimeProxy.js";
+import { buildCliTransportSystemPrompt, prepareCliTransport, SLOCK_AGENT_LAUNCH_DIR_ENV, SLOCK_CLI_TRANSPORT_DIR_ENV, toolEnvFromSpawnEnv } from "./cliTransport";
+import { prepareManagedMcpRuntimeProxy } from "../managedMcpRuntimeProxy";
+import {
+  createKimiRequestDiagnosticSession,
+  type KimiRequestDiagnosticRecord,
+  type KimiRequestDiagnosticSession,
+} from "./kimiRequestDiagnostics";
 import type {
   ParsedEvent,
   RuntimeDriver,
@@ -76,7 +129,7 @@ import type {
   RuntimeSessionDescriptor,
   SpawnContext,
   SpawnResult,
-} from "./types.js";
+} from "./types";
 
 const KIMI_SESSION_DIR = ".kimi-sessions";
 
@@ -113,12 +166,97 @@ export type KimiSessionFactory = (ctx: SpawnContext, sessionId: string) => Promi
 export interface KimiSdkEventMappingState {
   sessionId: string | null;
   sessionAnnounced: boolean;
+  seenUsageSteps: Set<string>;
+  usageIdentityOmissionObserved: boolean;
 }
 
 export function createKimiSdkEventMappingState(sessionId: string | null = null): KimiSdkEventMappingState {
   return {
     sessionId,
     sessionAnnounced: false,
+    seenUsageSteps: new Set(),
+    usageIdentityOmissionObserved: false,
+  };
+}
+
+export function setKimiSdkEventMappingSession(
+  state: KimiSdkEventMappingState,
+  sessionId: string | null,
+): void {
+  if (state.sessionId === sessionId) return;
+  state.sessionId = sessionId;
+  state.sessionAnnounced = false;
+  state.seenUsageSteps.clear();
+  state.usageIdentityOmissionObserved = false;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function buildKimiStepUsageEvent(
+  event: Extract<KimiSdkEvent, { type: "turn.step.completed" }>,
+  state: KimiSdkEventMappingState,
+): Extract<ParsedEvent, { kind: "telemetry" }> | null {
+  if (!event.usage || typeof event.usage !== "object") return null;
+
+  const usage = event.usage as unknown as Record<string, unknown>;
+  const inputOther = finiteNumber(usage.inputOther);
+  const output = finiteNumber(usage.output);
+  const inputCacheRead = finiteNumber(usage.inputCacheRead);
+  const inputCacheCreation = finiteNumber(usage.inputCacheCreation);
+  const attrs: Record<string, number> = {};
+  if (inputOther !== undefined) attrs.input_tokens = inputOther;
+  if (output !== undefined) attrs.output_tokens = output;
+  if (inputCacheRead !== undefined) attrs.cached_read_tokens = inputCacheRead;
+  if (inputCacheCreation !== undefined) attrs.cache_write_tokens = inputCacheCreation;
+  if (Object.keys(attrs).length === 0) return null;
+  if (
+    inputOther !== undefined
+    && output !== undefined
+    && inputCacheRead !== undefined
+    && inputCacheCreation !== undefined
+  ) {
+    attrs.total_tokens = inputOther + output + inputCacheRead + inputCacheCreation;
+  }
+
+  // The live SDK path assigns one UUID to each loop step and preserves it on
+  // the public completion event. The fallback covers schema-valid/replayed
+  // events that omit stepId. Mark a step only after usable usage is observed,
+  // so an earlier completion with absent usage cannot suppress a later report.
+  const stepIdentity = typeof event.stepId === "string" && event.stepId.length > 0
+    ? `step:${event.stepId}`
+    : Number.isFinite(event.turnId) && Number.isFinite(event.step)
+      ? `turn:${event.turnId}:step:${event.step}`
+      : null;
+  if (!stepIdentity) {
+    if (state.usageIdentityOmissionObserved) return null;
+    state.usageIdentityOmissionObserved = true;
+    return {
+      kind: "telemetry",
+      name: "usage_omission",
+      source: "kimi_turn_step_completed_usage",
+      sessionId: state.sessionId || undefined,
+      ...(Number.isFinite(event.turnId) ? { turnId: String(event.turnId) } : {}),
+      attrs: {
+        omission_reason: "missing_usage_identity",
+        event_type: "turn.step.completed",
+      },
+    };
+  }
+  if (state.seenUsageSteps.has(stepIdentity)) return null;
+  state.seenUsageSteps.add(stepIdentity);
+
+  const sessionId = state.sessionId ?? event.sessionId;
+  return {
+    kind: "telemetry",
+    name: "token_usage",
+    source: "kimi_turn_step_completed_usage",
+    usageKind: "per_generation",
+    sessionId: sessionId || undefined,
+    turnId: String(event.turnId),
+    runtimeResultId: sessionId ? `${sessionId}:${stepIdentity}` : stepIdentity,
+    attrs,
   };
 }
 
@@ -173,6 +311,19 @@ function pushSessionInitIfNeeded(state: KimiSdkEventMappingState, events: Parsed
  * The single turn-triggering source class is `turn.ended` → daemon idle ONLY
  * derives from this. Other events MUST NOT produce `kind: "turn_end"`.
  */
+/**
+ * Kimi's Bash tool reports a command that exited non-zero as an error result
+ * ("Command failed with exit code: N."): the command ran, so the tool call is
+ * ok and the exit code is recorded. `isError` is optional in the SDK; when it
+ * is absent the outcome is unknown and left out.
+ */
+export function kimiToolResultOutcome(event: { isError?: boolean; output?: unknown }): { ok?: boolean; exitCode?: number } {
+  if (event.isError !== true) return event.isError === false ? { ok: true } : {};
+  const text = typeof event.output === "string" ? event.output : JSON.stringify(event.output ?? "").slice(0, 4096);
+  const exit = /Command failed with exit code: (\d+)/.exec(text);
+  return exit ? { ok: true, exitCode: Number(exit[1]) } : { ok: false };
+}
+
 export function mapKimiSdkEventToParsedEvents(
   event: KimiSdkEvent,
   state: KimiSdkEventMappingState,
@@ -197,10 +348,16 @@ export function mapKimiSdkEventToParsedEvents(
         kind: "tool_call",
         name: event.name || "unknown_tool",
         input: event.args ?? {},
+        ...(event.toolCallId ? { callId: event.toolCallId } : {}),
       });
       return events;
     case "tool.result":
-      events.push({ kind: "tool_output", name: "" });
+      events.push({
+        kind: "tool_output",
+        name: "",
+        ...(event.toolCallId ? { callId: event.toolCallId } : {}),
+        ...kimiToolResultOutcome(event),
+      });
       return events;
     case "compaction.started":
       events.push({ kind: "compaction_started" });
@@ -217,6 +374,12 @@ export function mapKimiSdkEventToParsedEvents(
       events.push({ kind: "turn_end", sessionId: state.sessionId || undefined });
       return events;
 
+    case "turn.step.completed": {
+      const usage = buildKimiStepUsageEvent(event, state);
+      if (usage) events.push(usage);
+      return events;
+    }
+
     // ── explicit drops (RS-004) ──
     // `warning` is non-fatal in the SDK's vocabulary; mapping it to
     // ParsedEvent.kind="error" would latch the agent into APM's error state
@@ -227,7 +390,6 @@ export function mapKimiSdkEventToParsedEvents(
     // turn / step lifecycle (state-only, no parsed payload)
     case "turn.started":
     case "turn.step.started":
-    case "turn.step.completed":
     case "turn.step.retrying":
     case "turn.step.interrupted":
     // tool-call progress / hooks (could elevate to internal_progress in future)
@@ -343,7 +505,8 @@ export async function createKimiAgentSessionForContext(
   sessionId: string,
   deps: KimiSessionFactoryDeps = {},
 ): Promise<{ harness: KimiHarness; session: KimiSession; wrapperPath: string }> {
-  const createHarnessImpl = deps.createHarness ?? createKimiHarness;
+  const sdk = deps.createHarness && deps.createLocalKaos ? null : await loadKimiSdk();
+  const createHarnessImpl = deps.createHarness ?? sdk!.createKimiHarness;
   const prepareTransportImpl = deps.prepareTransport ?? prepareCliTransport;
   const sessionDir = buildKimiSessionDir(ctx.workingDirectory);
   mkdirSync(sessionDir, { recursive: true });
@@ -364,9 +527,19 @@ export async function createKimiAgentSessionForContext(
   // stale credential/proxy env is read. Build a tool Kaos that overlays the
   // per-session env; keep persistence on a plain LocalKaos so session files and
   // credentials stay local to the daemon host.
-  const localKaos = await (deps.createLocalKaos ?? LocalKaos.create)();
+  // The Kaos env layers over the daemon's own process.env, so overlay the
+  // whole spawn env the transport computed for this agent (identity, runtime
+  // context, agent-configured env) and unset what it removed — what a
+  // child-process runtime gets. Without it, tools that read SLOCK_AGENT_ID /
+  // SLOCK_SERVER_URL / RAFT_CURRENT_* directly (not through the `raft`
+  // wrapper) see no agent. Kaos types layers as strings; undefined values
+  // pass through to Node's spawn, which omits them.
+  const localKaos = await (deps.createLocalKaos ?? (() => sdk!.LocalKaos.create()))();
   const toolKaos = localKaos.withEnv({
-    PATH: `${slockDir}${path.delimiter}${process.env.PATH ?? ""}`,
+    ...(toolEnvFromSpawnEnv(spawnEnv) as Record<string, string>),
+    // Same PATH as the spawned-runtime env (wrapper dir + agent-configured or
+    // daemon PATH), not a fresh process.env.PATH that drops the agent's own.
+    PATH: spawnEnv.PATH ?? `${slockDir}${path.delimiter}${process.env.PATH ?? ""}`,
     NO_COLOR: "1",
     SLOCK_HOME: slockHome,
     [SLOCK_AGENT_LAUNCH_DIR_ENV]: path.basename(slockDir),
@@ -374,10 +547,10 @@ export async function createKimiAgentSessionForContext(
   });
 
   // Kimi Code keeps config, OAuth credentials, and sessions under
-  // KIMI_CODE_HOME (default: ~/.kimi-code). Use the SDK resolver so model
-  // detection and session launch cannot silently read different homes. Pass
-  // the prepared per-agent override into the SDK's canonical resolver;
-  // per-agent env is not installed into the daemon process-wide environment.
+  // KIMI_CODE_HOME (default: ~/.kimi-code). Use the same resolver as model
+  // detection so the two cannot silently read different homes. Pass the
+  // prepared per-agent override into it; per-agent env is not installed into
+  // the daemon process-wide environment.
   const homeDir = resolveKimiHome(spawnEnv.KIMI_CODE_HOME);
   mkdirSync(homeDir, { recursive: true });
 
@@ -431,46 +604,103 @@ export async function createKimiAgentSessionForContext(
       },
     } : {}),
   };
+  // task #365: right before the SDK session is resumed or created. What ran
+  // before it is local preparation only (CLI transport files, LocalKaos, the
+  // harness object, the managed MCP proxy): no provider request and no tool
+  // execution. A stale launch throws here; the launch's proxies are released
+  // by the process manager's failed-start cleanup.
+  ctx.assertLaunchCurrent?.();
   let session: KimiSession;
-  if (ctx.config.sessionId) {
-    let resumed = false;
-    try {
-      session = await harness.resumeSession({ ...sessionFields, id: ctx.config.sessionId });
-      resumed = true;
-    } catch (resumeError) {
-      // Resume can fail if upstream's on-disk session file is gone (e.g.
-      // user wiped ~/.kimi-code/sessions/) or otherwise unreadable. Fall through
-      // to a fresh session — losing memory continuity is preferable to
-      // bricking the agent.
-      void resumeError;
+  try {
+    if (ctx.config.sessionId) {
+      let resumed = false;
+      try {
+        session = await harness.resumeSession({ ...sessionFields, id: ctx.config.sessionId });
+        resumed = true;
+      } catch (resumeError) {
+        // Only a missing or corrupted session file falls through to a fresh
+        // session (losing memory continuity beats bricking the agent). Every
+        // other failure (login, config, I/O, anything unknown) is not fixed by a
+        // fresh session and is surfaced instead of hidden (task #1221).
+        if (!isKimiError(resumeError) || !KIMI_RECOVERABLE_RESUME_CODES.has(resumeError.code)) {
+          throw typedKimiStartError(resumeError, selectedModel);
+        }
+        // task #365: the failed resume was an await; check again before the
+        // fresh session is created.
+        ctx.assertLaunchCurrent?.();
+        session = await harness.createSession({
+          ...sessionFields,
+          ...(selectedModel ? { model: selectedModel } : {}),
+          ...(launchRuntimeFields.reasoningEffort ? { thinking: launchRuntimeFields.reasoningEffort } : {}),
+        });
+      }
+      // Resume restores the persisted model/thinking profile. Re-apply the
+      // current Runtime Profile before the first resumed turn: `model` and
+      // `thinking` are not resume options, while the Session methods are the
+      // SDK's supported live reconfiguration surface. A failure here is not a
+      // missing session and must remain visible rather than falling back to a
+      // fresh create.
+      if (resumed) {
+        if (selectedModel) {
+          await session.setModel(selectedModel);
+        }
+        if (launchRuntimeFields.reasoningEffort) {
+          await session.setThinking(launchRuntimeFields.reasoningEffort);
+        }
+      } else if (selectedModel) {
+        // Fresh fallback: resolve the model now, as on the fresh path below.
+        await session.setModel(selectedModel);
+      }
+    } else {
       session = await harness.createSession({
         ...sessionFields,
         ...(selectedModel ? { model: selectedModel } : {}),
         ...(launchRuntimeFields.reasoningEffort ? { thinking: launchRuntimeFields.reasoningEffort } : {}),
       });
+      // createSession only records the model alias; the SDK resolves it against
+      // the local config on the first request. Resolve it now so a model that is
+      // not configured on this computer fails the start (typed, stops automatic
+      // relaunches) instead of failing every first turn (task #1221).
+      if (selectedModel) await session.setModel(selectedModel);
     }
-    // Resume restores the persisted model/thinking profile. Re-apply the
-    // current Runtime Profile before the first resumed turn: `model` and
-    // `thinking` are not resume options, while the Session methods are the
-    // SDK's supported live reconfiguration surface. A failure here is not a
-    // missing session and must remain visible rather than falling back to a
-    // fresh create.
-    if (resumed) {
-      if (selectedModel) {
-        await session.setModel(selectedModel);
-      }
-      if (launchRuntimeFields.reasoningEffort) {
-        await session.setThinking(launchRuntimeFields.reasoningEffort);
-      }
-    }
-  } else {
-    session = await harness.createSession({
-      ...sessionFields,
-      ...(selectedModel ? { model: selectedModel } : {}),
-      ...(launchRuntimeFields.reasoningEffort ? { thinking: launchRuntimeFields.reasoningEffort } : {}),
-    });
+  } catch (error) {
+    throw typedKimiStartError(error, selectedModel);
   }
   return { harness, session, wrapperPath };
+}
+
+/**
+ * Resume failures a fresh session recovers from: the SDK's session-file codes
+ * (@botiverse/kimi-code-sdk KIMI_ERROR_INFO): `session.not_found` (no such
+ * session), `session.state_not_found` ("session directory is corrupted or
+ * missing state.json"), `session.state_invalid` ("state.json is corrupted;
+ * remove the session or repair the file"). The agent continues on a new
+ * session; the old session files are left untouched (not deleted or repaired).
+ */
+const KIMI_RECOVERABLE_RESUME_CODES: ReadonlySet<string> = new Set([
+  "session.not_found",
+  "session.state_not_found",
+  "session.state_invalid",
+]);
+
+/**
+ * Map a Kimi SDK error to the daemon's typed start failure, so the reason
+ * reaches the server (and the user) instead of the generic
+ * runtime_spawn_failed. The SDK marks these codes non-retryable.
+ */
+export function typedKimiStartError(error: unknown, selectedModel: string | null): unknown {
+  if (!isKimiError(error)) return error;
+  const detailModel = typeof error.details?.model === "string" ? error.details.model : null;
+  if ((error.code === "config.invalid" && detailModel) || error.code === "model.not_configured" || error.code === "model.config_invalid") {
+    return Object.assign(new RuntimeModelNotConfiguredError({ runtimeId: "kimi-sdk", model: detailModel ?? selectedModel ?? "default" }), { cause: error });
+  }
+  if (error.code === "auth.login_required") {
+    return Object.assign(new RuntimeLoginRequiredError({ runtimeId: "kimi-sdk", message: error.message }), { cause: error });
+  }
+  if (error.code === "config.invalid") {
+    return Object.assign(new RuntimeConfigInvalidError({ runtimeId: "kimi-sdk", message: error.message }), { cause: error });
+  }
+  return error;
 }
 
 export class KimiSdkRuntimeSession implements RuntimeSession {
@@ -488,6 +718,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
   private sdkTurnActive = false;
   private goalRunActive = false;
   private pendingTurnEndSessionId: string | undefined;
+  private requestDiagnostics: KimiRequestDiagnosticSession | null = null;
   private nextTurnStartAttemptId = 1;
   private pendingTurnStartAttempt: PendingKimiTurnStartAttempt | undefined;
 
@@ -540,9 +771,11 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
     if (this.didClose) return { ok: false, reason: "closed" };
     this.started = true;
     const sessionId = input.sessionId || this.ctx.config.sessionId || randomUUID();
-    this.mappingState.sessionId = sessionId;
+    setKimiSdkEventMappingSession(this.mappingState, sessionId);
     this.setCurrentSessionId(sessionId);
 
+    // task #365: before the native runtime session is created.
+    this.ctx.assertLaunchCurrent?.();
     const { harness, session, wrapperPath } = await this.sessionFactory(
       {
         ...this.ctx,
@@ -556,8 +789,14 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
     this.harness = harness;
     this.session = session;
     this.wrapperPath = wrapperPath;
-    this.mappingState.sessionId = session.id;
+    setKimiSdkEventMappingSession(this.mappingState, session.id);
     this.setCurrentSessionId(session.id);
+    this.requestDiagnostics = createKimiRequestDiagnosticSession({
+      env: ambientProcessEnv(),
+      agentId: this.ctx.agentId,
+      sessionId: session.id,
+      emit: (record) => this.emitRequestDiagnostic(record),
+    });
     await this.seedGoalState(session);
     // Auto-approve tool-call permission requests (Kimi SDK gates bash and a
     // few other tools through `setApprovalHandler`; without a handler all
@@ -669,6 +908,7 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
   }
 
   private handleSdkEvent(event: KimiSdkEvent): void {
+    this.requestDiagnostics?.observeSdkEvent(event);
     if (event.type === "goal.updated") {
       this.updateGoalState({ goal: event.snapshot });
       return;
@@ -828,7 +1068,8 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
         return;
       }
       try {
-        void input.invoke()
+        const invocation = this.requestDiagnostics?.run(input.invoke) ?? input.invoke();
+        void invocation
           .then(
             () => {
               input.onSettled?.(true);
@@ -860,6 +1101,8 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
   }
 
   private async disposeSession(): Promise<void> {
+    this.requestDiagnostics?.close();
+    this.requestDiagnostics = null;
     const unsubscribe = this.unsubscribe;
     this.unsubscribe = null;
     try {
@@ -881,6 +1124,33 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
     } catch (error) {
       this.events.emit("stderr", kimiErrorMessage(error));
     }
+  }
+
+  private emitRequestDiagnostic(record: KimiRequestDiagnosticRecord): void {
+    this.events.emit("runtime_event", {
+      kind: "telemetry",
+      name: "request_diagnostic",
+      source: "kimi_request_diagnostic",
+      sessionId: this.mappingState.sessionId || undefined,
+      turnId: record.turnId,
+      attrs: {
+        diagnostic_kind: "kimi_request",
+        correlation_id: record.correlationId,
+        step: record.step,
+        outer_attempt: record.outerAttempt,
+        inner_attempt: record.innerAttempt,
+        outcome: record.outcome,
+        duration_ms: record.durationMs,
+        ...(record.startedAtMs === undefined ? {} : { started_at_ms: record.startedAtMs }),
+        ...(record.finishedAtMs === undefined ? {} : { finished_at_ms: record.finishedAtMs }),
+        ...(record.statusCode === undefined ? {} : { status_code: record.statusCode }),
+        ...(record.failedAttempt === undefined ? {} : { failed_attempt: record.failedAttempt }),
+        ...(record.nextAttempt === undefined ? {} : { next_attempt: record.nextAttempt }),
+        ...(record.maxAttempts === undefined ? {} : { max_attempts: record.maxAttempts }),
+        ...(record.retryDelayMs === undefined ? {} : { retry_delay_ms: record.retryDelayMs }),
+        ...(record.errorClass === undefined ? {} : { error_class: record.errorClass }),
+      },
+    } satisfies ParsedEvent);
   }
 
   private emitExitAndClose(code: number | null, signal: NodeJS.Signals | null): void {
@@ -912,10 +1182,10 @@ export class KimiSdkRuntimeSession implements RuntimeSession {
  * heavier (instantiates `KimiCore`, sets up RPC, allocates logs) for what is
  * a one-shot read; the TOML shape under `[models.<id>]` is stable across
  * upstream versions and all we need is `id` + optional `display_name`. Same
- * shape as `detectKimiModels(home)` in `kimi.ts`. `resolveKimiHome()` is the
- * SDK's exported helper so we honor `KIMI_CODE_HOME` env overrides
- * (default fallback `~/.kimi-code`; see `packages/agent-core/src/config/path.ts`
- * upstream).
+ * shape as `detectKimiModels(home)` in `kimi.ts`. `resolveKimiHome()` mirrors
+ * the SDK's helper (pinned by a test) so we honor `KIMI_CODE_HOME` env
+ * overrides (default fallback `~/.kimi-code`; see
+ * `packages/agent-core/src/config/path.ts` upstream) without loading the SDK.
  *
  * Tracing: when a `RuntimeModelDetectionContext` is passed through, we
  * record exactly one terminal event `daemon.kimi_sdk.models.config` on the
@@ -1053,6 +1323,8 @@ export class KimiSdkDriver implements RuntimeDriver {
    * composeStandingRoleAdditional + createKimiAgentSessionForContext.
    */
   readonly supportsNativeStandingPrompt = true;
+  /** task #13: resumeSession re-renders roleAdditional from this launch (measured on the SDK 0.34). */
+  readonly standingPromptRefreshesOnResume = true;
   readonly lifecycle = {
     kind: "persistent",
     stdin: "direct",

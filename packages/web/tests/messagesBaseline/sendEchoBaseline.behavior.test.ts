@@ -1,10 +1,9 @@
 import assert from "node:assert/strict";
-import test from "node:test";
-import { createMessageWindowHarness, flushAsyncWork } from "../messageWindowHarness.js";
-import { useMessageStore } from "../../src/store/messageStore.js";
-import type { Message } from "../../src/store/messageStore.js";
+import { createMessageWindowHarness, flushAsyncWork } from "../messageWindowHarness";
+import { useMessageStore } from "../../src/store/messageStore";
+import type { Message } from "../../src/store/messageStore";
 
-const SERIAL = { concurrency: false };
+const SERIAL = {};
 const CHANNEL_ID = "t4a-j1-send-echo";
 
 function persistedMessage(seq: number, overrides: Partial<Message> = {}): Message {
@@ -19,6 +18,19 @@ function persistedMessage(seq: number, overrides: Partial<Message> = {}): Messag
     content: `message ${seq}`,
     createdAt: new Date(Date.UTC(2026, 6, 10, 6, 0, seq)).toISOString(),
     ...overrides,
+  };
+}
+
+// The send body carries the browser's IANA zone; pin it so the assertion does
+// not depend on the machine running the test.
+function stubBrowserTimezone(timeZone: string): () => void {
+  const proto = Intl.DateTimeFormat.prototype;
+  const original = proto.resolvedOptions;
+  proto.resolvedOptions = function resolvedOptions(this: Intl.DateTimeFormat) {
+    return { ...original.call(this), timeZone };
+  };
+  return () => {
+    proto.resolvedOptions = original;
   };
 }
 
@@ -89,6 +101,7 @@ test("T4a-J1 baseline: REST echo and duplicate socket echo do not produce a seco
     randomId: "msg-1001",
     content: "draft body",
   });
+  const restoreTimezone = stubBrowserTimezone("Asia/Shanghai");
   try {
     harness.primeWindow(CHANNEL_ID, [persistedMessage(1), persistedMessage(2)], { lastSeq: 2 });
     useMessageStore.getState().addOptimisticMessage(optimisticMessage());
@@ -113,10 +126,12 @@ test("T4a-J1 baseline: REST echo and duplicate socket echo do not produce a seco
           asTask: undefined,
           randomId: "msg-1001",
           mentions: undefined,
+          timezone: "Asia/Shanghai",
         },
       },
     ]);
   } finally {
+    restoreTimezone();
     harness.restore();
   }
 });

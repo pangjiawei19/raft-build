@@ -14,7 +14,6 @@
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { relative, resolve } from "node:path";
-import test from "node:test";
 import { en as enMessages } from "../src/i18n/messages/en";
 
 const repoRoot = resolve(import.meta.dirname, "..");
@@ -54,7 +53,10 @@ test("Sidebar no longer carries the unreachable machine context-menu chain", () 
 test("logout and signed-in identity copy stay on the canonical wording", () => {
   const app = read("src/App.tsx");
   const emailVerification = read("src/components/auth/EmailVerificationPage.tsx");
-  const serverSelector = read("src/components/auth/ServerSelector.tsx");
+  const serverSelector = [
+    read("src/components/auth/ServerSelector.tsx"),
+    read("src/components/auth/ServerOptionCard.tsx"),
+  ].join("\n");
   const settings = read("src/components/settings/SettingsPanel.tsx");
 
   for (const [label, source] of Object.entries({ app, emailVerification, serverSelector, settings })) {
@@ -99,19 +101,19 @@ test("raw Modal usage is pinned so new hand-rolled confirmations cannot slip in"
   const expectedRawModalCounts: Record<string, number> = {
     // 2026-08-09, task #31: seven files LEFT this map by adopting DialogCard
     // (InviteHumanDialog, ReportIssueDialog, MachineDetailPanel, AddMembersDialog,
-    // CreateChannelDialog, CreateTaskDialog, WikiPanel, SOSDialog,
-    // CreateJointChannelDialog, RolePermissionHelpDialog — ten in total). Entries are deleted rather
+    // CreateChannelDialog, CreateTaskDialog, SOSDialog,
+    // CreateJointChannelDialog, RolePermissionHelpDialog — ten in total; the
+    // sidebar's SidebarSectionDialog followed in the Raft DS migration). Entries are deleted rather
     // than zeroed: this is a deepEqual against the real reading, so a stale entry
     // would quietly re-permit the count it used to allow. Lowering a ratchet is as
     // deliberate an act as raising one.
-    "src/components/AnnouncementModal.tsx": 1,
-    "src/components/ConfirmDialog.tsx": 1,
-    "src/components/agent/AgentDetailPanel.tsx": 2,
-    "src/components/agent/ChannelMembers.tsx": 2,
+    // task #677: ConfirmDialog left this map by migrating its frame to the rui
+    // Dialog family — confirmations are now design-system-owned end to end.
+    "src/components/agent/AgentDetailPanel.tsx": 1,
+    "src/components/agent/ChannelMembers.tsx": 1,
     // Flag-off compatibility keeps the pre-overflow member modal isolated so
     // disabling the rollout really returns to the old surface.
-    "src/components/agent/LegacyChannelMembers.tsx": 2,
-    "src/components/agent/CreateAgentDialog.tsx": 3,
+    "src/components/agent/CreateAgentDialog.tsx": 2,
     // task #187 overflow drawer: the unsaved name/description draft prompt needs
     // three actions (keep editing / discard / save and close); ordinary
     // destructive confirmations remain ConfirmDialog-owned.
@@ -119,16 +121,16 @@ test("raw Modal usage is pinned so new hand-rolled confirmations cannot slip in"
     // 5, not 4, since #4799 (embedded-WebView settings). Verified before bumping: none of
     // MainLayout's Modals is a confirmation — they wrap the thread panel, the legacy task
     // panel and workspace settings. The guard's PURPOSE (no hand-rolled confirmations) is
-    // intact; only its count drifted.
+    // intact; only its count drifted. Back to 4 since the Workspace grid layout and its
+    // settings Modal were removed.
     //
     // Worth noting how this broke. #4799 added the Modal at 17:43 and #4766 added this
     // baseline at 17:45, computed before #4799 landed. Both PRs were green alone and red
     // together, and staging has been red for everyone since — the same shape as tonight's
     // migration-number collisions. A baseline is a READING, and a reading can go stale while
     // you are looking away.
-    "src/components/layout/MainLayout.tsx": 5,
-    "src/components/layout/SidebarSectionDialog.tsx": 1,
-    "src/components/machine/AddMachineDialog.tsx": 1,
+    "src/components/layout/MainLayout.tsx": 4,
+    // AddMachineDialog left this map by adopting DialogCard (Raft DS Dialog).
     // ForwardComposerDialog left this map and ForwardComposerDesktop entered it:
     // the desktop forward surface split out of the dialog and took the raw Modal
     // with it. One entry out, one in — not a ratchet change, a rename of where
@@ -137,13 +139,18 @@ test("raw Modal usage is pinned so new hand-rolled confirmations cannot slip in"
     // The four mandatory setup steps in the browser flow (computer_runtime,
     // create_agent, survey, handoff) render as gate-owned Modals; the client
     // standalone page renders the same steps as page content instead.
-    "src/components/onboarding/ServerSetupProjectionGate.tsx": 4,
+    "src/components/onboarding/ServerSetupProjectionGate.tsx": 3,
+    // Desktop ⌘K search overlay: the real /search floated over the current channel
+    // in a Modal (backdrop primitive). Not a confirmation — a search surface.
+    "src/components/search/SearchOverlay.tsx": 1,
     "src/components/server/CommunityAgreementDialog.tsx": 1,
     // Product feedback is a routed Settings subpage. Its workspace and lazy
     // loading state intentionally use panel chrome rather than raw Modal.
-    // Connected Apps adds one installed-app detail Modal. It contains read-only
-    // state and ordinary commands; destructive uninstall remains ConfirmDialog-owned.
-    "src/components/settings/SettingsPanel.tsx": 4,
+    // Connected Apps keeps two non-destructive shells: app detail and
+    // offline-request handling. Registration / editing moved to raft-ui's
+    // wide Dialog (FormDialog); the retired built-in detail modal is gone;
+    // destructive uninstall remains ConfirmDialog-owned.
+    "src/components/settings/SettingsPanel.tsx": 2,
     // Ordinary Create Agent and Add/Edit MCP forms share this product dialog shell.
     "src/components/ui/DialogCard.tsx": 1,
     "src/components/task/LegacyTaskPanel.tsx": 1,

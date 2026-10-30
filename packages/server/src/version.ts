@@ -23,6 +23,7 @@ export function readServerVersion(moduleUrl: string = import.meta.url): string {
 export const SERVER_VERSION = readServerVersion();
 
 export type BuildIdentity = {
+  version: string;
   sha: string;
   builtAt: string;
   branch: string;
@@ -90,6 +91,7 @@ export function readBuildIdentityStatus(env: NodeJS.ProcessEnv = process.env): B
   return {
     ok: true,
     identity: {
+      version: SERVER_VERSION,
       sha: identity.sha.toLowerCase(),
       builtAt: identity.builtAt,
       branch: identity.branch,

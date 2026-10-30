@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { lazySchema } from "./lazySchema";
 
 export const AGENT_MIGRATION_STATES = [
   "provisioning",
@@ -16,17 +17,17 @@ export const AGENT_MIGRATION_STATES = [
   "failed",
 ] as const;
 
-export const agentMigrationSupportRefSchema = z.string().regex(/^mig_[A-Za-z0-9_-]{22}$/);
+export const agentMigrationSupportRefSchema = lazySchema("agentMigrationSupportRefSchema", () => z.string().regex(/^mig_[A-Za-z0-9_-]{22}$/));
 
 export const MAX_AGENT_MIGRATION_TRANSPORT_BYTES = 10 * 1024 * 1024 * 1024;
 export const MAX_AGENT_MIGRATION_TRANSFER_FILE_COUNT = 1_000_000;
 export const MAX_AGENT_MIGRATION_TRANSFER_BYTES = MAX_AGENT_MIGRATION_TRANSPORT_BYTES;
 export const MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT = 1_000_000;
 
-const boundedTransferCountSchema = z.number().int().nonnegative().max(MAX_AGENT_MIGRATION_TRANSFER_FILE_COUNT);
-const boundedExcludedCountSchema = z.number().int().nonnegative().max(MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT);
+const boundedTransferCountSchema = lazySchema("boundedTransferCountSchema", () => z.number().int().nonnegative().max(MAX_AGENT_MIGRATION_TRANSFER_FILE_COUNT));
+const boundedExcludedCountSchema = lazySchema("boundedExcludedCountSchema", () => z.number().int().nonnegative().max(MAX_AGENT_MIGRATION_EXCLUDED_REGENERABLE_COUNT));
 
-export const agentMigrationTransferSummarySchema = z.object({
+export const agentMigrationTransferSummarySchema = lazySchema("agentMigrationTransferSummarySchema", () => z.object({
   includedFileCount: boundedTransferCountSchema,
   includedBytes: z.number().int().nonnegative().max(MAX_AGENT_MIGRATION_TRANSFER_BYTES),
   excludedRegenerableCount: boundedExcludedCountSchema,
@@ -40,6 +41,16 @@ export const agentMigrationTransferSummarySchema = z.object({
     memoryMdPresent: z.boolean(),
     notesPresent: z.boolean(),
   }).strict(),
+  // Paths the agent listed in `.raftmigrateignore` (absent when none were).
+  excludedIgnored: z.object({
+    count: boundedExcludedCountSchema,
+    fileCount: boundedExcludedCountSchema,
+    bytes: z.number().int().nonnegative(),
+    largest: z.array(z.object({
+      path: z.string().min(1).max(4096),
+      bytes: z.number().int().nonnegative(),
+    }).strict()).max(5),
+  }).strict().optional(),
 }).strict().superRefine((summary, ctx) => {
   const categorized = Object.values(summary.excludedRegenerableByCategory)
     .reduce((total, count) => total + count, 0);
@@ -50,11 +61,65 @@ export const agentMigrationTransferSummarySchema = z.object({
       message: "excluded regenerable category counts must sum to excludedRegenerableCount",
     });
   }
-});
+}));
 
 export type AgentMigrationTransferSummary = z.infer<typeof agentMigrationTransferSummarySchema>;
 
-export const agentMigrationUpdatedPayloadSchema = z.object({
+export const AGENT_MIGRATION_SOURCE_BUILD_PHASES = ["scanning", "packing", "hashing"] as const;
+
+/** Bundle-build progress a source daemon reports between quiesce and control registration. */
+export const agentMigrationSourceBuildProgressReportSchema = lazySchema("agentMigrationSourceBuildProgressReportSchema", () => z.object({
+  migrationGeneration: z.string().min(1).max(512),
+  phase: z.enum(AGENT_MIGRATION_SOURCE_BUILD_PHASES),
+  files: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  bytes: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+}).strict());
+
+export type AgentMigrationSourceBuildProgress = {
+  phase: (typeof AGENT_MIGRATION_SOURCE_BUILD_PHASES)[number];
+  files: number;
+  bytes: number;
+  reportedAt: string;
+};
+
+/** Where a migration moves the agent: another Computer, or Raft hosted (antiproton). */
+export const AGENT_MIGRATION_TARGET_KINDS = ["computer", "hosted"] as const;
+export type AgentMigrationTargetKind = (typeof AGENT_MIGRATION_TARGET_KINDS)[number];
+
+/** antiproton `GET /provision/import-limits`, fixed on the migration at preflight. */
+export type AgentMigrationHostedImportLimits = {
+  maxTotalBytes: number;
+  maxFiles: number;
+  maxFileBytes: number;
+};
+
+export const AGENT_MIGRATION_HOSTED_SKIP_REASONS = [
+  "symlink",
+  "git",
+  "raft_state",
+  "path_rule",
+  "reserved",
+  "file_too_large",
+  "not_text",
+  "over_budget",
+  "provider_rejected",
+] as const;
+export type AgentMigrationHostedSkipReason = (typeof AGENT_MIGRATION_HOSTED_SKIP_REASONS)[number];
+
+/** What a hosted import brings over and what it leaves behind, shown before the switch and in the receipt. */
+export type AgentMigrationHostedImportSummary = {
+  importedFileCount: number;
+  importedBytes: number;
+  skipped: Array<{
+    reason: AgentMigrationHostedSkipReason;
+    count: number;
+    bytes: number;
+    /** The largest skipped paths for this reason, bounded. */
+    largestPaths: string[];
+  }>;
+};
+
+export const agentMigrationUpdatedPayloadSchema = lazySchema("agentMigrationUpdatedPayloadSchema", () => z.object({
   agentId: z.string().uuid(),
   migrationRef: agentMigrationSupportRefSchema,
   state: z.enum(AGENT_MIGRATION_STATES),
@@ -69,6 +134,6 @@ export const agentMigrationUpdatedPayloadSchema = z.object({
   targetOutcome: z.enum(["cleaned", "stopped"]).nullable(),
   canceledAt: z.string().datetime().nullable(),
   updatedAt: z.string().datetime(),
-}).strict();
+}).strict());
 
 export type AgentMigrationUpdatedPayload = z.infer<typeof agentMigrationUpdatedPayloadSchema>;

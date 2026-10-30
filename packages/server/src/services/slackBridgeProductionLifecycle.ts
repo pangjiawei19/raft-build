@@ -1,23 +1,36 @@
 import { randomUUID } from "node:crypto";
 
-import { currentDate } from "@botiverse/raft-shared";
+import { currentDate, type Tracer } from "@botiverse/raft-shared";
 import { and, desc, eq, inArray } from "drizzle-orm";
 
-import { getDb, type Database } from "../db/index.js";
+import { getDb, type Database } from "../db/index";
+import { getRedis, isRedisAvailable } from "../redis";
+import {
+  claimSlackMentionReconcile,
+  redisSlackMentionReconcileClaimStore,
+  type SlackMentionReconcileClaim,
+} from "./slackMentionReconcileClaim";
 import {
   externalAppCredentials,
   externalAppInstalls,
   externalBindingAudienceSnapshots,
   externalChannelBindings,
-} from "../db/schema.js";
+} from "../db/schema";
 import {
   createSlackPrivateAudienceRefresher,
   type SlackAudienceIdentityAuthority,
-} from "./slackAudienceRefreshService.js";
-import type { SlackBridgeProviderRuntime } from "./slackBridgeProviderRuntime.js";
-import { refreshSlackPublicConversationAuthority } from "./slackBridgeProvisioningControlPlane.js";
-import type { SlackBridgeAvatarMaterializer } from "./slackBridgeProvisioningControlPlane.js";
-import { refreshSlackBridgeInstallGrantReceipts } from "./slackBridgeInstallGrantService.js";
+} from "./slackAudienceRefreshService";
+import type { SlackBridgeProviderRuntime } from "./slackBridgeProviderRuntime";
+import { refreshSlackBindingPrivacy } from "./slackBindingPrivacyFreshnessService";
+import {
+  listSlackBridgeMentionCandidates,
+  slackBridgeMentionSyncState,
+  refreshSlackPublicConversationAuthority,
+} from "./slackBridgeProvisioningControlPlane";
+import type { SlackBridgeAvatarMaterializer } from "./slackBridgeProvisioningControlPlane";
+import { refreshSlackBridgeInstallGrantReceipts } from "./slackBridgeInstallGrantService";
+import { resolveExternalInstallServerGrantAuthority } from "./externalInstallServerGrantAuthority";
+import { SLACK_BRIDGE_AGENT_MENTION_BOT_SCOPES } from "./slackBridgeProductionAppContract";
 import {
   startSlackBridgePersistentWorker,
   type SlackBridgeAudienceRefreshReceipt,
@@ -28,12 +41,14 @@ import {
   type SlackBridgePersistentWorkerRunResult,
   type SlackBridgeProbeObservation,
   type SlackBridgeProbeRequest,
-} from "./slackBridgeWorkerLifecycle.js";
+} from "./slackBridgeWorkerLifecycle";
 
 const DEFAULT_INTERVAL_MS = 5 * 60_000;
 const DEFAULT_PROBE_FRESHNESS_MS = 10 * 60_000;
 const DEFAULT_MAX_PENDING_EVENTS = 1_000;
 const DEFAULT_MAX_OLDEST_EVENT_AGE_MS = 15 * 60_000;
+const AGENT_MENTION_RECONCILE_CLAIM_MS = 30_000;
+const AGENT_MENTION_RECONCILE_RENEW_MS = 10_000;
 
 export interface SlackBridgeProductionLifecycle {
   start(): void;
@@ -53,8 +68,38 @@ export interface SlackBridgeProductionLifecycleDependencies {
   maxPendingEvents?: number;
   maxOldestPendingEventAgeMs?: number;
   clock?: SlackBridgePersistentWorkerClock;
+  /**
+   * Claims one install's mention-usergroup reconcile across replicas. Every
+   * replica runs the lifecycle, so without a claim each one sends the same
+   * Slack usergroup writes at the same moment and trips Slack's rate limit.
+   */
+  claimAgentMentionReconcile?(
+    serverId: string,
+    installId: string,
+  ): Promise<SlackMentionReconcileClaim | null>;
   onReceipt?(receipt: SlackBridgeLifecycleExecutionReceipt): void;
   onError?(error: unknown): void;
+  tracer?: Tracer;
+}
+
+const UNCONTENDED_CLAIM: SlackMentionReconcileClaim = { held: async () => true, end: () => {} };
+
+function defaultClaimAgentMentionReconcile(
+  serverId: string,
+  installId: string,
+  owner: string,
+  onError?: (error: unknown) => void,
+): Promise<SlackMentionReconcileClaim | null> {
+  // No Redis: single replica / dev — just run.
+  if (!isRedisAvailable()) return Promise.resolve(UNCONTENDED_CLAIM);
+  return claimSlackMentionReconcile({
+    store: redisSlackMentionReconcileClaimStore(getRedis()),
+    key: `slock:slack-bridge:mention-reconcile:${serverId}:${installId}`,
+    token: owner,
+    ttlMs: AGENT_MENTION_RECONCILE_CLAIM_MS,
+    renewEveryMs: AGENT_MENTION_RECONCILE_RENEW_MS,
+    onError,
+  });
 }
 
 function validNow(value: Date): boolean {
@@ -95,8 +140,13 @@ export function createSlackBridgeProductionLifecycle(
   const intervalMs = dependencies.intervalMs ?? DEFAULT_INTERVAL_MS;
   const orchestratorId = dependencies.orchestratorId
     ?? `slack-bridge:${process.pid}:${randomUUID()}`;
+  const claimAgentMentionReconcile = dependencies.claimAgentMentionReconcile
+    ?? ((serverId: string, installId: string) => (
+      defaultClaimAgentMentionReconcile(serverId, installId, orchestratorId, dependencies.onError)
+    ));
   const latestAudience = new Map<string, SlackBridgeAudienceRefreshReceipt>();
   const bindingPrivacy = new Map<string, "public" | "private">();
+  const privacyRetryNotBeforeByInstall = new Map<string, number>();
   let worker: SlackBridgePersistentWorker | null = null;
   let stopped = false;
 
@@ -126,6 +176,140 @@ export function createSlackBridgeProductionLifecycle(
       // A provider or database failure never extends an old receipt. The
       // existing receipt expires on schedule and admission then fails closed.
       dependencies.onError?.(error);
+    }
+    // Privacy is independent from audience membership freshness. Refresh it
+    // before any worker consumes the stored classification; provider failure
+    // never extends the old deadline and the shared authority resolver then
+    // fails closed once that deadline expires.
+    const activeBindingIds = await db.select({
+      bindingId: externalChannelBindings.id,
+      installId: externalChannelBindings.installId,
+      serverId: externalChannelBindings.serverId,
+      registrationId: externalChannelBindings.registrationId,
+    })
+      .from(externalChannelBindings)
+      .where(eq(externalChannelBindings.state, "active"))
+      .orderBy(externalChannelBindings.installId, externalChannelBindings.id);
+    if (dependencies.provider.provisioningProvider.reconcileAgentMentionHandles) {
+      const scopes = new Set<string>(SLACK_BRIDGE_AGENT_MENTION_BOT_SCOPES);
+      const groups = new Map<string, (typeof activeBindingIds)[number]>();
+      for (const row of activeBindingIds) {
+        groups.set(`${row.serverId}:${row.installId}`, row);
+      }
+      for (const group of groups.values()) {
+        try {
+          const [install] = await db.select().from(externalAppInstalls).where(and(
+            eq(externalAppInstalls.id, group.installId),
+            eq(externalAppInstalls.registrationId, group.registrationId),
+            eq(externalAppInstalls.state, "active"),
+          )).limit(2);
+          if (
+            !install?.botUserId
+            || [...scopes].some((scope) => !install.installedScopes.includes(scope))
+          ) continue;
+          const grant = await resolveExternalInstallServerGrantAuthority(db, {
+            installId: group.installId,
+            serverId: group.serverId,
+            registrationId: group.registrationId,
+          });
+          if (!grant.current) continue;
+          const bindings = await db.select().from(externalChannelBindings).where(and(
+            eq(externalChannelBindings.serverId, group.serverId),
+            eq(externalChannelBindings.installId, group.installId),
+            eq(externalChannelBindings.state, "active"),
+          ));
+          const { candidates, humanCandidates } = await listSlackBridgeMentionCandidates(
+            db,
+            group.serverId,
+            bindings,
+          );
+          const claim = await claimAgentMentionReconcile(group.serverId, install.id);
+          if (!claim) continue;
+          let reconciled: Awaited<ReturnType<NonNullable<
+            typeof dependencies.provider.provisioningProvider.reconcileAgentMentionHandles
+          >>>;
+          try {
+            reconciled = await dependencies.provider.provisioningProvider
+              .reconcileAgentMentionHandles({
+                installId: install.id,
+                providerAppId: install.providerAppId,
+                providerAuthorityId: install.providerAuthorityId,
+                botUserId: install.botUserId,
+                connectionEpoch: install.connectionEpoch,
+                credentialRevision: install.credentialRevision,
+                now: observedAt,
+              }, {
+                serverId: group.serverId,
+                candidates,
+                humanCandidates,
+                isClaimHeld: claim.held,
+              });
+          } finally {
+            claim.end();
+          }
+          // Agent-mention usergroup sync is additive: a deterministic Slack
+          // rejection (workspace restricts usergroup management to admins,
+          // free plan, handle collisions) must never crash the lifecycle —
+          // bindings and message sync keep working, the persisted state just
+          // surfaces the recovery hint in settings until the next reconcile
+          // succeeds. Transport-level "unverified" does not rewrite state.
+          // Agents and humans count together; a principal that exhausted every
+          // handle candidate reports `name_taken` through `failures`.
+          const syncState = slackBridgeMentionSyncState({
+            reconciled,
+            candidates,
+            humanCandidates,
+            observedAt,
+          });
+          const prev = install.agentMentionSync;
+          const changed = syncState !== null && (
+            !prev
+            || prev.state !== syncState.state
+            || prev.slackError !== syncState.slackError
+            || prev.expected !== syncState.expected
+            || prev.actual !== syncState.actual
+          );
+          if (changed) {
+            await db.update(externalAppInstalls)
+              .set({ agentMentionSync: syncState })
+              .where(eq(externalAppInstalls.id, install.id));
+          }
+          if (syncState?.state === "degraded") {
+            console.warn("[SlackBridge] Agent mention reconciliation degraded", {
+              serverId: group.serverId,
+              installId: install.id,
+              slackError: syncState.slackError,
+              expected: syncState.expected,
+              actual: syncState.actual,
+              failures: reconciled.kind === "fact" ? reconciled.fact.failures : undefined,
+            });
+          }
+        } catch (error) {
+          dependencies.onError?.(error);
+        }
+      }
+    }
+    const activeInstallIds = new Set(activeBindingIds.map(({ installId }) => installId));
+    for (const installId of privacyRetryNotBeforeByInstall.keys()) {
+      if (!activeInstallIds.has(installId)) privacyRetryNotBeforeByInstall.delete(installId);
+    }
+    for (const { bindingId, installId } of activeBindingIds) {
+      if ((privacyRetryNotBeforeByInstall.get(installId) ?? 0) > nowMs) continue;
+      try {
+        const receipt = await refreshSlackBindingPrivacy({
+          bindingId,
+          provider: dependencies.provider,
+          db,
+          now: observedAt,
+        });
+        if (receipt.kind === "unavailable" && receipt.retryAfterMs !== undefined) {
+          privacyRetryNotBeforeByInstall.set(installId, nowMs + receipt.retryAfterMs);
+        } else {
+          privacyRetryNotBeforeByInstall.delete(installId);
+        }
+      } catch (error) {
+        dependencies.onError?.(error);
+      }
     }
     const rows = await db.select({
       bindingId: externalChannelBindings.id,
@@ -261,6 +445,7 @@ export function createSlackBridgeProductionLifecycle(
       dependencies.onReceipt?.(receipt);
     },
     onError: dependencies.onError,
+    tracer: dependencies.tracer,
   }, {
     orchestratorId,
     intervalMs,

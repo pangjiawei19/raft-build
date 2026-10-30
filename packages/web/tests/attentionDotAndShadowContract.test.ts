@@ -2,35 +2,37 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const read = (path: string) => readFileSync(resolve(repoRoot, path), "utf8");
 
-test("AttentionDot primitive exposes lg/sm physical-fit axis + brutal-pink default", () => {
+test("AttentionDot primitive exposes lg/sm physical-fit axis + the DS pink attention pixel", () => {
   const src = read("src/components/ui/AttentionDot.tsx");
   // Two-tier physical-fit axis (stdrc 2026-05-14 PR #1709 amend,
   // msg=6ad15567). `lg` is canonical default, `sm` is compact-only.
   // Size is physical fit, NOT priority — don't reintroduce `md` (or any
   // intermediate tier) under another name. See CLAUDE.md "Attention
-  // Dots" for the boundary test.
-  assert.match(src, /sm:\s*"size-1"/);
-  assert.match(src, /lg:\s*"size-2\.5"/);
-  assert.doesNotMatch(src, /md:\s*"size-2"/);
+  // Dots" for the boundary test. Raft Design System: `lg` is the 9px
+  // pixel with a 1.5px edge, `sm` the 6px compact one.
+  assert.match(src, /sm:\s*"size-1\.5 rounded-\[1px\] border"/);
+  assert.match(src, /lg:\s*"size-\[9px\] rounded-\[2px\] border-\[1\.5px\]"/);
+  assert.doesNotMatch(src, /md:\s*"size-/);
   // API surface must expose only the two tiers — banning `md` at the
   // type level is what makes accidental reintroduction a typecheck error
   // rather than a code-review nit.
   assert.match(src, /size\?:\s*"sm"\s*\|\s*"lg"/);
   // Default size = lg (canonical). If a callsite drops the `size` prop
-  // it should land on the canonical 10×10, not the compact tier.
+  // it should land on the canonical pixel, not the compact tier.
   assert.match(src, /size = "lg"/);
-  // brutal-pink stays the canonical default tone — overrides are explicit.
-  assert.match(src, /tone = "bg-brutal-pink"/);
-  // Border is what makes the dot read as an attention chip vs decorative
-  // pixel. Required at every tier.
-  assert.match(src, /border border-black/);
-  // rounded-full guarantees the dot shape across tiers.
-  assert.match(src, /rounded-full/);
+  // The attention pink (semantic accent) stays the canonical default tone —
+  // overrides are explicit.
+  assert.match(src, /tone = "bg-attention"/);
+  // The ink edge is what makes the dot read as an attention pixel vs
+  // decoration (every DS colour block is a sticker). Required at every tier.
+  assert.match(src, /border-sticker-ink/);
+  // Square = Raft: every dot is a square pixel, never a circle, never animated.
+  assert.doesNotMatch(src, /rounded-full/);
+  assert.doesNotMatch(src, /animate-/);
 });
 
 test("no `size=\"md\"` AttentionDot consumers remain (md was removed in PR #1709 amend)", () => {
@@ -68,31 +70,48 @@ test("LeftRail + Sidebar use AttentionDot for unread / cross-context dots", () =
   assert.match(leftRail, /import AttentionDot from "\.\.\/ui\/AttentionDot";/);
   assert.match(sidebar, /import AttentionDot from "\.\.\/ui\/AttentionDot";/);
 
-  // server-switcher dot must be `lg` (cross-context attention) on both
-  // desktop LeftRail and the mobile/short Sidebar surface. LeftRail now keeps
-  // its dot visual-only inside a button whose name and visible help are owned
-  // by aria-label + raft-ui Tooltip; it must not retain a browser-native title.
-  assert.match(leftRail, /<AttentionDot[\s\S]*?size="lg"[\s\S]*?aria-hidden="true"/);
+  // The desktop rail's server-switcher dot is the rail's shared attention
+  // composite (raft-ui AppRailItemAttention); the mobile/short Sidebar surface
+  // keeps the `lg` AttentionDot (cross-context attention).
+  assert.match(leftRail, /<AppRailItemAttention title=\{formatMessage\(\{ id: "layout\.leftRail\.serverFallbackName" \}\)\} \/>/);
   assert.match(sidebar, /<AttentionDot[\s\S]*?size="lg"[\s\S]*?title=\{formatMessage\(\{ id: "layout\.sidebar\.otherServersUnread" \}\)\}/);
 
   // No raw inline pink-dot spans should remain in these two files. If a
   // new dot is added, route it through AttentionDot.
-  assert.doesNotMatch(leftRail, /rounded-full border border-black bg-brutal-pink/);
-  assert.doesNotMatch(sidebar, /size-2 rounded-full bg-brutal-pink border border-black/);
+  assert.doesNotMatch(leftRail, /rounded-full border border-black bg-palette-pink/);
+  assert.doesNotMatch(sidebar, /size-2 rounded-full bg-palette-pink border border-black/);
 });
 
-test("shadow-soft-popover token exists in index.css with the locked value", () => {
+test("floating surfaces take raft-ui's DS float shadow, not a local token", () => {
   const css = read("src/index.css");
-  // Token value is pinned per CLAUDE.md "Shadow Boundary — Hard vs Soft".
-  // Tweaking the value is a design call; if you need a different soft
-  // shadow, talk to the designer before editing this line.
-  assert.match(css, /--shadow-soft-popover:\s*0 4px 12px rgba\(0,\s*0,\s*0,\s*0\.08\);/);
+  // Raft Design System: controls carry no shadow; menus, popovers and
+  // dialogs float on raft-ui's `shadow-float`. The web keeps no shadow
+  // token of its own that could drift from it.
+  assert.doesNotMatch(css, /--shadow-soft-popover|--shadow-brutal/);
+});
+
+test("centred modal frames draw through raft-ui's DialogSurface, not a restated frame", () => {
+  // The dialog frame (popover layer, dialog radius, seam ring, float shadow)
+  // is raft-ui's DialogSurface, so a change to it lands on every modal. An
+  // unprefixed `rounded-dialog` in the app means a hand-rolled copy of it;
+  // LegacyTaskPanel's sm:-only frame and the dev palette audit are the
+  // deliberate exceptions.
+  let hits = "";
+  try {
+    hits = execSync(`grep -RlE '(^|[^:])rounded-dialog' ${resolve(repoRoot, "src")}`, { encoding: "utf8" });
+  } catch (err: any) {
+    if (err.status === 1) hits = "";
+    else throw err;
+  }
+  const offenders = hits.split("\n").filter(Boolean)
+    .map((file) => file.slice(repoRoot.length + 1))
+    .filter((file) => file !== "src/pages/PaletteAuditPage.tsx");
+  assert.deepEqual(offenders, [], "use raft-ui's DialogSurface for a modal frame");
 });
 
 test("no inline shadow-[rgba(...)] arbitrary values in components/", () => {
   // Lint-ban: all shadow effects must reference a named token
-  // (shadow-brutal*, shadow-soft-popover). See CLAUDE.md "Shadow
-  // Boundary — Hard vs Soft".
+  // (raft-ui's shadow-float / shadow-sticker / shadow-focus).
   const componentsDir = resolve(repoRoot, "src/components");
   let hits = "";
   try {
@@ -102,5 +121,5 @@ test("no inline shadow-[rgba(...)] arbitrary values in components/", () => {
     if (err.status === 1) hits = "";
     else throw err;
   }
-  assert.equal(hits.trim(), "", `inline rgba shadows are banned (use shadow-brutal* or shadow-soft-popover instead):\n${hits}`);
+  assert.equal(hits.trim(), "", `inline rgba shadows are banned (use raft-ui's shadow-float / shadow-sticker / shadow-focus instead):\n${hits}`);
 });

@@ -2,11 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   FeedbackProvider,
   FeedbackWorkspace,
-} from "@botiverse/hands-feedback-react/source";
+} from "@botiverse/hands-feedback-react";
 import type {
   FeedbackWorkspaceNavigationOptions,
   FeedbackWorkspaceRoute,
-} from "@botiverse/hands-feedback-react/source";
+} from "@botiverse/hands-feedback-react";
 import { Download, X } from "lucide-react";
 import {
   Button,
@@ -18,17 +18,26 @@ import {
   LightboxStage,
   LightboxTitle,
   LightboxToolbar,
-} from "raft-ui";
+} from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 import { useLocation, useNavigate } from "react-router-dom";
 import api from "../../api/client";
+import { FEEDBACK_SDK_THEME } from "../../feedback/feedbackSdkTheme";
 import { handsFeedbackTransport } from "../../feedback/handsFeedbackTransport";
 import { useMediaQuery } from "../../hooks/effectPrimitives";
 import { useMobileBack } from "../../hooks/useAppNavigate";
 import { useLocale } from "../../i18n/LocaleProvider";
 import Banner from "../ui/Banner";
+import PanelHeader from "../ui/PanelHeader";
+import Tooltip from "../ui/Tooltip";
 
 const FEEDBACK_SETTINGS_SEGMENT = "/settings/feedback";
+
+
+const PANEL_HEADER_CONTAINER_PROPS = {
+  "data-testid": "settings-feedback-panel-header",
+  "data-slock-settings-tab": "feedback",
+};
 
 export function feedbackWorkspaceBasePath(pathname: string): string {
   const match = new RegExp(
@@ -108,11 +117,16 @@ export default function AboutFeedbackPanel() {
     () => feedbackWorkspaceBasePath(location.pathname),
     [location.pathname],
   );
+  const settingsBackPath = useMemo(
+    () => feedbackBasePath.replace(/\/settings\/feedback$/, "/settings"),
+    [feedbackBasePath],
+  );
   const pathRoute = useMemo(
     () => feedbackWorkspaceRouteFromPath(location.pathname),
     [location.pathname],
   );
-  const onMobileBack = useMobileBack(feedbackBasePath);
+  const onSettingsBack = useMobileBack(settingsBackPath);
+  const onWorkspaceBack = useMobileBack(feedbackBasePath);
   const controlledRoute =
     isMobile || pathRoute.view !== "inbox" ? pathRoute : undefined;
   const [attachmentError, setAttachmentError] = useState(false);
@@ -189,16 +203,42 @@ export default function AboutFeedbackPanel() {
   ) => {
     if (nextRoute.view === "inbox") {
       if (feedbackWorkspaceRouteFromPath(location.pathname).view !== "inbox")
-        onMobileBack();
+        onWorkspaceBack();
       return;
     }
     navigate(feedbackWorkspacePath(feedbackBasePath, nextRoute), {
       replace: options?.replace,
     });
-  }, [feedbackBasePath, location.pathname, navigate, onMobileBack]);
+  }, [feedbackBasePath, location.pathname, navigate, onWorkspaceBack]);
+
+  const handleOpenAttachment = useCallback(
+    (input: { ticketId: string; attachmentId: string }) => void openAttachment(input),
+    [openAttachment],
+  );
+
+  const handleLightboxOpenChange = useCallback((open: boolean) => {
+    if (!open) closeAttachmentPreview();
+  }, [closeAttachmentPreview]);
+
+  const isInbox = pathRoute.view === "inbox";
+  const mobileBackProps = useMemo(
+    () => isInbox
+      ? {
+          "data-testid": "settings-feedback-mobile-back",
+          title: formatMessage({ id: "settings.tabs.back" }),
+        }
+      : undefined,
+    [formatMessage, isInbox],
+  );
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-layer-primary">
+    <div className="slock-feedback-panel flex h-full min-h-0 flex-col bg-layer-canvas">
+      <PanelHeader
+        title={formatMessage({ id: "settings.about.feedbackTitle" })}
+        containerProps={PANEL_HEADER_CONTAINER_PROPS}
+        onMobileBack={isInbox ? onSettingsBack : undefined}
+        mobileBackProps={mobileBackProps}
+      />
       {attachmentError && (
         <Banner intent="warning" density="sm" className="mx-4 mt-3" role="alert">
           {formatMessage({ id: "settings.about.feedbackAttachmentOpenError" })}
@@ -207,18 +247,19 @@ export default function AboutFeedbackPanel() {
       <div className="min-h-0 flex-1">
         <FeedbackProvider
           transport={handsFeedbackTransport}
-          theme="brutal"
+          theme={FEEDBACK_SDK_THEME}
           locale={locale === "zh-cn" ? "zh-CN" : "en"}
         >
           <FeedbackWorkspace
             enablePullToRefresh={isMobile}
+            hideHeaderTitle
             {...(controlledRoute
               ? {
                   route: controlledRoute,
                   onRouteChange: onWorkspaceRouteChange,
                 }
               : {})}
-            onOpenAttachment={(input) => void openAttachment(input)}
+            onOpenAttachment={handleOpenAttachment}
             onOpenPendingAttachment={openPendingAttachment}
           />
         </FeedbackProvider>
@@ -226,29 +267,31 @@ export default function AboutFeedbackPanel() {
       {attachmentPreview && (
         <Lightbox
           open
-          onOpenChange={(open) => {
-            if (!open) closeAttachmentPreview();
-          }}
+          onOpenChange={handleLightboxOpenChange}
         >
           <LightboxContent aria-label={attachmentPreview.filename}>
             <LightboxToolbar>
               <LightboxTitle>{attachmentPreview.filename}</LightboxTitle>
               <LightboxActions>
+                <Tooltip content={formatMessage({ id: "common.lightbox.download" })}>
                 <Button
                   aria-label={formatMessage({ id: "common.lightbox.download" })}
-                  title={formatMessage({ id: "common.lightbox.download" })}
-                  size="icon-md"
+                  data-slot="button"
+                  size="icon-lg"
                   variant="outline"
                   onClick={downloadAttachment}
                 >
                   <Download aria-hidden="true" size={16} />
                 </Button>
+                </Tooltip>
+                <Tooltip content={formatMessage({ id: "common.lightbox.close" })}>
                 <LightboxClose
                   aria-label={formatMessage({ id: "common.lightbox.close" })}
-                  title={formatMessage({ id: "common.lightbox.close" })}
+                  data-slot="lightbox-close"
                 >
                   <X aria-hidden="true" size={16} />
                 </LightboxClose>
+                </Tooltip>
               </LightboxActions>
             </LightboxToolbar>
             <LightboxStage>

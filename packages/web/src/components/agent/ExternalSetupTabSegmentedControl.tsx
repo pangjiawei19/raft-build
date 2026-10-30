@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { SegmentedControl, SegmentedControlItem, SegmentedControlLabel } from "raft-ui";
+import { SegmentedControl, SegmentedControlItem, SegmentedControlLabel } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 
 import type { MessageId } from "../../i18n/messages";

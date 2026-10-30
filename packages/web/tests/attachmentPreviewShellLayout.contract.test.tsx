@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { resetAttachmentPreviewSummaryCache } from "../src/components/message/attachmentPreviewSummaryCache";
-import { afterEach, test } from "node:test";
 import { MemoryRouter } from "react-router-dom";
 import { cleanup, fireEvent, render as rtlRender, screen, waitFor } from "@testing-library/react";
 import { TestIntlProvider } from "./helpers/intl";
@@ -219,7 +218,9 @@ test("attachment preview shell exposes compact edge controls through the mounted
   const download = screen.getByRole("button", { name: "Download" });
   const close = screen.getByRole("button", { name: "Close" });
   for (const control of [download, close]) {
-    assert.match(control.getAttribute("class") ?? "", /(^| )size-7( |$)/);
+    // Head actions are the DS 44 header icon button (`size="icon-lg"`, raft
+    // size-11), like the lightbox close.
+    assert.match(control.getAttribute("class") ?? "", /(^| )size-11( |$)/);
     const icon = control.querySelector("svg");
     assert.ok(icon);
     assert.equal(icon.getAttribute("width"), "14");
@@ -326,3 +327,4 @@ test("attachment preview shell consumes Escape while mounted and removes the lis
   fireEvent.keyDown(document, { key: "Escape" });
   assert.equal(closeCount, closedWhileMounted, "unmounted previews must not retain global Escape handlers");
 });
+

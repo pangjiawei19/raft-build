@@ -1,4 +1,4 @@
-import type { ParsedEvent } from "./drivers/index.js";
+import type { ParsedEvent } from "./drivers/index";
 
 export type RuntimeDiagnosticEvent =
   Extract<ParsedEvent, { kind: "runtime_diagnostic" }>;
@@ -47,6 +47,9 @@ export function runtimeRecoveryTraceAttrs(
   return {
     kind: event.kind,
     source: event.source,
+    // The trace client stamps its own `source` ("daemon") over the attr above;
+    // this copy survives into otel so recoveries group by cause.
+    recovery_source: event.source,
     resume_error_class: event.resumeErrorClass,
     recovery_action: event.recoveryAction,
     requested_session_id_present: Boolean(event.requestedSessionId),

@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { MemoryRouter } from "react-router-dom";
 import { cleanup, render as rtlRender } from "@testing-library/react";
 import { TestIntlProvider } from "./helpers/intl";
@@ -103,6 +102,29 @@ function makeDeletedAgent(): Agent {
   };
 }
 
+function makeActiveAgent(): Agent {
+  return {
+    ...makeDeletedAgent(),
+    id: "agent-2",
+    name: "nora",
+    displayName: "Nora",
+    description: "reviews css",
+    status: "active",
+    model: "claude",
+    deletedAt: null,
+  };
+}
+
+function makeActiveAgentMessage(): Message {
+  return {
+    ...makeMessage(),
+    senderType: "agent",
+    senderId: "agent-2",
+    senderName: "Nora",
+    senderDescription: "reviews css",
+  };
+}
+
 function makeAgentMessage(): Message {
   return {
     ...makeMessage(),
@@ -148,54 +170,108 @@ async function renderMessage(options: { agents?: Agent[]; message?: Message; loc
 
 afterEach(cleanup);
 
-function findSenderName(row: HTMLElement) {
-  return Array.from(row.querySelectorAll<HTMLElement>("span, button")).find(
-    (el) => el.textContent === "Current User",
+function findSenderName(row: HTMLElement, displayName = "Current User") {
+  // The mention button carries a stable testid; the plain sender span falls
+  // back to a text lookup so agent senders work too.
+  return (
+    row.querySelector<HTMLElement>('[data-testid^="message-sender-mention-"]') ??
+    Array.from(row.querySelectorAll<HTMLElement>("span, button")).find(
+      (el) => el.textContent === displayName,
+    ) ??
+    null
   );
 }
 
-test("header reserves a right-side gutter so floating affordances never overlap text", async () => {
+test("header keeps its full width; the hover toolbar takes the time's place", async () => {
   const { row } = await renderMessage();
   const name = findSenderName(row);
   assert.ok(name, "sender name renders");
-  const header = name.parentElement;
+  const cluster = name.parentElement;
+  assert.ok(cluster, "sender sits inside the left cluster");
+  const header = cluster.parentElement;
   assert.ok(header);
-  // The header row reserves a right gutter (pr-24) and clips overflow so the
-  // floating hover toolbar sits in reserved space.
-  assert.match(header.className, /(?:^| )pr-24(?: |$)/);
+  // The header clips overflow inside the left cluster.
   assert.match(header.className, /(?:^| )overflow-hidden(?: |$)/);
+  assert.match(cluster.className, /(?:^| )min-w-0(?: |$)/);
+  assert.match(cluster.className, /(?:^| )overflow-hidden(?: |$)/);
+  // The cluster shrinks but never grows: the time keeps following the
+  // description in wide rows and is only pushed right when the row overflows.
+  assert.doesNotMatch(cluster.className, /(?:^| )flex-1(?: |$)/);
+  // No reserved gutter: the toolbar rides the message's top edge over the
+  // time, and the time fades out while the toolbar shows.
+  assert.doesNotMatch(header.className, /(?:^| )pr-/);
+  const time = Array.from(header.querySelectorAll<HTMLElement>("span")).find((el) =>
+    /(?:^| )font-mono(?: |$)/.test(el.className) && /(?:^| )whitespace-nowrap(?: |$)/.test(el.className),
+  );
+  assert.ok(time, "the time renders in the header");
+  assert.match(time.className, /opacity-\[calc\(1-var\(--mi-toolbar-opacity,0\)\)\]/);
 });
 
-test("header prioritizes time, name, then subtitle truncation", async () => {
+test("header gives up the subtitle first, then the model, then the name; time sits outside the cluster", async () => {
   const { row } = await renderMessage();
 
   const name = findSenderName(row);
   assert.ok(name);
-  // Name shrinks and truncates but never collapses below its content.
-  assert.match(name.className, /(?:^| )min-w-0(?: |$)/);
-  assert.match(name.className, /(?:^| )shrink-0(?: |$)/);
+  // Name is OUT of the shrink pool (task #743): any nonzero shrink — even
+  // `shrink` against a `shrink-[999]` sibling — hands it a sub-pixel share and
+  // `truncate` then shows "C…" while the subtitle still has room. It truncates
+  // only when it alone is wider than the cluster (max-w-full).
   assert.match(name.className, /(?:^| )truncate(?: |$)/);
+  assert.match(name.className, /(?:^| )shrink-0(?: |$)/);
+  assert.match(name.className, /(?:^| )max-w-full(?: |$)/);
 
-  const subtitle = row.querySelector<HTMLElement>("span[title='Head of Ops']");
+  // Innermost match: the tail wrapper has the same text when it holds only the subtitle.
+  const subtitle = [...row.querySelectorAll<HTMLElement>("span")].findLast((el) => el.textContent === "Head of Ops");
   assert.ok(subtitle, "subtitle renders with a title tooltip");
-  // Subtitle is the first to truncate: min-w-0 + truncate, but NOT shrink-0.
+  // Subtitle yields first: it is the only shrinkable item in the tail.
   assert.match(subtitle.className, /(?:^| )min-w-0(?: |$)/);
   assert.match(subtitle.className, /(?:^| )truncate(?: |$)/);
   assert.doesNotMatch(subtitle.className, /(?:^| )shrink-0(?: |$)/);
+  assert.doesNotMatch(subtitle.className, /shrink-\[/, "no weighted shrink: weights leak onto siblings");
 
-  // Time never wraps or truncates — it stays fixed on the right.
+  // The tail (model · badges · subtitle) is its own shrinkable flex box beside
+  // the name, so the name never shares in its shrink.
+  const tail = subtitle.parentElement;
+  assert.ok(tail);
+  assert.match(tail.getAttribute("data-testid") ?? "", /^message-sender-tail-/);
+  assert.match(tail.className, /(?:^| )min-w-0(?: |$)/);
+  assert.match(tail.className, /(?:^| )overflow-hidden(?: |$)/);
+  assert.ok(tail.parentElement === name.parentElement, "tail sits beside the name in the left cluster");
+
+  // Cluster and time are siblings: time sits OUTSIDE the cluster, so a
+  // narrow panel can never clip it.
+  const cluster = name.parentElement;
+  assert.ok(cluster);
   const time = Array.from(row.querySelectorAll<HTMLElement>("span")).find((el) =>
     /(?:^| )whitespace-nowrap(?: |$)/.test(el.className) && /font-mono/.test(el.className),
   );
   assert.ok(time, "timestamp renders as a non-wrapping mono span");
   assert.match(time.className, /(?:^| )shrink-0(?: |$)/);
+  assert.ok(time.parentElement === cluster.parentElement, "time is a sibling of the cluster");
 });
 
-test("deleted sender badge stays on one line in compact localized headers", async () => {
+test("model label yields after the subtitle and before the name", async () => {
+  const { row } = await renderMessage({ agents: [makeActiveAgent()], message: makeActiveAgentMessage() });
+  const model = row.querySelector<HTMLElement>('[data-testid^="message-sender-model-"]');
+  assert.ok(model, "model label renders for an agent message");
+  // Fixed while the subtitle still has room; truncates only once the tail is
+  // narrower than the model itself (max-w-full of the tail).
+  assert.match(model.className, /(?:^| )shrink-0(?: |$)/);
+  assert.match(model.className, /(?:^| )max-w-full(?: |$)/);
+  assert.match(model.className, /(?:^| )truncate(?: |$)/);
+  const name = findSenderName(row, "Nora");
+  assert.ok(name);
+  const tail = model.parentElement;
+  assert.ok(tail);
+  assert.match(tail.getAttribute("data-testid") ?? "", /^message-sender-tail-/);
+  assert.ok(tail.parentElement === name.parentElement, "model sits in the tail beside the name");
+});
+
+test("archived sender badge stays on one line in compact localized headers", async () => {
   const { row } = await renderMessage({ agents: [makeDeletedAgent()], message: makeAgentMessage(), locale: "zh-cn" });
 
-  const deletedBadge = Array.from(row.querySelectorAll<HTMLElement>("span")).find((el) => el.textContent === "已删除");
-  assert.ok(deletedBadge, "localized deleted sender badge renders");
-  assert.match(deletedBadge.className, /(?:^| )shrink-0(?: |$)/);
-  assert.match(deletedBadge.className, /(?:^| )whitespace-nowrap(?: |$)/);
+  const archivedBadge = Array.from(row.querySelectorAll<HTMLElement>("span")).find((el) => el.textContent === "已归档");
+  assert.ok(archivedBadge, "localized archived sender badge renders");
+  assert.match(archivedBadge.className, /(?:^| )shrink-0(?: |$)/);
+  assert.match(archivedBadge.className, /(?:^| )whitespace-nowrap(?: |$)/);
 });

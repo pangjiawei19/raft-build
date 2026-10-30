@@ -1,8 +1,7 @@
 import assert from "node:assert/strict";
-import { afterEach, test as nodeTest } from "node:test";
+import { test as nodeTest } from "vitest";
 import "./helpers/domSetup";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
-import { THREAD_AGENT_FOLLOWER_MANAGEMENT_FEATURE_FLAG_KEY } from "@botiverse/raft-shared";
 import { MemoryRouter } from "react-router-dom";
 import api from "../src/api/client";
 import ThreadsInbox from "../src/components/thread/ThreadsInbox";
@@ -17,13 +16,12 @@ import { useSearchContentStore } from "../src/store/searchContentStore";
 import { useServerStore } from "../src/store/serverStore";
 import {
   resetServerFeatureFlagsForTests,
-  setServerFeatureFlagForTests,
 } from "../src/store/serverFeatureFlags";
 import { useThreadAgentFollowerStore } from "../src/store/threadAgentFollowerStore";
 
 type TestFn = (t: unknown) => void | Promise<void>;
 const test = (name: string, fn: TestFn) =>
-  nodeTest(name, { concurrency: false }, fn as never);
+  nodeTest(name,  fn as never);
 
 const originalGet = api.get.bind(api);
 
@@ -209,7 +207,11 @@ test("Activity Done checks stay hidden until their row is hovered or focused, wh
   assert.match(inactiveDone.className, /(?:^|\s)opacity-0(?:\s|$)/);
   assert.match(inactiveDone.className, /(?:^|\s)group-hover:opacity-100(?:\s|$)/);
   assert.match(inactiveDone.className, /(?:^|\s)group-focus-visible:opacity-100(?:\s|$)/);
-  assert.match(inactiveDone.className, /(?:^|\s)\[@media\(hover:none\)\]:opacity-100(?:\s|$)/);
+  // On touch the long-press menu carries Done; the row keeps its time and count.
+  assert.match(inactiveDone.className, /(?:^|\s)\[@media\(hover:none\)\]:hidden(?:\s|$)/);
+  // DS Inbox: a row's own action is an ink-outline button, not a ghost wash on the row's wash.
+  assert.match(inactiveDone.className, /(?:^|\s)border-line-strong(?:\s|$)/);
+  assert.match(inactiveDone.className, /(?:^|\s)bg-layer-card(?:\s|$)/);
 
   const activeDone = within(rows[1]).getByTestId("inbox-row-done");
   assert.equal(rows[1].getAttribute("data-active"), "true");
@@ -277,7 +279,7 @@ test("Activity rows use A-style title, inline icon, optional subtitle, and sende
 
   const threadRow = within(rows[2]);
   assert.equal(threadRow.getByTestId("conversation-card-title-icon").getAttribute("data-kind"), "thread");
-  assert.equal(threadRow.getByTestId("conversation-card-title-icon").querySelector("svg")?.getAttribute("class")?.includes("brutal-pink"), false);
+  assert.equal(threadRow.getByTestId("conversation-card-title-icon").querySelector("svg")?.getAttribute("class")?.match(/(?:palette|brutal)-pink/) == null, true);
   assert.equal(threadRow.getByTestId("conversation-card-primary").textContent?.includes("thread parent topic"), true);
   assert.equal(threadRow.getByTestId("conversation-card-subtitle").textContent?.trim(), "#design");
   assert.equal(
@@ -319,17 +321,17 @@ test("Activity title color distinguishes unread emphasis from the muted read sta
   assert.equal(primaryTitles.length, 3);
 
   assert.match(primaryTitles[0].className, /(?:^|\s)font-semibold(?:\s|$)/);
-  assert.match(primaryTitles[0].className, /(?:^|\s)text-black\/55(?:\s|$)/);
+  assert.match(primaryTitles[0].className, /(?:^|\s)text-foreground-muted(?:\s|$)/);
   assert.doesNotMatch(primaryTitles[0].className, /(?:^|\s)text-black(?:\s|$)/);
 
   assert.match(primaryTitles[1].className, /(?:^|\s)font-bold(?:\s|$)/);
-  assert.match(primaryTitles[1].className, /(?:^|\s)text-black(?:\s|$)/);
-  assert.doesNotMatch(primaryTitles[1].className, /(?:^|\s)text-black\/55(?:\s|$)/);
+  assert.match(primaryTitles[1].className, /(?:^|\s)text-foreground(?:\s|$)/);
+  assert.doesNotMatch(primaryTitles[1].className, /(?:^|\s)text-foreground-muted(?:\s|$)/);
 
-  assert.match(primaryTitles[2].className, /(?:^|\s)text-black\/55(?:\s|$)/);
+  assert.match(primaryTitles[2].className, /(?:^|\s)text-foreground-muted(?:\s|$)/);
 });
 
-test("Activity row metadata uses square raft-ui Badge primitives for every information item", () => {
+test("Activity row metadata uses raft-ui Badge primitives for every information item", () => {
   useMessageStore.setState({ drafts: { "thread-1": "unfinished reply" } });
   renderInbox([
     makeThreadItem({
@@ -355,13 +357,23 @@ test("Activity row metadata uses square raft-ui Badge primitives for every infor
     ],
   );
   for (const badge of badges) {
-    assert.equal(badge.getAttribute("data-slot"), "badge");
-    assert.doesNotMatch(badge.className, /(?:^|\s)rounded(?:-|\s|$)/);
+    // The task badge is raft-ui's TaskStatusBadge (its own slot); the rest are
+    // rui Badge primitives. Every corner comes from the raft radius tokens
+    // (chip / sticker), never a local rounding override on the row.
+    const slot = badge.getAttribute("data-slot");
+    assert.ok(slot === "badge" || slot === "task-status-badge", `${badge.getAttribute("data-testid")} slot=${slot}`);
+    const radii = badge.className.split(/\s+/).filter((c) => /^rounded(?:-|$)/.test(c));
+    assert.ok(radii.length > 0, `${badge.getAttribute("data-testid")} must carry a raft radius token`);
+    for (const radius of radii) {
+      assert.ok(
+        radius === "rounded-chip" || radius === "rounded-sticker",
+        `${badge.getAttribute("data-testid")} radius=${radius}`,
+      );
+    }
   }
 });
 
 test("Activity thread rows omit agent follower counts and row-level roster requests", async () => {
-  setServerFeatureFlagForTests("server-1", THREAD_AGENT_FOLLOWER_MANAGEMENT_FEATURE_FLAG_KEY, true);
   const getCalls: string[] = [];
   renderInbox([
     makeThreadItem({
@@ -412,7 +424,7 @@ test("Activity thread rows omit agent follower counts and row-level roster reque
   );
 });
 
-test("Activity in-review task badge uses the canonical lavender status color", () => {
+test("Activity in-review task badge uses the canonical status source", () => {
   renderInbox([
     makeThreadItem({
       taskNumber: 79,
@@ -425,14 +437,23 @@ test("Activity in-review task badge uses the canonical lavender status color", (
     '[data-testid="conversation-card-task-badge"]',
   );
   assert.ok(taskBadge);
-  assert.equal(taskBadge.getAttribute("data-slot"), "badge");
+  // Appearance is raft-ui's single source now: the badge IS a TaskStatusBadge
+  // and carries the status id in its kebab-case form for the marker/token.
+  assert.equal(taskBadge.getAttribute("data-slot"), "task-status-badge");
   assert.equal(taskBadge.getAttribute("data-status"), "in_review");
-  assert.match(taskBadge.className, /(?:^|\s)bg-brutal-lavender(?:\s|$)/);
-  assert.doesNotMatch(taskBadge.className, /(?:^|\s)bg-accent-400(?:\s|$)/);
-  assert.equal(taskBadge.style.backgroundColor, "var(--color-brutal-lavender)");
+  assert.ok(
+    taskBadge.querySelector("[data-slot='task-status-icon']"),
+    "the badge renders the rui status icon",
+  );
+  // Artea (#proj-frontend task #748): the chip shares the metadata row with sm
+  // Badges, so it takes rui's `size="sm"` (the raft Badge's 12px caption /
+  // mono-meta text, h-5) instead of the chat footer chip's 13px.
+  assert.match(taskBadge.className, /(?:^|\s)text-\[12px\](?:\s|$)/);
+  assert.match(taskBadge.className, /(?:^|\s)h-5(?:\s|$)/);
+  assert.doesNotMatch(taskBadge.className, /(?:^|\s)text-\[13px\](?:\s|$)/);
 });
 
-test("Activity todo task badge pins the same canonical orange used by Chat", () => {
+test("Activity todo task badge uses the same canonical source as Chat", () => {
   renderInbox([
     makeThreadItem({
       taskNumber: 515,
@@ -445,7 +466,7 @@ test("Activity todo task badge pins the same canonical orange used by Chat", () 
     '[data-testid="conversation-card-task-badge"]',
   );
   assert.ok(taskBadge);
+  assert.equal(taskBadge.getAttribute("data-slot"), "task-status-badge");
   assert.equal(taskBadge.getAttribute("data-status"), "todo");
-  assert.match(taskBadge.className, /(?:^|\s)bg-brutal-orange(?:\s|$)/);
-  assert.equal(taskBadge.style.backgroundColor, "var(--color-brutal-orange)");
+  assert.ok(taskBadge.querySelector("[data-slot='task-status-icon']"));
 });

@@ -1,7 +1,7 @@
 import { ArrowLeft } from "lucide-react";
 import { isHostShell } from "../../embed";
 import type { HTMLAttributes, ReactNode } from "react";
-import Button from "./Button";
+import { PanelAction, PanelActions, PanelHeader, PanelHeaderContent, PanelHeaderIcon, PanelHeading, PanelMeta, PanelStatus, PanelTitle } from "@botiverse/raft-ui";
 
 // React's `HTMLAttributes` doesn't expose `data-*` keys in TS, so widen
 // passthrough prop types with a string-key index signature so callsites
@@ -9,24 +9,41 @@ import Button from "./Button";
 type DivPassthroughProps = HTMLAttributes<HTMLDivElement> & Record<`data-${string}`, string | undefined>;
 type ButtonPassthroughProps = HTMLAttributes<HTMLButtonElement> & Record<`data-${string}`, string | undefined>;
 
+const NO_CONTAINER_PROPS: DivPassthroughProps = {};
+
+// raft-ui's header icon is the yellow location sticker. Every other panel's
+// icon is the DS neutral tile (`rf-chan` / `rf-tile`: the sunken fill, an
+// ink-2 glyph, no visible edge and no die-cut ring). raft-ui has no neutral
+// PanelHeaderIcon tone yet, so the tile is drawn over the sticker here; the
+// ring has to go too, or dark mode cuts a sticker edge round a plain tile.
+const ICON_TONE_CLASS = {
+  location: "",
+  neutral: "border-transparent bg-fill-muted text-foreground-muted ring-0",
+} as const;
+
 /**
- * Canonical panel-header primitive — covers every panel column header
- * in the app (12 callsites: ChatPanel / AgentDetailPanel / HumanDetailPanel
- * / MachineDetailPanel / SettingsPanel / SavedPanel / ThreadsInbox /
- * MessageSearchPage / ReleaseNotesPanel / ThreadPanel × 2 instances).
+ * A profile handle is an id, so it is machine text (Space Mono) everywhere:
+ * the header subtitle, the creator row and the detail-block handle. The size
+ * stays with the slot it sits in.
+ */
+export const PROFILE_HANDLE_FONT_CLASS = "font-mono";
+
+/**
+ * The panel column head: one component for every column, with different
+ * prop combinations per surface.
  *
- * Captures the layout contract from CLAUDE.md "Layout Dimensions" —
- * h-[62px] header, 36px icon container, mobile back chevron, title +
- * optional subtitle, right-aligned actions slot.
- *
- * stdrc 2026-05-10 #wg-theme:220bdc61 ("可以开始了") and follow-up
- * 9b4579f8 ("你想想，能用同一个组件吗？") — Tier 1 audit candidate.
- * Same component, different prop combinations for each surface.
+ * Raft Design System › Panel: one head for every column — 56 tall (48 in
+ * short windows), white paper with a seam bottom, a 17/22 headline title, a
+ * 12/16 ink-3 subtitle, the location sticker or avatar on the left and ghost
+ * icon buttons on the right. raft-ui's panel-header recipe draws all of it,
+ * edges included; this adapter only arranges the slots.
  *
  * **API design**:
- * - `iconBg` accepts a className token (e.g. `"bg-soft-signal"`),
- *   not a raw color value. Future theme upgrades can swap the token
- *   map without touching call sites (Joy 2026-05-10 design API note).
+ * - `iconTone` says what the icon tile means: `"location"` is the yellow
+ *   "you are here" sticker that only a channel (#) head carries; every other
+ *   panel (Tasks, Activity, Saved, Graph, Settings, a computer, …) gets the
+ *   default `"neutral"` tile — the sunken fill and an ink-2 glyph (DS
+ *   ChannelIcon / tile: yellow only marks where you are).
  * - `titleSlot` replaces the H2+subtitle stack entirely — for
  *   non-text titles like the search input in MessageSearchPage.
  * - `titleSuffix` renders inline next to the H2 title — for status
@@ -39,7 +56,7 @@ type ButtonPassthroughProps = HTMLAttributes<HTMLButtonElement> & Record<`data-$
  *   attributes through to specific elements without leaking the
  *   internal DOM structure into PanelHeader's API surface.
  */
-export interface PanelHeaderProps {
+export interface AppPanelHeaderProps {
   /** Title — primary text or custom node. Wrapped in `<h2 truncate>`.
    *  Use `titleSlot` instead for non-text titles. */
   title?: ReactNode;
@@ -51,25 +68,33 @@ export interface PanelHeaderProps {
    *  dot, activity indicator). Lives OUTSIDE the truncate envelope so
    *  it never gets cut off. Inside the same flex row as the H2. */
   titleSuffix?: ReactNode;
-  /** Optional subtitle line below the title (font-mono, text-xs,
-   *  text-black/50). Truncated to single line by default. */
+  /** Optional subtitle line below the title (12/16 ink-3; pass ids in
+   *  `font-mono`). Truncated to single line by default. */
   subtitle?: ReactNode;
   /** When true, subtitle is allowed to wrap to multiple lines instead
    *  of single-line truncation. Used for channel descriptions. */
   subtitleMultiline?: boolean;
-  /** Optional icon node (e.g. `<Bookmark size={18} />`) — rendered
-   *  inside the size-icon-header container, desktop-only (md:flex). */
+  /** Extra classes for the subtitle element (e.g. the profile handle's
+   *  machine type — see PROFILE_HANDLE_FONT_CLASS). */
+  subtitleClassName?: string;
+  /** Optional icon node (e.g. `<Bookmark size={18} />`) — rendered in the
+   *  head's 27px icon tile, desktop-only unless `iconAlwaysVisible`. */
   icon?: ReactNode;
-  /** ClassName for the icon container background. Defaults to
-   *  `bg-soft-signal`. Pass tokens like `bg-brutal-cyan` for
-   *  agent/DM surfaces. */
-  iconBg?: string;
-  /** Pre-wrapped icon slot — bypasses the size-icon-header /
-   *  border-2 / iconBg wrapper. Pass elements that bring their own
-   *  container (e.g. `<AvatarSlot context="panel-header" ... />`).
+  /** What the icon tile means. `"location"` = the yellow "you are here"
+   *  sticker, for a channel head only. `"neutral"` (default) = the sunken
+   *  tile with an ink-2 glyph, for every other panel. */
+  iconTone?: "location" | "neutral";
+  /** Pre-wrapped icon slot — bypasses the tile wrapper. Pass
+   *  elements that bring their own container (e.g.
+   *  `<AvatarSlot context="panel-header" ... />`).
    *  Mutually exclusive with `icon`. Honors the same visibility
    *  rules as `icon` (mobile hide unless `iconAlwaysVisible`). */
   iconSlot?: ReactNode;
+  /** Marks what the icon slot holds. `"avatar"` declares an identity
+   *  avatar: the sticker chrome is dropped (recipe reads
+   *  `data-icon-kind="avatar"` → transparent, auto size) so the avatar's
+   *  own sticker is the only frame. Glyph icons keep the sticker. */
+  iconKind?: "avatar";
   /** Whether the icon is visible on every viewport. Default `false`
    *  matches "non-identity" surfaces (Saved / Release Notes / Settings)
    *  that hide the icon on mobile to save header space. Set to `true`
@@ -78,7 +103,7 @@ export interface PanelHeaderProps {
    *  visible at every viewport. */
   iconAlwaysVisible?: boolean;
   /** Optional mobile back-chevron callback. When provided, renders a
-   *  `btn-brutal-sm` chevron-left button visible only on mobile
+   *  ghost back button visible only on mobile
    *  (`md:hidden` by default; ThreadPanel uses `lg:hidden` because
    *  it's an overlay panel with a different breakpoint contract). */
   onMobileBack?: () => void;
@@ -103,20 +128,22 @@ export interface PanelHeaderProps {
   /** Additional props passed to the outer header container (e.g.
    *  `data-testid`, `title` for tooltip, additional `className`). */
   containerProps?: DivPassthroughProps;
-  /** Right-aligned action slot — typically a row of `Button`s
-   *  with `gap-1.5`. */
+  /** Right-aligned action slot — typically ghost icon buttons
+   *  (`PanelAction`). */
   actions?: ReactNode;
 }
 
-export default function PanelHeader({
+export default function AppPanelHeader({
   title,
   titleSlot,
   titleSuffix,
   subtitle,
   subtitleMultiline = false,
+  subtitleClassName,
   icon,
-  iconBg = "bg-soft-signal",
+  iconTone = "neutral",
   iconSlot,
+  iconKind,
   iconAlwaysVisible = false,
   onMobileBack,
   mobileBreakpoint = "md",
@@ -125,10 +152,10 @@ export default function PanelHeader({
   titleClickProps,
   containerProps,
   actions,
-}: PanelHeaderProps) {
+}: AppPanelHeaderProps) {
   // HOST-SHELL EMBED: the native WebView already draws a title bar, so web must not
   // draw a second one. But the ACTIONS must not die with the title — Computers' "+"
-  // and Connected Apps' "Register app" live in this slot, and dropping the whole
+  // and Connected Apps' "Register App" live in this slot, and dropping the whole
   // header (which is what the pre-contract `embed=1` did) silently deletes them.
   // So: no title, no back button, no chrome — actions only, in a compact row.
   //
@@ -155,70 +182,68 @@ export default function PanelHeader({
       ? "lg:hidden"
       : "md:hidden";
   const iconVisibilityClass = iconAlwaysVisible
-    ? "flex"
+    ? ""
     : mobileBreakpoint === "lg"
     ? "hidden lg:flex"
     : "hidden md:flex";
-  const { className: containerExtraClass, ...containerRest } = containerProps ?? {};
+  const { className: containerExtraClass, ...containerRest } = containerProps ?? NO_CONTAINER_PROPS;
   return (
-    <div
+    <PanelHeader
       {...containerRest}
-      // stdrc 2026-05-14 #wg-theme:16123203 "确保同类页面用的组件都是
-      // 长得左边 (BEFORE) 那样" — flat `gap-3 px-5` everywhere, no narrow-
-      // viewport shrink. Earlier 2026-05-10 rule (`gap-2 px-3 sm:gap-3
-      // sm:px-5`) was reverted: stdrc preferred the wider padding seen on
-      // the old hand-rolled MobileComputersPanel, so every Settings sub-page
-      // (Account / Browser / Server / Computers) now reads the same width
-      // at every breakpoint.
-      className={`flex h-panel-header items-center gap-3 border-b-2 border-black bg-white px-5 ${containerExtraClass ?? ""}`}
+      // Padding, gap and the edge buttons' placement belong to the raft-ui
+      // recipe, so every column head starts and ends on the same edges.
+      className={containerExtraClass}
     >
       {onMobileBack && (
-        <Button
+        <PanelAction
           {...mobileBackProps}
           onClick={onMobileBack}
-          shape="icon"
           className={`${mobileHiddenClass} ${mobileBackProps?.className ?? ""}`}
         >
-          <ArrowLeft size={14} />
-        </Button>
+          <ArrowLeft size={22} />
+        </PanelAction>
       )}
       {icon && (
-        <div
-          className={`${iconVisibilityClass} size-icon-header shrink-0 items-center justify-center border-2 border-black ${iconBg}`}
-        >
+        <PanelHeaderIcon className={`${iconVisibilityClass} ${ICON_TONE_CLASS[iconTone]}`}>
           {icon}
-        </div>
+        </PanelHeaderIcon>
       )}
       {iconSlot && (
-        <div className={`${iconVisibilityClass} shrink-0`}>{iconSlot}</div>
+        <PanelHeaderIcon className={iconVisibilityClass} data-icon-kind={iconKind}>
+          {iconSlot}
+        </PanelHeaderIcon>
       )}
       {titleSlot ? (
-        <div className="min-w-0 flex-1">{titleSlot}</div>
+        <PanelHeaderContent>{titleSlot}</PanelHeaderContent>
       ) : (
-        <div
-          {...titleClickProps}
-          className={`min-w-0 flex-1 ${titleClickProps?.className ?? ""}`}
-        >
-          <div className="flex items-center gap-2 min-w-0">
-            <h2 className="truncate font-bold text-base leading-tight text-black">
-              {title}
-            </h2>
-            {titleSuffix && <div className="shrink-0">{titleSuffix}</div>}
-          </div>
+        <PanelHeaderContent {...titleClickProps}>
+          <PanelHeading>
+            <PanelTitle
+              render={(
+                <h2>
+                  {title}
+                </h2>
+              )}
+            />
+            {/* PanelStatus, not PanelMeta: the meta line truncates
+                (overflow hidden), which would cut a badge's edge ring. */}
+            {titleSuffix && <PanelStatus>{titleSuffix}</PanelStatus>}
+          </PanelHeading>
           {subtitle && (
-            <p
-              className={`text-xs text-black/50 font-mono ${
+            <PanelMeta
+              render={<p />}
+              className={`${
                 subtitleMultiline ? "" : "truncate"
-              }`}
+              }${subtitleClassName ? ` ${subtitleClassName}` : ""}`}
             >
               {subtitle}
-            </p>
+            </PanelMeta>
           )}
-        </div>
+        </PanelHeaderContent>
       )}
       {actions && (
-        <div className="flex shrink-0 items-center gap-1.5">{actions}</div>
+        <PanelActions>{actions}</PanelActions>
       )}
-    </div>
+    </PanelHeader>
   );
 }

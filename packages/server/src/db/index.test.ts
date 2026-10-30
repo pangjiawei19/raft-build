@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
-import { afterEach, test } from "vitest";
 import { sql } from "drizzle-orm";
 import { BasicTracer, MemoryTraceSink, noopTracer, traceSpanFactRowForSpan } from "@botiverse/raft-shared";
 import type pg from "pg";
-import { pgPoolReadOnlyClientRecycledTotal } from "../metrics.js";
-import { runWithTraceSpan } from "../tracing/semanticTrace.js";
+import { dbQueryDuration, dbQueryErrorsTotal, pgPoolReadOnlyClientRecycledTotal } from "../metrics";
+import { traceQuerySpan } from "../tracing/queryTrace";
+import { runWithTraceSpan } from "../tracing/semanticTrace";
 import {
   executeCancellablePgPoolSql,
   getSqlTraceHash,
@@ -12,7 +12,7 @@ import {
   isReadOnlyTransactionError,
   setDbTracer,
   withDbTraceAttributes,
-} from "./index.js";
+} from "./index";
 
 const realDateNow = Date.now;
 const TRACE_EVENT_ROW_TEST_RESOURCE = {
@@ -243,6 +243,160 @@ test("instrumentPool records one span per checkout with raw query and fingerprin
   assert.equal(discardedRow.reason, "release_discarded");
 });
 
+test("connection spans say whether the client was reused and how long the first statement's round trip took", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  setDbTracer(new BasicTracer({ sink, clock: () => now }));
+
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("primary", pool);
+
+  // First checkout of a new client: the 40ms checkout includes opening it.
+  now = 0;
+  const pending = pool.connect();
+  now = 40;
+  const first = await pending;
+  // The first statement's result comes back 150ms after it is sent; a second
+  // statement does not change first_query_ms.
+  client.beforeQueryReturn = () => { now += 150; };
+  await first.query("SELECT id, retired_at FROM users WHERE id = $1");
+  client.beforeQueryReturn = () => { now += 5; };
+  await first.query("SELECT 1");
+  first.release();
+
+  // The same client checked out again is a reused connection.
+  now = 500;
+  const second = await pool.connect();
+  client.beforeQueryReturn = () => { now += 120; };
+  await second.query("SELECT email_verified FROM users WHERE id = $1");
+  second.release();
+
+  const spans = sink.getAllSpans().filter((span) => span.name === "server.db.connection");
+  assert.equal(spans.length, 2);
+  assert.equal(spans[0]!.attrs?.connection_reused, false);
+  assert.equal(spans[0]!.attrs?.connect_ms, spans[0]!.attrs?.queue_ms);
+  assert.equal(spans[0]!.attrs?.first_query_ms, 150);
+  assert.equal(spans[1]!.attrs?.connection_reused, true);
+  assert.equal(spans[1]!.attrs?.connect_ms, undefined, "no connect time for a reused client");
+  assert.equal(spans[1]!.attrs?.first_query_ms, 120);
+});
+
+test("every new connection is recorded; reused ones only past 100 ms, and record_condition says which rule applied", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  setDbTracer(new BasicTracer({ sink, clock: () => now }));
+
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("primary", pool);
+
+  // A new connection held only 20 ms is still recorded (complete new-connection counts).
+  const first = await pool.connect();
+  client.beforeQueryReturn = () => { now += 20; };
+  await first.query("SELECT 1");
+  first.release();
+  // A reused connection held 20 ms is not recorded.
+  now = 1_000;
+  const second = await pool.connect();
+  await second.query("SELECT 1");
+  second.release();
+  // A reused connection held 150 ms is.
+  now = 2_000;
+  const third = await pool.connect();
+  client.beforeQueryReturn = () => { now += 150; };
+  await third.query("SELECT 1");
+  third.release();
+
+  const spans = sink.getAllSpans().filter((span) => span.name === "server.db.connection");
+  assert.deepEqual(
+    spans.map((span) => [span.attrs?.connection_reused, span.attrs?.record_condition]),
+    [[false, "new_connection"], [true, "hold_over_100ms"]],
+  );
+});
+
+/**
+ * A FakeClient whose query goes through a socket the way pg's does: the
+ * statement is written (the write callback fires once flushed), then reply
+ * bytes arrive as a "data" event, then the result resolves.
+ */
+class SocketFakeClient extends FakeClient {
+  readonly connection: { stream: { write: (chunk: unknown, encoding?: unknown, callback?: unknown) => boolean; on: (event: string, listener: () => void) => void } };
+  private readonly dataListeners: Array<() => void> = [];
+  writeFlushAfterMs = 0;
+  firstByteAfterMs = 0;
+  resultAfterMs = 0;
+
+  constructor(private readonly clock: { now: number }) {
+    super();
+    const flushes: Array<() => void> = [];
+    this.connection = {
+      stream: {
+        write: (_chunk, encoding, callback) => {
+          const done = typeof encoding === "function" ? encoding : callback;
+          if (typeof done === "function") flushes.push(done as () => void);
+          return true;
+        },
+        on: (event, listener) => {
+          if (event === "data") this.dataListeners.push(listener);
+        },
+      },
+    };
+    this.beforeQueryReturn = () => {
+      // pg writes parse/bind/execute/sync separately; the last flush counts.
+      this.connection.stream.write("parse", undefined, undefined);
+      this.connection.stream.write("sync", () => {});
+      this.clock.now += this.writeFlushAfterMs;
+      for (const flush of flushes.splice(0)) flush();
+      this.clock.now += this.firstByteAfterMs;
+      for (const listener of this.dataListeners) listener();
+      this.clock.now += this.resultAfterMs;
+    };
+  }
+}
+
+test("connection spans carry connection_id, idle_ms and the first statement split into write and first byte", async () => {
+  const clock = { now: 0 };
+  Date.now = () => clock.now;
+  const sink = new MemoryTraceSink();
+  setDbTracer(new BasicTracer({ sink, clock: () => clock.now }));
+
+  const client = new SocketFakeClient(clock);
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("primary", pool);
+
+  // Connect path, new client: flushed after 2ms, first reply byte at 902ms, done at 905ms.
+  client.writeFlushAfterMs = 2;
+  client.firstByteAfterMs = 900;
+  client.resultAfterMs = 3;
+  const first = await pool.connect();
+  await first.query("SELECT id FROM users WHERE id = $1");
+  first.release();
+
+  // pool.query path, reused after 4s idle: flushed after 1ms, first byte at 1,201ms.
+  clock.now += 4_000;
+  client.writeFlushAfterMs = 1;
+  client.firstByteAfterMs = 1_200;
+  client.resultAfterMs = 5;
+  await pool.query("SELECT revoked_at FROM session_families WHERE id = $1");
+
+  const spans = sink.getAllSpans().filter((span) => span.name === "server.db.connection");
+  assert.equal(spans.length, 2);
+  assert.equal(spans[0]!.attrs?.connection_id, spans[1]!.attrs?.connection_id, "one client, one connection_id");
+  assert.equal(typeof spans[0]!.attrs?.connection_id, "number");
+  assert.equal(spans[0]!.attrs?.idle_ms, undefined, "a new client has no idle time");
+  assert.equal(spans[0]!.attrs?.first_query_ms, 905);
+  assert.equal(spans[0]!.attrs?.first_query_write_ms, 2);
+  assert.equal(spans[0]!.attrs?.first_query_first_byte_ms, 902);
+  assert.equal(spans[1]!.attrs?.connection_reused, true);
+  assert.equal(spans[1]!.attrs?.idle_ms, 4_000);
+  assert.equal(spans[1]!.attrs?.first_query_ms, 1_206);
+  assert.equal(spans[1]!.attrs?.first_query_write_ms, 1);
+  assert.equal(spans[1]!.attrs?.first_query_first_byte_ms, 1_201);
+});
+
 test("instrumentPool preserves callback connect release semantics and labels read-replica pools", async () => {
   let now = 0;
   Date.now = () => now;
@@ -310,6 +464,57 @@ test("instrumentPool traces pool.query through the same checkout path used by dr
   assert.equal(spans[0].attrs?.query_fingerprint, "SELECT pg_sleep(?), * FROM users WHERE id = ?");
   assert.equal(spans[0].attrs?.db_callsite, "agent_orchestrator.cache_miss");
   assert.equal(spans[0].attrs?.discarded, false);
+  // pool.query's single statement is the whole hold; a fresh client is not reused.
+  assert.equal(spans[0].attrs?.first_query_ms, 210);
+  assert.equal(spans[0].attrs?.connection_reused, false);
+
+  // The same client used again (pool.query or connect) counts as reused.
+  client.beforeQueryReturn = () => { now = 500; };
+  now = 300;
+  await pool.query("SELECT pg_sleep(0.2)");
+  const again = sink.getAllSpans().filter((span) => span.name === "server.db.connection")[1]!;
+  assert.equal(again.attrs?.connection_reused, true);
+  assert.equal(again.attrs?.connect_ms, undefined);
+  assert.equal(again.attrs?.first_query_ms, 200);
+});
+
+test("instrumentPool names the connection span after the work statement, not the closing COMMIT", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  setDbTracer(new BasicTracer({ sink, clock: () => now }));
+
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("search", pool);
+
+  now = 10;
+  const checkedOut = await pool.connect();
+  await checkedOut.query("BEGIN READ ONLY");
+  await checkedOut.query("SELECT set_config('work_mem', $1, true)", ["32MB"]);
+  await withDbTraceAttributes(
+    { db_callsite: "messages.search" },
+    () => checkedOut.query("SELECT id FROM messages WHERE search_vector @@ $1", ["q"]),
+  );
+  await checkedOut.query("COMMIT");
+  now = 200;
+  checkedOut.release();
+
+  // A checkout that only ran transaction control keeps that as its identity.
+  now = 300;
+  const emptyTx = await pool.connect();
+  await emptyTx.query("BEGIN");
+  await emptyTx.query("ROLLBACK");
+  now = 450;
+  emptyTx.release();
+
+  const spans = sink.getAllSpans().filter((span) => span.name === "server.db.connection");
+  assert.equal(spans.length, 2);
+  assert.equal(spans[0].attrs?.statement_kind, "select");
+  assert.equal(spans[0].attrs?.query, "SELECT id FROM messages WHERE search_vector @@ $1");
+  assert.equal(spans[0].attrs?.db_callsite, "messages.search");
+  assert.equal(spans[1].attrs?.statement_kind, "transaction");
+  assert.equal(spans[1].attrs?.query, "ROLLBACK");
 });
 
 test("isReadOnlyTransactionError recognizes SQLSTATE 25006 and read-only transaction text", () => {
@@ -346,11 +551,11 @@ test("instrumentPool destroys checked-out clients that hit read-only transaction
   const connectionSpan = sink.getAllSpans().find((span) => span.name === "server.db.connection");
   assert.equal(connectionSpan?.attrs?.discarded, true);
   assert.equal(connectionSpan?.attrs?.reason, "release_discarded");
-  const recycleSpan = sink.getAllSpans().find((span) => span.name === "server.db.pool.read_only_client_recycled");
-  assert.equal(recycleSpan?.attrs?.pool, "primary");
-  assert.equal(recycleSpan?.attrs?.sqlstate, "25006");
-  assert.equal(recycleSpan?.attrs?.outcome, "client_discarded");
-  assert.equal(recycleSpan?.attrs?.reason, "read_only_transaction");
+  const recycleEvent = sink.getAllLogEvents().find((event) => event.name === "server.db.pool.read_only_client_recycled");
+  assert.equal(recycleEvent?.attrs?.pool, "primary");
+  assert.equal(recycleEvent?.attrs?.sqlstate, "25006");
+  assert.equal(recycleEvent?.attrs?.outcome, "client_discarded");
+  assert.equal(recycleEvent?.attrs?.reason, "read_only_transaction");
 });
 
 test("instrumentPool destroys pool.query read-only clients and throttles structured logs", async () => {
@@ -502,6 +707,69 @@ test("instrumentPool links db connection spans to the active trace parent", asyn
   assert.equal(dbSpan.context.parentSpanId, root.context.spanId);
 });
 
+/** Like pg-pool: one physical client, and a fresh client.release on every checkout. */
+class ReassigningReleasePool {
+  readonly options = {};
+  readonly releases: unknown[][] = [];
+  readonly client = {
+    query: (query: { callback?: (err: Error | undefined, result?: pg.QueryResult) => void }) => {
+      this.onQuery();
+      queueMicrotask(() => query.callback?.(undefined, { command: "SELECT", rowCount: 0, oid: 0, fields: [], rows: [] }));
+      return query;
+    },
+    release: (..._args: unknown[]) => {},
+  };
+
+  constructor(private readonly onQuery: () => void) {}
+
+  async connect() {
+    this.client.release = (...args: unknown[]) => {
+      this.releases.push(args);
+    };
+    return this.client as unknown as pg.PoolClient;
+  }
+}
+
+test("every search checkout of a reused pool client records a connection span under its search span", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  const tracer = new BasicTracer({ sink, clock: () => now });
+  setDbTracer(tracer);
+
+  const pool = new ReassigningReleasePool(() => {
+    now += 200;
+  });
+  instrumentPool("search", pool as unknown as pg.Pool);
+
+  const root = tracer.startSpan("server.http.request", { surface: "server", kind: "server" });
+  await runWithTraceSpan(root, async () => {
+    for (const phase of ["first", "second", "third"]) {
+      await traceQuerySpan(
+        { queryName: "messages.search", phase },
+        () => executeCancellablePgPoolSql(pool as unknown as pg.Pool, sql`SELECT ${phase}::text`),
+      );
+    }
+  }, tracer);
+  root.end();
+
+  assert.equal(pool.releases.length, 3);
+  const searchSpans = sink.getAllSpans().filter((span) => span.name === "server.db.query");
+  const connectionSpans = sink.getAllSpans().filter((span) => span.name === "server.db.connection");
+  assert.equal(searchSpans.length, 3);
+  // Before the fix only the client's first checkout was recorded.
+  assert.equal(connectionSpans.length, 3);
+  assert.deepEqual(
+    connectionSpans.map((span) => span.context.parentSpanId),
+    searchSpans.map((span) => span.context.spanId),
+  );
+  for (const span of connectionSpans) {
+    assert.equal(span.context.traceId, root.context.traceId);
+    assert.equal(span.attrs?.pool, "search");
+    assert.equal(span.attrs?.statement_kind, "select");
+  }
+});
+
 test("executeCancellablePgPoolSql cancels the exact active search query and discards the client", async () => {
   const client = new CancellableFakeClient();
   const pool = new CancellableFakePool(client) as unknown as pg.Pool;
@@ -567,4 +835,158 @@ test("executeCancellablePgPoolSql ignores aborts after the search query has comp
 
   assert.deepEqual(cancelCalls, []);
   assert.deepEqual(client.releaseArgs, [[]]);
+});
+
+async function statementCount(pool: string, statement: string): Promise<number> {
+  const json = await dbQueryDuration.get();
+  const match = json.values.find((value) =>
+    value.metricName === "slock_db_query_duration_seconds_count"
+    && value.labels.pool === pool
+    && value.labels.statement === statement);
+  return match?.value ?? 0;
+}
+
+async function statementErrorCount(pool: string, sqlstate: string): Promise<number> {
+  const json = await dbQueryErrorsTotal.get();
+  const match = json.values.find((value) => value.labels.pool === pool && value.labels.sqlstate === sqlstate);
+  return match?.value ?? 0;
+}
+
+test("checked-out statements are timed once each by pool and statement kind, including the transaction frame", async () => {
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("metrics-checkout", pool);
+
+  const checkedOut = await pool.connect();
+  await checkedOut.query("BEGIN");
+  await checkedOut.query("select * from messages where id = $1", ["x"]);
+  await checkedOut.query("update messages set content = $1", ["y"]);
+  await checkedOut.query("COMMIT");
+  checkedOut.release();
+
+  assert.equal(await statementCount("metrics-checkout", "transaction"), 2);
+  assert.equal(await statementCount("metrics-checkout", "select"), 1);
+  assert.equal(await statementCount("metrics-checkout", "update"), 1);
+});
+
+test("pool.query is timed exactly once even when the client was already instrumented by an earlier checkout", async () => {
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("metrics-pool-query", pool);
+
+  const checkedOut = await pool.connect();
+  checkedOut.release();
+  await pool.query("select 1");
+  await new Promise<void>((resolve, reject) => {
+    pool.query("select 2", (err: Error | undefined) => (err ? reject(err) : resolve()));
+  });
+
+  assert.equal(await statementCount("metrics-pool-query", "select"), 2);
+});
+
+test("statement failures count by bounded SQLSTATE: 57014 is its own series, unknown codes fold to other", async () => {
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("metrics-errors", pool);
+
+  client.queryError = Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" });
+  await assert.rejects(() => pool.query("select pg_sleep(20)"));
+  const checkedOut = await pool.connect();
+  await assert.rejects(() => checkedOut.query("select pg_sleep(20)"));
+  checkedOut.release();
+
+  client.queryError = Object.assign(new Error("duplicate key"), { code: "23505" });
+  await assert.rejects(() => pool.query("insert into users values (1)"));
+  client.queryError = Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+  await assert.rejects(() => pool.query("select 1"));
+
+  assert.equal(await statementErrorCount("metrics-errors", "57014"), 2);
+  assert.equal(await statementErrorCount("metrics-errors", "other"), 1);
+  assert.equal(await statementErrorCount("metrics-errors", "no_sqlstate"), 1);
+  assert.equal(await statementErrorCount("metrics-errors", "23505"), 0);
+  // Failed statements still land in the duration histogram.
+  assert.equal(await statementCount("metrics-errors", "select"), 3);
+});
+
+test("cancellable search statements are timed by their caller, and a caller abort is not counted as a timeout", async () => {
+  const client = new CancellableFakeClient();
+  const pool = new CancellableFakePool(client) as unknown as pg.Pool;
+  instrumentPool("metrics-search", pool);
+
+  const done = executeCancellablePgPoolSql(pool, sql`SELECT ${"needle"}::text AS value`);
+  await waitForSubmittedQuery(client);
+  client.resolve([{ value: "needle" }]);
+  await done;
+  assert.equal(await statementCount("metrics-search", "select"), 1);
+
+  client.submittedQuery = undefined;
+  const timedOut = executeCancellablePgPoolSql(pool, sql`SELECT ${"slow"}::text AS value`);
+  await waitForSubmittedQuery(client);
+  client.reject(Object.assign(new Error("canceling statement due to statement timeout"), { code: "57014" }));
+  await assert.rejects(timedOut);
+  assert.equal(await statementErrorCount("metrics-search", "57014"), 1);
+
+  client.submittedQuery = undefined;
+  const abort = new AbortController();
+  const aborted = executeCancellablePgPoolSql(pool, sql`SELECT ${"gone"}::text AS value`, {
+    signal: abort.signal,
+    cancelQuery: () => {},
+  });
+  await waitForSubmittedQuery(client);
+  abort.abort();
+  client.reject(Object.assign(new Error("canceling statement due to user request"), { code: "57014" }));
+  await assert.rejects(aborted);
+  assert.equal(await statementErrorCount("metrics-search", "57014"), 1);
+  assert.equal(await statementCount("metrics-search", "select"), 2);
+});
+
+test("a pool that hands out no connection in time counts as acquire_timeout, even with tracing off", async () => {
+  const client = new FakeClient();
+  const fake = new FakePool(client);
+  fake.connectError = new Error("timeout exceeded when trying to connect");
+  const pool = fake as unknown as pg.Pool;
+  instrumentPool("metrics-acquire", pool);
+
+  await assert.rejects(() => pool.connect());
+  await assert.rejects(() => pool.query("select 1"));
+
+  assert.equal(await statementErrorCount("metrics-acquire", "acquire_timeout"), 2);
+  assert.equal(await statementCount("metrics-acquire", "select"), 0);
+});
+
+test("a statement that fails with a lock conflict records db.lock_conflict before the error propagates, with no values", async () => {
+  let now = 0;
+  Date.now = () => now;
+  const sink = new MemoryTraceSink();
+  setDbTracer(new BasicTracer({ sink, clock: () => now }));
+  const client = new FakeClient();
+  const pool = new FakePool(client) as unknown as pg.Pool;
+  instrumentPool("primary", pool);
+
+  for (const sqlstate of ["40P01", "40001", "55P03"]) {
+    client.queryError = Object.assign(new Error(`conflict ${sqlstate}`), { code: sqlstate });
+    const checkedOut = await pool.connect();
+    // The caller swallows it: the event must already be recorded.
+    await withDbTraceAttributes({ db_callsite: "test.swallowed" }, () =>
+      checkedOut.query("UPDATE external_channel_bindings SET state = 'paused' WHERE id = $1", ["b-secret"]).catch(() => null));
+    checkedOut.release();
+  }
+  // A non-conflict failure records nothing.
+  client.queryError = Object.assign(new Error("syntax"), { code: "42601" });
+  const other = await pool.connect();
+  await other.query("SELECT 1").catch(() => null);
+  other.release();
+
+  const events = sink.getAllLogEvents().filter((event) => event.name === "db.lock_conflict");
+  assert.deepEqual(events.map((event) => event.attrs?.sqlstate), ["40P01", "40001", "55P03"]);
+  for (const event of events) {
+    assert.equal(event.attrs?.pool, "primary");
+    assert.equal(event.attrs?.statement_kind, "update");
+    assert.equal(event.attrs?.in_transaction, false);
+    assert.equal(event.attrs?.db_callsite, "test.swallowed");
+    assert.equal(event.attrs?.sql_fingerprint, "UPDATE external_channel_bindings SET state = ? WHERE id = ?");
+    assert.equal(typeof event.attrs?.sql_hash, "string");
+    assert.equal(JSON.stringify(event.attrs).includes("paused"), false, "no literal values");
+    assert.equal(JSON.stringify(event.attrs).includes("b-secret"), false, "no parameters");
+  }
 });

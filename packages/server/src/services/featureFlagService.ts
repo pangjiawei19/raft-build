@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import { isInTransaction } from "../db/ambientTransaction";
 import { asc, eq, inArray, sql, and, or } from "drizzle-orm";
-import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index.js";
+import { getDb, type DatabaseExecutor, type DatabaseTransaction } from "../db/index";
 import {
   featureFlagConfigVersions,
   featureFlagAudienceMembers,
@@ -11,53 +12,132 @@ import {
   servers,
   serverLabAccess,
   serverLabEnrollments,
-} from "../db/schema.js";
-import { getServerBillingEntitlements, type ServerBillingEntitlement } from "./planService.js";
+} from "../db/schema";
+import { getServerBillingEntitlements, type ServerBillingEntitlement } from "./planService";
 import {
-  ACTIVITY_V2_FEATURE_FLAG_KEY as SHARED_ACTIVITY_V2_FEATURE_FLAG_KEY,
   AGENT_MIGRATION_FEATURE_FLAG_KEY as SHARED_AGENT_MIGRATION_FEATURE_FLAG_KEY,
   APPLE_WEB_LOGIN_FEATURE_FLAG_KEY as SHARED_APPLE_WEB_LOGIN_FEATURE_FLAG_KEY,
-  CHAT_GRID_LAYOUT_FEATURE_FLAG_KEY as SHARED_CHAT_GRID_LAYOUT_FEATURE_FLAG_KEY,
+  CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY as SHARED_CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY,
   COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY as SHARED_COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY,
   PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY as SHARED_PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY,
   PUBLIC_SERVER_FEATURE_FLAG_KEY as SHARED_PUBLIC_SERVER_FEATURE_FLAG_KEY,
   SERVER_LABS_UI_FEATURE_FLAG_KEY as SHARED_SERVER_LABS_UI_FEATURE_FLAG_KEY,
-  RUNTIME_ACCOUNT_USAGE_FEATURE_FLAG_KEY as SHARED_RUNTIME_ACCOUNT_USAGE_FEATURE_FLAG_KEY,
-  THREAD_AGENT_FOLLOWER_MANAGEMENT_FEATURE_FLAG_KEY,
   SERVER_GUEST_FEATURE_FLAG_KEY as SHARED_SERVER_GUEST_FEATURE_FLAG_KEY,
+  REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY as SHARED_REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY,
   canUseProBillingFeatures,
+  clientRuleConstraintsSatisfied,
+  clientRuleShapeError,
   currentDate,
+  findClientRuleBypassConflicts,
+  type FeatureFlagClientFacts,
+  type FeatureFlagClientRuleBypassConflict,
+  type FeatureFlagRuleForConflictCheck,
+  type FeatureFlagRuleShapeInput,
 } from "@botiverse/raft-shared";
 
 export const FEATURE_FLAG_CONFIG_SCOPE_GLOBAL = "global";
-export const ACTIVITY_V2_FEATURE_FLAG_KEY = SHARED_ACTIVITY_V2_FEATURE_FLAG_KEY;
 export const ATTACHMENT_COMMENTS_FEATURE_FLAG_KEY = "attachment_comments_v0";
-export const HUMAN_ACTIVITY_MUTE_FEATURE_FLAG_KEY = "human_activity_mute_v0";
-export const MESSAGE_FORWARDING_FEATURE_FLAG_KEY = "message_forwarding_v0";
 export const ATTACHMENT_DIRECT_UPLOAD_FEATURE_FLAG_KEY = "attachment_direct_upload_v0";
+/**
+ * Recent search on a dense term walks only the caller's server
+ * (message_server_timeline). Absent = off (global walk); turn on only after the
+ * timeline verified 0/0; kill_switch reverts to the global walk without a deploy.
+ */
+export const SEARCH_SERVER_TIMELINE_WALK_FEATURE_FLAG_KEY = "search_server_timeline_walk";
+export const ATTACHMENT_ORIGINAL_STORAGE_V2_FEATURE_FLAG_KEY = "attachment_original_storage_v2";
 export const ATTACHMENT_PREVIEW_UNIFIED_FEATURE_FLAG_KEY = "attachment_preview_unified_v0";
-export const AGENT_ACTIVITY_KERNEL_ARBITRATION_FEATURE_FLAG_KEY = "agent_activity_kernel_arbitration_v0";
+export const PUBLIC_DERIVED_STORAGE_V2_FEATURE_FLAG_KEY = "public_derived_storage_v2";
 export const ONBOARDING_OPENER_V2_FEATURE_FLAG_KEY = "onboarding_opener_v2";
 export const ONBOARDING_OWNER_WIZARD_FEATURE_FLAG_KEY = "onboarding_owner_wizard_v0";
-export const INBOX_VISIBILITY_V3_FEATURE_FLAG_KEY = "inbox_visibility_v3_v0";
 export const AGENT_MIGRATION_FEATURE_FLAG_KEY = SHARED_AGENT_MIGRATION_FEATURE_FLAG_KEY;
 export const APPLE_WEB_LOGIN_FEATURE_FLAG_KEY = SHARED_APPLE_WEB_LOGIN_FEATURE_FLAG_KEY;
-export const CHAT_GRID_LAYOUT_FEATURE_FLAG_KEY = SHARED_CHAT_GRID_LAYOUT_FEATURE_FLAG_KEY;
+export const CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY = SHARED_CHANNEL_TO_JOINT_CONVERSION_FEATURE_FLAG_KEY;
 export const COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY = SHARED_COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY;
 export const READ_RECEIPTS_FEATURE_FLAG_KEY = "read_receipts_v0";
-export const MOBILE_PUSH_DELIVERY_FEATURE_FLAG_KEY = "mobile_push_delivery_v0";
+// Android (FCM) delivery rollout. Sends only when FCM is configured
+// (FCM_CREDENTIALS_JSON + FCM_PROJECT_ID, fcmPushProvider.ts).
+export const MOBILE_PUSH_FCM_FEATURE_FLAG_KEY = "mobile_push_fcm_v0";
 export const GROK_RUNTIME_FEATURE_FLAG_KEY = "grok_runtime_v0";
 export const LLM_TRANSLATION_FEATURE_FLAG_KEY = "llm_translation_v0";
 export const PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY = SHARED_PROVIDER_CONNECTIONS_FEATURE_FLAG_KEY;
 export const PUBLIC_SERVER_FEATURE_FLAG_KEY = SHARED_PUBLIC_SERVER_FEATURE_FLAG_KEY;
 export const SERVER_LABS_UI_FEATURE_FLAG_KEY = SHARED_SERVER_LABS_UI_FEATURE_FLAG_KEY;
-export const RUNTIME_ACCOUNT_USAGE_FEATURE_FLAG_KEY = SHARED_RUNTIME_ACCOUNT_USAGE_FEATURE_FLAG_KEY;
 export const SERVER_GUEST_FEATURE_FLAG_KEY = SHARED_SERVER_GUEST_FEATURE_FLAG_KEY;
+export const REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY = SHARED_REMOTE_COMPUTER_UPGRADE_V2_FEATURE_FLAG_KEY;
+/**
+ * RFC 070 constructed wake context (at-wake session recycling with a
+ * constructed briefing, the cold-idle sweep, and the startup MEMORY.md block).
+ * Server-scoped, default OFF: evaluated at each agent start and sent to the
+ * daemon as `AgentConfig.constructedWakeContext`; a missing flag or any
+ * evaluation failure leaves the behavior off.
+ */
+export const CONSTRUCTED_WAKE_CONTEXT_FEATURE_FLAG_KEY = "constructed_wake_context";
+
+/**
+ * Sub-agent delegation prompt: named agents whose runtime can start sub-agents
+ * are told to stay on Raft (think, reply fast, coordinate) and hand hands-on
+ * work to parallel sub-agents. Server-scoped, default OFF: evaluated at each
+ * agent start and sent to the daemon as `AgentConfig.subagentDelegation`; a
+ * missing flag or any evaluation failure leaves the prompt unchanged.
+ */
+export const SUBAGENT_DELEGATION_FEATURE_FLAG_KEY = "subagent_delegation_prompt";
+
+/**
+ * RFC 072 §7 passive AX ("peripheral vision": command-guidance holds and
+ * context-scoped thread evidence). Server-scoped, default OFF: evaluated at
+ * each agent start and sent to the daemon as `AgentConfig.passiveAx`; a
+ * missing flag or any evaluation failure leaves it off. The daemon composes
+ * it with its local `RAFT_PASSIVE_AX=0` kill switch and hands the result to
+ * the CLI through the context-generation record (task #359).
+ */
+export const PASSIVE_AX_FEATURE_FLAG_KEY = "passive_ax";
+
+/**
+ * RFC 074 §2 personal assistant v0 (identity borrowing). Server-scoped,
+ * default OFF: a missing flag or any evaluation failure keeps every
+ * assistant-only read refused and the assistant link unsettable.
+ */
+export const IDENTITY_BORROWING_FEATURE_FLAG_KEY = "identity_borrowing";
+
+/**
+ * Reminder app gray rollout. Server-scoped, default OFF. When on, the legacy
+ * `raft reminder schedule|update|snooze` writes are refused with
+ * `reminders_moved_to_app` (list, log and cancel stay; queued legacy reminders
+ * still fire), and agent start sends `AgentConfig.reminderApp` so a current
+ * Computer replaces the prompt's Reminders section. A missing flag or any
+ * evaluation failure leaves everything as it was.
+ */
+export const REMINDER_APP_FEATURE_FLAG_KEY = "reminder_app";
+
+/**
+ * Vault app gray rollout. Server-scoped, default OFF. When on, agent start
+ * sends `AgentConfig.vaultApp` so a current Computer adds the Vault line to
+ * the credential section. A missing flag or any evaluation failure leaves it
+ * off.
+ */
+export const VAULT_APP_FEATURE_FLAG_KEY = "vault_app";
+
+/**
+ * Hosted Cindy (step 4, #raft-antiproton:8008c6f0). Server-scoped, default
+ * OFF, effective only while `antiproton_hosted_runtime` is also on: the
+ * onboarding agent may be a hosted (Antiproton) agent and is briefed once its
+ * workspace import lands, with no computer involved.
+ */
+export const ANTIPROTON_CINDY_FEATURE_FLAG_KEY = "antiproton_cindy";
+
+/**
+ * Hosted-agent model choice (tygg, #raft-antiproton:c4acc0a7). Server-scoped,
+ * default OFF. While off, Raft decides the model: every hosted agent starts on
+ * DeepSeek Flash, the web shows no model picker, and a request naming another
+ * model is refused. Allowed servers pick from the provider's list as before.
+ * A missing flag or any evaluation failure reads as off.
+ */
+export const ANTIPROTON_MODEL_PICKER_FEATURE_FLAG_KEY = "antiproton_model_picker";
 
 const FEATURE_FLAG_LOCK_NAMESPACE = 0x46464c47; // "FFLG"
 const FEATURE_FLAG_CONFIG_VERSION_LOCK_NAMESPACE = 0x46464356; // "FFCV"
 const FEATURE_FLAG_CONFIG_VERSION_LOCK_KEY = 0;
-const RULE_STAGE_ORDER = ["user", "platform", "server", "audience", "lab", "plan", "percentage"] as const;
+const RULE_STAGE_ORDER = ["user", "platform", "client", "server", "audience", "lab", "plan", "percentage"] as const;
 const LAB_KEY_RE = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
 const AUDIENCE_KEY_RE = /^[a-z0-9][a-z0-9_.-]{0,127}$/;
 
@@ -83,6 +163,17 @@ export class FeatureFlagPlatformRuleAlreadyExistsError extends Error {
 
 export type FeatureFlagRandomizationUnit = "user" | "server";
 export type FeatureFlagPlatform = "web" | "mobile";
+// `client` stage definitions are shared with the Feature Flag Admin (task #1144).
+export {
+  FEATURE_FLAG_CLIENT_BUILD_TYPES,
+  FEATURE_FLAG_CLIENT_OS_VALUES,
+  clientRuleConstraintsSatisfied,
+  findClientRuleBypassConflicts,
+  parseFeatureFlagClientFacts,
+  type FeatureFlagClientBuildType,
+  type FeatureFlagClientFacts,
+  type FeatureFlagClientOs,
+} from "@botiverse/raft-shared";
 export type FeatureFlagRuleStage = (typeof RULE_STAGE_ORDER)[number];
 export type FeatureFlagRuleDecision = "allow" | "deny";
 export type FeatureFlagOperatorActor = {
@@ -92,13 +183,13 @@ export type FeatureFlagOperatorActor = {
 
 export type FeatureFlagReason =
   | "missing_flag"
-  | "initial_allowlist"
   | "kill_switch"
   | "flag_disabled"
   | "missing_user_unit"
   | "missing_server_unit"
   | "user_rule"
   | "platform_rule"
+  | "client_rule"
   | "server_rule"
   | "audience_rule"
   | "lab_rule"
@@ -118,6 +209,7 @@ export interface EvaluateFeatureFlagInput {
   userId?: string | null;
   serverId?: string | null;
   platform?: FeatureFlagPlatform | null;
+  client?: FeatureFlagClientFacts | null;
 }
 
 type FeatureFlagRow = typeof featureFlags.$inferSelect;
@@ -220,6 +312,56 @@ function asStringArray(value: unknown): string[] {
   return value.filter((item): item is string => typeof item === "string" && item.length > 0);
 }
 
+/** App-level mirror of the `client` CHECK constraints (shared with the Feature Flag Admin). */
+export function assertClientRuleShape(input: FeatureFlagRuleShapeInput): void {
+  const error = clientRuleShapeError(input);
+  if (error) throw new FeatureFlagRuleValidationError(error);
+}
+
+/**
+ * Rejects a write that INTRODUCES a client-rule bypass (see findClientRuleBypassConflicts): a later stage
+ * or the default that could grant the flag to a client failing a client allow rule. Conflicts that already
+ * existed before the write do not block it, so narrowing and cleanup stay possible (same contract as the
+ * Feature Flag Admin and the rollout guardrail). Checked in both directions.
+ */
+async function assertNoNewClientRuleBypass(
+  tx: DatabaseTransaction,
+  flagKey: string,
+  before: FeatureFlagRuleForConflictCheck[],
+  after: FeatureFlagRuleForConflictCheck[],
+  defaultEnabledAfter?: boolean,
+): Promise<void> {
+  const [flag] = await tx.select({ defaultEnabled: featureFlags.defaultEnabled }).from(featureFlags).where(eq(featureFlags.key, flagKey));
+  const defaultEnabledBefore = flag?.defaultEnabled ?? false;
+  const conflictKey = (conflict: FeatureFlagClientRuleBypassConflict) =>
+    `${conflict.kind}|${conflict.clientRuleId}|${conflict.bypassRuleId ?? ""}|${conflict.serverId ?? ""}`;
+  const existing = new Set(
+    findClientRuleBypassConflicts({ rules: before, defaultEnabled: defaultEnabledBefore }).map(conflictKey),
+  );
+  const conflict = findClientRuleBypassConflicts({
+    rules: after,
+    defaultEnabled: defaultEnabledAfter ?? defaultEnabledBefore,
+  }).find((candidate) => !existing.has(conflictKey(candidate)));
+  if (!conflict) return;
+  const bypass = conflict.kind === "default_enabled"
+    ? "the flag's defaultEnabled"
+    : `${conflict.kind.replace("_", " ")} rule ${conflict.bypassRuleId}${conflict.serverId ? ` (server ${conflict.serverId})` : ""}`;
+  throw new FeatureFlagRuleValidationError(
+    `Client allow rule ${conflict.clientRuleId} would be bypassed by ${bypass}: a client that fails the client `
+      + "rule would fall through and still get the flag.",
+  );
+}
+
+function conflictCheckRows(rows: FeatureFlagRuleRow[]): FeatureFlagRuleForConflictCheck[] {
+  return rows.map((row) => ({
+    id: row.id,
+    stage: row.stage,
+    decision: row.decision,
+    values: asStringArray(row.values),
+    percentageBasisPoints: row.percentageBasisPoints,
+  }));
+}
+
 function assertLabRuleShape(input: {
   flagKey: string;
   stage: FeatureFlagRuleStage;
@@ -313,6 +455,26 @@ function matchExplicitRule(
   for (const rule of rulesForStage(rules, stage)) {
     if (asStringArray(rule.values).includes(value)) {
       return fromRule(flag.key, rule, `${stage}_rule` as FeatureFlagReason);
+    }
+  }
+  return null;
+}
+
+function matchClientRule(
+  flag: FeatureFlagRow,
+  rules: FeatureFlagRuleRow[],
+  input: Pick<EvaluateFeatureFlagInput, "serverId" | "client">,
+): FeatureFlagEvaluation | null {
+  if (!input.serverId) return null;
+  for (const rule of rulesForStage(rules, "client")) {
+    if (!asStringArray(rule.values).includes(input.serverId)) continue;
+    const constraints = {
+      clientOs: rule.clientOs == null ? null : asStringArray(rule.clientOs),
+      minClientBuild: rule.minClientBuild,
+      clientBuildTypes: rule.clientBuildTypes == null ? null : asStringArray(rule.clientBuildTypes),
+    };
+    if (clientRuleConstraintsSatisfied(constraints, input.client)) {
+      return fromRule(flag.key, rule, "client_rule");
     }
   }
   return null;
@@ -429,6 +591,9 @@ function evaluateFlagRow(
   const platformRule = matchExplicitRule(flag, rules, "platform", input.platform);
   if (platformRule) return platformRule;
 
+  const clientRule = matchClientRule(flag, rules, input);
+  if (clientRule) return clientRule;
+
   const serverRule = matchExplicitRule(flag, rules, "server", input.serverId);
   if (serverRule) return serverRule;
 
@@ -481,7 +646,10 @@ async function preloadEffectiveLabKeysByServer(
   if (serverIds.length === 0 || labKeys.length === 0) return effectiveByServer;
 
   try {
-    const rows = await executor
+    // Inside a transaction (evaluateFeatureFlag(..., tx)) the read runs in a
+    // savepoint: the catch below continues, and a failed statement would
+    // otherwise have aborted the caller's transaction (25P02 on its next query).
+    const readLabRows = (reader: DatabaseExecutor) => reader
       .select({
         serverId: serverLabEnrollments.serverId,
         labKey: serverLabEnrollments.labKey,
@@ -506,6 +674,9 @@ async function preloadEffectiveLabKeysByServer(
         inArray(serverLabEnrollments.labKey, labKeys),
         eq(serverLabEnrollments.enabled, true),
       ));
+    const rows = isInTransaction()
+      ? await executor.transaction((savepoint) => readLabRows(savepoint))
+      : await readLabRows(executor);
 
     for (const row of rows) {
       const labKeysForServer = effectiveByServer.get(row.serverId) ?? new Set<string>();
@@ -560,12 +731,28 @@ async function preloadMatchingAudienceKeysByIdentity(
   return matches;
 }
 
+/**
+ * CONTRACT: one evaluation per input, positionally aligned with `inputs`.
+ *
+ * Batching here is about LOADING, not about answering. Flag rows, rules and the
+ * audience/lab/plan preloads are fetched once for the whole batch (still a fixed
+ * number of queries regardless of batch size), but the decision itself is a pure
+ * function of (flag row, rules, identity) and is computed separately for every
+ * input. A batch may therefore mix keys, users, servers and platforms freely.
+ *
+ * This used to collapse the batch by key and answer each key from whichever
+ * input appeared first, which silently returned another identity's answer for a
+ * per-server rollout. Evaluating per input is what the parameter type already
+ * promises; collapsing was the bug.
+ */
 export async function evaluateFeatureFlags(
   inputs: EvaluateFeatureFlagInput[],
   executor: DatabaseExecutor = getDb(),
 ): Promise<FeatureFlagEvaluation[]> {
   const keys = [...new Set(inputs.map((input) => input.key).filter(Boolean))];
-  if (keys.length === 0) return [];
+  if (keys.length === 0) {
+    return inputs.map((input) => ({ key: input.key, enabled: false, reason: "missing_flag" as const }));
+  }
   const now = currentDate();
 
   const flagRows = await executor
@@ -620,45 +807,16 @@ export async function evaluateFeatureFlags(
     now,
   };
 
-  const initialThreadFollowerServerIds = [...new Set(inputs
-    .filter((input) => (
-      input.key === THREAD_AGENT_FOLLOWER_MANAGEMENT_FEATURE_FLAG_KEY
-      && !flagByKey.has(input.key)
-      && Boolean(input.serverId)
-    ))
-    .map((input) => input.serverId)
-    .filter((serverId): serverId is string => Boolean(serverId)))];
-  const initialThreadFollowerAllowedIds = new Set<string>();
-  if (initialThreadFollowerServerIds.length > 0) {
-    const rows = await executor
-      .select({ id: servers.id })
-      .from(servers)
-      .where(and(
-        inArray(servers.id, initialThreadFollowerServerIds),
-        inArray(servers.slug, ["botiverse", "slock-android"]),
-      ));
-    for (const row of rows) initialThreadFollowerAllowedIds.add(row.id);
-  }
-
-  const results: FeatureFlagEvaluation[] = [];
-  for (const key of keys) {
-    const firstInput = inputs.find((input) => input.key === key)!;
+  return inputs.map((input) => {
+    const key = input.key;
     const evaluation = evaluateFlagRow(
       flagByKey.get(key) ?? null,
       rulesByKey.get(key) ?? [],
-      firstInput,
+      input,
       preload,
     );
-    results.push(
-      evaluation.reason === "missing_flag"
-      && key === THREAD_AGENT_FOLLOWER_MANAGEMENT_FEATURE_FLAG_KEY
-      && firstInput.serverId
-      && initialThreadFollowerAllowedIds.has(firstInput.serverId)
-        ? { key, enabled: true, reason: "initial_allowlist" }
-        : evaluation,
-    );
-  }
-  return results;
+    return evaluation;
+  });
 }
 
 export async function evaluateFeatureFlag(
@@ -667,6 +825,45 @@ export async function evaluateFeatureFlag(
 ): Promise<FeatureFlagEvaluation> {
   const [evaluation] = await evaluateFeatureFlags([input], executor);
   return evaluation ?? { key: input.key, enabled: false, reason: "missing_flag" };
+}
+
+/**
+ * Task #205: the before-login answer for the public GET /api/public/feature-flags. There is no user
+ * and no server, so only a flag's kill switch, enabled bit, `platform` rules and default can decide.
+ * Only flags marked `pre_auth_evaluable` are read, and only their `platform` rules are loaded, so the
+ * query itself never touches a user, server, audience, lab or plan rule. Every other key (unmarked,
+ * missing, disabled) answers false, and the caller cannot tell which.
+ */
+export async function evaluatePreAuthFeatureFlags(
+  keys: string[],
+  platform: FeatureFlagPlatform | null,
+  executor: DatabaseExecutor = getDb(),
+): Promise<Record<string, boolean>> {
+  const uniqueKeys = [...new Set(keys)];
+  const result: Record<string, boolean> = Object.fromEntries(uniqueKeys.map((key) => [key, false]));
+  if (uniqueKeys.length === 0) return result;
+
+  const flagRows = await executor
+    .select()
+    .from(featureFlags)
+    .where(and(inArray(featureFlags.key, uniqueKeys), eq(featureFlags.preAuthEvaluable, true)));
+  const platformRules = flagRows.length > 0 && platform
+    ? await executor
+        .select()
+        .from(featureFlagRules)
+        .where(and(
+          inArray(featureFlagRules.flagKey, flagRows.map((flag) => flag.key)),
+          eq(featureFlagRules.stage, "platform"),
+        ))
+    : [];
+
+  for (const flag of flagRows) {
+    if (flag.killSwitch || !flag.enabled) continue;
+    const rules = platformRules.filter((rule) => rule.flagKey === flag.key);
+    const platformRule = matchExplicitRule(flag, rules, "platform", platform);
+    result[flag.key] = platformRule ? platformRule.enabled : flag.defaultEnabled;
+  }
+  return result;
 }
 
 export async function listFeatureFlags(executor: DatabaseExecutor = getDb()) {
@@ -709,6 +906,10 @@ export async function updateFeatureFlag(
   patch: Partial<Omit<typeof featureFlags.$inferInsert, "key" | "createdAt">>,
 ) {
   return withFeatureFlagLock(key, async (tx) => {
+    if (patch.defaultEnabled === true) {
+      const rules = await tx.select().from(featureFlagRules).where(eq(featureFlagRules.flagKey, key));
+      await assertNoNewClientRuleBypass(tx, key, conflictCheckRows(rules), conflictCheckRows(rules), true);
+    }
     const [updated] = await tx
       .update(featureFlags)
       .set({ ...patch, updatedAt: new Date() })
@@ -779,6 +980,10 @@ export async function createFirstServerAllowFeatureFlagRule(input: {
         "A server rule already exists; only the first server allow rule can be created through this helper.",
       );
     }
+    await assertNoNewClientRuleBypass(tx, input.flagKey, conflictCheckRows(existingRules), [
+      ...conflictCheckRows(existingRules),
+      { id: "(new rule)", stage: "server", decision: "allow", values: serverIds },
+    ]);
 
     const [created] = await tx.insert(featureFlagRules).values({
       flagKey: input.flagKey,
@@ -867,8 +1072,20 @@ export async function createFeatureFlagRule(input: {
   values?: string[];
   percentageBasisPoints?: number | null;
   variant?: string | null;
+  clientOs?: string[] | null;
+  minClientBuild?: number | null;
+  clientBuildTypes?: string[] | null;
 }) {
   const values = input.values ?? [];
+  assertClientRuleShape({
+    stage: input.stage,
+    values,
+    percentageBasisPoints: input.percentageBasisPoints ?? null,
+    variant: input.variant ?? null,
+    clientOs: input.clientOs ?? null,
+    minClientBuild: input.minClientBuild ?? null,
+    clientBuildTypes: input.clientBuildTypes ?? null,
+  });
   assertLabRuleShape({
     flagKey: input.flagKey,
     stage: input.stage,
@@ -884,6 +1101,17 @@ export async function createFeatureFlagRule(input: {
       variant: input.variant ?? null,
     });
     await assertEnabledAudienceKeys(tx, input.stage, values);
+    const existing = await tx.select().from(featureFlagRules).where(eq(featureFlagRules.flagKey, input.flagKey));
+    await assertNoNewClientRuleBypass(tx, input.flagKey, conflictCheckRows(existing), [
+      ...conflictCheckRows(existing),
+      {
+        id: "(new rule)",
+        stage: input.stage,
+        decision: input.decision,
+        values,
+        percentageBasisPoints: input.percentageBasisPoints ?? null,
+      },
+    ]);
     const [created] = await tx.insert(featureFlagRules).values({
       flagKey: input.flagKey,
       stage: input.stage,
@@ -892,6 +1120,9 @@ export async function createFeatureFlagRule(input: {
       values: [...new Set(values)],
       percentageBasisPoints: input.percentageBasisPoints ?? null,
       variant: input.variant ?? null,
+      clientOs: input.clientOs ?? null,
+      minClientBuild: input.minClientBuild ?? null,
+      clientBuildTypes: input.clientBuildTypes ?? null,
     }).returning();
     await bumpFeatureFlagConfigVersion({ updatedBy: "legacy-server-admin" }, tx);
     return created;
@@ -928,7 +1159,36 @@ export async function updateFeatureFlagRule(
         : patch.percentageBasisPoints,
       variant: patch.variant === undefined ? current.variant : patch.variant,
     });
+    assertClientRuleShape({
+      stage: nextStage,
+      values: nextValues,
+      percentageBasisPoints: patch.percentageBasisPoints === undefined
+        ? current.percentageBasisPoints
+        : patch.percentageBasisPoints,
+      variant: patch.variant === undefined ? current.variant : patch.variant,
+      clientOs: patch.clientOs === undefined
+        ? (current.clientOs == null ? null : asStringArray(current.clientOs))
+        : (patch.clientOs as string[] | null),
+      minClientBuild: patch.minClientBuild === undefined ? current.minClientBuild : patch.minClientBuild,
+      clientBuildTypes: patch.clientBuildTypes === undefined
+        ? (current.clientBuildTypes == null ? null : asStringArray(current.clientBuildTypes))
+        : (patch.clientBuildTypes as string[] | null),
+    });
     await assertEnabledAudienceKeys(tx, nextStage, nextValues);
+    const siblings = await tx.select().from(featureFlagRules).where(eq(featureFlagRules.flagKey, flagKey));
+    await assertNoNewClientRuleBypass(tx, flagKey, conflictCheckRows(siblings), conflictCheckRows(siblings).map((row) => (
+      row.id === ruleId
+        ? {
+          ...row,
+          stage: nextStage,
+          decision: patch.decision ?? current.decision,
+          values: nextValues,
+          percentageBasisPoints: patch.percentageBasisPoints === undefined
+            ? current.percentageBasisPoints
+            : patch.percentageBasisPoints,
+        }
+        : row
+    )));
     const normalizedPatch = patch.values === undefined
       ? patch
       : { ...patch, values: [...new Set(patch.values as string[])] };

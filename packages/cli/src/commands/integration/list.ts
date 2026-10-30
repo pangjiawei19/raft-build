@@ -1,17 +1,19 @@
 // `raft integration list` — GET /internal/agent-api/integrations
 
 import type { Command } from "commander";
+import type {
+  AgentLoginIntegrationInventoryProjection,
+} from "@botiverse/raft-shared";
 import {
   AGENT_LOGIN_INTEGRATION_INVENTORY_PROJECTION,
-  type AgentLoginIntegrationInventoryProjection,
-} from "@botiverse/raft-shared";
+} from "@botiverse/raft-shared/src/agentCliSurface";
 
-import { defineCommand, registerCliCommand } from "../../core/command.js";
-import type { CommandRuntimeOptions } from "../../core/context.js";
-import { writeJson, writeText, NL } from "../../core/renderer.js";
-import { createAgentApiSurfaceClient } from "../../agentApiPath.js";
-import { apiFailureError } from "../_apiFailure.js";
-import { formatIntegrationList, type IntegrationListResponse } from "./_format.js";
+import { defineCommand, registerCliCommand } from "../../core/command";
+import type { CommandRuntimeOptions } from "../../core/context";
+import { writeJson, writeText, NL } from "../../core/renderer";
+import { createAgentApiSurfaceClient } from "../../agentApiPath";
+import { apiFailureError } from "../_apiFailure";
+import { formatIntegrationList, projectCurrentIntegrationList, type IntegrationListResponse } from "./_format";
 
 interface ListOptions {
   json?: boolean;
@@ -24,7 +26,7 @@ export function integrationListJsonResponse(
 ) {
   return {
     ok: true,
-    data,
+    data: projectCurrentIntegrationList(data),
     observationScope: inventoryProjection.observationScope,
   } as const;
 }

@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 import { createIntl } from "react-intl";
 
 import { en as enMessages } from "../src/i18n/messages/en";
@@ -30,10 +29,12 @@ const intls = {
 const fmt = (loc: "en" | "zh-cn", id: string, v?: Record<string, unknown>) =>
   String(intls[loc].formatMessage({ id }, v as never));
 
-const RAW_SRC = readFileSync(
-  resolve(import.meta.dirname, "../src/components/actions/ActionCard.tsx"),
-  "utf8",
-);
+// The card and the hook that turns an action into its property rows: the field
+// labels moved into the hook when the card adopted raft-ui MessageActionCard.
+const RAW_SRC = [
+  "../src/components/actions/ActionCard.tsx",
+  "../src/components/actions/useActionCardDetail.ts",
+].map((file) => readFileSync(resolve(import.meta.dirname, file), "utf8")).join("\n");
 
 /**
  * Source with comments stripped, for the negative guards below.
@@ -140,7 +141,8 @@ test("every rich-text chunk in this file is keyed", () => {
 test("field labels are deduplicated across the action cases", () => {
   // 23 label sites collapsed to 13 ids. Minting one id per SITE is how the same
   // English drifts into two Chinese translations.
-  const ids = [...SRC.matchAll(/id: "(actionCard\.field\.[A-Za-z]+)"/g)].map((m) => m[1]);
+  const ids = [...SRC.matchAll(/(?:id: |field\()"(actionCard\.field\.[A-Za-z]+)"/g)].map((m) => m[1]);
+  assert.ok(ids.length >= 20, `found only ${ids.length} field label sites — the pattern drifted`);
   const unique = new Set(ids);
   assert.ok(ids.length > unique.size, "expected reuse — every field id is used once only");
   for (const id of unique) {
@@ -175,7 +177,7 @@ test("every actionCard id exists in BOTH catalogs", () => {
     assert.notEqual(zh[id], "", `${id} has empty Chinese`);
   }
   // Every id the source references must exist.
-  for (const m of SRC.matchAll(/id: "(actionCard\.[A-Za-z.]+)"/g)) {
+  for (const m of SRC.matchAll(/(?:id: |field\()"(actionCard\.[A-Za-z.]+)"/g)) {
     assert.notEqual(en[m[1]], undefined, `${m[1]} referenced but not in en`);
   }
 });
@@ -235,7 +237,7 @@ test("each action type is bound to ITS OWN verb id", () => {
 });
 
 test("each action type is bound to ITS OWN title id", () => {
-  const pairs = parseSwitchPairs("ActionTitleLine", "function ActionDetail", "title(");
+  const pairs = parseSwitchPairs("ActionTitleLine", "function ResultLink", "title(");
   // channel:create resolves through a visibility ternary, so its FIRST id is the
   // private arm; the public arm is asserted separately below.
   const expected: Record<string, string> = {
@@ -263,7 +265,7 @@ test("each action type is bound to ITS OWN title id", () => {
 
 test("no verb or title id is used for two different actions", () => {
   const verbs = [...parseSwitchPairs("actionVerb", "function ActionTitleLine", "return ").values()];
-  const titles = [...parseSwitchPairs("ActionTitleLine", "function ActionDetail", "title(").values()];
+  const titles = [...parseSwitchPairs("ActionTitleLine", "function ResultLink", "title(").values()];
   for (const [what, ids] of [["verb", verbs], ["title", titles]] as const) {
     assert.equal(new Set(ids).size, ids.length, `two actions share a ${what} id`);
   }

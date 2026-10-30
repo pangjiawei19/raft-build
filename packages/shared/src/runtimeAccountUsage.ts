@@ -1,6 +1,17 @@
 import { z } from "zod";
+import { lazySchema } from "./lazySchema";
 
 export const RUNTIME_ACCOUNT_USAGE_PROTOCOL_VERSION = 2 as const;
+
+/**
+ * Server-side relay budget for a manual refresh round-trip: the server waits
+ * for the computer's correlated snapshot before answering the refresh POST.
+ * Collection usually completes in seconds, but a single daemon-side usage read
+ * can run to its own 20s collector timeout, so the budget covers that worst
+ * case plus transport slack — a slow Computer should surface as an answer,
+ * not as a relay timeout.
+ */
+export const RUNTIME_ACCOUNT_USAGE_RELAY_BUDGET_MS = 25_000;
 
 export const RUNTIME_ACCOUNT_USAGE_PROVIDERS = ["claude", "codex", "kimi", "grok"] as const;
 export type RuntimeAccountUsageProvider = (typeof RUNTIME_ACCOUNT_USAGE_PROVIDERS)[number];
@@ -21,15 +32,15 @@ export const RUNTIME_ACCOUNT_USAGE_WINDOW_STATUSES = [
 ] as const;
 export type RuntimeAccountUsageWindowStatus = (typeof RUNTIME_ACCOUNT_USAGE_WINDOW_STATUSES)[number];
 
-const isoInstantSchema = z.string().datetime({ offset: true });
-const safeLabelSchema = z.string().trim().min(1).max(80).refine(
+const isoInstantSchema = lazySchema("isoInstantSchema", () => z.string().datetime({ offset: true }));
+const safeLabelSchema = lazySchema("safeLabelSchema", () => z.string().trim().min(1).max(80).refine(
   (value) => !/[\u0000-\u001f\u007f]/.test(value),
   "Label contains control characters",
-);
-const maskedLabelSchema = safeLabelSchema.refine(
+));
+const maskedLabelSchema = lazySchema("maskedLabelSchema", () => safeLabelSchema.refine(
   (value) => /[*•…]/u.test(value),
   "Account labels must contain an explicit mask marker",
-);
+));
 
 /**
  * Converts a provider account email into the only identity form allowed in a
@@ -80,7 +91,7 @@ export function maskRuntimeAccountEmail(value: unknown): string | undefined {
   return masked.length <= 80 ? masked : undefined;
 }
 
-export const runtimeAccountUsageWindowSchema = z.strictObject({
+export const runtimeAccountUsageWindowSchema = lazySchema("runtimeAccountUsageWindowSchema", () => z.strictObject({
   id: z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/),
   label: safeLabelSchema,
   status: z.enum(RUNTIME_ACCOUNT_USAGE_WINDOW_STATUSES),
@@ -104,12 +115,16 @@ export const runtimeAccountUsageWindowSchema = z.strictObject({
       message: "usable windows require usedRatio",
     });
   }
-});
+}));
 
-export const runtimeAccountUsageAccountSchema = z.strictObject({
+export const runtimeAccountUsageAccountSchema = lazySchema("runtimeAccountUsageAccountSchema", () => z.strictObject({
   accountKey: z.string().regex(/^[a-f0-9]{64}$/),
   maskedLabel: maskedLabelSchema.optional(),
   planLabel: safeLabelSchema.optional(),
+  // Provider-reported display name (Kimi's profile nickname). Unlike maskedLabel
+  // it is not an email, so it carries no mask marker; accounts signed in by
+  // phone have no email and this is their only readable identity.
+  displayName: safeLabelSchema.optional(),
   health: z.enum(RUNTIME_ACCOUNT_USAGE_HEALTHS),
   parseErrorCode: z.string().regex(/^[a-z0-9][a-z0-9_.-]{0,63}$/).optional(),
   windows: z.array(runtimeAccountUsageWindowSchema).max(12),
@@ -120,9 +135,9 @@ export const runtimeAccountUsageAccountSchema = z.strictObject({
   if (account.parseErrorCode && !account.windows.some((window) => window.status === "parse_unavailable")) {
     ctx.addIssue({ code: "custom", message: "parseErrorCode requires a parse_unavailable window" });
   }
-});
+}));
 
-export const runtimeAccountUsageSnapshotSchema = z.strictObject({
+export const runtimeAccountUsageSnapshotSchema = lazySchema("runtimeAccountUsageSnapshotSchema", () => z.strictObject({
   protocolVersion: z.literal(RUNTIME_ACCOUNT_USAGE_PROTOCOL_VERSION),
   provider: z.enum(RUNTIME_ACCOUNT_USAGE_PROVIDERS),
   collectedAt: isoInstantSchema,
@@ -152,7 +167,7 @@ export const runtimeAccountUsageSnapshotSchema = z.strictObject({
       windowIds.add(window.id);
     }
   }
-});
+}));
 
 export type RuntimeAccountUsageWindow = z.infer<typeof runtimeAccountUsageWindowSchema>;
 export type RuntimeAccountUsageAccount = z.infer<typeof runtimeAccountUsageAccountSchema>;

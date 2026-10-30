@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
-import { buildRuntimeModelSourceResultMessage } from "./runtimeModelSourceProjection.js";
+import { buildRuntimeModelSourceResultMessage } from "./runtimeModelSourceProjection";
 
 test("runtime model wire carries typed live truth and legacy catalog together", () => {
   const message = buildRuntimeModelSourceResultMessage("req-live", {
@@ -58,6 +57,7 @@ test("runtime model wire keeps every non-live outcome typed and legacy-safe", ()
     [{ kind: "no_models" }, { models: [] }],
     [{ kind: "unsupported" }, { error: "unsupported" }],
     [{ kind: "error", retryable: true }, { error: "error" }],
+    [{ kind: "error", retryable: true, code: "runtime_not_authenticated" }, { error: "error" }],
   ] as const;
 
   for (const [outcome, legacy] of cases) {
@@ -78,4 +78,11 @@ test("empty live catalog normalizes to no_models before crossing the wire", () =
   );
   assert.deepEqual(message.outcome, { kind: "no_models" });
   assert.deepEqual(message.models, []);
+});
+
+test("task #1242: the serialized result frame keeps the lookup verdict beside the legacy error field", () => {
+  const message = buildRuntimeModelSourceResultMessage("req-nf", { kind: "error", retryable: true, code: "runtime_not_found", reason: "probe_timeout" }, "launchable");
+  const wire = JSON.parse(JSON.stringify(message));
+  assert.deepEqual(wire.outcome, { kind: "error", retryable: true, code: "runtime_not_found", reason: "probe_timeout" });
+  assert.equal(wire.error, "error");
 });

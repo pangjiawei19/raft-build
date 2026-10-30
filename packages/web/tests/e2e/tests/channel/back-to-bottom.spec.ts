@@ -176,3 +176,45 @@ test.describe("Back to bottom", () => {
     expect(finalGap).toBeLessThan(40);
   });
 });
+
+// Task #758 (Artea): a press once slid the pill half its width (a pressed
+// translate replaced the `-translate-x-1/2` that centres it), so a person's
+// release landed on the message text and no click happened. Raft's press only
+// adds a wash: no colour swap, no shift, no scale (DS foundations, Motion), so
+// a held press leaves the button exactly where it was. Playwright's click()
+// releases in the same instant, before any transition, so this test holds the
+// button down the way a hand does.
+test.describe("Back to bottom (held press)", () => {
+  test("a held press keeps the button under the pointer, and releasing it returns to the bottom", async ({ page, request }) => {
+    const seedState = await waitForSeedState();
+    const login = await loginViaApi(request, seedState);
+    await dismissOwnerOnboarding(request, seedState, login.accessToken);
+
+    await page.goto(`/s/${seedState.server.slug}`);
+    await expect(page.getByTestId("message-scroller")).toBeVisible();
+    await expect(page.getByText(seedState.messages.latestContent)).toBeVisible();
+    const scroller = page.getByTestId("message-scroller");
+    await scroller.hover();
+    await page.mouse.wheel(0, -700);
+    const bottomButton = page.locator('button:has-text("Back to bottom")').first();
+    await expect(bottomButton).toBeVisible();
+    await page.mouse.wheel(0, -700);
+    await expect.poll(() => measureBottomGap(page)).toBeGreaterThan(500);
+    await page.waitForTimeout(300);
+
+    const rest = (await bottomButton.boundingBox())!;
+    const x = rest.x + rest.width / 2;
+    const y = rest.y + rest.height / 2;
+    await page.mouse.move(x, y);
+    await page.waitForTimeout(250);
+    await page.mouse.down();
+    await page.waitForTimeout(250);
+    const pressed = (await bottomButton.boundingBox())!;
+    const underPointer = await page.evaluate(([px, py]) => document.elementFromPoint(px, py)?.closest("button")?.textContent ?? null, [x, y]);
+    expect(Math.abs(pressed.x - rest.x), "a press adds a wash and does not move the button").toBeLessThanOrEqual(0.5);
+    expect(underPointer, "the pointer is still on the button while it is held").toContain("Back to bottom");
+    await page.mouse.up();
+
+    expect(await waitForStableGap(page, { timeoutMs: 8000 })).toBeLessThan(40);
+  });
+});

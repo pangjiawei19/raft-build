@@ -1,6 +1,9 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 
-export const SHOW_MORE_TOGGLE_CLASS = "text-[11px] font-black text-black/60 underline underline-offset-2 hover:text-black focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-black";
+/** Raft Design System UI text link (the section action / "See all" form): ink
+ *  footnote text, 600, a 1.5px underline 3px below; keyboard focus gets the
+ *  shared focus ring. Not a prose link, so it never turns link blue. */
+export const SHOW_MORE_TOGGLE_CLASS = "rounded-[2px] text-footnote font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] hover:decoration-attention outline-none focus-visible:shadow-focus";
 
 type ShowMoreToggleProps = Omit<ButtonHTMLAttributes<HTMLButtonElement>, "children" | "type"> & {
   expanded: boolean;

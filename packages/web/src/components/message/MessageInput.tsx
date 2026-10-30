@@ -1,8 +1,8 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, useMemo } from "react";
 import { useIntl } from "react-intl";
 import type { IntlShape } from "react-intl";
-import { Send, UserX, Hash, Paperclip, X, FileText, ImagePlus, Monitor, Blocks } from "lucide-react";
-import Spinner from "../ui/Spinner";
+import { Send, UserX, Hash, Paperclip, X, FileText, ImagePlus, Monitor, Blocks, ArrowLeftRight } from "lucide-react";
+import { Badge, Button, CheckboxIndicator, Composer, ComposerActions, ComposerAttachment, ComposerAttachmentBody, ComposerAttachmentFailedOverlay, ComposerAttachmentFile, ComposerAttachmentImage, ComposerAttachmentMeta, ComposerAttachmentRemove, ComposerAttachments, ComposerAttachmentTitle, ComposerAttachmentUploadingOverlay, ComposerAttachmentUploadProgressBar, ComposerDropOverlay, ComposerDropOverlayLabel, ComposerIconButton, ComposerInput, ComposerRoot, ComposerSubmit, ComposerSuggestionAside, ComposerSuggestionContent, ComposerSuggestionGroup, ComposerSuggestionGroupLabel, ComposerSuggestionIcon, ComposerSuggestionList, ComposerSuggestionMeta, ComposerSuggestionTitle, ComposerToolbar, ComposerToolbarLabel, IconTile, Separator, Spinner } from "@botiverse/raft-ui";
 import {
   DndContext,
   closestCenter,
@@ -21,7 +21,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useMessageStore } from "../../store/messageStore";
-import type { MessageMention, PendingMentionAction } from "../../store/messageStore";
+import type { MessageDeliveryWarning, MessageMention, PendingMentionAction, Message } from "../../store/messageStore";
 import { useImageLightboxStore } from "../../store/imageLightboxStore";
 import type { MessageAttachment } from "../../store/imageLightboxStore";
 import { useAgentStore } from "../../store/agentStore";
@@ -31,19 +31,25 @@ import { useChannelStore } from "../../store/channelStore";
 import { useMachineStore } from "../../store/machineStore";
 import { useServerFeatureFlag } from "../../store/serverFeatureFlags";
 import type { Channel } from "../../store/channelStore";
+import { useChannelFirstPageSettled } from "../../hooks/useChannelFirstPageSettled";
 import { useChannelMembers } from "../../hooks/useChannelMembers";
+import { readChannelConversionBlocked, useChannelConversionState } from "../../hooks/useChannelConversionState";
 import { notifyChannelMembersChanged } from "../../store/channelMemberEvents";
+import {
+  notifyAttachmentUploadChanged,
+  subscribeAttachmentUploadChanged,
+} from "../../store/attachmentUploadEvents";
 import { useAutocomplete } from "../../hooks/useAutocomplete";
 import { useAppNavigate } from "../../hooks/useAppNavigate";
 import { useRankedComposerSuggestions } from "../../hooks/useRankedComposerSuggestions";
+import { useComposerAutosize } from "./useComposerAutosize";
+import { AutocompleteOptionRow } from "./AutocompleteOptionRow";
 import { extractClipboardFiles } from "../../utils/clipboardFiles";
 import AvatarSlot from "../ui/AvatarSlot";
 import Banner from "../ui/Banner";
-import CheckMarker from "../ui/CheckMarker";
-import SectionEyebrow from "../ui/SectionEyebrow";
+import Tooltip from "../ui/Tooltip";
 import AgentActivityDot from "../agent/AgentActivityDot";
 import api from "../../api/client";
-import type { Message } from "../../store/messageStore";
 import {
   buildMentionCandidateGroupsFromRankedCandidates,
   createMentionCandidateSearchEntries,
@@ -54,16 +60,19 @@ import {
 import type {
   MentionCandidate,
 } from "./mentionCandidates";
+import { memberServerBadgeLabels } from "../../utils/channelLocalMembership";
 import { transparentImageBackgroundClass } from "../../utils/imagePreviewStyles";
 import { decideMessageAttachmentSelection } from "../../utils/messageAttachmentLimits";
 import { resolveAttachmentUploadLimitBytes } from "../../utils/attachmentUploadLimit";
 import {
   AttachmentUploadClientError,
   cancelAttachmentUploadSession,
+  listActiveAttachmentUploads,
   uploadAttachmentFile,
 } from "../../utils/directAttachmentUpload";
 import type {
   DirectAttachmentUploadSession,
+  RecoveryView,
 } from "../../utils/directAttachmentUpload";
 import {
   formatAttachmentUploadClientError,
@@ -82,12 +91,6 @@ import {
   insertMentionAtCursor,
   SENDER_MENTION_INSERT_EVENT,
 } from "./senderMentionInsert";
-import {
-  ARCHIVED_CHANNEL_BADGE_CLASS,
-  ARCHIVED_CHANNEL_ICON_CLASS,
-  ARCHIVED_CHANNEL_MUTED_TEXT_CLASS,
-  ARCHIVED_CHANNEL_TEXT_CLASS,
-} from "../channel/channelArchiveVisual";
 import {
   COMPOSER_RESOURCE_REFERENCES_FEATURE_FLAG_KEY,
   formatRaftRefTarget,
@@ -383,6 +386,7 @@ function SortableAttachment({
   mimeType,
   uploadStatus,
   uploadProgress,
+  attachmentId,
   onRemove,
   onPreview,
 }: {
@@ -392,19 +396,24 @@ function SortableAttachment({
   mimeType: string;
   uploadStatus: PendingFile["uploadStatus"];
   uploadProgress: number;
-  onRemove: () => void;
-  onPreview?: () => void;
+  attachmentId: string | null;
+  onRemove: (pendingId: string) => void;
+  onPreview?: (attachmentId: string) => void;
 }) {
   const { formatMessage } = useIntl();
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
-  const style = {
+  const style = useMemo(() => ({
     transform: CSS.Transform.toString(transform),
     transition,
     opacity: isDragging ? 0.5 : 1,
     zIndex: isDragging ? 10 : undefined,
-  };
+  }), [transform, transition, isDragging]);
+  const handleRemove = useCallback(() => onRemove(id), [onRemove, id]);
+  const handlePreview = useCallback(() => {
+    if (attachmentId && onPreview) onPreview(attachmentId);
+  }, [onPreview, attachmentId]);
   return (
-    <div ref={setNodeRef} style={style} className="relative group" {...attributes}>
+    <ComposerAttachment ref={setNodeRef} style={style} {...attributes}>
       {/* Drag handle: the chip body itself. Spreading dnd-kit's
           {...listeners} ONLY here (not on the outer container) keeps
           the Remove button outside the drag handle, so taps on the
@@ -415,137 +424,205 @@ function SortableAttachment({
           which `e.stopPropagation()` on a React synthetic onClick
           can't preempt; the X tap got swallowed and onRemove never
           fired. tygg #proj-mobile task #8. */}
+      <Tooltip content={preview && onPreview ? formatMessage({ id: "message.composer.previewImage" }) : undefined}>
       <div
         {...listeners}
         role={preview && onPreview ? "button" : undefined}
         tabIndex={preview && onPreview ? 0 : undefined}
-        onClick={preview && onPreview ? onPreview : undefined}
+        onClick={preview && onPreview ? handlePreview : undefined}
         onKeyDown={(e) => {
           if (!preview || !onPreview) return;
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
-            onPreview();
+            handlePreview();
           }
         }}
         aria-label={preview && onPreview ? formatMessage({ id: "message.composer.previewAttachment" }, { file: fileName }) : undefined}
-        title={preview && onPreview ? formatMessage({ id: "message.composer.previewImage" }) : undefined}
-        className={preview && onPreview ? "cursor-zoom-in" : "cursor-grab active:cursor-grabbing"}
+        className={`${preview ? "size-full " : ""}${preview && onPreview ? "cursor-zoom-in" : "cursor-grab active:cursor-grabbing"}`}
       >
+        {/* Image chips: the attachment recipe sizes ComposerAttachmentImage as
+            size-full of this body, so the body must fill the fixed 64px
+            chip. Left at auto height, a portrait image grew to its natural
+            height and spilled over the textarea below (#bug-triage task #11). */}
         {preview ? (
-          <img src={preview} alt={fileName} className={`size-16 object-cover border-2 border-black ${transparentImageBackgroundClass}`} />
+          <ComposerAttachmentImage>
+            <img src={preview} alt={fileName} className={`size-full object-cover ${transparentImageBackgroundClass}`} />
+          </ComposerAttachmentImage>
         ) : (
-          <div className="flex h-16 w-32 items-center gap-2 border-2 border-black bg-white px-2">
-            <FileText size={16} className="shrink-0 text-black/70" />
-            <div className="min-w-0">
-              <div className="truncate text-xs font-bold text-black">{fileName}</div>
-              <div className="truncate text-[10px] text-black/50">{mimeType || formatMessage({ id: "message.composer.fileFallback" })}</div>
-            </div>
-          </div>
+          <ComposerAttachmentFile>
+            <FileText size={16} aria-hidden />
+            <ComposerAttachmentBody>
+              <ComposerAttachmentTitle>{fileName}</ComposerAttachmentTitle>
+              <ComposerAttachmentMeta>{mimeType || formatMessage({ id: "message.composer.fileFallback" })}</ComposerAttachmentMeta>
+            </ComposerAttachmentBody>
+          </ComposerAttachmentFile>
         )}
       </div>
-      {/* Remove button. Desktop: hidden until hover so the chip reads
-          clean. Touch devices: always visible — `(hover: none)` matches
-          phones/tablets without an attached pointer, which is exactly
-          where the hover-only X disappears.
-          size-5 on touch gives a 20px hit area instead of the desktop
-          16px — still small but big enough for thumb tap on a 64px
-          chip without enlarging the chip itself. */}
+      </Tooltip>
       {uploadStatus === "validating" && (
-        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center border-2 border-black bg-white/85 px-1 text-center text-[10px] font-bold text-black">
-          <Spinner size="sm" className="mb-1" />
+        <ComposerAttachmentUploadingOverlay>
+          <Spinner size="sm" className="mb-1" aria-label={formatMessage({ id: "common.loadingLabel" })} />
           <span>{formatMessage({ id: "message.composer.checkingAttachment" })}</span>
-        </div>
+        </ComposerAttachmentUploadingOverlay>
       )}
       {uploadStatus === "uploading" && (
-        <div className="absolute inset-0 z-10 flex flex-col items-center justify-center border-2 border-black bg-white/85 px-1 text-center text-[10px] font-bold text-black">
-          <Spinner size="sm" className="mb-1" />
-          <span>
-            {uploadProgress >= 99
-              ? formatMessage({ id: "message.composer.finishingUpload" })
-              : uploadProgress > 0
-                ? `${uploadProgress}%`
-                : formatMessage({ id: "message.composer.uploading" })}
-          </span>
-          <div className="absolute bottom-0 left-0 h-1 w-full bg-black/15">
-            <div
-              className="h-full bg-brutal-pink"
-              style={{ width: `${Math.max(4, Math.min(uploadProgress, 100))}%` }}
-            />
-          </div>
-        </div>
+        <>
+          <ComposerAttachmentUploadingOverlay>
+            <Spinner size="sm" className="mb-1" aria-label={formatMessage({ id: "common.loadingLabel" })} />
+            <span>
+              {uploadProgress >= 99
+                ? formatMessage({ id: "message.composer.finishingUpload" })
+                : uploadProgress > 0
+                  ? `${uploadProgress}%`
+                  : formatMessage({ id: "message.composer.uploading" })}
+            </span>
+          </ComposerAttachmentUploadingOverlay>
+          <ComposerAttachmentUploadProgressBar value={uploadProgress} />
+        </>
       )}
       {uploadStatus === "error" && (
-        <div
-          className="absolute inset-0 z-10 flex flex-col items-center justify-center border-2 border-black bg-brutal-orange/90 px-1 text-center text-[10px] font-bold leading-3 text-black"
-        >
+        <ComposerAttachmentFailedOverlay>
           <span>{formatMessage({ id: "message.composer.uploadFailed" })}</span>
-        </div>
+        </ComposerAttachmentFailedOverlay>
       )}
-      <button
-        type="button"
-        onClick={onRemove}
+      {/* Remove affordance. The ComposerAttachmentRemove recipe owns the
+          chrome: desktop hides it until group hover; touch devices
+          (`hover: none`) get an always-visible larger hit area — exactly
+          the phones/tablets where a hover-only ✕ disappears. It stays
+          OUTSIDE the drag-handle body above so taps reach onRemove. */}
+      <ComposerAttachmentRemove
+        onClick={handleRemove}
         aria-label={formatMessage({ id: "message.composer.removeAttachment" }, { file: fileName })}
-        className="absolute -top-1.5 -right-1.5 z-20 flex size-4 items-center justify-center rounded-full bg-black text-white opacity-0 transition-opacity group-hover:opacity-100 [@media(hover:none)]:h-6 [@media(hover:none)]:w-6 [@media(hover:none)]:opacity-100"
       >
         <X size={10} />
-      </button>
+      </ComposerAttachmentRemove>
+    </ComposerAttachment>
+  );
+}
+
+// Banner actions for one recoverable / failed upload. Own components so each
+// row binds its id in a memoized handler (react-perf: no inline closures).
+function RecoverableUploadCancelButton({
+  uploadId,
+  filename,
+  onCancel,
+}: {
+  uploadId: string;
+  filename: string;
+  onCancel: (uploadId: string) => Promise<void>;
+}) {
+  const { formatMessage } = useIntl();
+  const handleClick = useCallback(() => { void onCancel(uploadId); }, [onCancel, uploadId]);
+  return (
+    <Button
+      type="button"
+      size="sm"
+      variant="outline"
+      className="shrink-0"
+      onClick={handleClick}
+      aria-label={formatMessage({ id: "message.composer.cancelRecoveredUploadLabel" }, { file: filename })}
+    >
+      {formatMessage({ id: "message.composer.cancelRecoveredUpload" })}
+    </Button>
+  );
+}
+
+function UploadFailureActions({
+  fileId,
+  fileName,
+  canRetry,
+  onRetry,
+  onRemove,
+}: {
+  fileId: string;
+  fileName: string;
+  canRetry: boolean;
+  onRetry: (id: string) => void;
+  onRemove: (id: string) => void;
+}) {
+  const { formatMessage } = useIntl();
+  const handleRetry = useCallback(() => onRetry(fileId), [onRetry, fileId]);
+  const handleRemove = useCallback(() => onRemove(fileId), [onRemove, fileId]);
+  return (
+    <div className="ml-auto flex shrink-0 items-center gap-1.5">
+      {canRetry && (
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={handleRetry}
+          aria-label={formatMessage({ id: "message.composer.retryUploadAttachment" }, { file: fileName })}
+        >
+          {formatMessage({ id: "message.composer.tapToRetry" })}
+        </Button>
+      )}
+      <Button
+        type="button"
+        size="icon-sm"
+        variant="ghost"
+        onClick={handleRemove}
+        aria-label={formatMessage({ id: "message.composer.removeAttachment" }, { file: fileName })}
+      >
+        <X size={12} />
+      </Button>
     </div>
   );
 }
 
-function MentionCandidateBody({
-  candidate,
-  selected,
-  muted,
+function MentionCandidateBody({  candidate,
 }: {
   candidate: MentionCandidate;
-  selected: boolean;
-  muted: boolean;
 }) {
   const { formatMessage } = useIntl();
   const description = getMentionCandidateDescription(candidate);
   const serverLabel = getMentionCandidateServerLabel(candidate);
-  const nameClass = muted
-    ? selected ? "text-black/70" : "text-black/50"
-    : "text-black";
-  const handleClass = muted
-    ? selected ? "text-black/40" : "text-black/30"
-    : "text-black/40";
-  const descriptionClass = muted
-    ? selected ? "text-black/50" : "text-black/40"
-    : selected ? "text-black/70" : "text-black/50";
-  const nameWidthClass = description ? "max-w-[45%] shrink-0 sm:max-w-[35%]" : "min-w-0";
   const actorTypeLabel = candidate.type === "user"
     ? formatMessage({ id: "message.composer.actorType.human" })
     : candidate.type === "agent"
       ? formatMessage({ id: "message.composer.actorType.agent" })
-      : null;
+      : candidate.type === "external"
+        ? formatMessage({ id: "settings.slackBridge.providerBadge" })
+        : null;
 
   return (
-    <div className="flex min-w-0 flex-1 items-center gap-1.5 text-left">
-      <span className={`${nameWidthClass} truncate ${nameClass}`}>{candidate.displayName || candidate.name}</span>
+    <>
+      <ComposerSuggestionTitle className="max-w-[12rem] flex-[0_1_auto]">
+        {candidate.displayName || candidate.name}
+      </ComposerSuggestionTitle>
       {actorTypeLabel && (
-        <span
+        <Badge
           data-testid={`mention-actor-type-${candidate.type}`}
-          className={`shrink-0 border border-current px-1 py-px text-[10px] font-bold uppercase leading-none ${descriptionClass}`}
+          appearance="soft"
+          variant="muted"
+          className="shrink-0"
         >
           {actorTypeLabel}
-        </span>
+        </Badge>
       )}
       {description && (
-        <span className={`min-w-0 flex-1 truncate text-xs font-normal ${descriptionClass}`} title={description}>
-          {description}
-        </span>
+        <Tooltip content={description}>
+          <ComposerSuggestionMeta className="min-w-0 truncate" title={description}>
+            {description}
+          </ComposerSuggestionMeta>
+        </Tooltip>
       )}
       {serverLabel && (
-        <span className={`min-w-0 max-w-[10rem] truncate text-xs font-normal ${descriptionClass}`} title={formatMessage({ id: "message.composer.sourceServer" }, { server: serverLabel })}>
-          {serverLabel}
-        </span>
+        <Tooltip content={formatMessage({ id: "message.composer.sourceServer" }, { server: serverLabel })}>
+          <ComposerSuggestionMeta className="min-w-0 max-w-[10rem] truncate">
+            {serverLabel}
+          </ComposerSuggestionMeta>
+        </Tooltip>
       )}
-      <span className={`ml-auto shrink-0 text-xs font-mono ${handleClass}`}>@{candidate.name}</span>
-    </div>
+      <ComposerSuggestionAside>
+        <ComposerSuggestionMeta variant="code" className="max-w-[7rem] truncate">@{candidate.name}</ComposerSuggestionMeta>
+      </ComposerSuggestionAside>
+    </>
   );
 }
+
+// Computers and apps have no face: raft-ui's neutral IconTile (DS `rf-tile`),
+// no colour of its own, at the 19px avatar step of the raft compact avatars
+// beside it.
 
 function MentionCandidateAvatar({
   candidate,
@@ -556,17 +633,17 @@ function MentionCandidateAvatar({
 }) {
   if (candidate.type === "computer") {
     return (
-      <span data-mention-candidate-avatar="computer" className="flex size-5 shrink-0 items-center justify-center border border-black bg-brutal-cyan/30">
-        <Monitor size={12} aria-hidden />
-      </span>
+      <IconTile size="xs" data-mention-candidate-avatar="computer">
+        <Monitor aria-hidden />
+      </IconTile>
     );
   }
 
   if (candidate.type === "app") {
     return (
-      <span data-mention-candidate-avatar="app" className="flex size-5 shrink-0 items-center justify-center border border-black bg-soft-signal/40">
-        <Blocks size={12} aria-hidden />
-      </span>
+      <IconTile size="xs" data-mention-candidate-avatar="app">
+        <Blocks aria-hidden />
+      </IconTile>
     );
   }
 
@@ -577,7 +654,7 @@ function MentionCandidateAvatar({
         type="agent"
         agentAvatarUrl={candidate.avatarUrl}
         badge={muted ? undefined : <MentionCandidateActivityBadge agentId={candidate.id} />}
-        className={muted ? "!border-black/40 opacity-60" : undefined}
+        className={muted ? "opacity-60" : undefined}
       />
     );
   }
@@ -590,23 +667,39 @@ function MentionCandidateAvatar({
       gravatarHash={candidate.gravatarHash}
       email={candidate.email}
       humanPlaceholder={!candidate.avatarUrl && !candidate.gravatarHash && !candidate.email}
-      className={muted ? "!border-black/40 opacity-60 [&_svg]:opacity-50" : undefined}
+      className={muted ? "opacity-60 [&_svg]:opacity-50" : undefined}
     />
   );
 }
 
 function MentionCandidateActivityBadge({ agentId }: { agentId: string }) {
   return (
-    <span data-mention-avatar-badge-shell="true" className="absolute bottom-0 right-0 block size-0">
-      <AgentActivityDot
-        agentId={agentId}
-        size="sm"
-        pulse
-        className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2"
-      />
-    </span>
+    <AgentActivityDot agentId={agentId} size="sm" data-mention-avatar-badge-shell="true" />
   );
 }
+
+// Pointer-down blur prevention for composer buttons (Android Chrome can
+// collapse the keyboard on pointer-down blur before the click runs). Pure
+// handlers — module scope so they are never recreated per render.
+const preventSendButtonPointerDownBlur = (e: React.PointerEvent<HTMLButtonElement>) => {
+  // Android Chrome can collapse the keyboard on the pointer-down blur before
+  // the submit click runs, shifting the visual viewport and swallowing the
+  // first tap. Keep focus stable; the following click still submits.
+  e.preventDefault();
+};
+
+const preventToolbarButtonPointerDownBlur = (e: React.PointerEvent<HTMLButtonElement>) => {
+  // Toolbar buttons sit beside the textarea. Preserve focus through
+  // pointerdown so Android Chrome does not collapse the keyboard before the
+  // button click opens the picker or toggles composer state.
+  e.preventDefault();
+};
+
+const preventTaskTogglePointerDownBlur = (e: React.PointerEvent<HTMLElement>) => {
+  // Keep the composer focused while toggling task mode; the following click
+  // still toggles the checkbox without sending.
+  e.preventDefault();
+};
 
 export default function MessageInput({
   channelId,
@@ -618,6 +711,7 @@ export default function MessageInput({
   mentionChannelId,
   mentionScopeChannelType,
   loadMentionMembers = true,
+  deferUntilFirstPage = false,
   migrateDraftFromChannelId,
   isChannelThread,
   threadMessages,
@@ -654,6 +748,12 @@ export default function MessageInput({
   mentionScopeChannelType?: "channel" | "private" | "joint" | "dm" | "thread" | null;
   /** Disable member roster loading when autocomplete is intentionally server-scoped from a synthetic draft key. */
   loadMentionMembers?: boolean;
+  /**
+   * Hold the mention roster and recoverable-upload fetches until this channel's
+   * first message page is in (task #17). Set by the host that owns that page
+   * load (ChatPanel); other hosts never record one and load immediately.
+   */
+  deferUntilFirstPage?: boolean;
   /** Provisional composer key to adopt when an empty thread receives its first durable reply. */
   migrateDraftFromChannelId?: string;
   /** Whether this is a thread under a regular channel (not DM). Controls whether @mention shows all server members. */
@@ -708,7 +808,10 @@ export default function MessageInput({
   const setDraft = useMessageStore((s) => s.setDraft);
   const adoptDraftChannel = useMessageStore((s) => s.adoptDraftChannel);
   const clearDraft = useMessageStore((s) => s.clearDraft);
-  const currentUser = useAuthStore().user;
+  // Narrow selector: the composer only needs the current user, so it must not
+  // re-render on unrelated authStore mutations (a bare useAuthStore() subscribes
+  // to the whole store). See frontend render-cost contract.
+  const currentUser = useAuthStore((s) => s.user);
   const nav = useAppNavigate();
   const [content, setContent] = useState(draft);
   const sendMessage = useMessageStore((s) => s.sendMessage);
@@ -746,6 +849,24 @@ export default function MessageInput({
     draftCacheKey: string;
     authScope: string;
   } | null>(null);
+  // The composer <textarea> is deliberately NOT a React-controlled input. For a
+  // controlled textarea React also rewrites `defaultValue` — the element's text
+  // child — on every keystroke, and a DOM structure change there forces Chrome
+  // to re-evaluate every non-subject `:has()` rule against the whole page: ~58ms
+  // of style recalc per key in a 300-message channel vs ~0.06ms for a plain
+  // `.value` write (kabi-desktop task #133). `content` stays the source of
+  // truth; the DOM value follows it imperatively, exactly like React's own
+  // controlled update (`if (node.value !== value) node.value = value`) minus the
+  // text-node rewrite. Never pass `value` / `defaultValue` to the textarea.
+  // Every commit, not just on `content` changes: a textarea node attached in
+  // this commit (refs attach before the parent's layout effects) must get the
+  // current content too. One string compare per render. Precondition: `content`
+  // is updated synchronously from onChange. If it ever moves into a deferred /
+  // transition update, this would write stale content over what is being typed.
+  useLayoutEffect(() => {
+    const el = textareaRef.current;
+    if (el && el.value !== content) el.value = content;
+  });
   const composerTextareaRef = useCallback((node: HTMLTextAreaElement | null) => {
     textareaRef.current = node;
     committedComposerOwnershipRef.current = node
@@ -770,12 +891,18 @@ export default function MessageInput({
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>(() => (
     preservePendingDraftFiles ? getDraftPendingFiles(draftPendingFilesCacheKey) : []
   ));
+  const [recoverableUploads, setRecoverableUploads] = useState<RecoveryView[]>([]);
+  const recoverableUploadsRef = useRef<RecoveryView[]>([]);
+  const canceledRecoverableUploadIdsRef = useRef<Set<string>>(new Set());
+  const recoverableRefreshGenerationRef = useRef(0);
+  const recoverableRefreshControllerRef = useRef<AbortController | null>(null);
   const [selectedMentions, setSelectedMentions] = useState<MessageMention[]>([]);
   const selectedMentionsRef = useRef<MessageMention[]>([]);
   selectedMentionsRef.current = selectedMentions;
   const mentionUndoSnapshotRef = useRef<MentionUndoSnapshot | null>(null);
   const [pendingMentionActions, setPendingMentionActions] = useState<PendingMentionAction[]>([]);
   const [unresolvedMentionHandles, setUnresolvedMentionHandles] = useState<string[]>([]);
+  const [deliveryWarnings, setDeliveryWarnings] = useState<MessageDeliveryWarning[]>([]);
   const [pendingMentionActionState, setPendingMentionActionState] = useState<Record<string, PendingMentionActionLocalState>>({});
   const [pendingMentionActionRemoving, setPendingMentionActionRemoving] = useState<Record<string, boolean>>({});
   const [pendingMentionActionExecuting, setPendingMentionActionExecuting] = useState<Record<string, PendingMentionActionLocalState>>({});
@@ -793,6 +920,8 @@ export default function MessageInput({
   const [mentionActionNotice, setMentionActionNotice] = useState("");
   const dndSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
   const membershipChannelId = mentionChannelId || channelId;
+  const { blocked: conversionBlocked } = useChannelConversionState(membershipChannelId);
+  const conversionBlockedMessage = formatMessage({ id: "message.composer.conversionInProgress" });
 
   const resetAttachmentSelectionValidation = useCallback(() => {
     attachmentSelectionAbortRef.current.abort();
@@ -888,6 +1017,8 @@ export default function MessageInput({
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setUnresolvedMentionHandles([]);
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
+    setDeliveryWarnings([]);
+    // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setPendingMentionActionState({});
     // oxlint-disable-next-line react-doctor/no-adjust-state-on-prop-change
     setPendingMentionActionExecuting({});
@@ -950,7 +1081,7 @@ export default function MessageInput({
   useEffect(() => {
     // oxlint-disable-next-line react-doctor/no-event-handler -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
     if (autoFocus && (autoFocusMode === "always" || window.matchMedia("(hover: hover)").matches)) {
-      textareaRef.current?.focus();
+      textareaRef.current?.focus({ preventScroll: autoFocusMode === "desktop" });
     }
   }, [autoFocus, autoFocusMode, channelId]);
 
@@ -966,18 +1097,22 @@ export default function MessageInput({
   }, [content]);
 
   // Cleanup object URLs and in-flight uploads on unmount
-  // oxlint-disable react-hooks/exhaustive-deps -- This cleanup must intentionally read the latest refs at unmount time; mount-time snapshots would lose in-flight/ready attachment drafts.
   useEffect(() => {
     if (attachmentSelectionAbortRef.current.signal.aborted) {
       attachmentSelectionAbortRef.current = new AbortController();
     }
+    // The container is created once via useRef(new Map) and never
+    // reassigned — capture it here so the cleanup reads no `.current`.
+    // (pendingFilesRef stays a ref read: its array IS reassigned over time.)
+    const uploadControllers = uploadControllersRef.current;
+    const formatMessageFn = formatMessageRef.current;
     return () => {
       resetAttachmentSelectionValidation();
       if (preservePendingDraftFiles) {
-        const interrupted = markInterruptedUploads(pendingFilesRef.current, formatMessageRef.current);
+        const interrupted = markInterruptedUploads(pendingFilesRef.current, formatMessageFn);
         for (const p of pendingFilesRef.current) {
           if (p.uploadStatus === "uploading") {
-            uploadControllersRef.current.get(p.id)?.abort();
+            uploadControllers.get(p.id)?.abort();
           }
         }
         const currentAuthScope = getDraftPendingFilesAuthScope(useAuthStore.getState().user?.id);
@@ -985,22 +1120,114 @@ export default function MessageInput({
           saveDraftPendingFiles(draftPendingFilesCacheKeyRef.current, interrupted);
         }
       } else {
-        for (const controller of uploadControllersRef.current.values()) {
+        for (const controller of uploadControllers.values()) {
           controller.abort();
         }
         for (const p of pendingFilesRef.current) {
           if (p.preview) URL.revokeObjectURL(p.preview);
         }
       }
-      uploadControllersRef.current.clear();
+      uploadControllers.clear();
     };
   }, [preservePendingDraftFiles, resetAttachmentSelectionValidation]);
-  // oxlint-enable react-hooks/exhaustive-deps
+
+  // Recoverable uploads and mention members are not needed for the first
+  // paint; wait for the conversation's first message page (task #17).
+  const channelFirstPageSettled = useChannelFirstPageSettled(channelId);
+  const secondaryLoadsReady = !deferUntilFirstPage || channelFirstPageSettled;
+  // Direct-upload sessions outlive a drawer/channel remount. Hydrate only
+  // active sessions owned by this member and expose cancellation; without the
+  // original File object it is unsafe to pretend that a browser can resume
+  // the PUT, so the UI deliberately offers no fake "continue" action.
+  // With `resolveChannelId`, `channelId` is only a draft key: the channel is
+  // created on first send (e.g. a thread that has no replies yet). Upload
+  // sessions are bound to a real channel, so there is nothing to recover until
+  // it exists — the same contract attachment uploads already follow.
+  const channelExists = !resolveChannelId;
+  const refreshRecoverableUploads = useCallback(() => {
+    if (!preservePendingDraftFiles || !channelExists) return;
+    const generation = recoverableRefreshGenerationRef.current + 1;
+    recoverableRefreshGenerationRef.current = generation;
+    recoverableRefreshControllerRef.current?.abort();
+    const controller = new AbortController();
+    recoverableRefreshControllerRef.current = controller;
+    void listActiveAttachmentUploads(api, channelId, controller.signal)
+      .then((uploads) => {
+        if (!controller.signal.aborted && recoverableRefreshGenerationRef.current === generation) {
+          const serverIds = new Set(uploads.map((upload) => upload.uploadId));
+          for (const uploadId of canceledRecoverableUploadIdsRef.current) {
+            if (!serverIds.has(uploadId)) canceledRecoverableUploadIdsRef.current.delete(uploadId);
+          }
+          const visible = uploads.filter((upload) => !canceledRecoverableUploadIdsRef.current.has(upload.uploadId));
+          recoverableUploadsRef.current = visible;
+          setRecoverableUploads(visible);
+        }
+      })
+      .catch(() => {
+        if (!controller.signal.aborted && recoverableRefreshGenerationRef.current === generation) {
+          recoverableUploadsRef.current = [];
+          setRecoverableUploads([]);
+        }
+      });
+  }, [channelExists, channelId, preservePendingDraftFiles]);
+
+  useEffect(() => {
+    if (!preservePendingDraftFiles || !secondaryLoadsReady) return;
+    refreshRecoverableUploads();
+    // Set identity is stable (never reassigned) — capture for the cleanup.
+    const canceledIds = canceledRecoverableUploadIdsRef.current;
+    return () => {
+      recoverableRefreshGenerationRef.current += 1;
+      recoverableRefreshControllerRef.current?.abort();
+      recoverableRefreshControllerRef.current = null;
+      recoverableUploadsRef.current = [];
+      canceledIds.clear();
+    };
+  }, [preservePendingDraftFiles, refreshRecoverableUploads, secondaryLoadsReady]);
+
+  useEffect(() => {
+    if (!preservePendingDraftFiles) return;
+    return subscribeAttachmentUploadChanged((change) => {
+      if (change.channelId !== channelId) return;
+      if (change.kind === "canceled") {
+        canceledRecoverableUploadIdsRef.current.add(change.uploadId);
+        const pending = pendingFilesRef.current.find((file) => file.directUploadSession?.uploadId === change.uploadId);
+        if (pending) {
+          uploadControllersRef.current.get(pending.id)?.abort();
+          uploadControllersRef.current.delete(pending.id);
+          if (pending.preview) URL.revokeObjectURL(pending.preview);
+          const next = pendingFilesRef.current.filter((file) => file.id !== pending.id);
+          pendingFilesRef.current = next;
+          setPendingFiles(next);
+          saveDraftPendingFiles(draftPendingFilesCacheKeyRef.current, next);
+        }
+        const nextRecoverable = recoverableUploadsRef.current.filter((upload) => upload.uploadId !== change.uploadId);
+        recoverableUploadsRef.current = nextRecoverable;
+        setRecoverableUploads(nextRecoverable);
+      }
+      refreshRecoverableUploads();
+    });
+  }, [channelId, preservePendingDraftFiles, refreshRecoverableUploads]);
+
+  const cancelRecoverableUpload = useCallback(async (uploadId: string) => {
+    try {
+      await cancelAttachmentUploadSession(api, uploadId);
+      notifyAttachmentUploadChanged({ channelId, uploadId, kind: "canceled" });
+    } catch {
+      // Keep the row visible so a transient failure remains actionable.
+    }
+  }, [channelId]);
   // Stryker restore all
 
   // Save draft on content change. Writes local `content` into the external
   // messageStore draft slot — a write-to-external-store sync, not derived local
   // state. no-derived-state-effect pattern-matches the effect shape; FP here.
+  // NOTE(task #20): deliberately NOT debounced. The analyzed "second render
+  // per key" is unproven — this component's own drafts selector returns a
+  // string primitive equal to `content`, which Zustand bails out on — and a
+  // debounce opens stale-read windows for the RENDER-TIME draft seed on
+  // remount/switch paths. Per render-cost-contract's proof rule, changing this
+  // needs a measured render-count RED first (task #19 fixtures).
   // oxlint-disable-next-line react-doctor/no-derived-state-effect, react-doctor/no-effect-chain -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
   useEffect(() => {
     setDraft(channelId, content);
@@ -1013,7 +1240,9 @@ export default function MessageInput({
   const machines = useMachineStore((s) => s.machines);
   const [installedApps, setInstalledApps] = useState<InstalledRapAppSummary[]>([]);
   const installedAppsServerIdRef = useRef<string | null>(null);
-  const { channelAgents, channelHumans } = useChannelMembers(mentionChannelId || channelId, { enabled: loadMentionMembers });
+  const { channelAgents, channelHumans, channelExternalMembers } = useChannelMembers(mentionChannelId || channelId, {
+    enabled: loadMentionMembers && secondaryLoadsReady,
+  });
   const channels = useChannelStore((s) => s.channels);
   const dmChannels = useChannelStore((s) => s.dmChannels);
   const composerChannel = useMemo(
@@ -1031,6 +1260,10 @@ export default function MessageInput({
   // Autocomplete hooks (state only — filtering done below)
   const mention = useAutocomplete(MENTION_TRIGGER, "@");
   const channel = useAutocomplete(CHANNEL_TRIGGER, "#");
+  // useAutocomplete returns a fresh object every render, but these are
+  // useCallback-stable — depend on the functions, not the wrapper.
+  const { dismiss: dismissMentionPopover, clampIndex: clampMentionIndex, handleKeyDown: handleMentionKeyDown, detect: detectMentionTrigger } = mention;
+  const { dismiss: dismissChannelPopover, clampIndex: clampChannelIndex, handleKeyDown: handleChannelKeyDown, detect: detectChannelTrigger } = channel;
 
   // Apps are needed only while @ autocomplete is open. Keeping this lazy avoids
   // turning every mounted composer into an unrelated registry request; the
@@ -1054,12 +1287,10 @@ export default function MessageInput({
 
   // Channel switches keep MessageInput mounted, so any open autocomplete
   // popover must be cleared explicitly instead of relying on unmount cleanup.
-  // oxlint-disable react-hooks/exhaustive-deps -- dismiss popovers on channelId change; effect correctly deps on the stable `.dismiss` callbacks + channelId. `mention`/`channel` are fresh objects every render (useAutocomplete); depending on the whole objects would dismiss the open popover every keystroke.
   useEffect(() => {
-    mention.dismiss();
-    channel.dismiss();
-  }, [channelId, mention.dismiss, channel.dismiss]);
-  // oxlint-enable react-hooks/exhaustive-deps
+    dismissMentionPopover();
+    dismissChannelPopover();
+  }, [channelId, dismissMentionPopover, dismissChannelPopover]);
 
   // Build channel member ID sets for fast lookup
   const channelMemberIds = useMemo(() => {
@@ -1070,7 +1301,6 @@ export default function MessageInput({
   }, [channelAgents, channelHumans]);
 
   // Build & filter mention candidates
-  // oxlint-disable react-hooks/exhaustive-deps -- mention scope only depends on channel type; the helper takes the channel object to keep the predicate API readable/testable.
   const allCandidates = useMemo(() => {
     const byKey = new Map<string, MentionCandidate>();
     const addCandidate = (candidate: MentionCandidate) => {
@@ -1117,11 +1347,13 @@ export default function MessageInput({
     for (const human of channelHumans) {
       if (currentUser && human.id === currentUser.id) continue;
       const isRemoteHuman = Boolean(currentServer?.id && human.serverId && human.serverId !== currentServer.id);
+      const serverLabels = memberServerBadgeLabels(human, currentServer?.id);
       addCandidate({
         id: human.id,
         serverId: isRemoteHuman ? human.serverId : undefined,
         serverName: isRemoteHuman ? human.serverName : undefined,
         serverSlug: isRemoteHuman ? human.serverSlug : undefined,
+        serverLabels: serverLabels.length > 0 ? serverLabels : undefined,
         name: human.name,
         displayName: human.displayName,
         type: "user",
@@ -1143,6 +1375,25 @@ export default function MessageInput({
         type: "agent",
         avatarUrl: agent.avatarUrl,
         description: agent.description,
+      });
+    }
+    for (const external of channelExternalMembers) {
+      // Slack-side participant — pick the first handle; when the projection
+      // has no usable handle fall back to the display name. The composer
+      // token must satisfy Raft's `\p{L}\p{N}_-` handle charset
+      // (structuredRaftMentionStillAppears rejects a token containing
+      // `.`/`'`/etc.), so sanitize every other char to `-`.
+      const rawHandle = external.handles.find((h) => h.trim().length > 0)
+        ?? external.displayName.replace(/\s+/g, "");
+      const handle = rawHandle.replace(/[^\p{L}\p{N}_-]/gu, "-");
+      if (!handle) continue;
+      addCandidate({
+        id: external.id,
+        name: handle,
+        displayName: external.displayName,
+        type: "external",
+        avatarUrl: external.avatarUrl,
+        description: formatMessage({ id: "settings.slackBridge.providerBadge" }),
       });
     }
     if (resourceReferencesGate.enabled) {
@@ -1168,8 +1419,7 @@ export default function MessageInput({
       }
     }
     return [...byKey.values()];
-  }, [currentUser, currentServer?.id, humans, agents, channelHumans, channelAgents, mentionScopeChannel?.type, machines, installedApps, resourceReferencesGate.enabled]);
-  // oxlint-enable react-hooks/exhaustive-deps
+  }, [currentUser, currentServer?.id, humans, agents, channelHumans, channelAgents, channelExternalMembers, mentionScopeChannel, machines, installedApps, resourceReferencesGate.enabled, formatMessage]);
 
   // Stryker disable all: this block is React wiring from local candidate arrays into
   // the covered composer ranker/worker hook. The behavior surface is pinned by
@@ -1205,20 +1455,15 @@ export default function MessageInput({
   const filteredChannels = useRankedComposerSuggestions(channel.query, channelSearchEntries);
   // Stryker restore all
 
-  // Clamp indices when filtered lists change
-  // oxlint-disable-next-line react-hooks/exhaustive-deps -- clamp on filtered-length change only; `mention` is a fresh object every render (useAutocomplete) so depending on it would re-run every keystroke. `mention.clampIndex` is useCallback-stable.
-  useEffect(() => { mention.clampIndex(filteredMentions.flat.length); }, [filteredMentions.flat.length]);
-  // oxlint-disable-next-line react-hooks/exhaustive-deps -- clamp on filtered-length change only; `channel` is a fresh object every render (useAutocomplete returns an unmemoized literal) so depending on it would re-run every keystroke. `channel.clampIndex` is useCallback-stable.
-  useEffect(() => { channel.clampIndex(filteredChannels.length); }, [filteredChannels.length]);
+  // Clamp indices when filtered lists change. The clamp functions are
+  // useCallback-stable (the `mention`/`channel` wrappers are fresh objects
+  // every render, so depending on them would re-run every keystroke).
+  useEffect(() => { clampMentionIndex(filteredMentions.flat.length); }, [clampMentionIndex, filteredMentions.flat.length]);
+  useEffect(() => { clampChannelIndex(filteredChannels.length); }, [clampChannelIndex, filteredChannels.length]);
 
-  // Auto-resize textarea
-  const autoResize = useCallback(() => {
-    const el = textareaRef.current;
-    if (!el) return;
-    el.style.height = "auto";
-    const minH = parseFloat(getComputedStyle(el).minHeight) || 0;
-    el.style.height = `${Math.max(Math.min(el.scrollHeight, 160), minH)}px`;
-  }, []);
+  // Auto-resize: browser-native `field-sizing: content` when supported, else
+  // a rAF-coalesced bounded measurement — see useComposerAutosize (task #20).
+  const { autoResize, scheduleAutoResize, cancelScheduledAutoResize } = useComposerAutosize(textareaRef);
 
   // Selection-quote v0 (#proj-chat task #32): a message's selection context
   // menu "Quote" dispatches SELECTED_TEXT_QUOTE_EVENT with the target composer
@@ -1347,7 +1592,7 @@ export default function MessageInput({
     setTimeout(() => { textareaRef.current?.focus({ preventScroll: true }); textareaRef.current?.setSelectionRange(newCursor, newCursor); }, 0);
   }, [content, channel]);
 
-  const preventAutocompleteOptionMouseDown = useCallback((e: React.MouseEvent<HTMLButtonElement>) => {
+  const preventAutocompleteOptionMouseDown = useCallback((e: React.MouseEvent<HTMLElement>) => {
     e.preventDefault();
   }, []);
 
@@ -1374,6 +1619,7 @@ export default function MessageInput({
       draftCacheKey: committedComposerOwnershipRef.current?.draftCacheKey ?? draftPendingFilesCacheKey,
     },
   ) => {
+    const directUploadId = pending.directUploadSession?.uploadId;
     const updatePendingFile = (update: (file: PendingFile) => PendingFile) => {
       if (isCommittedComposerOwner(origin.channelId, origin.draftCacheKey)) {
         setPendingFiles((prev) => prev.map((pf) => pf.id === pending.id ? update(pf) : pf));
@@ -1456,6 +1702,7 @@ export default function MessageInput({
         uploadError: undefined,
         uploadCanRetry: undefined,
       }));
+      if (directUploadId) notifyAttachmentUploadChanged({ channelId: origin.channelId, uploadId: directUploadId, kind: "completed" });
       return attachmentId;
     } catch (err) {
       if (controller.signal.aborted) return null;
@@ -1602,13 +1849,15 @@ export default function MessageInput({
         uploadControllersRef.current.get(removed.id)?.abort();
         uploadControllersRef.current.delete(removed.id);
         if (removed.directUploadSession) {
-          void cancelAttachmentUploadSession(api, removed.directUploadSession.uploadId).catch(() => undefined);
+          void cancelAttachmentUploadSession(api, removed.directUploadSession.uploadId)
+            .then(() => notifyAttachmentUploadChanged({ channelId, uploadId: removed.directUploadSession!.uploadId, kind: "canceled" }))
+            .catch(() => undefined);
         }
       }
       if (removed?.preview) URL.revokeObjectURL(removed.preview);
       return prev.filter((_, i) => i !== index);
     });
-  }, []);
+  }, [channelId]);
 
   const retryFile = useCallback((id: string) => {
     const pending = pendingFilesRef.current.find((pf) => pf.id === id);
@@ -1636,7 +1885,7 @@ export default function MessageInput({
     }
   }, []);
 
-  const handleChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+  const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     const cursorPos = e.target.selectionStart;
     const undoSnapshot = mentionUndoSnapshotRef.current;
@@ -1646,15 +1895,17 @@ export default function MessageInput({
     submittedDraftIntentRef.current = null;
     setContent(val);
     setSelectedMentions((prev) => prev.filter((selected) => mentionStillAppears(val, selected)));
-    autoResize();
+    // Scheduled, not synchronous: the keystroke must not pay for a layout pass
+    // before the character can paint (see autoResize above).
+    scheduleAutoResize();
 
     const textBeforeCursor = val.slice(0, cursorPos);
-    if (mention.detect(textBeforeCursor, cursorPos)) {
-      channel.dismiss();
-    } else if (!channel.detect(textBeforeCursor, cursorPos)) {
+    if (detectMentionTrigger(textBeforeCursor, cursorPos)) {
+      dismissChannelPopover();
+    } else if (!detectChannelTrigger(textBeforeCursor, cursorPos)) {
       // Neither matched — both are already dismissed by detect()
     }
-  };
+  }, [scheduleAutoResize, detectMentionTrigger, detectChannelTrigger, dismissChannelPopover]);
 
   // Handle pasting copied files from the OS clipboard into the attachment flow.
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
@@ -1832,9 +2083,9 @@ export default function MessageInput({
     return true;
   }, [isCommittedComposerOwner]);
 
-  const handleSubmit = async (e: React.FormEvent | React.KeyboardEvent, options?: { forceAsTask?: boolean }) => {
+  const handleSubmit = useCallback(async (e: React.FormEvent | React.KeyboardEvent, options?: { forceAsTask?: boolean }) => {
     e.preventDefault();
-    if (submitDisabled || submitBusy) return;
+    if (submitDisabled || submitBusy || readChannelConversionBlocked(membershipChannelId)) return;
     const hasContent = content.trim().length > 0;
     const hasFiles = pendingFiles.length > 0;
     if (!hasContent && !hasFiles && !(allowEmptySubmit && onSendOverride)) return;
@@ -1935,6 +2186,10 @@ export default function MessageInput({
       }
       return;
     }
+    if (readChannelConversionBlocked(membershipChannelId)) {
+      submittedDraftIntentRef.current = releaseSubmittedDraftIntent(submittedDraftIntentRef.current, submittedDraftIntent);
+      return;
+    }
     const submittedTextarea = textareaRef.current!;
     const keepComposerFocused = e.type === "keydown";
     setContent("");
@@ -1943,8 +2198,11 @@ export default function MessageInput({
     // Stryker disable next-line ArrayDeclaration: clearing the draft-pending cache is pinned by the remount/send DOM test; `setPendingFiles([])` also keeps the in-memory chip state clear.
     saveDraftPendingFiles(draftPendingFilesCacheKeyRef.current, []);
     setPendingFiles([]);
-    mention.dismiss();
-    channel.dismiss();
+    dismissMentionPopover();
+    dismissChannelPopover();
+    // Cancel the measurement queued by the last keystroke so it cannot run
+    // after this clear and overwrite the height (task #513).
+    cancelScheduledAutoResize();
     submittedTextarea.style.height = "";
     if (!keepComposerFocused) submittedTextarea.blur();
 
@@ -1954,6 +2212,7 @@ export default function MessageInput({
     if (onSendOverride) {
       try {
         await onWillSend?.();
+        if (readChannelConversionBlocked(membershipChannelId)) throw new Error(conversionBlockedMessage);
         setError("");
         await onSendOverride(msg, mentionsToSend);
       } catch (err) {
@@ -1989,8 +2248,10 @@ export default function MessageInput({
 
     try {
       await onWillSend?.();
+      if (readChannelConversionBlocked(membershipChannelId)) throw new Error(conversionBlockedMessage);
       setError("");
       setUnresolvedMentionHandles([]);
+      setDeliveryWarnings([]);
 
       // Create optimistic message immediately. Images get local blob previews; other files get filename cards.
       const optimisticAttachments = filesToSend.map((pf, i) => ({
@@ -2026,6 +2287,7 @@ export default function MessageInput({
       onChannelResolved?.(deliveryChannelId);
       setPendingMentionActions(sendResult.pendingMentionActions);
       setUnresolvedMentionHandles(sendResult.unresolvedMentionHandles ?? []);
+      setDeliveryWarnings(sendResult.deliveryWarnings ?? []);
       setPendingMentionActionState({});
       setPendingMentionActionRemoving({});
       setPendingMentionActionExecuting({});
@@ -2070,7 +2332,16 @@ export default function MessageInput({
       if (isCurrentComposer) setError(errorMessage);
       console.error("Failed to send message:", err);
     }
-  };
+  }, [
+    submitDisabled, submitBusy, membershipChannelId, content, pendingFiles,
+    allowEmptySubmit, onSendOverride, alsoCreateTask, formatMessage, channelId,
+    draftPendingFilesCacheKey, selectedMentions, resolveDeliveryChannelId,
+    isCommittedComposerOwner, startAttachmentUpload, restoreFailedSendDraft,
+    clearDraft, dismissMentionPopover, dismissChannelPopover,
+    cancelScheduledAutoResize, onWillSend, addOptimisticMessage, currentUser,
+    conversionBlockedMessage, sendMessage, onChannelResolved, setAlsoCreateTask,
+    removeOptimisticMessage,
+  ]);
 
   const clearPendingMentionActionRemovalTimers = useCallback((resolutionId?: string) => {
     const clearTimers = (timers: ReturnType<typeof setTimeout>[] | undefined) => {
@@ -2238,7 +2509,42 @@ export default function MessageInput({
     setUnresolvedMentionHandles([]);
   }, []);
 
-  const handleKeyDown = (e: React.KeyboardEvent) => {
+  const dismissDeliveryWarning = useCallback(() => {
+    setDeliveryWarnings([]);
+  }, []);
+
+  const handleRemovePendingFile = useCallback((pendingId: string) => {
+    removeFile(pendingFiles.findIndex((candidate) => candidate.id === pendingId));
+  }, [pendingFiles, removeFile]);
+
+  const handlePreviewDraftImage = useCallback((attachmentId: string) => {
+    openDraftImagePreview(attachmentId);
+  }, [openDraftImagePreview]);
+
+  const handleAttachmentDragEnd = useCallback((event: DragEndEvent) => {
+    const { active, over } = event;
+    if (over && active.id !== over.id) {
+      setPendingFiles((prev) => {
+        const oldIndex = prev.findIndex((p) => p.id === active.id);
+        const newIndex = prev.findIndex((p) => p.id === over.id);
+        return arrayMove(prev, oldIndex, newIndex);
+      });
+    }
+  }, []);
+
+  const handleAttachImageClick = useCallback(() => imageInputRef.current?.click(), []);
+
+  const handleAttachFileClick = useCallback(() => fileInputRef.current?.click(), []);
+
+  const handleSelectMentionCandidate = useCallback((candidate: MentionCandidate) => {
+    doInsertMention(candidate);
+  }, [doInsertMention]);
+
+  const handleSelectChannelCandidate = useCallback((ch: { name: string }) => {
+    doInsertChannel(ch);
+  }, [doInsertChannel]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.nativeEvent.isComposing || e.keyCode === 229) return;
 
     const undoSnapshot = mentionUndoSnapshotRef.current;
@@ -2259,12 +2565,12 @@ export default function MessageInput({
       return;
     }
 
-    if (mention.handleKeyDown(e, filteredMentions.flat.length, () => {
+    if (handleMentionKeyDown(e, filteredMentions.flat.length, () => {
       const item = filteredMentions.flat[mention.index];
       if (item) doInsertMention(item);
     })) return;
 
-    if (channel.handleKeyDown(e, filteredChannels.length, () => {
+    if (handleChannelKeyDown(e, filteredChannels.length, () => {
       const item = filteredChannels[channel.index];
       if (item) doInsertChannel(item);
     })) return;
@@ -2299,32 +2605,13 @@ export default function MessageInput({
 
     e.preventDefault();
     handleSubmit(e);
-  };
+  }, [handleMentionKeyDown, handleChannelKeyDown, filteredMentions, filteredChannels, mention.index, channel.index, doInsertMention, doInsertChannel, handleSubmit]);
 
-  const preventSendButtonPointerDownBlur = (e: React.PointerEvent<HTMLButtonElement>) => {
-    // Android Chrome can collapse the keyboard on the pointer-down blur before
-    // the submit click runs, shifting the visual viewport and swallowing the
-    // first tap. Keep focus stable; the following click still submits.
-    e.preventDefault();
-  };
 
-  const preventToolbarButtonPointerDownBlur = (e: React.PointerEvent<HTMLButtonElement>) => {
-    // Toolbar buttons sit beside the textarea. Preserve focus through
-    // pointerdown so Android Chrome does not collapse the keyboard before the
-    // button click opens the picker or toggles composer state.
-    e.preventDefault();
-  };
-
-  const preventTaskTogglePointerDownBlur = (e: React.PointerEvent<HTMLButtonElement>) => {
-    // Keep the composer focused while toggling task mode; the following click
-    // still toggles the checkbox without sending.
-    e.preventDefault();
-  };
-
-  const toggleTaskModeWithoutBlur = (e: React.MouseEvent<HTMLButtonElement>) => {
+  const toggleTaskModeWithoutBlur = useCallback((e: React.MouseEvent<HTMLElement>) => {
     e.preventDefault();
     setAlsoCreateTask((prev) => !prev);
-  };
+  }, []);
 
   const hasValidatingAttachments = pendingFiles.some((pf) => pf.uploadStatus === "validating");
   const hasUploadingAttachments = pendingFiles.some((pf) => pf.uploadStatus === "uploading");
@@ -2336,11 +2623,18 @@ export default function MessageInput({
   const compactPendingFiles = pendingFiles.filter(
     (pf) => pf.uploadStatus !== "error" || isBillingUploadQuotaError(pf.uploadError),
   );
+  const sortablePendingFileIds = useMemo(() => compactPendingFiles.map((pf) => pf.id), [compactPendingFiles]);
+  const locallyOwnedUploadIds = new Set(pendingFiles.flatMap((file) => (
+    file.directUploadSession ? [file.directUploadSession.uploadId] : []
+  )));
+  const visibleRecoverableUploads = recoverableUploads.filter(
+    (upload) => !locallyOwnedUploadIds.has(upload.uploadId),
+  );
   const canSubmit = content.trim().length > 0 || pendingFiles.length > 0 || (allowEmptySubmit && Boolean(onSendOverride));
-  const submitBlocked = !canSubmit || hasValidatingAttachments || hasUploadingAttachments || hasFailedAttachments || submitDisabled || submitBusy;
+  const submitBlocked = !canSubmit || hasValidatingAttachments || hasUploadingAttachments || hasFailedAttachments || submitDisabled || submitBusy || conversionBlocked;
   // Stryker disable next-line ConditionalExpression,LogicalOperator: spinner state is covered by MessageInput DOM tests; generated mutants hang tsx.
   const showSubmitSpinner = submitBusy || hasValidatingAttachments || hasUploadingAttachments;
-  const submitTitle = submitBusy
+  const submitTitle = conversionBlocked ? conversionBlockedMessage : submitBusy
     ? formatMessage({ id: "message.composer.sending" })
     : submitDisabled
       ? submitDisabledReason ?? formatMessage({ id: "message.composer.sendDisabled" })
@@ -2351,7 +2645,7 @@ export default function MessageInput({
           : hasFailedAttachments
             ? formatMessage({ id: "message.composer.retryFailedTitle" })
             : submitTitleOverride ?? formatMessage({ id: "message.composer.send" });
-  const submitLabel = submitBusy
+  const submitLabel = conversionBlocked ? conversionBlockedMessage : submitBusy
     ? formatMessage({ id: "message.composer.sendingLabel" })
     : submitDisabled
       ? submitDisabledReason ?? formatMessage({ id: "message.composer.sendDisabled" })
@@ -2363,192 +2657,36 @@ export default function MessageInput({
             ? formatMessage({ id: "message.composer.retryFailedTitle" })
             : submitLabelOverride ?? formatMessage({ id: "message.composer.send" });
   // Stryker disable next-line ConditionalExpression: icon branch is covered by MessageInput DOM tests; generated JSX mutants hang tsx.
-  const submitIcon = showSubmitSpinner ? <Spinner size="sm" /> : <Send size={14} />;
+  const submitIcon = showSubmitSpinner ? <Spinner size="sm" aria-label={formatMessage({ id: "common.loadingLabel" })} /> : <Send size={18} />;
 
   return (
-    <form
+    <ComposerRoot
       onSubmit={handleSubmit}
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
       onDrop={handleDrop}
-      className={
-        variant === "compact"
-          ? "relative flex items-center bg-white"
-          : "relative flex items-center border-t-2 border-black bg-white px-3 pt-3 safe-bottom"
-      }
+      // Full: the conversation's own composer, on the 20px edge its messages
+      // and header keep (DS: "the composer below" shares the header's edge),
+      // on the panel colour so it covers the timeline it floats over.
+      // Compact: the host docks it (COMPOSER_DOCK_CLASS) and owns the
+      // surface around it.
+      className={variant === "compact" ? "relative flex min-w-0 w-full items-center" : "relative flex min-w-0 w-full items-center bg-layer-canvas px-5 pt-2 safe-bottom"}
     >
       {/* Drop overlay — only visible while a file drag is in progress over
           the composer area. Pointer-events are kept on so the overlay
           itself is the drop target (browser fires drop on the topmost
           element under the cursor at drop time). */}
       {isDraggingFiles && (
-        <div
+        <ComposerDropOverlay
           aria-hidden
           data-testid="composer-drop-overlay"
-          className="absolute inset-0 z-30 flex items-center justify-center border-2 border-dashed border-brutal-pink bg-brutal-pink/15"
         >
-          <span className="border-2 border-black bg-white px-3 py-1.5 text-sm font-bold text-black shadow-brutal-sm">
+          <ComposerDropOverlayLabel>
             {formatMessage({ id: "message.composer.dropToAttach" })}
-          </span>
-        </div>
+          </ComposerDropOverlayLabel>
+        </ComposerDropOverlay>
       )}
-      {/* @mention dropdown */}
-      {mention.show && filteredMentions.flat.length > 0 && (
-        <div
-          ref={mention.popupRef}
-          data-testid="mention-autocomplete-popover"
-          className="absolute bottom-full left-3 right-3 mb-1 max-h-48 overflow-y-auto card-brutal"
-        >
-          {filteredMentions.inChannel.length > 0 && filteredMentions.notInChannel.length > 0 && (
-            <SectionEyebrow as="div" className="px-3 py-1.5">
-              {formatMessage({ id: "message.composer.inThisChannel" })}
-            </SectionEyebrow>
-          )}
-          {filteredMentions.inChannel.map((candidate, i) => (
-            <button
-              key={`${candidate.type}:${candidate.id}`}
-              type="button"
-              data-ac-index={i}
-              onMouseDown={preventAutocompleteOptionMouseDown}
-              onClick={() => doInsertMention(candidate)}
-              className={`flex w-full items-center gap-2 px-3 py-2 text-sm font-medium transition-colors ${
-                i === mention.index
-                  ? "bg-soft-signal text-black font-bold"
-                  : "text-black hover:bg-soft-signal/50"
-              }`}
-            >
-              <MentionCandidateAvatar candidate={candidate} muted={false} />
-              <MentionCandidateBody candidate={candidate} selected={i === mention.index} muted={false} />
-            </button>
-          ))}
-          {filteredMentions.notInChannel.length > 0 && (
-            <SectionEyebrow as="div" className={`px-3 py-1.5 ${filteredMentions.inChannel.length > 0 ? "border-t-2 border-black" : ""}`}>
-              {formatMessage({ id: "message.composer.notInThisChannel" })}
-            </SectionEyebrow>
-          )}
-          {filteredMentions.notInChannel.map((candidate, i) => {
-            const flatIndex = filteredMentions.inChannel.length + i;
-            const isSelected = flatIndex === mention.index;
-            return (
-              <button
-                key={`${candidate.type}:${candidate.id}`}
-                type="button"
-                data-ac-index={flatIndex}
-                onMouseDown={preventAutocompleteOptionMouseDown}
-                onClick={() => doInsertMention(candidate)}
-                className={`flex w-full items-center gap-2 px-3 py-2 text-sm font-medium transition-colors ${
-                  isSelected
-                    ? "bg-black/10 text-black/70 font-bold"
-                    : "text-black/50 hover:bg-black/5"
-                }`}
-              >
-                <MentionCandidateAvatar candidate={candidate} muted />
-                <UserX size={12} className="shrink-0 text-black/40 -ml-1" />
-                <MentionCandidateBody candidate={candidate} selected={isSelected} muted />
-              </button>
-            );
-          })}
-          {filteredMentions.computers.length > 0 && (
-            <SectionEyebrow as="div" className="border-t-2 border-black px-3 py-1.5">
-              {formatMessage({ id: "message.composer.computers" })}
-            </SectionEyebrow>
-          )}
-          {filteredMentions.computers.map((candidate, i) => {
-            const flatIndex = filteredMentions.inChannel.length + filteredMentions.notInChannel.length + i;
-            const isSelected = flatIndex === mention.index;
-            return (
-              <button
-                key={`computer:${candidate.id}`}
-                type="button"
-                data-ac-index={flatIndex}
-                onMouseDown={preventAutocompleteOptionMouseDown}
-                onClick={() => doInsertMention(candidate)}
-                className={`flex w-full items-center gap-2 px-3 py-2 text-sm font-medium transition-colors ${isSelected ? "bg-brutal-cyan/30 font-bold text-black" : "text-black hover:bg-brutal-cyan/15"}`}
-              >
-                <MentionCandidateAvatar candidate={candidate} muted={false} />
-                <MentionCandidateBody candidate={candidate} selected={isSelected} muted={false} />
-              </button>
-            );
-          })}
-          {filteredMentions.apps.length > 0 && (
-            <SectionEyebrow as="div" className="border-t-2 border-black px-3 py-1.5">
-              {formatMessage({ id: "message.composer.apps" })}
-            </SectionEyebrow>
-          )}
-          {filteredMentions.apps.map((candidate, i) => {
-            const flatIndex = filteredMentions.inChannel.length + filteredMentions.notInChannel.length + filteredMentions.computers.length + i;
-            const isSelected = flatIndex === mention.index;
-            return (
-              <button
-                key={`app:${candidate.id}`}
-                type="button"
-                data-ac-index={flatIndex}
-                onMouseDown={preventAutocompleteOptionMouseDown}
-                onClick={() => doInsertMention(candidate)}
-                className={`flex w-full items-center gap-2 px-3 py-2 text-sm font-medium transition-colors ${isSelected ? "bg-soft-signal/40 font-bold text-black" : "text-black hover:bg-soft-signal/20"}`}
-              >
-                <MentionCandidateAvatar candidate={candidate} muted={false} />
-                <MentionCandidateBody candidate={candidate} selected={isSelected} muted={false} />
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {/* #channel dropdown */}
-      {channel.show && filteredChannels.length > 0 && (
-        <div
-          ref={channel.popupRef}
-          data-testid="channel-autocomplete-popover"
-          className="absolute bottom-full left-3 right-3 mb-1 max-h-48 overflow-y-auto card-brutal"
-        >
-          {filteredChannels.map((ch, i) => {
-            const isSelected = i === channel.index;
-            const isArchived = !!ch.archivedAt;
-            return (
-              <button
-                key={ch.id}
-                type="button"
-                data-ac-index={i}
-                onMouseDown={preventAutocompleteOptionMouseDown}
-                onClick={() => doInsertChannel(ch)}
-                className={`flex w-full items-center gap-2 px-3 py-2 text-sm font-medium transition-colors ${
-                  isSelected
-                    ? isArchived
-                      ? "bg-black/10 text-black/70 font-bold"
-                      : "bg-brutal-pink text-black font-bold"
-                    : isArchived
-                      ? `${ARCHIVED_CHANNEL_TEXT_CLASS} hover:bg-black/5`
-                      : "text-black hover:bg-soft-signal"
-                }`}
-              >
-                <div
-                  className={`flex size-5 shrink-0 items-center justify-center border ${
-                    isArchived ? ARCHIVED_CHANNEL_ICON_CLASS : "border-black bg-soft-signal text-black"
-                  }`}
-                >
-                  <Hash size={12} />
-                </div>
-                <span className="flex min-w-0 flex-1 items-baseline gap-2 text-left">
-                  <span className="max-w-[50%] flex-none truncate">{ch.name}</span>
-                  {ch.description && (
-                    <span className={`min-w-0 flex-1 truncate text-xs ${isArchived ? ARCHIVED_CHANNEL_MUTED_TEXT_CLASS : "text-black/40"}`}>
-                      {ch.description}
-                    </span>
-                  )}
-                </span>
-                {isArchived && (
-                  <span className={`ml-auto shrink-0 ${ARCHIVED_CHANNEL_BADGE_CLASS}`}>
-                    {formatMessage({ id: "message.composer.archivedBadge" })}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </div>
-      )}
-
       <input
         ref={imageInputRef}
         data-testid="composer-media-input"
@@ -2567,7 +2705,9 @@ export default function MessageInput({
         onChange={handleAttachmentPickerChange}
       />
 
-      <div className="flex w-full flex-col gap-2">
+      {/* `relative`: the suggestion lists below anchor here, so they span the
+          composer's own column (the frame's width), not the padded root. */}
+      <div className="relative flex w-full flex-col gap-2">
         {activationBanner}
         {error && (
           <Banner intent="warning" density="sm" className="font-bold">
@@ -2588,26 +2728,55 @@ export default function MessageInput({
         )}
 
         {mentionActionNotice && (
-          <div className="border-2 border-black/35 bg-black/[0.04] px-2 py-1 text-[11px] font-bold leading-4 text-black/70">
+          <div className="rounded-control bg-fill-muted px-2.5 py-1.5 text-caption font-semibold text-foreground-muted">
             {mentionActionNotice}
           </div>
+        )}
+
+        {isDmComposer && deliveryWarnings.some((warning) => warning.reason === "agent_stopped") && (
+          <Banner
+            intent="warning"
+            density="sm"
+            className="grid-cols-[minmax(0,1fr)_auto] font-bold [&>[data-slot=banner-description]]:break-words [&>[data-slot=banner-action]]:col-start-2 [&>[data-slot=banner-action]]:row-start-1 [&>[data-slot=banner-action]]:mt-0"
+            actions={(
+              <Tooltip content={formatMessage({ id: "message.composer.dismissDeliveryWarning" })}>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-sm"
+                data-slot="button"
+                onClick={dismissDeliveryWarning}
+                className="text-warning-strong"
+                aria-label={formatMessage({ id: "message.composer.dismissDeliveryWarning" })}
+              >
+                <X size={12} strokeWidth={3} aria-hidden="true" />
+              </Button>
+              </Tooltip>
+            )}
+          >
+            {formatMessage({ id: "message.composer.agentStoppedDeliveryWarning" })}
+          </Banner>
         )}
 
         {!isDmComposer && unresolvedMentionHandles.length > 0 && (
           <Banner
             intent="warning"
             density="sm"
-            className="font-bold"
+            className="grid-cols-[minmax(0,1fr)_auto] font-bold [&>[data-slot=banner-description]]:break-words [&>[data-slot=banner-action]]:col-start-2 [&>[data-slot=banner-action]]:row-start-1 [&>[data-slot=banner-action]]:mt-0"
             actions={(
-              <button
+              <Tooltip content={formatMessage({ id: "message.composer.dismissUnresolvedMentions" })}>
+              <Button
                 type="button"
+                variant="ghost"
+                size="icon-sm"
+                data-slot="button"
                 onClick={dismissUnresolvedMentionWarning}
-                className="btn-brutal-sm bg-white p-1"
+                className="text-warning-strong"
                 aria-label={formatMessage({ id: "message.composer.dismissUnresolvedMentions" })}
-                title={formatMessage({ id: "message.composer.dismissUnresolvedMentions" })}
               >
                 <X size={12} strokeWidth={3} aria-hidden="true" />
-              </button>
+              </Button>
+              </Tooltip>
             )}
           >
             {formatMessage(
@@ -2630,24 +2799,55 @@ export default function MessageInput({
           />
         )}
 
+        {visibleRecoverableUploads.length > 0 && (
+          <Banner
+            intent="warning"
+            density="sm"
+            className="min-w-0 font-normal"
+            data-testid="composer-recoverable-uploads"
+          >
+            <div className="min-w-0 space-y-2">
+              <div className="font-bold">
+                {formatMessage(
+                  { id: "message.composer.recoverableUploadsTitle" },
+                  { count: visibleRecoverableUploads.length },
+                )}
+              </div>
+              <div className="break-words text-footnote">
+                {formatMessage({ id: "message.composer.recoverableUploadsDescription" })}
+              </div>
+              <ul className="space-y-1.5">
+                {visibleRecoverableUploads.map((upload) => (
+                  <li key={upload.uploadId}>
+                    <Separator className="mb-1.5" />
+                    <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+                      <Tooltip content={upload.filename}>
+                        <span className="min-w-0 flex-1 truncate text-footnote font-bold">
+                          {upload.filename}
+                        </span>
+                      </Tooltip>
+                      <RecoverableUploadCancelButton
+                        uploadId={upload.uploadId}
+                        filename={upload.filename}
+                        onCancel={cancelRecoverableUpload}
+                      />
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          </Banner>
+        )}
+
         {/* Pending attachments */}
         {compactPendingFiles.length > 0 && (
           <DndContext
             sensors={dndSensors}
             collisionDetection={closestCenter}
-            onDragEnd={(event: DragEndEvent) => {
-              const { active, over } = event;
-              if (over && active.id !== over.id) {
-                setPendingFiles((prev) => {
-                  const oldIndex = prev.findIndex((p) => p.id === active.id);
-                  const newIndex = prev.findIndex((p) => p.id === over.id);
-                  return arrayMove(prev, oldIndex, newIndex);
-                });
-              }
-            }}
+            onDragEnd={handleAttachmentDragEnd}
           >
-            <SortableContext items={compactPendingFiles.map((pf) => pf.id)} strategy={horizontalListSortingStrategy}>
-              <div className="flex gap-2 flex-wrap">
+            <SortableContext items={sortablePendingFileIds} strategy={horizontalListSortingStrategy}>
+              <ComposerAttachments>
                 {compactPendingFiles.map((pf) => (
                   <SortableAttachment
                     key={pf.id}
@@ -2657,15 +2857,16 @@ export default function MessageInput({
                     mimeType={pf.file.type}
                     uploadStatus={pf.uploadStatus}
                     uploadProgress={pf.uploadProgress}
-                    onRemove={() => removeFile(pendingFiles.findIndex((candidate) => candidate.id === pf.id))}
+                    attachmentId={pf.attachmentId ?? null}
+                    onRemove={handleRemovePendingFile}
                     onPreview={
                       pf.preview && pf.uploadStatus === "ready" && pf.attachmentId
-                        ? () => openDraftImagePreview(pf.attachmentId!)
+                        ? handlePreviewDraftImage
                         : undefined
                     }
                   />
                 ))}
-              </div>
+              </ComposerAttachments>
             </SortableContext>
           </DndContext>
         )}
@@ -2674,11 +2875,11 @@ export default function MessageInput({
           <div
             key={`upload-error-${pf.id}`}
             role="alert"
-            className="flex w-full flex-wrap items-center gap-2 border-2 border-black bg-brutal-orange px-2 py-1.5 text-xs text-black"
+            className="flex w-full flex-wrap items-center gap-2 rounded-container bg-warning-soft px-3 py-2 text-footnote text-foreground"
           >
             <div className="min-w-0 flex-[1_1_14rem]">
               <div className="break-all font-bold">{pf.file.name}</div>
-              <div className="break-words leading-4">
+              <div className="break-words text-foreground-muted">
                 {pf.uploadError || formatMessage({ id: "message.composer.uploadFailed" })}
               </div>
               {pf.uploadProgress > 0 && (
@@ -2687,111 +2888,306 @@ export default function MessageInput({
                 </div>
               )}
             </div>
-            <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              {pf.uploadCanRetry !== false && (
-                <button
-                  type="button"
-                  onClick={() => retryFile(pf.id)}
-                  aria-label={formatMessage({ id: "message.composer.retryUploadAttachment" }, { file: pf.file.name })}
-                  className="border-2 border-black bg-white px-2 py-1 font-bold underline shadow-brutal-xs hover:bg-soft-signal"
-                >
-                  {formatMessage({ id: "message.composer.tapToRetry" })}
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => removeFile(pendingFiles.findIndex((candidate) => candidate.id === pf.id))}
-                aria-label={formatMessage({ id: "message.composer.removeAttachment" }, { file: pf.file.name })}
-                className="flex size-7 items-center justify-center border-2 border-black bg-black text-white"
-              >
-                <X size={12} />
-              </button>
-            </div>
+            <UploadFailureActions
+              fileId={pf.id}
+              fileName={pf.file.name}
+              canRetry={pf.uploadCanRetry !== false}
+              onRetry={retryFile}
+              onRemove={handleRemovePendingFile}
+            />
           </div>
         ))}
 
         {/* Composer shell — single bordered card holding the textarea AND
-            the action toolbar. stdrc 2026-05-07 #proj-message task #18:
-            "参考分支 bugen/theme-skin-poc 做一下输入框的，按钮整合进输入框内部".
-            Modern composer pattern (Linear / OpenAI playground / ChatGPT)
-            unifies typing + actions into one card instead of stacking
-            input + separate toolbar row. */}
+            the action toolbar. */}
         {/* Accessory chips ride ABOVE the composer card — the same slot as
-            pending attachments — so the input itself stays clean (cindyz,
-            task #21). */}
+            pending attachments — so the input itself stays clean. */}
         {accessoryRow ? (
-          <div className="flex flex-wrap items-center gap-1">{accessoryRow}</div>
+          <div className="flex flex-wrap items-center gap-1.5">{accessoryRow}</div>
         ) : null}
-        <div className="flex flex-col gap-2 border-2 border-black bg-white p-2 shadow-brutal-sm focus-within:shadow-brutal">
-          <textarea
+
+        {/* @mention dropdown — placed before <Composer> (outside the card) per
+            the RUI spec, so the card never clips it. */}
+        {mention.show && filteredMentions.flat.length > 0 && (
+          <ComposerSuggestionList
+            ref={mention.popupRef}
+            className="z-40"
+            data-testid="mention-autocomplete-popover"
+          >
+            {(filteredMentions.inChannel.length > 0 || filteredMentions.externals.length > 0) && (
+              <ComposerSuggestionGroup>
+                {(filteredMentions.notInChannel.length > 0 || filteredMentions.externals.length > 0) && (
+                  <ComposerSuggestionGroupLabel>
+                    {formatMessage({ id: "message.composer.inThisChannel" })}
+                  </ComposerSuggestionGroupLabel>
+                )}
+                {filteredMentions.inChannel.map((candidate, i) => (
+                  <AutocompleteOptionRow
+                    key={`${candidate.type}:${candidate.id}`}
+                    value={candidate}
+                    flatIndex={i}
+                    highlighted={i === mention.index}
+                    onMouseDown={preventAutocompleteOptionMouseDown}
+                    onSelect={handleSelectMentionCandidate}
+                  >
+                    <ComposerSuggestionIcon>
+                      <MentionCandidateAvatar candidate={candidate} muted={false} />
+                    </ComposerSuggestionIcon>
+                    <ComposerSuggestionContent>
+                      <MentionCandidateBody candidate={candidate} />
+                    </ComposerSuggestionContent>
+                  </AutocompleteOptionRow>
+                ))}
+                {filteredMentions.externals.map((candidate, i) => {
+                  const flatIndex = filteredMentions.inChannel.length + i;
+                  const isSelected = flatIndex === mention.index;
+                  return (
+                    <AutocompleteOptionRow
+                      key={`external:${candidate.id}`}
+                      value={candidate}
+                      flatIndex={flatIndex}
+                      highlighted={isSelected}
+                      onMouseDown={preventAutocompleteOptionMouseDown}
+                      onSelect={handleSelectMentionCandidate}
+                      aria-label={formatMessage(
+                        { id: "message.externalIdentity.openAria" },
+                        { name: candidate.displayName ?? candidate.name },
+                      )}
+                    >
+                      <ComposerSuggestionIcon>
+                        <MentionCandidateAvatar candidate={candidate} muted={false} />
+                      </ComposerSuggestionIcon>
+                      <ComposerSuggestionIcon variant="auxiliary">
+                        {/* Slack-side participant — visually tag as external */}
+                        <ArrowLeftRight aria-hidden="true" size={10} strokeWidth={2.5} />
+                      </ComposerSuggestionIcon>
+                      <ComposerSuggestionContent>
+                        <MentionCandidateBody candidate={candidate} />
+                      </ComposerSuggestionContent>
+                    </AutocompleteOptionRow>
+                  );
+                })}
+              </ComposerSuggestionGroup>
+            )}
+            {filteredMentions.notInChannel.length > 0 && (
+              <>
+                <Separator className="mt-1" />
+                <ComposerSuggestionGroup className="pt-1">
+                  <ComposerSuggestionGroupLabel>
+                    {formatMessage({ id: "message.composer.notInThisChannel" })}
+                  </ComposerSuggestionGroupLabel>
+                  {filteredMentions.notInChannel.map((candidate, i) => {
+                    const flatIndex = filteredMentions.inChannel.length + filteredMentions.externals.length + i;
+                    const isSelected = flatIndex === mention.index;
+                    return (
+                      <AutocompleteOptionRow
+                        key={`${candidate.type}:${candidate.id}`}
+                        value={candidate}
+                        flatIndex={flatIndex}
+                        highlighted={isSelected}
+                        className="opacity-60"
+                        onMouseDown={preventAutocompleteOptionMouseDown}
+                        onSelect={handleSelectMentionCandidate}
+                      >
+                        <ComposerSuggestionIcon>
+                          <MentionCandidateAvatar candidate={candidate} muted />
+                        </ComposerSuggestionIcon>
+                        <ComposerSuggestionIcon variant="auxiliary">
+                          <UserX size={12} />
+                        </ComposerSuggestionIcon>
+                        <ComposerSuggestionContent>
+                          <MentionCandidateBody candidate={candidate} />
+                        </ComposerSuggestionContent>
+                      </AutocompleteOptionRow>
+                    );
+                  })}
+                </ComposerSuggestionGroup>
+              </>
+            )}
+            {filteredMentions.computers.length > 0 && (
+              <>
+                <Separator className="mt-1" />
+                <ComposerSuggestionGroup className="pt-1">
+                  <ComposerSuggestionGroupLabel>
+                    {formatMessage({ id: "message.composer.computers" })}
+                  </ComposerSuggestionGroupLabel>
+                  {filteredMentions.computers.map((candidate, i) => {
+                    const flatIndex = filteredMentions.inChannel.length + filteredMentions.externals.length + filteredMentions.notInChannel.length + i;
+                    const isSelected = flatIndex === mention.index;
+                    return (
+                      <AutocompleteOptionRow
+                        key={`computer:${candidate.id}`}
+                        value={candidate}
+                        flatIndex={flatIndex}
+                        highlighted={isSelected}
+                        onMouseDown={preventAutocompleteOptionMouseDown}
+                        onSelect={handleSelectMentionCandidate}
+                      >
+                        <ComposerSuggestionIcon>
+                          <MentionCandidateAvatar candidate={candidate} muted={false} />
+                        </ComposerSuggestionIcon>
+                        <ComposerSuggestionContent>
+                          <MentionCandidateBody candidate={candidate} />
+                        </ComposerSuggestionContent>
+                      </AutocompleteOptionRow>
+                    );
+                  })}
+                </ComposerSuggestionGroup>
+              </>
+            )}
+            {filteredMentions.apps.length > 0 && (
+              <>
+                <Separator className="mt-1" />
+                <ComposerSuggestionGroup className="pt-1">
+                  <ComposerSuggestionGroupLabel>
+                    {formatMessage({ id: "message.composer.apps" })}
+                  </ComposerSuggestionGroupLabel>
+                  {filteredMentions.apps.map((candidate, i) => {
+                    const flatIndex = filteredMentions.inChannel.length + filteredMentions.externals.length + filteredMentions.notInChannel.length + filteredMentions.computers.length + i;
+                    const isSelected = flatIndex === mention.index;
+                    return (
+                      <AutocompleteOptionRow
+                        key={`app:${candidate.id}`}
+                        value={candidate}
+                        flatIndex={flatIndex}
+                        highlighted={isSelected}
+                        onMouseDown={preventAutocompleteOptionMouseDown}
+                        onSelect={handleSelectMentionCandidate}
+                      >
+                        <ComposerSuggestionIcon>
+                          <MentionCandidateAvatar candidate={candidate} muted={false} />
+                        </ComposerSuggestionIcon>
+                        <ComposerSuggestionContent>
+                          <MentionCandidateBody candidate={candidate} />
+                        </ComposerSuggestionContent>
+                      </AutocompleteOptionRow>
+                    );
+                  })}
+                </ComposerSuggestionGroup>
+              </>
+            )}
+          </ComposerSuggestionList>
+        )}
+
+        {/* #channel dropdown */}
+        {channel.show && filteredChannels.length > 0 && (
+          <ComposerSuggestionList
+            ref={channel.popupRef}
+            className="z-40"
+            data-testid="channel-autocomplete-popover"
+          >
+            <ComposerSuggestionGroup>
+              {filteredChannels.map((ch, i) => {
+                const isSelected = i === channel.index;
+                const isArchived = !!ch.archivedAt;
+                return (
+                  <AutocompleteOptionRow
+                    key={ch.id}
+                    value={ch}
+                    flatIndex={i}
+                    highlighted={isSelected}
+                    onMouseDown={preventAutocompleteOptionMouseDown}
+                    onSelect={handleSelectChannelCandidate}
+                  >
+                    <ComposerSuggestionIcon variant="framed">
+                      <Hash size={12} />
+                    </ComposerSuggestionIcon>
+                    <ComposerSuggestionContent>
+                      <ComposerSuggestionTitle>{ch.name}</ComposerSuggestionTitle>
+                      {ch.description && (
+                        <ComposerSuggestionMeta>{ch.description}</ComposerSuggestionMeta>
+                      )}
+                      {isArchived && (
+                        <ComposerSuggestionAside>
+                          <Badge appearance="soft" variant="muted">
+                            {formatMessage({ id: "message.composer.archivedBadge" })}
+                          </Badge>
+                        </ComposerSuggestionAside>
+                      )}
+                    </ComposerSuggestionContent>
+                  </AutocompleteOptionRow>
+                );
+              })}
+            </ComposerSuggestionGroup>
+          </ComposerSuggestionList>
+        )}
+
+        <Composer>
+          <ComposerInput
             id={textareaId}
+            data-testid="composer-textarea"
             ref={composerTextareaRef}
-            value={content}
             onChange={handleChange}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
             placeholder={placeholder ?? formatMessage({ id: "message.composer.messagePlaceholder" }, { channel: channelName })}
             maxLength={maxLength}
-            className="max-h-32 w-full resize-none text-base md:text-sm font-display focus:outline-none leading-5 min-h-5 md:min-h-10"
             rows={1}
           />
-          <div className="flex items-center justify-between gap-3">
+          <ComposerToolbar>
             {variant === "compact" ? (
               <div />
             ) : (
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
+              <ComposerActions>
+                <Tooltip content={formatMessage({ id: "message.composer.attachImage" })}>
+                <ComposerIconButton
                   onPointerDown={preventToolbarButtonPointerDownBlur}
-                  onClick={() => imageInputRef.current!.click()}
-                  className="btn-brutal-sm bg-white p-1"
-                  title={formatMessage({ id: "message.composer.attachImage" })}
+                  onClick={handleAttachImageClick}
+                  data-slot="button"
+                  aria-label={formatMessage({ id: "message.composer.attachImage" })}
                 >
-                  <ImagePlus size={14} />
-                </button>
-                <button
-                  type="button"
+                  <ImagePlus size={18} />
+                </ComposerIconButton>
+                </Tooltip>
+                <Tooltip content={formatMessage({ id: "message.composer.attachFile" })}>
+                <ComposerIconButton
                   onPointerDown={preventToolbarButtonPointerDownBlur}
-                  onClick={() => fileInputRef.current!.click()}
-                  className="btn-brutal-sm bg-white p-1"
-                  title={formatMessage({ id: "message.composer.attachFile" })}
+                  onClick={handleAttachFileClick}
+                  data-slot="button"
+                  aria-label={formatMessage({ id: "message.composer.attachFile" })}
                 >
-                  <Paperclip size={14} />
-                </button>
-              </div>
+                  <Paperclip size={18} />
+                </ComposerIconButton>
+                </Tooltip>
+              </ComposerActions>
             )}
-            <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2">
               {showTaskButton && (
-                <button
-                  type="button"
+                <Tooltip content={formatMessage({ id: "message.composer.sendAsTaskTooltip" })}>
+                {/* raft-ui's composer toolbar label (DS `rf-check` in the
+                    composer bar), drawn as a button so a tap toggles without
+                    taking focus from the input. */}
+                <ComposerToolbarLabel
+                  render={<button type="button" />}
                   role="checkbox"
                   data-testid="composer-as-task-toggle"
                   aria-checked={alsoCreateTask}
-                  className="inline-flex items-center gap-1.5 select-none"
-                  title={formatMessage({ id: "message.composer.sendAsTaskTooltip" })}
+                  className="rounded-control outline-none focus-visible:shadow-focus"
                   onPointerDown={preventTaskTogglePointerDownBlur}
                   onClick={toggleTaskModeWithoutBlur}
                 >
-                  <CheckMarker
+                  <CheckboxIndicator
                     checked={alsoCreateTask}
                   />
-                  <span className="text-xs font-bold text-black/60">{formatMessage({ id: "message.composer.asTask" })}</span>
-                </button>
+                  {formatMessage({ id: "message.composer.asTask" })}
+                </ComposerToolbarLabel>
+                </Tooltip>
               )}
-              <button
-                type="submit"
+              <Tooltip content={submitTitle}>
+              <ComposerSubmit
+                size="icon-sm"
+                data-slot="button"
                 onPointerDown={preventSendButtonPointerDownBlur}
                 disabled={submitBlocked}
-                className="btn-brutal-sm flex size-7 shrink-0 items-center justify-center bg-brutal-pink p-0 disabled:opacity-30 disabled:pointer-events-none"
-                title={submitTitle}
                 aria-label={submitLabel}
               >
                 {submitIcon}
-              </button>
+              </ComposerSubmit>
+              </Tooltip>
             </div>
-          </div>
-        </div>
+          </ComposerToolbar>
+        </Composer>
       </div>
-    </form>
+    </ComposerRoot>
   );
 }

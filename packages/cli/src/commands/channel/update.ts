@@ -1,14 +1,14 @@
 // `raft channel update --target <#channel> [--name <name>] [--description <text>] [--public|--private]`
-// -> PATCH /internal/agent/:id/channels/:channelId
+// -> PATCH /internal/agent-api/channels/:channelId
 
 import type { Command } from "commander";
 
-import { createAgentApiSurfaceClient } from "../../agentApiPath.js";
-import { defineCommand, registerCliCommand } from "../../core/command.js";
-import type { CommandRuntimeOptions } from "../../core/context.js";
-import { CliError } from "../../core/errors.js";
-import { writeText, adoptCliReplyText } from "../../core/renderer.js";
-import { parseRegularChannelTarget } from "./leave.js";
+import { createAgentApiSurfaceClient } from "../../agentApiPath";
+import { defineCommand, registerCliCommand } from "../../core/command";
+import type { CommandRuntimeOptions } from "../../core/context";
+import { CliError } from "../../core/errors";
+import { writeText, adoptCliReplyText } from "../../core/renderer";
+import { parseRegularChannelTarget } from "./leave";
 
 interface UpdateChannelOpts {
   target?: string;
@@ -36,11 +36,11 @@ export function formatUpdateChannelResult(channel: UpdatedChannel): string {
 export const channelUpdateCommand = defineCommand(
   {
     name: "update",
-    description: "Edit a regular channel when this agent has server admin authority",
+    description: "Edit a public, private, or joint channel when this agent has server admin or channel admin authority (a joint channel's name and description change for every connected server; its visibility cannot change)",
     options: [
       {
         flags: "--target <target>",
-        description: "Regular channel to edit, e.g. '#engineering'",
+        description: "Channel to edit, e.g. '#engineering'",
       },
       {
         flags: "--name <name>",
@@ -66,7 +66,7 @@ export const channelUpdateCommand = defineCommand(
     if (!channelName) {
       throw new CliError({
         code: "INVALID_TARGET",
-        message: "Target must be a regular channel in the form '#channel-name'. DMs and thread targets are not supported.",
+        message: "Target must be a channel in the form '#channel-name'. DMs and thread targets are not supported.",
       });
     }
     if (opts.public && opts.private) {
@@ -106,11 +106,7 @@ export const channelUpdateCommand = defineCommand(
       });
     }
 
-    const updateRes = await client.request<UpdatedChannel>(
-      "PATCH",
-      `/internal/agent/${encodeURIComponent(agentContext.agentId)}/channels/${encodeURIComponent(channel.id)}`,
-      body,
-    );
+    const updateRes = await createAgentApiSurfaceClient(client).channels.update({ channelId: channel.id as never }, body);
     if (!updateRes.ok || !updateRes.data) {
       throw new CliError({
         code: updateRes.status >= 500 ? "SERVER_5XX" : "UPDATE_FAILED",

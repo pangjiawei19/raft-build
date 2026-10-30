@@ -1,13 +1,14 @@
 import {
   FeedbackProvider,
   FeedbackWorkspace,
-} from "@botiverse/hands-feedback-react/source";
+} from "@botiverse/hands-feedback-react";
 import type {
   FeedbackTicketDetail,
   FeedbackTicketSummary,
   HandsFeedbackTransport,
-} from "@botiverse/hands-feedback-react/source";
-import "@botiverse/hands-feedback-react/source/styles.css";
+} from "@botiverse/hands-feedback-react";
+import "@botiverse/hands-feedback-react/styles.css";
+import { FEEDBACK_SDK_THEME } from "../src/feedback/feedbackSdkTheme";
 
 const TRIAL_TICKET_ID = "feedback-sdk-trial-ticket";
 const FIXTURE_NOW = Date.UTC(2026, 6, 25, 15, 0, 0);
@@ -149,13 +150,13 @@ export default function FeedbackSdkTrial({
       ? "screens.feedback-sdk.detail"
       : "screens.feedback-sdk.inbox";
   return (
-    <main className="min-h-screen bg-layer-page p-0 font-display text-foreground">
+    <main className="min-h-screen bg-layer-canvas p-0 font-display text-foreground">
       <div
         data-visual-case={caseId}
-        className="overflow-hidden bg-layer-page"
+        className="overflow-hidden bg-layer-canvas"
         style={{ width: narrow ? 390 : 760, height: narrow ? 844 : 720 }}
       >
-        <FeedbackProvider transport={trialTransport} theme="brutal" locale="en">
+        <FeedbackProvider transport={trialTransport} theme={FEEDBACK_SDK_THEME} locale="en">
           <FeedbackWorkspace
             {...(detail ? { initialTicketId: TRIAL_TICKET_ID } : {})}
           />

@@ -19,7 +19,12 @@ export interface LiveAgentActivityItem {
   textDescriptor?: ActivityTextDescriptor;
   context: string | null;
   activity: AgentActivity | null;
+  /** The agent's latest signal. */
   createdAt: number;
+  /** When this stretch of work began. Who-is-working lists and stacks are in this order. */
+  startedAt: number;
+  /** When the agent went idle; it stays listed for LIVE_AGENT_IDLE_GRACE_MS in case it resumes. */
+  idleSince: number | null;
 }
 
 export interface ThreadContextLike {
@@ -38,6 +43,11 @@ const MAX_TEXT_LENGTH = 140;
 // survives one heartbeat (plus network jitter) while still clearing a crashed
 // agent that stopped heartbeating within ~1.5 missed beats.
 export const LIVE_AGENT_ACTIVITY_VISIBLE_MS = 90_000;
+// An agent that goes idle stays in "Working now" this long before it leaves.
+// Agents go idle between tool calls and pick up again a moment later; without
+// the grace their faces dropped out of the stack and came back many times a
+// minute (DS › AgentActivity: faces change only when someone starts or stops).
+export const LIVE_AGENT_IDLE_GRACE_MS = 5_000;
 
 function truncateText(text: string, maxLength = MAX_TEXT_LENGTH): string {
   const compact = text.replace(/\s+/g, " ").trim();
@@ -100,6 +110,8 @@ export function buildStatusActivityItem(
     context: null,
     activity,
     createdAt: event.timestamp ?? Date.now(),
+    startedAt: event.timestamp ?? Date.now(),
+    idleSince: null,
   };
 }
 
@@ -116,57 +128,76 @@ export function applyStatusActivityEvent(
     isRefreshOnly?: boolean;
   },
   agents: Agent[],
-  maxItems = 20,
 ): LiveAgentActivityItem[] {
   const activity = normalizeActivity(event.activityKind ?? event.activity);
   const now = event.timestamp ?? Date.now();
   if (event.isRefreshOnly === true || event.isHeartbeat === true) {
-    // Refresh the current live-work row in place without manufacturing or
-    // reordering ticker history. A terminal snapshot still clears the row.
+    // Refresh the agent's row in place: a snapshot never adds an agent or
+    // moves one. A terminal snapshot settles it like an idle event.
     const activeItems = pruneExpiredLiveAgentActivityItems(items, now);
-    if (!isLiveWorkActivity(activity)) {
-      return activeItems.filter((item) => item.agentId !== event.agentId);
-    }
+    if (!isLiveWorkActivity(activity)) return settleLiveAgentActivity(activeItems, event.agentId, now);
     const refreshedItem = buildStatusActivityItem(event, agents)!;
     let projected = false;
     return activeItems.map((item) => {
       if (projected || item.agentId !== event.agentId || item.kind !== "activity") return item;
       projected = true;
-      return { ...refreshedItem, id: item.id };
+      return { ...refreshedItem, id: item.id, startedAt: item.startedAt };
     });
   }
   if (!isLiveWorkActivity(activity)) {
-    return pruneExpiredLiveAgentActivityItems(items, now)
-      .filter((item) => item.agentId !== event.agentId);
+    return settleLiveAgentActivity(pruneExpiredLiveAgentActivityItems(items, now), event.agentId, now);
   }
-  return appendLiveAgentActivityItem(items, buildStatusActivityItem(event, agents), maxItems);
+  return appendLiveAgentActivityItem(items, buildStatusActivityItem(event, agents));
 }
 
+/** The agent went idle: keep its row (and its place) for the grace period. */
+function settleLiveAgentActivity(items: LiveAgentActivityItem[], agentId: string, now: number): LiveAgentActivityItem[] {
+  return items.map((item) => (item.agentId === agentId && item.idleSince === null ? { ...item, idleSince: now } : item));
+}
+
+/**
+ * Who is working now (DS › AgentActivity): one row per agent, in the order
+ * they started. A new event updates the agent's row where it is, so the face
+ * stack and the Working-now list change only when someone starts or stops;
+ * an agent picking up again within the idle grace keeps its place.
+ */
 export function appendLiveAgentActivityItem(
   items: LiveAgentActivityItem[],
   item: LiveAgentActivityItem | null,
-  maxItems = 20,
 ): LiveAgentActivityItem[] {
   const now = item?.createdAt ?? Date.now();
   const activeItems = pruneExpiredLiveAgentActivityItems(items, now);
   if (!item) return activeItems;
-  const last = activeItems[0];
+  const index = activeItems.findIndex((existing) => existing.agentId === item.agentId);
+  if (index === -1) return [...activeItems, { ...item, startedAt: item.createdAt, idleSince: null }];
+  const current = activeItems[index];
   if (
-    last &&
-    last.kind === item.kind &&
-    last.agentId === item.agentId &&
-    last.text === item.text &&
-    last.context === item.context &&
-    Math.abs(last.createdAt - item.createdAt) < 2000
+    current.idleSince === null &&
+    current.kind === item.kind &&
+    current.text === item.text &&
+    current.context === item.context &&
+    Math.abs(current.createdAt - item.createdAt) < 2000
   ) {
     return activeItems;
   }
-  return [item, ...activeItems.filter((existing) => existing.id !== item.id)].slice(0, maxItems);
+  const next = activeItems.slice();
+  next[index] = { ...item, startedAt: current.startedAt, idleSince: null };
+  return next;
 }
 
 export function pruneExpiredLiveAgentActivityItems(
   items: LiveAgentActivityItem[],
   now = Date.now(),
 ): LiveAgentActivityItem[] {
-  return items.filter((item) => now - item.createdAt < LIVE_AGENT_ACTIVITY_VISIBLE_MS);
+  return items.filter((item) => now < liveAgentActivityExpiry(item));
+}
+
+/** When a row leaves on its own: the idle grace runs out, or (the safety net) no signal for the visible window. */
+function liveAgentActivityExpiry(item: LiveAgentActivityItem): number {
+  return item.idleSince === null ? item.createdAt + LIVE_AGENT_ACTIVITY_VISIBLE_MS : item.idleSince + LIVE_AGENT_IDLE_GRACE_MS;
+}
+
+/** The earliest moment any row leaves on its own, to schedule the next prune; null with no rows. */
+export function nextLiveAgentActivityExpiry(items: readonly LiveAgentActivityItem[]): number | null {
+  return items.length === 0 ? null : Math.min(...items.map(liveAgentActivityExpiry));
 }

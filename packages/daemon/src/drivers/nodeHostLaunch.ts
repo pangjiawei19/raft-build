@@ -1,3 +1,4 @@
+import { ambientProcessEnv } from "../processEnvPatch";
 import { createRequire } from "node:module";
 
 /**
@@ -154,7 +155,7 @@ export class NodeHostUnavailableError extends Error {
  * host keeps both the executable and environment object unchanged.
  */
 export function resolveNodeHostLaunch(options: NodeHostLaunchOptions = {}): NodeHostLaunch {
-  const env = options.env ?? process.env;
+  const env = options.env ?? ambientProcessEnv();
   const command = options.execPath ?? process.execPath;
   const hostKind = detectNodeHostKind(options);
 

@@ -1,4 +1,4 @@
-import type { PropsWithChildren } from "react";
+import type { ComponentProps, PropsWithChildren } from "react";
 import {
   ToastAction,
   ToastActions,
@@ -11,12 +11,14 @@ import {
   ToastTitle,
   ToastViewport,
   useToastManager,
-} from "raft-ui";
+} from "@botiverse/raft-ui";
 import { forwardToastManager } from "./forwardToast";
 
 // Backport raft-ui >=0.0.20's placement-aware stacked motion while Web remains
 // on 0.0.15 for the legacy BottomSheet API used by the Forward mobile flow.
 const TOP_STACKED_TOAST_CLASS = "top-0 bottom-auto w-full max-w-full origin-top [--toast-y:calc(var(--toast-offset-y)+(var(--toast-index)*var(--toast-gap))+var(--toast-swipe-movement-y))] [transform:translateX(var(--toast-swipe-movement-x))_translateY(calc(var(--toast-swipe-movement-y)+(var(--toast-index)*var(--toast-peek))))_scale(var(--toast-scale))] data-[expanded]:[transform:translateX(var(--toast-swipe-movement-x))_translateY(var(--toast-y))_scale(1)] data-[starting-style]:[transform:translateY(-120%)_scale(0.98)] [&[data-ending-style]:not([data-swipe-direction])]:[transform:translateY(-120%)_scale(0.98)]";
+
+const TOP_TOAST_SWIPE_DIRECTIONS: ComponentProps<typeof ToastRoot>["swipeDirection"] = ["up", "right"];
 
 function ForwardToastList() {
   const { toasts } = useToastManager();
@@ -24,26 +26,25 @@ function ForwardToastList() {
   return toasts.map((toastObject) => {
     const showAction = Boolean(toastObject.actionProps?.children);
     const showClose = toastObject.data?.hasClose === true;
-    const isSuccess = toastObject.data?.intent === "success";
 
     return (
       <ToastRoot
         key={toastObject.id}
         layout="stacked"
         toast={toastObject}
-        swipeDirection={["up", "right"]}
+        swipeDirection={TOP_TOAST_SWIPE_DIRECTIONS}
         className={TOP_STACKED_TOAST_CLASS}
       >
         <ToastContent className="grid-cols-[minmax(0,1fr)_auto] items-center gap-x-4 gap-y-0">
           <ToastBody className="min-w-0 flex-1 text-left">
-            <ToastTitle className={`whitespace-normal break-words text-left ${isSuccess ? "text-sm font-medium leading-5" : ""}`} />
+            <ToastTitle className="whitespace-normal break-words text-left" />
           </ToastBody>
           {showAction || showClose ? (
             <ToastActions className="col-span-1 col-start-2 row-start-1 w-auto shrink-0 justify-self-end">
               {showClose ? <ToastClose /> : null}
-              {showAction ? (
-                <ToastAction className="border-0 bg-transparent px-0 py-1 text-xs font-medium text-black/55 shadow-none transition-colors hover:border-transparent hover:bg-transparent hover:text-black hover:no-underline hover:shadow-none hover:translate-x-0 hover:translate-y-0" />
-              ) : null}
+              {/* The DS toast action (underlined HUD text) is drawn by the
+                  shared raft-ui recipe; no local palette or hover chrome. */}
+              {showAction ? <ToastAction /> : null}
             </ToastActions>
           ) : null}
         </ToastContent>

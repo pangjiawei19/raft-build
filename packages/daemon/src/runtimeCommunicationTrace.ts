@@ -1,10 +1,16 @@
-import type { ParsedEvent } from "./drivers/index.js";
+import type { ParsedEvent } from "./drivers/index";
+import { createTurnTokenAccumulator, turnTokenTraceAttrs, type TurnTokenAccumulator } from "./runtimeTurnTokens";
 
 export interface RuntimeTraceCounters {
   events: number;
   toolCalls: number;
   toolOutputs: number;
   raftMessageSendAttempts: number;
+  /** Sends the daemon's Raft proxy saw the Server accept or hold. Unlike the
+   * attempt count, this does not depend on recognizing the runtime's tool names. */
+  raftMessagesSent: number;
+  raftMessageSendsHeld: number;
+  tokens: TurnTokenAccumulator;
   compactionStarts: number;
   compactionFinishes: number;
   textEvents: number;
@@ -17,6 +23,9 @@ export function createRuntimeTraceCounters(): RuntimeTraceCounters {
     toolCalls: 0,
     toolOutputs: 0,
     raftMessageSendAttempts: 0,
+    raftMessagesSent: 0,
+    raftMessageSendsHeld: 0,
+    tokens: createTurnTokenAccumulator(),
     compactionStarts: 0,
     compactionFinishes: 0,
     textEvents: 0,
@@ -33,10 +42,13 @@ export function runtimeTraceCounterAttrs(
     runtime_tool_calls_count: counters.toolCalls,
     runtime_tool_outputs_count: counters.toolOutputs,
     runtime_raft_message_send_attempts_count: counters.raftMessageSendAttempts,
+    runtime_raft_messages_sent_count: counters.raftMessagesSent,
+    runtime_raft_message_sends_held_count: counters.raftMessageSendsHeld,
     runtime_compaction_starts_count: counters.compactionStarts,
     runtime_compaction_finishes_count: counters.compactionFinishes,
     runtime_text_events_count: counters.textEvents,
     runtime_thinking_events_count: counters.thinkingEvents,
+    ...turnTokenTraceAttrs(counters.tokens),
   };
 }
 
@@ -62,6 +74,11 @@ export function noteRuntimeTraceCounter(counters: RuntimeTraceCounters, event: P
       counters.thinkingEvents++;
       break;
   }
+}
+
+export function noteRaftMessageSendOutcome(counters: RuntimeTraceCounters, state: "sent" | "held"): void {
+  if (state === "sent") counters.raftMessagesSent++;
+  else counters.raftMessageSendsHeld++;
 }
 
 export function noteRaftMessageSendAttempt(counters: RuntimeTraceCounters, toolName: string): void {

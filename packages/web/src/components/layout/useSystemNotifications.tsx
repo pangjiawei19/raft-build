@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
-import { AlertTriangle, ArrowUpCircle, Download, Monitor, WifiOff } from "lucide-react";
+import { AlertTriangle, Download, GitBranch, HardDrive, MessageSquare, Monitor, WifiOff } from "lucide-react";
 import {
   PLAN_CONFIG,
   DOWNGRADE_GRACE_PERIOD_DAYS,
   getEffectiveLimits,
   getFinitePlanLimitExcess,
-  isDaemonOutdated,
 } from "@botiverse/raft-shared";
+import { machineDiskLowPresentation } from "../../utils/machineDiskPresentation";
+import { useFeedbackUnread } from "../../feedback/useFeedbackUnread";
 import { useServerStore } from "../../store/serverStore";
 import { useAgentStore } from "../../store/agentStore";
 import { useMachineStore } from "../../store/machineStore";
@@ -42,6 +43,11 @@ import {
   formatComputerAttentionCounts,
   summarizeComputerAttention,
 } from "../../utils/computerUpgradeIndicator";
+import { isJointChannelReadOnly, jointInviteAcceptErrorMessage } from "../../utils/jointChannelLimit";
+import { useUsageLimitAttention } from "./useUsageLimitAttention";
+import { usePendingJointInvites } from "./usePendingJointInvites";
+import api from "../../api/client";
+import { showToast } from "../toastBridge";
 export { compareNotificationKind, topNotificationKind } from "./notificationKind";
 export type { NotificationKind } from "./notificationKind";
 
@@ -72,6 +78,11 @@ export interface NotificationEntry {
   body: ReactNode;
   action?: NotificationAction;
   secondaryAction?: NotificationAction;
+  /** Server-backed unread state. Omitted entries retain the legacy behavior
+   *  of appearing unread while visible. */
+  unread?: boolean;
+  /** Called when the Notification Center opens; must be idempotent. */
+  onSeen?: () => void;
   /** When set, the row gets a Dismiss action that hides this notification until the
    *  fingerprint changes. The fingerprint must encode every dimension of
    *  the notification's state — e.g. for machine-offline include the sorted
@@ -83,16 +94,19 @@ export interface NotificationEntry {
 export type SystemNotificationSurface = "desktop" | "mobile";
 
 export function useSystemNotifications(surface: SystemNotificationSurface = "desktop"): NotificationEntry[] {
-  const { formatMessage } = useIntl();
+  const { formatMessage, formatDate } = useIntl();
   const server = useServerStore((s) => s.current);
   const machines = useMachineStore((s) => s.machines);
   const machineLoading = useMachineStore((s) => s.loading);
-  const latestDaemonVersion = useMachineStore((s) => s.latestDaemonVersion);
   const allAgents = useAgentStore((s) => s.agents);
   const agentLoading = useAgentStore((s) => s.loading);
   const channelsList = useChannelStore((s) => s.channels);
   const { capabilities } = useServerPermissions();
   const nav = useAppNavigate();
+  const feedbackUnread = useFeedbackUnread();
+  const usageLimitAttention = useUsageLimitAttention();
+  const { invites: pendingJointInvites, refresh: refreshPendingJointInvites } = usePendingJointInvites();
+  const [acceptingJointInviteId, setAcceptingJointInviteId] = useState<string | null>(null);
 
   const serverId = server?.id ?? null;
   const [pwaPlatform, setPwaPlatform] = useState<PwaInstallPlatform>("other");
@@ -233,8 +247,104 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
     window.dispatchEvent(new CustomEvent(PWA_INSTALL_OPEN_EVENT, { detail: { source: "notification_center" } }));
   }, [handleDismissPwaInstall, pwaDeferredPrompt, pwaPlatform, trackPwaInstall]);
 
+  // Same endpoint as the email link (App.tsx `?jointInvite=`), so accept
+  // authority and limit checks are identical on both paths.
+  const acceptJointInvite = useCallback(async (inviteId: string) => {
+    if (!serverId) return;
+    setAcceptingJointInviteId(inviteId);
+    try {
+      const { data } = await api.post(`/channels/joint-invites/${encodeURIComponent(inviteId)}/accept`, undefined, {
+        headers: { "X-Server-Id": serverId },
+      });
+      const channelId = typeof data?.id === "string" ? data.id : null;
+      if (channelId) {
+        await useChannelStore.getState().ensureChannel(channelId);
+        nav.toChannel(channelId);
+      }
+    } catch (err) {
+      showToast({ title: jointInviteAcceptErrorMessage(err, formatMessage), type: "error" });
+    } finally {
+      setAcceptingJointInviteId(null);
+      void refreshPendingJointInvites();
+    }
+  }, [formatMessage, nav, refreshPendingJointInvites, serverId]);
+
   return useMemo<NotificationEntry[]>(() => {
     const out: NotificationEntry[] = [];
+
+    // ── 0a. Pending joint channel invites (RFC 075 §4.5) ─────────────────
+    for (const invite of pendingJointInvites) {
+      out.push({
+        id: `joint-invite:${invite.id}`,
+        kind: "info",
+        icon: <GitBranch size={16} className="text-foreground" />,
+        dismissalKey: `joint-invite:${invite.id}`,
+        title: formatMessage({ id: "layout.systemNotifications.jointInviteTitle" }, { channel: invite.channelName }),
+        body: (
+          <span className="text-foreground-muted">
+            {formatMessage({ id: "layout.systemNotifications.jointInviteBody" }, { server: invite.fromServerName })}
+          </span>
+        ),
+        action: {
+          label: formatMessage({ id: "layout.systemNotifications.jointInviteAccept" }),
+          onClick: () => void acceptJointInvite(invite.id),
+          variant: "primary",
+          disabled: acceptingJointInviteId !== null,
+        },
+      });
+    }
+
+    // ── 0. Authoritative runtime-account usage limits ───────────────────
+    // These rows come from the durable server projection. Never infer them
+    // from Agent error strings: only a newer normalized usage snapshot may
+    // activate or silently resolve an incident.
+    for (const notification of usageLimitAttention.notifications) {
+      const provider = notification.provider === "claude"
+        ? "Claude"
+        : notification.provider === "codex"
+          ? "Codex"
+          : notification.provider === "kimi"
+            ? "Kimi"
+            : "Grok";
+      const reset = notification.resetsAt
+        ? formatDate(new Date(notification.resetsAt), { dateStyle: "medium", timeStyle: "short" })
+        : null;
+      out.push({
+        id: `usage-limit:${notification.id}`,
+        kind: "warning",
+        icon: <AlertTriangle size={16} className="text-foreground" />,
+        unread: notification.seenAt === null,
+        onSeen: () => { void usageLimitAttention.markSeen(notification.id); },
+        title: formatMessage(
+          { id: "layout.systemNotifications.usageLimitTitle" },
+          { provider },
+        ),
+        body: (
+          <span className="text-foreground-muted">
+            {formatMessage(
+              { id: reset
+                ? "layout.systemNotifications.usageLimitBodyWithReset"
+                : "layout.systemNotifications.usageLimitBody" },
+              {
+                count: notification.affectedAgentIds.length,
+                computer: notification.machine.name,
+                reset,
+              },
+            )}
+          </span>
+        ),
+        action: {
+          label: formatMessage({ id: "layout.systemNotifications.view" }),
+          onClick: () => nav.toComputer(notification.machine.id),
+          variant: "primary",
+        },
+        secondaryAction: {
+          label: formatMessage({ id: "common.announcement.dismiss" }),
+          onClick: () => { void usageLimitAttention.dismiss(notification.id); },
+          variant: "secondary",
+        },
+      });
+    }
 
     // ── 1. Plan downgrade ────────────────────────────────────────────────
     if (server && server.plan === "free" && server.planDowngradedAt) {
@@ -256,7 +366,7 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
       out.push({
         id: "plan-downgrade",
         kind: graceExpired ? "error" : "warning",
-        icon: <AlertTriangle size={16} className="text-black" />,
+        icon: <AlertTriangle size={16} className="text-foreground" />,
         // Dismissal fingerprint: anchor on which phase + how much of an excess
         // remains so the notification re-surfaces if the user adds more resources
         // or grace expires.
@@ -305,13 +415,45 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
       void PLAN_CONFIG;
     }
 
+    // ── 1b. Joint channels over the free-server limit (contract v0.3 §18.8) ──
+    // Admins who are members of the joint get one entry per joint per round;
+    // the dismissal key includes the deadline, so the next round resurfaces.
+    // Members see the in-channel banner regardless of role.
+    if (server?.role === "owner" || server?.role === "admin") {
+      for (const joint of channelsList) {
+        if (joint.type !== "joint" || !joint.jointOverLimitGraceEndsAt || joint.archivedAt) continue;
+        const locked = isJointChannelReadOnly(joint);
+        const deadline = formatDate(new Date(joint.jointOverLimitGraceEndsAt), { dateStyle: "medium", timeStyle: "short" });
+        out.push({
+          id: `joint-over-limit:${joint.id}`,
+          kind: locked ? "error" : "warning",
+          icon: <AlertTriangle size={16} className="text-foreground" />,
+          dismissalKey: `joint-over-limit:${joint.id}:${joint.jointOverLimitGraceEndsAt}:${locked ? "locked" : "grace"}`,
+          title: formatMessage(
+            { id: locked ? "layout.systemNotifications.jointOverLimitLockedTitle" : "layout.systemNotifications.jointOverLimitTitle" },
+            { channel: joint.name },
+          ),
+          body: (
+            <span>
+              {formatMessage(
+                { id: locked ? "message.chatPanel.jointLocked" : "message.chatPanel.jointOverLimitGrace" },
+                { deadline },
+              )}
+            </span>
+          ),
+          action: {
+            label: formatMessage({ id: "layout.systemNotifications.upgrade" }),
+            onClick: () => nav.toSettings("billing"),
+            variant: "primary",
+          },
+        });
+      }
+    }
+
     // ── 2. Machine state notifications ─────────────────────────────────────────
     if (capabilities.viewMachines && !machineLoading && !agentLoading) {
       const computerAttention = summarizeComputerAttention(machines);
       const offlineMachines = machines.filter((m) => !m.isComputer && m.status === "offline");
-      const outdatedMachines = machines.filter(
-        (m) => !m.isComputer && m.status === "online" && isDaemonOutdated(m.daemonVersion, latestDaemonVersion),
-      );
       const liveAgents = allAgents.filter((a) => !a.deletedAt);
 
       if (surface === "mobile" && computerAttention.status !== "none") {
@@ -328,10 +470,10 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
         out.push({
           id: "computer-attention",
           kind: "warning",
-          icon: <Monitor size={16} className="text-black" />,
+          icon: <Monitor size={16} className="text-foreground" />,
           dismissalKey: `computer-attention:${versionFingerprint}:${problemIds}:${computerAttention.upgradeCount}:${computerAttention.offlineCount}`,
           title: formatMessage({ id: "layout.systemNotifications.computersNeedAttention" }),
-          body: <span className="text-black/60">{counts}</span>,
+          body: <span className="text-foreground-muted">{counts}</span>,
           action: {
             label: formatMessage({ id: "layout.systemNotifications.view" }),
             onClick: () => {
@@ -369,7 +511,7 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
         out.push({
           id: "machine-offline",
           kind: offlineKind,
-          icon: <WifiOff size={16} className="text-black" />,
+          icon: <WifiOff size={16} className="text-foreground" />,
           // Fingerprint = which machines are offline. If a different set goes
           // offline (different machine id, or the count changes), the
           // dismissal no longer matches and the notification shows again.
@@ -380,14 +522,14 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
           ),
           body:
             activeAgentsOnOffline.length > 0 ? (
-              <span className="text-black/60">
+              <span className="text-foreground-muted">
                 {formatMessage(
                   { id: "layout.systemNotifications.machineOfflineActiveAgentsBody" },
                   { count: activeAgentsOnOffline.length },
                 )}
               </span>
             ) : (
-              <span className="text-black/60">
+              <span className="text-foreground-muted">
                 {formatMessage({ id: "layout.systemNotifications.machineOfflineNoActiveAgentsBody" })}
               </span>
             ),
@@ -399,26 +541,39 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
         });
       }
 
-      if (outdatedMachines.length > 0) {
-        const names = outdatedMachines.map((m) => m.name).join(", ");
-        const outdatedIds = outdatedMachines.map((m) => m.id).sort().join(",");
-        // Fingerprint also includes the latest target version so a freshly
-        // released daemon resurfaces the notification even if the same machine
-        // set was previously dismissed.
-        const versionFingerprint = `${latestDaemonVersion ?? "unknown"}:${outdatedIds}`;
+      // Low disk space is a machine-wide condition agents cannot fix, so it
+      // goes to the person who attached the Computer. Dismissal holds until
+      // another Computer joins or the free space drops into a worse band.
+      const diskLowMachines = machines.flatMap((machine) => {
+        if (!machine.isComputer || !machine.computerAttachedByCurrentUser) return [];
+        const diskLow = machineDiskLowPresentation(machine, formatMessage);
+        return diskLow ? [{ machine, diskLow }] : [];
+      });
+      if (diskLowMachines.length > 0) {
+        const first = diskLowMachines[0]!;
         out.push({
-          id: "machine-outdated",
+          id: "machine-disk-low",
           kind: "warning",
-          icon: <ArrowUpCircle size={16} className="text-black" />,
-          dismissalKey: `machine-outdated:${versionFingerprint}`,
+          icon: <HardDrive size={16} className="text-foreground" />,
+          dismissalKey: `machine-disk-low:${diskLowMachines
+            .map(({ machine, diskLow }) => `${machine.id}=${diskLow.band}`)
+            .sort()
+            .join(",")}`,
           title: formatMessage(
-            { id: "layout.systemNotifications.machineOutdatedTitle" },
-            { names, count: outdatedMachines.length },
+            { id: "layout.systemNotifications.machineDiskLowTitle" },
+            { count: diskLowMachines.length },
           ),
-          body: <span className="text-black/60">{formatMessage({ id: "layout.systemNotifications.machineOutdatedBody" })}</span>,
+          body: (
+            <span className="text-foreground-muted">
+              {formatMessage(
+                { id: "layout.systemNotifications.machineDiskLowBody" },
+                { free: first.diskLow.free, percent: first.diskLow.freePercent },
+              )}
+            </span>
+          ),
           action: {
             label: formatMessage({ id: "layout.systemNotifications.view" }),
-            onClick: () => nav.toMachine(outdatedMachines[0].id),
+            onClick: () => nav.toMachine(first.machine.id),
             variant: "primary",
           },
         });
@@ -436,9 +591,9 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
       out.push({
         id: "pwa-install",
         kind: "info",
-        icon: <Download size={16} className="text-black" />,
+        icon: <Download size={16} className="text-foreground" />,
         title: formatMessage({ id: "layout.systemNotifications.installRaftTitle" }),
-        body: <span className="text-black/60">{formatMessage({ id: "layout.systemNotifications.installRaftBody" })}</span>,
+        body: <span className="text-foreground-muted">{formatMessage({ id: "layout.systemNotifications.installRaftBody" })}</span>,
         action: {
           label: formatMessage({ id: pwaInstallBusy ? "layout.systemNotifications.opening" : "layout.systemNotifications.install" }),
           onClick: () => {
@@ -455,12 +610,26 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
       });
     }
 
+    if (server && feedbackUnread > 0) {
+      out.push({
+        id: "feedback-replies",
+        kind: "info",
+        icon: <MessageSquare size={16} />,
+        title: formatMessage({ id: "layout.systemNotifications.feedbackRepliesTitle" }),
+        body: formatMessage({ id: "layout.systemNotifications.feedbackRepliesBody" }, { count: feedbackUnread }),
+        action: {
+          label: formatMessage({ id: "layout.systemNotifications.feedbackRepliesView" }),
+          onClick: () => nav.toSettings("feedback"),
+        },
+      });
+    }
+
     return out;
   }, [
+    feedbackUnread,
     server,
     machines,
     machineLoading,
-    latestDaemonVersion,
     allAgents,
     agentLoading,
     channelsList,
@@ -472,6 +641,11 @@ export function useSystemNotifications(surface: SystemNotificationSurface = "des
     handleDismissPwaInstall,
     surface,
     formatMessage,
+    formatDate,
+    usageLimitAttention,
+    pendingJointInvites,
+    acceptingJointInviteId,
+    acceptJointInvite,
   ]);
 }
 

@@ -1,7 +1,7 @@
 import "./helpers/domSetup";
+import { comboboxText } from "./helpers/combobox";
 
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { createIntl } from "react-intl";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -184,7 +184,7 @@ test("mounted CreateAgentDialog surfaces Chinese generic-create fallback after a
   );
 
   await waitFor(() => {
-    const selected = screen.getAllByRole("combobox").map((el) => el.textContent ?? "");
+    const selected = screen.getAllByRole("combobox").map((el) => comboboxText(el));
     assert.ok(selected.some((text) => text.includes("Claude Code")), selected.join(" | "));
     assert.ok(selected.some((text) => text.includes("Claude Sonnet")), selected.join(" | "));
   });

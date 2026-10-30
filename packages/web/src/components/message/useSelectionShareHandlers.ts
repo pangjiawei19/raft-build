@@ -5,15 +5,16 @@ import { useSelectionStore } from "../../store/selectionStore";
 import { useMessageStore } from "../../store/messageStore";
 import type { Message } from "../../store/messageStore";
 import {
-  captureSelectedMessages,
+  captureSelectedMessageImage,
   SelectScreenshotTimeoutError,
   SHARE_PREVIEW_MAX_WIDTH,
 } from "../../utils/selectScreenshot";
+import { ScreenshotInvalidOutputError, ScreenshotNeedsPaginationError } from "../../utils/screenshotBudget";
+import type { ValidatedScreenshot } from "../../utils/screenshotBudget";
 import {
   selectionToMarkdown,
   copyTextToClipboard,
   createSelectedMessagesShareArtifact,
-  dataUrlToPngFile,
   navigateShareArtifactToX,
 } from "../../utils/selectMarkdown";
 
@@ -144,16 +145,31 @@ export function gatherSelectedMessagesWithMeta(opts?: {
   return { messages, unresolvedCount: sel.selectedIds.size - seen.size };
 }
 
+/**
+ * User-facing text for the two capture failures task #1302 added: the
+ * selection is over the pixel budget even at 1x, or the engine returned an
+ * unusable image. Both keep the selection, so the user can retry or select
+ * fewer messages. `null` for any other error.
+ */
+function describeCaptureFailure(
+  err: unknown,
+  formatMessage: ReturnType<typeof useIntl>["formatMessage"],
+): string | null {
+  if (err instanceof ScreenshotNeedsPaginationError) return formatMessage({ id: "message.share.selectionTooLong" });
+  if (err instanceof ScreenshotInvalidOutputError) return formatMessage({ id: "message.share.renderEmpty" });
+  return null;
+}
+
 export interface SelectionShareHandlers {
   picCapturing: boolean;
-  picPreview: string | null;
-  setPicPreview: (v: string | null) => void;
+  picPreview: ValidatedScreenshot | null;
+  setPicPreview: (v: ValidatedScreenshot | null) => void;
   picError: string | null;
   setPicError: (v: string | null) => void;
   copiedMd: boolean;
   onSavePic: () => Promise<void>;
   onShareX: () => Promise<void>;
-  onSharePreviewToX: (dataUrl: string) => Promise<void>;
+  onSharePreviewToX: (image: ValidatedScreenshot) => Promise<void>;
   onCopyMd: () => Promise<void>;
 }
 
@@ -175,6 +191,8 @@ export interface UseSelectionShareHandlersOptions {
   channelMessages?: readonly Message[];
   threadReplyMessages?: readonly Message[];
   threadParentMessageRef?: RefObject<Message | null>;
+  /** Panel whose rows the image is captured from (see CaptureOptions.scope). */
+  captureScopeRef?: RefObject<HTMLElement | null>;
   onUnresolvedSelection?: (unresolvedCount: number) => void;
 }
 
@@ -183,13 +201,14 @@ export function useSelectionShareHandlers(
 ): SelectionShareHandlers {
   const { formatMessage } = useIntl();
   const [picCapturing, setPicCapturing] = useState(false);
-  const [picPreview, setPicPreview] = useState<string | null>(null);
+  const [picPreview, setPicPreview] = useState<ValidatedScreenshot | null>(null);
   const [picError, setPicError] = useState<string | null>(null);
   const [copiedMd, setCopiedMd] = useState(false);
   const channelMessages = opts.channelMessages;
   const threadReplyMessages = opts.threadReplyMessages;
   const threadParentMessageRef = opts.threadParentMessageRef;
   const onUnresolvedSelection = opts.onUnresolvedSelection;
+  const captureScopeRef = opts.captureScopeRef;
 
   const captureSharePreview = useCallback(async () => {
     const { messages, unresolvedCount } = gatherSelectedMessagesWithMeta({ channelMessages, threadReplyMessages, threadParentMessageRef });
@@ -198,22 +217,17 @@ export function useSelectionShareHandlers(
       return null;
     }
     if (messages.length === 0) return null;
-    return await captureSelectedMessages(messages.map((m) => m.id), {
-      // Match the live main-panel bg per the post-#1272 layout color
-      // contract (sidebar=cream, main=white). Prior cream bg was the
-      // pre-contract value; export now reads as a white surface like
-      // the actual chat. stdrc 2026-05-02 #proj-message:787397b0
-      // 14135081: "share message 的截图的背景色，没对上最新的".
-      backgroundColor: "#FFFFFF",
+    return await captureSelectedMessageImage(messages.map((m) => m.id), {
       maxWidth: SHARE_PREVIEW_MAX_WIDTH,
       threadChildIds: new Set(messages.filter((m) => m.isThreadChild).map((m) => m.id)),
+      scope: captureScopeRef?.current,
     });
-  }, [channelMessages, onUnresolvedSelection, threadParentMessageRef, threadReplyMessages]);
+  }, [captureScopeRef, channelMessages, onUnresolvedSelection, threadParentMessageRef, threadReplyMessages]);
 
-  const createShareArtifactAndNavigateToX = useCallback(async (dataUrl: string) => {
+  const createShareArtifactAndNavigateToX = useCallback(async (image: ValidatedScreenshot) => {
     const selectionChannelId = useSelectionStore.getState().channelId;
     if (!selectionChannelId) return;
-    const file = await dataUrlToPngFile(dataUrl, "raft-thread.png");
+    const file = new File([image.blob], "raft-thread.png", { type: "image/png" });
     const artifact = await createSelectedMessagesShareArtifact(file, selectionChannelId);
     setPicPreview(null);
     useSelectionStore.getState().exit();
@@ -231,8 +245,8 @@ export function useSelectionShareHandlers(
     setPicError(null);
     setPicCapturing(true);
     try {
-      const dataUrl = await captureSharePreview();
-      if (dataUrl) setPicPreview(dataUrl);
+      const image = await captureSharePreview();
+      if (image) setPicPreview(image);
     } catch (err) {
       // html-to-image rejects with the raw `<img onerror>` Event when a
       // cloned <img> fails to load — `String(err)` on an Event yields
@@ -241,7 +255,10 @@ export function useSelectionShareHandlers(
       // huxijin 2026-05-02 #proj-mobile:fd343bd8 3e1aa57a.
       console.error("captureSelectedMessages failed:", err);
       let msg: string;
-      if (err instanceof SelectScreenshotTimeoutError) {
+      const captureMessage = describeCaptureFailure(err, formatMessage);
+      if (captureMessage) {
+        msg = captureMessage;
+      } else if (err instanceof SelectScreenshotTimeoutError) {
         msg = formatMessage(
           { id: "message.share.renderTimedOut" },
           { seconds: err.timeoutSeconds },
@@ -277,25 +294,26 @@ export function useSelectionShareHandlers(
     setPicError(null);
     setPicCapturing(true);
     try {
-      const dataUrl = await captureSharePreview();
-      if (dataUrl) await createShareArtifactAndNavigateToX(dataUrl);
+      const image = await captureSharePreview();
+      if (image) await createShareArtifactAndNavigateToX(image);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
         return;
       }
       console.error("share to X failed:", err);
-      setPicError(err instanceof Error ? err.message : formatMessage({ id: "message.share.failed" }));
+      setPicError(describeCaptureFailure(err, formatMessage)
+        ?? (err instanceof Error ? err.message : formatMessage({ id: "message.share.failed" })));
     } finally {
       setPicCapturing(false);
     }
   }, [captureSharePreview, channelMessages, createShareArtifactAndNavigateToX, formatMessage, onUnresolvedSelection, picCapturing, threadParentMessageRef, threadReplyMessages]);
 
-  const onSharePreviewToX = useCallback(async (dataUrl: string) => {
+  const onSharePreviewToX = useCallback(async (image: ValidatedScreenshot) => {
     if (picCapturing) return;
     setPicError(null);
     setPicCapturing(true);
     try {
-      await createShareArtifactAndNavigateToX(dataUrl);
+      await createShareArtifactAndNavigateToX(image);
     } catch (err) {
       console.error("share preview to X failed:", err);
       setPicError(err instanceof Error ? err.message : formatMessage({ id: "message.share.failed" }));

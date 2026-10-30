@@ -1,5 +1,4 @@
 import assert from "node:assert/strict";
-import test, { afterEach } from "node:test";
 import { createIntl } from "react-intl";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -92,4 +91,18 @@ test("mounted InviteHumanDialog localizes join-link preparation failure", async 
   renderInviteDialog();
 
   assert.ok(await screen.findByText(zh["member.invite.failedPrepareLink"]));
+});
+
+test("InviteHumanDialog warns that invited members can reach every agent, on both tabs", async () => {
+  seedInviteServer();
+  api.get = (async () => ({
+    data: [{ id: "link-1", token: "join-token" }],
+  })) as typeof api.get;
+
+  renderInviteDialog();
+
+  assert.ok(await screen.findByText(zh["member.invite.agentReachHint"]));
+  fireEvent.click(screen.getByTestId("invite-tab-link"));
+  assert.ok(screen.getByText(zh["member.invite.agentReachHint"]));
+  assert.match(en["member.invite.agentReachHint"], /every agent/);
 });

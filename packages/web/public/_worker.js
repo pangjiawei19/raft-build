@@ -1,4 +1,4 @@
-const BUILT_ASSET_PREFIX = "/assets/";
+const BUILT_ASSET_PREFIXES = ["/assets/", "/feedback/assets/"];
 const DESKTOP_MANIFEST_PATH = "/desktop-manifest.json";
 const IMMUTABLE_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable";
 const MAX_DESKTOP_MANIFEST_BYTES = 65_536;
@@ -7,7 +7,7 @@ const WELL_KNOWN_CHANGE_PASSWORD_PATH = `${WELL_KNOWN_PREFIX}change-password`;
 const CHANGE_PASSWORD_INTENT_PATH = "/change-password";
 
 function isBuiltAssetRequest(request) {
-  return new URL(request.url).pathname.startsWith(BUILT_ASSET_PREFIX);
+  return BUILT_ASSET_PREFIXES.some(prefix => new URL(request.url).pathname.startsWith(prefix));
 }
 
 function isHtmlResponse(response) {
@@ -160,8 +160,9 @@ export function normalizeBuiltAssetResponse(request, response) {
  * Contents frozen by @Mahua from the real signed artifacts (#proj-mobile):
  * Android package + both signing certs (legacy and rotated — a device on either
  * must verify), iOS appID from the Team ID in the live signed IPA. Scope is
- * exactly `/download`; nothing else is claimed, so no other Raft URL changes
- * behaviour on a device that has the app.
+ * limited to `/download` and channel/DM permalinks. The latter also carry
+ * reply/message anchors in their query. The native parser validates identities
+ * and anchors after delivery; this association is not an authorization check.
  */
 const WELL_KNOWN_ASSETLINKS_PATH = "/.well-known/assetlinks.json";
 const WELL_KNOWN_AASA_PATH = "/.well-known/apple-app-site-association";
@@ -185,7 +186,26 @@ const APPLE_APP_SITE_ASSOCIATION = {
     details: [
       {
         appIDs: ["XDAPXFY8FZ.build.raft.app"],
-        components: [{ "/": "/download", comment: "mobile download entry only" }],
+        // Apple stops at the first matching component and its `*` also matches
+        // `/`, so the excludes come first and keep the families to exactly
+        // `/s/<slug>/<kind>/<id>`: no empty id, no extra segment on either side.
+        components: [
+          { "/": "/download", comment: "mobile download entry only" },
+          { "/": "/s/*/channel/", exclude: true, comment: "no channel id" },
+          { "/": "/s/*/*/channel/*", exclude: true, comment: "nested route, not a channel permalink" },
+          { "/": "/s/*/channel/*/*", exclude: true, comment: "extra segment after the channel id" },
+          { "/": "/s/*/dm/", exclude: true, comment: "no dm id" },
+          { "/": "/s/*/*/dm/*", exclude: true, comment: "nested route, not a dm permalink" },
+          { "/": "/s/*/dm/*/*", exclude: true, comment: "extra segment after the dm id" },
+          {
+            "/": "/s/*/channel/*",
+            comment: "channel and reply permalinks; native validates identity and query anchors",
+          },
+          {
+            "/": "/s/*/dm/*",
+            comment: "direct-message permalinks; native validates identity and query anchors",
+          },
+        ],
       },
     ],
   },

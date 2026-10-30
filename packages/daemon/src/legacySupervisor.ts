@@ -1,3 +1,4 @@
+import { ambientProcessEnv } from "./processEnvPatch";
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
@@ -20,6 +21,7 @@ export interface LegacyDaemonSupervisorProbe {
 function execFileText(file: string, args: string[]): string | undefined {
   try {
     return execFileSync(file, args, {
+      env: ambientProcessEnv(),
       encoding: "utf8",
       timeout: 1_000,
       maxBuffer: 256 * 1024,

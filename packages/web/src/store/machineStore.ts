@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import api from "../api/client";
-import { useServerStore } from "./serverStore";
+import { coalesce, useServerStore } from "./serverStore";
 import { registerServerReset } from "./serverResetRegistry";
 import { emitStateTransitionTrace } from "../utils/stateTransitionTrace";
 import {
@@ -12,6 +12,16 @@ import type {
   MachineTransition,
 } from "./events/machineEvents";
 import type { CreatorSummary } from "./agentStore";
+import type { AcceptedComputerUpgrade } from "../utils/computerUpgradeInFlight";
+import { currentTimeMs, normalizeComputerReleaseNotes } from "@botiverse/raft-shared";
+import type { ComputerReleaseNotes, MachineDiskStatus } from "@botiverse/raft-shared";
+
+export interface MachineRuntimeDetection {
+  status: "pending" | "complete" | "incomplete";
+  unfinishedRuntimes?: string[];
+  reason?: "deadline" | "child_failed" | "cancelled";
+  updatedAtMs?: number;
+}
 
 export interface Machine {
   id: string;
@@ -23,6 +33,12 @@ export interface Machine {
   runtimes: string[];
   /** Live runtime binary/package versions reported by the connected daemon. */
   runtimeVersions?: Record<string, string>;
+  /**
+   * task #1268: the daemon's runtime detection state, sent explicitly by the
+   * server. `pending` / `incomplete` mean `runtimes` is the last confirmed
+   * list (unconfirmed, not unavailable). Absent/null = complete.
+   */
+  runtimeDetection?: MachineRuntimeDetection | null;
   hostname: string | null;
   os: string | null;
   daemonVersion: string | null;
@@ -35,6 +51,9 @@ export interface Machine {
   // True when this Computer row was attached by the current user. Raw daemons
   // and older server responses leave this false/absent.
   computerAttachedByCurrentUser?: boolean;
+  // Latest disk report while online; null/absent when offline, never
+  // reported, or from an older server. See machineDiskLowPresentation.
+  diskStatus?: MachineDiskStatus | null;
   // Public, server-scoped identity of the human who attached this managed
   // Computer. Null for departed creators and raw daemon rows.
   creator?: CreatorSummary | null;
@@ -45,6 +64,14 @@ export interface Machine {
   // Compatibility projection of the closed server policy decision.
   // true is the only broadcastable state; false means policy denied.
   computerUpgradeAvailable?: boolean | null;
+  // Remote upgrade v2 (task #873): the latest request for this machine, as
+  // the server projects it. `pending` until the machine reconnects or the
+  // deadline passes; nothing else is modelled.
+  upgradeRequest?: MachineUpgradeRequest | null;
+  // Remote upgrade v2: only `true` may be driven from the web. false = this
+  // Computer predates the web-driven path; null = version unknown. Both show
+  // the greyed button + local upgrade hint (same fail-closed shape as the server).
+  remoteUpgradeSupported?: boolean | null;
   // Per-machine source-aware policy projection. This is the only authority for
   // target/copy; top-level latestComputerVersion is an artifact hint.
   computerBroadcastPolicy?: {
@@ -64,6 +91,8 @@ export interface MachineWorkspaceEntry {
   totalSizeBytes: number;
   lastModified: string;
   fileCount: number;
+  /** Reported by daemons from 1.0.46; older daemons only use `~/.slock/agents/`. */
+  displayPath?: string;
   status: "active" | "stopped" | "deleted" | "orphan";
   agentName: string | null;
   agentStatus: string | null;
@@ -72,22 +101,28 @@ export interface MachineWorkspaceEntry {
 /** Per-machine Computer upgrade/restart progress driven by WS frames.
  *  Keyed by machineId. Reset when the machine goes offline or a new
  *  operation begins on the same machine. */
+export interface MachineUpgradeRequest {
+  id: string;
+  targetVersion: string;
+  requestedAt: string;
+  state: "pending" | "done" | "failed" | "no_response";
+  observedVersion: string | null;
+  reason: string | null;
+  resolvedAt: string | null;
+}
+
 export interface ComputerOperationProgress {
-  operation: "upgrade" | "restart";
+  /** Restart is the only in-flight Computer operation the web tracks; upgrades
+   *  are request rows settled by the machine's reconnect (remote upgrade v2). */
+  operation: "restart";
   /** requestId echoed from the command for terminal receipt correlation. */
   requestId?: string;
-  /** Upgrade phase from `computer:upgrade:progress`. */
-  phase?: "downloading" | "verifying" | "applying" | "restarting";
   /** Optional human-readable status message. */
   message?: string;
   /** Derived 0-100 progress value for determinate phases. */
   progressValue?: number;
-  /** True once `computer:upgrade:done` arrives (ok=true). */
+  /** True once the terminal receipt arrives. */
   done?: boolean;
-  /** True if the upgrade was rolled back. */
-  rolledBack?: boolean;
-  /** New version after successful upgrade. */
-  newVersion?: string;
   /** Error message on failure. */
   error?: string;
 }
@@ -96,15 +131,21 @@ export type MachineLoadStatus = "loading" | "loaded" | "error";
 
 interface MachineState {
   machines: Machine[];
-  latestDaemonVersion: string | null;
   /** Latest published artifact hint. Never a per-machine target or
    *  eligibility authority; each row's computerBroadcastPolicy owns those. */
   latestComputerVersion: string | null;
+  /** Display-only release notes for the latest published Computer version. */
+  latestComputerReleaseNotes: ComputerReleaseNotes | null;
   loading: boolean;
   loadStatus: MachineLoadStatus;
   loadError: boolean;
   selectedMachineId: string | null;
   showAddMachine: boolean;
+  /**
+   * Machine a native host wants first in the sidebar's Computers list (the
+   * desktop pins "this device"; see sidebarMachineOrder.ts). Null on the web.
+   */
+  pinnedMachineId: string | null;
   /** Transient: API key shown once after registration */
   pendingApiKey: string | null;
   pendingMachineId: string | null;
@@ -113,6 +154,19 @@ interface MachineState {
   machineWorkspacesLoading: Record<string, boolean>;
   /** Per-machine Computer operation progress (upgrade/restart) */
   computerOperationProgress: Record<string, ComputerOperationProgress | null>;
+  /** Per-machine web Upgrade click in flight: the target version, from the
+   *  click until the POST settles and the refreshed machine row carries the
+   *  server's upgradeRequest. Client-only; never a server fact. */
+  computerUpgradeSubmitting: Record<string, string>;
+  /** Per-machine upgrade request the server accepted for this tab's Upgrade
+   *  click; see computerUpgradeInFlight. Client-only copy of a server fact. */
+  computerUpgradeAccepted: Record<string, AcceptedComputerUpgrade>;
+  /** Per-machine time (client clock, ms) this tab saw a live online→offline
+   *  status event; cleared when it comes back online. The machine row has no
+   *  disconnect timestamp (`lastHeartbeat` in the store is only as fresh as
+   *  the last loadMachines), so a transition seen live is the best anchor for
+   *  "offline since". Client-only; never a server fact. */
+  computerOfflineObservedAt: Record<string, number>;
 
   loadMachines: () => Promise<void>;
   /** Ask a computer to re-detect its installed runtimes. Fresh list arrives via the capabilities push. */
@@ -141,17 +195,19 @@ interface MachineState {
   ) => boolean;
   updateMachineCapabilities: (
     machineId: string,
-    runtimes: string[],
+    runtimes: string[] | undefined,
     hostname?: string,
     os?: string,
     daemonVersion?: string,
     computerVersion?: string | null,
     runtimeVersions?: Record<string, string>,
+    runtimeDetection?: MachineRuntimeDetection | null,
   ) => void;
   rotateApiKey: (machineId: string) => Promise<string>;
   clearPendingApiKey: () => void;
   setSelectedMachine: (machineId: string | null) => void;
   setShowAddMachine: (show: boolean) => void;
+  setPinnedMachineId: (machineId: string | null) => void;
   scanMachineWorkspaces: (machineId: string) => Promise<void>;
   deleteMachineWorkspace: (
     machineId: string,
@@ -161,22 +217,8 @@ interface MachineState {
     machineId: string,
     progress: ComputerOperationProgress | null,
   ) => void;
-  updateComputerUpgradeProgress: (
-    machineId: string,
-    requestId: string,
-    phase: "downloading" | "verifying" | "applying" | "restarting",
-    message?: string,
-    /** Byte-% (0-100) for the `downloading` phase — animates the bar. */
-    percent?: number,
-  ) => void;
-  completeComputerUpgrade: (
-    machineId: string,
-    requestId: string,
-    ok: boolean,
-    newVersion?: string,
-    rolledBack?: boolean,
-    error?: string,
-  ) => void;
+  setComputerUpgradeSubmitting: (machineId: string, targetVersion: string | null) => void;
+  setComputerUpgradeAccepted: (machineId: string, request: MachineUpgradeRequest) => void;
   completeComputerRestart: (
     machineId: string,
     requestId: string,
@@ -195,7 +237,6 @@ export const useMachineStore = create<MachineState>((set, get) => {
     const { state, transition } = applyMachineEvent(
       {
         machines: current.machines,
-        latestDaemonVersion: current.latestDaemonVersion,
         latestComputerVersion: current.latestComputerVersion,
         computerOperationProgress: current.computerOperationProgress,
       },
@@ -218,13 +259,14 @@ export const useMachineStore = create<MachineState>((set, get) => {
 
   return {
     machines: [],
-    latestDaemonVersion: null,
     latestComputerVersion: null,
+    latestComputerReleaseNotes: null,
     loading: true,
     loadStatus: "loading",
     loadError: false,
     selectedMachineId: null,
     showAddMachine: false,
+    pinnedMachineId: null,
     pendingApiKey: null,
     pendingMachineId: null,
     machineWorkspaces: {},
@@ -233,41 +275,24 @@ export const useMachineStore = create<MachineState>((set, get) => {
     setComputerOperation: (machineId, progress) => {
       dispatchMachineEvent({ kind: "operation-set", machineId, progress });
     },
-
-    updateComputerUpgradeProgress: (
-      machineId,
-      requestId,
-      phase,
-      message,
-      percent,
-    ) => {
-      dispatchMachineEvent({
-        kind: "upgrade-progress",
-        machineId,
-        requestId,
-        phase,
-        message,
-        percent,
+    computerUpgradeSubmitting: {},
+    computerUpgradeAccepted: {},
+    computerOfflineObservedAt: {},
+    setComputerUpgradeAccepted: (machineId, request) => {
+      set({
+        computerUpgradeAccepted: {
+          ...get().computerUpgradeAccepted,
+          [machineId]: { request, acceptedAtMs: currentTimeMs() },
+        },
       });
     },
-
-    completeComputerUpgrade: (
-      machineId,
-      requestId,
-      ok,
-      newVersion,
-      rolledBack,
-      error,
-    ) => {
-      dispatchMachineEvent({
-        kind: "upgrade-done",
-        machineId,
-        requestId,
-        ok,
-        newVersion,
-        rolledBack,
-        error,
-      });
+    setComputerUpgradeSubmitting: (machineId, targetVersion) => {
+      const current = get().computerUpgradeSubmitting;
+      if ((current[machineId] ?? null) === targetVersion) return;
+      const next = { ...current };
+      if (targetVersion === null) delete next[machineId];
+      else next[machineId] = targetVersion;
+      set({ computerUpgradeSubmitting: next });
     },
 
     rescanRuntimes: async (machineId: string) => {
@@ -292,39 +317,44 @@ export const useMachineStore = create<MachineState>((set, get) => {
       const epoch = useServerStore.getState().serverEpoch;
       const serverId = useServerStore.getState().current?.id;
       if (!serverId) return;
-      set({ loadError: false });
-      if (get().machines.length === 0) {
-        set({ loading: true, loadStatus: "loading" });
-      }
-      // Initial/retry loads with no usable rows re-enter loading. Refreshes keep
-      // existing rows visible while the current server epoch is revalidated.
-      try {
-        const { data } = await api.get(`/servers/${serverId}/machines`);
-        if (useServerStore.getState().serverEpoch !== epoch) return;
-        const machines = Array.isArray(data) ? data : data.machines;
-        const latestDaemonVersion = Array.isArray(data)
-          ? null
-          : (data.latestDaemonVersion ?? null);
-        const latestComputerVersion = Array.isArray(data)
-          ? null
-          : (data.latestComputerVersion ?? null);
-        dispatchMachineEvent({
-          kind: "hydrate",
-          machines,
-          latestDaemonVersion,
-          latestComputerVersion,
-        });
-        set({ loading: false, loadStatus: "loaded", loadError: false });
-      } catch (err) {
-        console.error("Failed to load machines:", err);
-        if (useServerStore.getState().serverEpoch !== epoch) return;
-        const hasCachedMachines = get().machines.length > 0;
-        set({
-          loading: false,
-          loadStatus: hasCachedMachines ? "loaded" : "error",
-          loadError: true,
-        });
-      }
+      // Coalesce concurrent triggers (connect snapshot + realtime fallbacks +
+      // surface opens) onto one request; epoch in the key keeps an epoch
+      // change from piggybacking on a stale-epoch fetch.
+      return coalesce(`machines:${serverId}:${epoch}`, async () => {
+        set({ loadError: false });
+        if (get().machines.length === 0) {
+          set({ loading: true, loadStatus: "loading" });
+        }
+        // Initial/retry loads with no usable rows re-enter loading. Refreshes keep
+        // existing rows visible while the current server epoch is revalidated.
+        try {
+          const { data } = await api.get(`/servers/${serverId}/machines`);
+          if (useServerStore.getState().serverEpoch !== epoch) return;
+          const machines = Array.isArray(data) ? data : data.machines;
+          const latestComputerVersion = Array.isArray(data)
+            ? null
+            : (data.latestComputerVersion ?? null);
+          // Additive field; re-validated here so a bad payload drops the
+          // notes instead of reaching the renderer.
+          const releaseNotes = Array.isArray(data) ? null : data.latestComputerReleaseNotes;
+          const latestComputerReleaseNotes = normalizeComputerReleaseNotes(releaseNotes?.version, releaseNotes);
+          dispatchMachineEvent({
+            kind: "hydrate",
+            machines,
+            latestComputerVersion,
+          });
+          set({ latestComputerReleaseNotes, loading: false, loadStatus: "loaded", loadError: false });
+        } catch (err) {
+          console.error("Failed to load machines:", err);
+          if (useServerStore.getState().serverEpoch !== epoch) return;
+          const hasCachedMachines = get().machines.length > 0;
+          set({
+            loading: false,
+            loadStatus: hasCachedMachines ? "loaded" : "error",
+            loadError: true,
+          });
+        }
+      });
     },
 
     registerMachine: async (name: string) => {
@@ -391,13 +421,26 @@ export const useMachineStore = create<MachineState>((set, get) => {
       machineId: string,
       status: "online" | "offline",
       statusVersion?: number,
-    ) =>
-      dispatchMachineEvent({
+    ) => {
+      const wasOnline = get().machines.find((m) => m.id === machineId)?.status === "online";
+      const transition = dispatchMachineEvent({
         kind: "status",
         machineId,
         status,
         statusVersion,
-      }),
+      });
+      if (transition.accepted) {
+        const observed = get().computerOfflineObservedAt;
+        if (status === "offline" && wasOnline) {
+          set({ computerOfflineObservedAt: { ...observed, [machineId]: currentTimeMs() } });
+        } else if (status === "online" && machineId in observed) {
+          const next = { ...observed };
+          delete next[machineId];
+          set({ computerOfflineObservedAt: next });
+        }
+      }
+      return transition;
+    },
 
     requestMachineReconcile: (reason) =>
       dispatchMachineEvent({ kind: "reconcile", reason }),
@@ -416,12 +459,13 @@ export const useMachineStore = create<MachineState>((set, get) => {
 
     updateMachineCapabilities: (
       machineId: string,
-      runtimes: string[],
+      runtimes: string[] | undefined,
       hostname?: string,
       os?: string,
       daemonVersion?: string,
       computerVersion?: string | null,
       runtimeVersions?: Record<string, string>,
+      runtimeDetection?: MachineRuntimeDetection | null,
     ) => {
       dispatchMachineEvent({
         kind: "capabilities",
@@ -432,6 +476,7 @@ export const useMachineStore = create<MachineState>((set, get) => {
         os,
         daemonVersion,
         computerVersion,
+        runtimeDetection,
       });
     },
 
@@ -459,6 +504,7 @@ export const useMachineStore = create<MachineState>((set, get) => {
     setSelectedMachine: (machineId) => set({ selectedMachineId: machineId }),
 
     setShowAddMachine: (show) => set({ showAddMachine: show }),
+    setPinnedMachineId: (machineId) => set((state) => (state.pinnedMachineId === machineId ? state : { pinnedMachineId: machineId })),
 
     scanMachineWorkspaces: async (machineId: string) => {
       const serverId = useServerStore.getState().current?.id;
@@ -521,13 +567,11 @@ function domainStateToStorePatch(
 ): Pick<
   MachineState,
   | "machines"
-  | "latestDaemonVersion"
   | "latestComputerVersion"
   | "computerOperationProgress"
 > {
   return {
     machines: state.machines,
-    latestDaemonVersion: state.latestDaemonVersion,
     latestComputerVersion: state.latestComputerVersion,
     computerOperationProgress: state.computerOperationProgress,
   };
@@ -537,8 +581,8 @@ function domainStateToStorePatch(
 registerServerReset(() =>
   useMachineStore.setState({
     machines: [],
-    latestDaemonVersion: null,
     latestComputerVersion: null,
+    latestComputerReleaseNotes: null,
     loading: true,
     loadStatus: "loading",
     loadError: false,
@@ -549,5 +593,8 @@ registerServerReset(() =>
     machineWorkspaces: {},
     machineWorkspacesLoading: {},
     computerOperationProgress: {},
+    computerUpgradeSubmitting: {},
+    computerUpgradeAccepted: {},
+    computerOfflineObservedAt: {},
   }),
 );

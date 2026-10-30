@@ -20,6 +20,19 @@
 import { memo, useMemo } from "react";
 import { useIntl } from "react-intl";
 import { Pencil } from "lucide-react";
+import {
+  getMessagePreviewSizeClass,
+  getMessagePreviewTimeSizeClass,
+  useAppearanceStore,
+} from "../../store/appearanceStore";
+import {
+  MessageReplies,
+  MessageRepliesItem,
+  MessageRepliesItemContent,
+  MessageRepliesItemSender,
+  MessageRepliesItemTime,
+  MessageRepliesSummary,
+} from "@botiverse/raft-ui";
 import AvatarSlot from "../ui/AvatarSlot";
 import { useAgentStore } from "../../store/agentStore";
 import type { Agent } from "../../store/agentStore";
@@ -132,6 +145,9 @@ export const InlineThreadReplies = memo(function InlineThreadReplies({
 }: InlineThreadRepliesProps) {
   const { formatMessage } = useIntl();
   const { formatMessageTime } = useTimeFormatter();
+  const messageBodyFontSize = useAppearanceStore((s) => s.messageBodyFontSize);
+  const previewSizeClass = getMessagePreviewSizeClass(messageBodyFontSize);
+  const previewTimeSizeClass = getMessagePreviewTimeSizeClass(messageBodyFontSize);
   if (!hasInlineThreadReplySurface(replies, replyCount)) return null;
 
   // The server may serve more than we show (or fewer, on an older payload);
@@ -145,15 +161,24 @@ export const InlineThreadReplies = memo(function InlineThreadReplies({
     { id: "message.inlineThreadReplies.replyCount" },
     { count: replyCount },
   );
+  // Raft DS › Message `rf-replies__sum`: "N replies" in ink-2, ink while
+  // there are new replies, which follow as the pink count sticker (the
+  // recipe draws the `strong`); the sticker reads as "N new".
   const countLabel = (
-    <span
+    <MessageRepliesSummary
       data-message-affordance="inline-thread-replies-count"
-      className="shrink-0 text-[12.5px] font-bold text-black/55 transition-colors group-hover:text-black"
+      className={unreadCount > 0 ? "shrink-0 text-foreground" : "shrink-0 text-foreground-muted"}
     >
       {countText}
-      {unreadCount > 0
-        ? ` · ${formatMessage({ id: "message.inlineThreadReplies.newReplyCount" }, { count: unreadCount })}`
-        : ""}
+      {unreadCount > 0 ? (
+        <strong
+          role="img"
+          aria-label={formatMessage({ id: "message.inlineThreadReplies.newReplyCount" }, { count: unreadCount })}
+          data-message-affordance="inline-thread-replies-new-count"
+        >
+          {unreadCount}
+        </strong>
+      ) : null}
       {hasDraft ? (
         <>
           {" · "}
@@ -166,26 +191,26 @@ export const InlineThreadReplies = memo(function InlineThreadReplies({
           {formatMessage({ id: "message.inlineThreadReplies.draft" })}
         </>
       ) : null}
-      {" ›"}
-    </span>
+    </MessageRepliesSummary>
   );
 
   return (
-    <button
-      type="button"
+    <MessageReplies
       onClick={onOpenThread}
       data-message-affordance="inline-thread-replies"
-      /* This is an intuitive row-level action, not a web link; keep the app's
-         default arrow cursor while the full gray surface remains clickable. */
-      className="group mt-1.5 flex min-w-0 w-full max-w-full flex-col gap-1 bg-black/[0.03] px-2.5 py-2 text-left transition-colors hover:bg-black/[0.08] focus-visible:outline focus-visible:outline-1 focus-visible:outline-black"
+      // mb-px: the card frame's bottom sits one pixel above the text baseline
+      // that the 24 rhythm is measured from; Josh's measure of the followed
+      // case reads 23 without it. The DS replies block (fill-muted, 13/18,
+      // 480 max) is the recipe's.
+      className="mb-px"
     >
       {countLabel}
       {previews.map((reply) => {
         return (
-          <span
+          <MessageRepliesItem
             key={reply.messageId}
             data-inline-thread-reply-row
-            className="flex min-w-0 w-full max-w-full items-center gap-1.5 text-[12.5px] leading-tight"
+            className="w-full max-w-full"
           >
             <span className="shrink-0">
               <ReplyAvatar
@@ -197,20 +222,22 @@ export const InlineThreadReplies = memo(function InlineThreadReplies({
             {/* The clock remains fixed, so the sender must be allowed to give
                 width back on narrow panes; otherwise its intrinsic width can
                 push the entire row past the preview surface. */}
-            <span className="min-w-0 shrink truncate font-semibold text-black/70">
+            <MessageRepliesItemSender className={previewSizeClass}>
               {reply.senderDisplayName || reply.senderName}
-            </span>
-            <span className="min-w-0 flex-1 truncate text-black/60">{reply.preview}</span>
-            <time
+            </MessageRepliesItemSender>
+            <MessageRepliesItemContent className={previewSizeClass}>
+              {reply.preview}
+            </MessageRepliesItemContent>
+            <MessageRepliesItemTime
               dateTime={reply.createdAt}
               data-inline-thread-reply-time
-              className="ml-auto shrink-0 text-[11.5px] tabular-nums text-black/40"
+              className={`ml-auto shrink-0 ${previewTimeSizeClass}`}
             >
               {formatMessageTime(reply.createdAt)}
-            </time>
-          </span>
+            </MessageRepliesItemTime>
+          </MessageRepliesItem>
         );
       })}
-    </button>
+    </MessageReplies>
   );
 });

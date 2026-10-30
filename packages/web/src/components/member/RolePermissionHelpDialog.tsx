@@ -1,3 +1,4 @@
+import { Card } from "@botiverse/raft-ui";
 import { useIntl } from "react-intl";
 import type { MessageId } from "../../i18n/messages";
 import DialogCard from "../ui/DialogCard";
@@ -57,19 +58,19 @@ export default function RolePermissionHelpDialog({
       onClose={onClose}
       closeOnBackdrop
     >
-        <div className="space-y-3">
+        <div className="space-y-2">
           {rows.map((row) => (
-            <div key={row.roleId} className="border-2 border-black/20 bg-white p-3">
+            <Card key={row.roleId} className="p-3">
               <div className="mb-1 flex flex-wrap items-baseline gap-x-2 gap-y-1">
-                <div className="text-sm font-bold text-black">{formatMessage({ id: row.roleId })}</div>
-                <div className="text-xs font-bold text-black/60">
+                <div className="text-subhead font-bold text-foreground">{formatMessage({ id: row.roleId })}</div>
+                <div className="text-footnote font-semibold text-foreground-hint">
                   {formatMessage({ id: row.summaryId })}
                 </div>
               </div>
-              <p className="text-sm leading-relaxed text-black/75">
+              <p className="text-callout text-foreground-muted">
                 {formatMessage({ id: row.detailsId })}
               </p>
-            </div>
+            </Card>
           ))}
         </div>
     </DialogCard>

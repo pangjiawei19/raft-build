@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import test from "node:test";
 import {
   SLACK_BRIDGE_PROVISIONING_PROTOCOL_VERSION,
   slackBridgeChannelPairRemovalsRequestSchema,
@@ -42,6 +41,7 @@ function response(stage: SlackBridgeSetupStage): SlackBridgeProvisioningResponse
         bindings: [],
         audiences: [],
         lastVerifiedAt: null,
+        agentMentionSync: null,
         failingSurface: stage === "connect" ? "install" : null,
       },
     },
@@ -246,20 +246,22 @@ test("managed replacement crosses strict DELETE before PUT, preflight, and enabl
   assert.deepEqual(view.snapshot.channelPairs, enabled.snapshot.channelPairs);
 });
 
-test("production adapter fails closed on an incomplete OAuth authority response", async () => {
+test("production adapter shows a read-only OAuth stage without authority and never starts OAuth", async () => {
   let oauthStarts = 0;
-  const invalid = { ...response("oauth"), oauthAuthority: null };
+  const readOnly = { ...response("oauth"), oauthAuthority: null };
   const client: SlackBridgeProvisioningHttpClient = {
-    async get() { return { data: invalid }; },
+    async get() { return { data: readOnly }; },
     async post() {
       oauthStarts += 1;
-      return { data: invalid };
+      return { data: readOnly };
     },
-    async put() { return { data: invalid }; },
+    async put() { return { data: readOnly }; },
   };
   const provider = createSlackBridgeProvisioningProvider(client);
 
-  await assert.rejects(provider.load(), /OAuth stage requires current server-grant authority/);
+  assert.equal((await provider.load()).snapshot.stage, "oauth");
+  assert.equal((await provider.beginOAuth()).kind, "view");
+  assert.equal((await provider.beginReauthorization!()).kind, "view");
   assert.equal(oauthStarts, 0);
 });
 
@@ -296,6 +298,7 @@ test("production adapter rejects malformed health and never upgrades it to conne
       bindings: [{ id: "binding", state: "mystery" }],
       audiences: [],
       lastVerifiedAt: "2032-01-02T03:04:05.000Z",
+      agentMentionSync: null,
       failingSurface: null,
     },
   };
@@ -352,9 +355,16 @@ test("production adapter rejects duplicate or orphan health authority", async ()
     rawHealth: {
       install: null,
       credential: null,
-      bindings: [{ id: "binding-one", state: "active", bindingEpoch: 1 }],
+      bindings: [{
+        id: "binding-one",
+        state: "active",
+        bindingEpoch: 1,
+        stateReason: null,
+        recoveryAction: "none",
+      }],
       audiences: [{ bindingId: "binding-orphan", status: "matched" }],
       lastVerifiedAt: null,
+      agentMentionSync: null,
       failingSurface: "audience",
     },
   };
@@ -365,4 +375,39 @@ test("production adapter rejects duplicate or orphan health authority", async ()
   };
 
   await assert.rejects(createSlackBridgeProvisioningProvider(client).load(), /returned binding/);
+});
+
+test("re-authorization starts OAuth from a connected snapshot and never from setup stages", async () => {
+  const authority = {
+    registrationId: "11111111-1111-4111-8111-111111111111",
+    serverGrantId: "22222222-2222-4222-8222-222222222222",
+    grantEpoch: 7,
+  };
+  let current: SlackBridgeProvisioningResponse = { ...response("health"), oauthAuthority: authority };
+  const posts: Array<{ url: string; body?: unknown }> = [];
+  const client: SlackBridgeProvisioningHttpClient = {
+    async get() { return { data: current }; },
+    async post(url, body) {
+      posts.push({ url, body });
+      return {
+        data: {
+          authorizationUrl: "https://slack.com/oauth/v2/authorize?state=reauth",
+          expiresAt: "2032-01-02T03:04:05.000Z",
+        },
+      };
+    },
+    async put() { return { data: current }; },
+  };
+  const provider = createSlackBridgeProvisioningProvider(client);
+
+  assert.deepEqual(await provider.beginReauthorization!(), {
+    kind: "redirect",
+    url: "https://slack.com/oauth/v2/authorize?state=reauth",
+  });
+  assert.deepEqual(posts, [{ url: "/slack-bridge/oauth/start", body: authority }]);
+
+  current = response("connect");
+  const view = await provider.beginReauthorization!();
+  assert.equal(view.kind, "view");
+  assert.equal(posts.length, 1, "a disconnected workspace must use Connect, not re-authorization");
 });

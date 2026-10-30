@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
-import { test } from "vitest";
-import { RuntimeTurnState } from "./runtimeTurnState.js";
+import { RuntimeTurnState } from "./runtimeTurnState";
 
 test("runtime turn state allows busy steering during an active turn", () => {
   const state = new RuntimeTurnState();
@@ -75,4 +74,15 @@ test("runtime turn state resets fully between Codex process spawns", () => {
 
   assert.equal(state.activeTurnId, null);
   assert.equal(state.canSteerBusy, false);
+});
+
+test("hasLiveTurn covers an accepted turn and a running turn, not a completed one", () => {
+  const state = new RuntimeTurnState();
+  assert.equal(state.hasLiveTurn, false);
+  state.noteTurnAccepted("turn-1");
+  assert.equal(state.hasLiveTurn, true);
+  state.markTurnStarted("turn-1");
+  assert.equal(state.hasLiveTurn, true);
+  state.markTurnCompleted();
+  assert.equal(state.hasLiveTurn, false);
 });

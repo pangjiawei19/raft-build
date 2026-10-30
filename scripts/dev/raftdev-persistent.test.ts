@@ -3,7 +3,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import test, { type TestContext } from "node:test";
+import { test, type TestContext } from "vitest";
 import { fileURLToPath } from "node:url";
 
 const sourceRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
@@ -11,7 +11,7 @@ const sourceRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 function fixture(t: TestContext) {
   // 在独立仓库目录测试，nuke/destroy 永远不能看到用户真实的本地配置。
   const root = realpathSync(mkdtempSync(join(tmpdir(), "raft-persistent-")));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  t.onTestFinished(() => rmSync(root, { recursive: true, force: true }));
   const repo = join(root, "repo");
   const bin = join(root, "bin");
   mkdirSync(bin);
@@ -68,12 +68,14 @@ if (tool === 'docker') {
 } else if (tool === 'lsof') {
   if (!state.sessions.length) process.exit(1);
   out('listener');
-} else if (tool === 'npx') {
-  if (cmd === 'drizzle-kit' && rest[0] === 'push') process.exit(99);
-  if (cmd === 'tsx' && rest[0] === 'scripts/init-local.ts') {
+} else if (tool === 'npx' && cmd === 'drizzle-kit' && rest[0] === 'push') {
+  process.exit(99);
+} else if (tool === 'pnpm') {
+  if (process.env.RAFTDEV_TEST_FAIL_BUILD === '1' && cmd === '--filter') process.exit(23);
+  if (args.includes('scripts/init-local.ts')) {
     fs.writeFileSync(args[args.indexOf('--output')+1], JSON.stringify({user: {id: 'user'}, server: {id: 'server'}, machine: {apiKey: 'key-' + Date.now()}}));
   }
-} else if (tool === 'pnpm' && process.env.RAFTDEV_TEST_FAIL_BUILD === '1') process.exit(23);
+}
 `;
   for (const name of ["docker", "tmux", "lsof", "curl", "npx", "pnpm"]) {
     writeFileSync(join(bin, name), tool);
@@ -89,7 +91,7 @@ if (tool === 'docker') {
     RAFTDEV_TEST_STATE: state, RAFTDEV_TEST_LOG: log,
   };
   const run = (args: string[], extra: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath,
-    ["--import", "tsx", join(repo, "scripts/dev/raftdev.ts"), ...args],
+    ["--import", "@oxc-node/core/register", join(repo, "scripts/dev/raftdev.ts"), ...args],
     { cwd: repo, env: { ...env, ...extra }, encoding: "utf8", timeout: 20_000 });
   const ok = (args: string[]) => {
     const result = run(args);
@@ -118,7 +120,7 @@ test("持久环境默认常驻，重复 start 无副作用，stop/start 保留�
   assert.equal(f.resources().payload, "用户数据");
   f.ok(["start", f.name]);
   assert.equal(readFileSync(f.credentials, "utf8"), before);
-  assert.equal(f.commands().filter(c => c.tool === "npx" && c.args.includes("scripts/init-local.ts")).length, 1);
+  assert.equal(f.commands().filter(c => c.tool === "pnpm" && c.args.includes("scripts/init-local.ts")).length, 1);
   assert.equal(f.commands().filter(c => c.tool === "npx" && c.args.includes("migrate")).length, 1);
   assert.ok(!f.commands().some(c => c.args.includes("scripts/seed.ts") || c.args.includes("--force")));
   assert.ok(!f.commands().some(c => c.tool === "tmux" && c.args.includes("janitor")));

@@ -50,18 +50,8 @@ const INLINE_STYLE_EXEMPT = new Set([
 // This lets the direct token lint coexist with existing debt; additions are
 // review decisions governed by docs/development/review-principles.md, not evidence that a
 // source count stayed below a historical number.
-const HEX_EXEMPTIONS = new Set([
-  "src/components/agent/AgentWorkspace.tsx bg-[#07111f]",
-  "src/components/agent/AgentWorkspace.tsx text-[#f5f7ff]",
-  "src/components/markdown/MarkdownContent.tsx bg-[#07111f]",
-  "src/components/markdown/MarkdownContent.tsx text-[#f5f7ff]",
-  "src/components/message/MessageItem.tsx text-[#1f883d]",
-  "src/components/message/MessageItem.tsx text-[#cf222e]",
-  "src/components/search/MessageSearchPage.tsx bg-[#fff4bf]",
-  "src/components/search/MessageSearchPage.tsx bg-[#ffeefb]",
-  "src/components/settings/MemberGraphSection.tsx bg-[#f8f8f0]",
-  "src/components/workspace/WorkspaceGridDemo.tsx bg-[#1f2328]",
-]);
+// The Raft Design System rewrite retired every earlier exception.
+const HEX_EXEMPTIONS = new Set([]);
 
 const rawYellowViolations = [];
 const hexViolations = [];
@@ -98,7 +88,7 @@ for (const file of sourceFiles(sourceRoot)) {
 
 if (rawYellowViolations.length > 0) {
   console.error("Raw bg-brutal-yellow is not allowed in web source callsites.");
-  console.error("Use a semantic token such as bg-soft-signal, or a typed primitive intent, instead.");
+  console.error("Use a semantic token such as bg-palette-yellow (formerly bg-soft-signal), or a typed primitive intent, instead.");
   console.error(rawYellowViolations.join("\n"));
   process.exitCode = 1;
 }

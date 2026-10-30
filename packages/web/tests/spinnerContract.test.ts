@@ -2,11 +2,10 @@ import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { relative, resolve } from "node:path";
-import test from "node:test";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ts from "typescript";
-import Spinner from "../src/components/ui/Spinner";
+import { Spinner } from "@botiverse/raft-ui";
 
 const repoRoot = resolve(import.meta.dirname, "..");
 const read = (path: string) => readFileSync(resolve(repoRoot, path), "utf8");
@@ -17,7 +16,7 @@ const sourceFiles = (directory: string): string[] => readdirSync(directory, { wi
     return /\.(?:ts|tsx)$/.test(entry.name) ? [path] : [];
   });
 
-test("Spinner exposes xs/sm/md/lg + default/inverse + ring visual", () => {
+test("Spinner exposes xs/sm/md/lg + default/inverse + pixel visual", () => {
   const xsDefault = renderToStaticMarkup(
     createElement(Spinner, { size: "xs" }),
   );
@@ -30,25 +29,30 @@ test("Spinner exposes xs/sm/md/lg + default/inverse + ring visual", () => {
   const lgInverse = renderToStaticMarkup(
     createElement(Spinner, { size: "lg", variant: "inverse" }),
   );
+  const rootClass = (html: string) =>
+    html.match(/<span data-slot="spinner"[^>]*class="([^"]*)"/)?.[1] ?? "";
 
-  // Size axis is physical px tuned to the existing inline spinners the
-  // primitive replaces. Don't add intermediate tiers without first
-  // checking that no existing callsite already fits an existing tier.
-  assert.match(xsDefault, /size-2\.5/);
-  assert.match(smDefault, /size-4/);
-  assert.match(mdDefault, /size-5/);
-  assert.match(lgInverse, /size-8/);
+  // Size axis: four tiers, each a physical pixel size. Don't add intermediate
+  // tiers without first checking that no existing callsite already fits an
+  // existing tier.
+  assert.match(rootClass(xsDefault), /\[--spinner-pixel:4px\]/);
+  assert.match(rootClass(smDefault), /\[--spinner-pixel:5px\]/);
+  assert.match(rootClass(mdDefault), /\[--spinner-pixel:6px\]/);
+  assert.match(rootClass(lgInverse), /\[--spinner-pixel:8px\]/);
+  assert.match(xsDefault, /data-size="xs"/);
+  assert.match(lgInverse, /data-size="lg"/);
 
-  // Ring visual: rounded-full + animate-spin + border-2 with track + tip.
-  assert.match(mdDefault, /rounded-full/);
-  assert.match(mdDefault, /animate-spin/);
-  assert.match(mdDefault, /border-2/);
+  // Raft DS visual: four pixels lit in turn, never a ring.
+  assert.equal(mdDefault.match(/data-spinner-pixel=""/g)?.length, 4);
+  assert.doesNotMatch(mdDefault, /rounded-full|animate-spin|border-t-current/);
 
-  // Default tone is black-on-light: faded black track with solid black tip.
-  assert.match(mdDefault, /border-black\/20 border-t-black/);
-
-  // Inverse tone is white-on-dark: faded white track with solid white tip.
-  assert.match(lgInverse, /border-white\/40 border-t-white/);
+  // Tone is owned by the RUI recipe: the pixels paint with currentColor; the
+  // default inherits the surrounding text colour, inverse takes the inverse
+  // foreground token.
+  assert.match(rootClass(mdDefault), /(?:^|\s)text-current(?:\s|$)/);
+  assert.doesNotMatch(rootClass(mdDefault), /text-foreground-inverse/);
+  assert.match(rootClass(lgInverse), /(?:^|\s)text-foreground-inverse(?:\s|$)/);
+  assert.match(mdDefault, /bg-current/);
 
   // role=status + aria-label so screen readers announce the loading state
   // (the inline div spinners this replaces had no a11y at all).
@@ -56,11 +60,11 @@ test("Spinner exposes xs/sm/md/lg + default/inverse + ring visual", () => {
   assert.match(mdDefault, /aria-label="Loading"/);
 });
 
-test("Spinner accepts custom label and merges className", () => {
+test("Spinner accepts an aria-label override and merges className", () => {
   const html = renderToStaticMarkup(
     createElement(Spinner, {
       size: "sm",
-      label: "Uploading",
+      "aria-label": "Uploading",
       className: "absolute bottom-2 right-2",
     }),
   );
@@ -164,22 +168,22 @@ test("migrated callsites import and use Spinner", () => {
   const selectModeToolbar = read("src/components/message/SelectModeToolbar.tsx");
   const agentWorkspace = read("src/components/agent/AgentWorkspace.tsx");
 
-  assert.match(imageLightbox, /import Spinner from "\.\/ui\/Spinner"/);
+  assert.match(imageLightbox, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
   assert.match(imageLightbox, /<Spinner size="lg" variant="inverse"/);
 
-  assert.match(attachmentChip, /import Spinner from "\.\.\/ui\/Spinner"/);
+  assert.match(attachmentChip, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
   assert.match(attachmentChip, /<Spinner size="sm"/);
 
-  assert.match(messageItem, /import Spinner from "\.\.\/ui\/Spinner"/);
+  assert.match(messageItem, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
   assert.match(messageItem, /<Spinner size="xs"/);
   assert.match(messageItem, /<Spinner size="md" variant="inverse"/);
 
-  assert.match(messageInput, /import Spinner from "\.\.\/ui\/Spinner"/);
+  assert.match(messageInput, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
   assert.match(messageInput, /<Spinner size="sm"/);
 
-  assert.match(selectModeToolbar, /import Spinner from "\.\.\/ui\/Spinner"/);
+  assert.match(selectModeToolbar, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
   assert.match(selectModeToolbar, /<Spinner size="sm"/);
 
-  assert.match(agentWorkspace, /import Spinner from "\.\.\/ui\/Spinner"/);
+  assert.match(agentWorkspace, /import\s*\{[^}]*\bSpinner\b[^}]*\}\s*from\s*"@botiverse\/raft-ui"/);
   assert.match(agentWorkspace, /<Spinner size="xs"/);
 });

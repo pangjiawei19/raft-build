@@ -7,7 +7,11 @@
 // for audit.
 //
 // Hot-path auth lookup: prefix-indexed (O(1) by `idx_agent_credentials_prefix_active`,
-// the partial index that excludes revoked rows). Argon2id verify follows.
+// the partial index that excludes revoked rows). Verify follows: a
+// constant-time HMAC compare when the row has `api_key_hmac`; otherwise, or
+// when that compare fails, argon2id (legacy rows, `AGENT_API_KEY_HMAC_SECRET`
+// unset, or an HMAC from an older secret), and an argon2 success stores the
+// current HMAC.
 //
 // This module owns:
 //   - findAgentCredentialByApiKey(apiKey)   — middleware-side lookup
@@ -19,13 +23,15 @@
 // returns the raw key exactly once at mint time; subsequent reads return the
 // row WITHOUT the raw key.
 
-import { randomBytes, createHmac } from "node:crypto";
+import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
 import argon2 from "argon2";
-import { eq, and, isNull, desc } from "drizzle-orm";
-import { makeIsMember } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
-import { agentCredentials, agentBootstrapTokens, agents, servers } from "../db/schema.js";
-import { addTraceEvent } from "../tracing/semanticTrace.js";
+import { eq, and, isNull, desc, inArray, max } from "drizzle-orm";
+import { isExternalAgentRuntime, makeIsMember } from "@botiverse/raft-shared";
+import { getDb, type DatabaseExecutor } from "../db/index";
+import { agentCredentials, agentBootstrapTokens, agents, servers, raftbenchServiceAgents } from "../db/schema";
+import { hasExactRaftbenchServiceScopes } from "../raftbench/credentialScopes";
+import { addTraceEvent } from "../tracing/semanticTrace";
+import { agentCredentialVerifyTotal } from "../metrics";
 
 const API_KEY_PREFIX_LENGTH = 16;
 const RAW_KEY_BYTES = 32;
@@ -46,9 +52,91 @@ export const ALLOWED_AGENT_CAPABILITIES = [
   "channels",
   "knowledge",
   "mcp",
+  "raftbench",
 ] as const;
 export type AgentCapability = (typeof ALLOWED_AGENT_CAPABILITIES)[number];
 const isAgentCapability = makeIsMember(ALLOWED_AGENT_CAPABILITIES);
+
+/**
+ * Least-privilege default for an external agent's `sk_agent_*` when the
+ * minter does not name scopes: everything a normal member agent needs to
+ * message, read, react, work its inbox / mentions / tasks, use channels and
+ * threads, attach files, read knowledge and edit its own profile/avatar
+ * (`send`). Excluded (must be requested explicitly by an authorized minter):
+ *   - `server` — acting on the server: PATCH /server, POST /server/avatar,
+ *     labs, and migrations (moving a managed agent between computers);
+ *   - `mcp`    — calling managed MCP tools with server-held provider
+ *     credentials.
+ * A managed agent's runner credential (daemon `RUNNER_CREDENTIAL_SCOPES`)
+ * carries this set plus `server` and `mcp`.
+ */
+export const DEFAULT_EXTERNAL_AGENT_CAPABILITIES: readonly AgentCapability[] = [
+  "channels",
+  "knowledge",
+  "mentions",
+  "reactions",
+  "read",
+  "send",
+  "tasks",
+];
+
+/**
+ * A hosted runtime's credential (Antiproton) carries what a managed agent's
+ * runner credential carries: whatever an internal agent can do, a hosted one
+ * can too (tygg, #raft-antiproton:9a4fe245). Role checks still run live on
+ * every call, so `server` lets an admin agent edit the server, not a member.
+ */
+/**
+ * Capability set for a managed app bot (`agents.managed_by_app_install_id
+ * IS NOT NULL`). Narrower than `DEFAULT_EXTERNAL_AGENT_CAPABILITIES`: yezizp's
+ * Phase-1 ask is DM people/agents, channelable, send/receive. Tasks, manual,
+ * reactions, server/channel-management, knowledge, mcp are all withheld until
+ * the product asks for them.
+ */
+export const MANAGED_APP_BOT_CAPABILITIES: readonly AgentCapability[] = [
+  "send",
+  "read",
+  "mentions",
+  "channels",
+];
+
+export const HOSTED_RUNTIME_AGENT_CAPABILITIES: readonly AgentCapability[] = [
+  ...DEFAULT_EXTERNAL_AGENT_CAPABILITIES,
+  "server",
+  "mcp",
+];
+
+export type RequestedAgentCapabilities =
+  | { ok: true; scopes: AgentCapability[] }
+  | { ok: false; code: "scopes_invalid" | "scopes_empty"; error: string };
+
+/**
+ * Parse the optional `scopes` field of a mint/issue request body. Omitted →
+ * `defaults`; otherwise a non-empty subset of `ALLOWED_AGENT_CAPABILITIES`.
+ */
+export function resolveRequestedAgentCapabilities(
+  raw: unknown,
+  defaults: readonly AgentCapability[],
+): RequestedAgentCapabilities {
+  if (raw === undefined) return { ok: true, scopes: [...defaults] };
+  if (!Array.isArray(raw)) {
+    return { ok: false, code: "scopes_invalid", error: "scopes must be an array of capability literals" };
+  }
+  let scopes: AgentCapability[];
+  try {
+    scopes = normalizeAgentCapabilities(raw as readonly string[]);
+  } catch {
+    return {
+      ok: false,
+      code: "scopes_invalid",
+      error: `scopes must each be one of: ${ALLOWED_AGENT_CAPABILITIES.join(", ")}`,
+    };
+  }
+  if (scopes.length === 0) {
+    return { ok: false, code: "scopes_empty", error: "scopes must include at least one capability" };
+  }
+  return { ok: true, scopes };
+}
 
 // Exported so the device-code grant (task #30 PR-A2, deviceAuthService.ts)
 // reuses the EXACT same pepper + lookup-hash, not a parallel one — per
@@ -66,6 +154,33 @@ export function getBootstrapTokenPepper(): Buffer {
 
 export function computeTokenLookupHash(rawToken: string): Buffer {
   return createHmac("sha256", getBootstrapTokenPepper()).update(rawToken, "utf8").digest();
+}
+
+// Secret for `agent_credentials.api_key_hmac`. Deliberately separate from the
+// bootstrap pepper and with no JWT_SECRET fallback: rotating it invalidates
+// every stored HMAC, so it gets its own rotation boundary. Optional — when it
+// is unset (or too short) mint stores no HMAC and verify stays on argon2.
+export const AGENT_API_KEY_HMAC_SECRET_ENV = "AGENT_API_KEY_HMAC_SECRET";
+let warnedMissingApiKeyHmacSecret = false;
+
+function getAgentApiKeyHmacSecret(): Buffer | null {
+  const raw = process.env[AGENT_API_KEY_HMAC_SECRET_ENV];
+  if (!raw || raw.length < 32) {
+    if (!warnedMissingApiKeyHmacSecret) {
+      warnedMissingApiKeyHmacSecret = true;
+      console.warn(
+        `[AgentCredential] ${AGENT_API_KEY_HMAC_SECRET_ENV} unset or shorter than 32 chars — sk_agent_* keys verify with argon2 only`,
+      );
+    }
+    return null;
+  }
+  return Buffer.from(raw, "utf8");
+}
+
+/** HMAC-SHA-256 of a raw `sk_agent_*` key, or null when the secret is unset. */
+export function computeAgentApiKeyHmac(apiKey: string): Buffer | null {
+  const secret = getAgentApiKeyHmacSecret();
+  return secret ? createHmac("sha256", secret).update(apiKey, "utf8").digest() : null;
 }
 
 export function extractApiKeyPrefix(apiKey: string): string {
@@ -110,9 +225,12 @@ export async function getLatestActiveAgentCredential(
  * Look up an agent credential by raw API key.
  *
  * Hot path: prefix lookup served by `idx_agent_credentials_prefix_active`
- * (partial index `WHERE revoked_at IS NULL`) → argon2id verify against
- * matching rows. Revoked rows are excluded by the index — the middleware
- * never argon2-verifies against a revoked credential.
+ * (partial index `WHERE revoked_at IS NULL`) → verify against matching rows:
+ * constant-time HMAC compare when the row has `apiKeyHmac` and the secret is
+ * configured; otherwise, or when the compare fails, argon2id, whose success
+ * stores the current HMAC (best-effort).
+ * Revoked rows are excluded by the query on every request — the middleware
+ * never verifies against a revoked credential.
  *
  * Returns `null` for: unknown key, revoked credential, soft-deleted agent.
  * The agent join ensures the credential's bound agent still exists.
@@ -135,6 +253,7 @@ export async function findAgentCredentialByApiKey(
       id: agentCredentials.id,
       agentId: agentCredentials.agentId,
       apiKeyHash: agentCredentials.apiKeyHash,
+      apiKeyHmac: agentCredentials.apiKeyHmac,
       scopes: agentCredentials.scopes,
     })
     .from(agentCredentials)
@@ -150,22 +269,52 @@ export async function findAgentCredentialByApiKey(
   });
 
   const verifyStart = Date.now();
+  const presentedHmac = candidates.length > 0 ? computeAgentApiKeyHmac(apiKey) : null;
   let verifiedCredential: typeof candidates[number] | null = null;
+  let usedArgon2 = false;
+  // The verified row carried an HMAC that did not match, but argon2 accepted
+  // the key: that HMAC came from a different secret and is rewritten below.
+  let staleHmac = false;
   for (const cred of candidates) {
+    if (presentedHmac && cred.apiKeyHmac) {
+      if (cred.apiKeyHmac.length === presentedHmac.length && timingSafeEqual(cred.apiKeyHmac, presentedHmac)) {
+        verifiedCredential = cred;
+        break;
+      }
+      // No match: a wrong key, or an HMAC stored under a secret that has since
+      // changed. argon2 tells them apart, so a changed or re-created secret
+      // degrades to argon2 and heals itself instead of 401ing every key.
+    }
+    usedArgon2 = true;
     try {
       if (!(await argon2.verify(cred.apiKeyHash, apiKey))) continue;
       verifiedCredential = cred;
+      staleHmac = Boolean(presentedHmac && cred.apiKeyHmac);
       break;
     } catch {
       continue;
     }
   }
+  // "none": no candidate had this prefix, so nothing was verified.
+  // "argon2_rehmac": a stored HMAC was stale (secret changed); a burst of these
+  // after a secret change is the signal that load went back to argon2.
+  const verifyPath = candidates.length === 0
+    ? "none"
+    : staleHmac ? "argon2_rehmac" : usedArgon2 ? "argon2" : "hmac";
+  const verifyOutcome = verifiedCredential ? "matched" : "not_matched";
+  // Event name predates the HMAC path; kept for trace-query continuity.
   addTraceEvent("agent_credential_auth.argon2_verify.finished", {
     duration_ms: Date.now() - verifyStart,
     candidate_count: candidates.length,
-    outcome: verifiedCredential ? "matched" : "not_matched",
+    outcome: verifyOutcome,
+    verify_path: verifyPath,
   });
+  if (candidates.length > 0) agentCredentialVerifyTotal.inc({ path: verifyPath, outcome: verifyOutcome });
   if (!verifiedCredential) return null;
+
+  if (presentedHmac && (!verifiedCredential.apiKeyHmac || staleHmac)) {
+    await storeAgentApiKeyHmac(verifiedCredential.id, verifiedCredential.apiKeyHash, presentedHmac);
+  }
 
   // Resolve serverId via the bound agent. The credential row itself does
   // not carry serverId — it's derived from `agents.serverId` (FK chain).
@@ -191,49 +340,167 @@ export async function findAgentCredentialByApiKey(
   return result;
 }
 
+// Row verified by argon2: store its HMAC (filling a missing one, or replacing
+// one from an older secret) so later requests take the fast path. Conditional
+// on the hash just verified. Best-effort: auth already passed.
+async function storeAgentApiKeyHmac(credentialId: string, apiKeyHash: string, apiKeyHmac: Buffer): Promise<void> {
+  try {
+    await getDb()
+      .update(agentCredentials)
+      .set({ apiKeyHmac })
+      .where(and(eq(agentCredentials.id, credentialId), eq(agentCredentials.apiKeyHash, apiKeyHash)));
+  } catch (err) {
+    console.warn("[AgentCredential] api_key_hmac store failed", {
+      credentialId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Minimum interval between two `last_used_at` writes for the same credential
+ * in this process. `last_used_at` doubles as the external-agent presence
+ * signal ("seen in the last 120 s" → online), so the window must stay well
+ * under 120 s: 60 s (half of it) means a wake-hints stream ticking every 25 s
+ * is written every 2-3 ticks, at most ~85 s apart, instead of every other
+ * tick. The map is per process: with N replicas a credential is written at
+ * most N times per window, which is fine. Cutting writes further needs
+ * presence split from last_used_at (#proj-o11y task #6), not a longer window.
+ */
+export const AGENT_CREDENTIAL_USE_WRITE_THROTTLE_MS = 60_000;
+const MAX_TRACKED_CREDENTIAL_WRITES = 10_000;
+const lastCredentialUseWriteMs = new Map<string, number>();
+let credentialUseWriteThrottleMs = AGENT_CREDENTIAL_USE_WRITE_THROTTLE_MS;
+
+function claimCredentialUseWrite(credentialId: string, nowMs: number): boolean {
+  const last = lastCredentialUseWriteMs.get(credentialId);
+  if (last !== undefined && nowMs - last < credentialUseWriteThrottleMs) return false;
+  if (last === undefined && lastCredentialUseWriteMs.size >= MAX_TRACKED_CREDENTIAL_WRITES) {
+    // Bound memory: drop entries whose window already expired (they would
+    // write on their next request anyway).
+    for (const [id, at] of lastCredentialUseWriteMs) {
+      if (nowMs - at >= credentialUseWriteThrottleMs) lastCredentialUseWriteMs.delete(id);
+    }
+  }
+  lastCredentialUseWriteMs.set(credentialId, nowMs);
+  return true;
+}
+
+/**
+ * Test seam: override the throttle window (`null` restores the default) and
+ * forget per-credential throttle state.
+ */
+export function __setAgentCredentialUseThrottleMsForTests(ms: number | null): void {
+  credentialUseWriteThrottleMs = ms ?? AGENT_CREDENTIAL_USE_WRITE_THROTTLE_MS;
+  lastCredentialUseWriteMs.clear();
+}
+
 /**
  * Record observability triple (last_used_at, last_used_ip, last_used_user_agent)
  * for a successful credential auth. Best-effort: failure does not affect the
  * request path. Always called via `void recordAgentCredentialUse(...)` after
  * `next()` resolves on the middleware.
+ *
+ * Throttled per credential (see `AGENT_CREDENTIAL_USE_WRITE_THROTTLE_MS`):
+ * resolves `null` when the write was skipped (or failed), otherwise the
+ * `last_used_at` value that was written.
  */
 export async function recordAgentCredentialUse(input: {
   credentialId: string;
   ip: string | null;
   userAgent: string | null;
-}): Promise<void> {
+}): Promise<Date | null> {
+  const now = new Date();
+  if (!claimCredentialUseWrite(input.credentialId, now.getTime())) {
+    addTraceEvent("agent_credential_auth.last_used.finished", {
+      duration_ms: 0,
+      outcome: "throttled",
+    });
+    return null;
+  }
   const writeStart = Date.now();
   try {
     const db = getDb();
-    await db
+    // A revoked credential is never "seen": an already-open stream or an
+    // in-flight request must not refresh its presence after revocation.
+    const updated = await db
       .update(agentCredentials)
       .set({
-        lastUsedAt: new Date(),
+        lastUsedAt: now,
         lastUsedIp: input.ip,
         lastUsedUserAgent: input.userAgent,
       })
-      .where(eq(agentCredentials.id, input.credentialId));
+      .where(and(eq(agentCredentials.id, input.credentialId), isNull(agentCredentials.revokedAt)))
+      .returning({ id: agentCredentials.id });
+    const outcome = updated.length > 0 ? "updated" : "revoked";
     addTraceEvent("agent_credential_auth.last_used.finished", {
       duration_ms: Date.now() - writeStart,
-      outcome: "updated",
+      outcome,
     });
+    return outcome === "updated" ? now : null;
   } catch {
+    // Let the next request retry instead of waiting out the window.
+    lastCredentialUseWriteMs.delete(input.credentialId);
     addTraceEvent("agent_credential_auth.last_used.finished", {
       duration_ms: Date.now() - writeStart,
       outcome: "error",
     });
     // Swallow — observability writes must not impact auth latency / success.
+    return null;
   }
 }
 
 /**
+ * Re-validation for long-lived connections that authenticated once at open
+ * (the wake-hint stream): the credential is still unrevoked and its agent and
+ * server still exist. Same conditions as `findAgentCredentialByApiKey` plus
+ * the middleware's server-liveness check, keyed by credential id.
+ */
+export async function isAgentCredentialActive(credentialId: string): Promise<boolean> {
+  const [row] = await getDb()
+    .select({ id: agentCredentials.id })
+    .from(agentCredentials)
+    .innerJoin(agents, and(eq(agents.id, agentCredentials.agentId), isNull(agents.deletedAt)))
+    .innerJoin(servers, and(eq(servers.id, agents.serverId), isNull(servers.deletedAt)))
+    .where(and(eq(agentCredentials.id, credentialId), isNull(agentCredentials.revokedAt)))
+    .limit(1);
+  return Boolean(row);
+}
+
+/**
+ * Presence read for `GET /agents`: max(last_used_at) over each agent's
+ * non-revoked credentials, one query for the whole page.
+ */
+export async function getAgentsLastSeenAt(agentIds: readonly string[]): Promise<Map<string, Date>> {
+  const result = new Map<string, Date>();
+  if (agentIds.length === 0) return result;
+  const db = getDb();
+  const rows = await db
+    .select({
+      agentId: agentCredentials.agentId,
+      lastSeenAt: max(agentCredentials.lastUsedAt),
+    })
+    .from(agentCredentials)
+    .where(and(inArray(agentCredentials.agentId, [...agentIds]), isNull(agentCredentials.revokedAt)))
+    .groupBy(agentCredentials.agentId);
+  for (const row of rows) {
+    if (!row.lastSeenAt) continue;
+    const at = row.lastSeenAt instanceof Date ? row.lastSeenAt : new Date(row.lastSeenAt);
+    if (!Number.isNaN(at.getTime())) result.set(row.agentId, at);
+  }
+  return result;
+}
+
+/**
  * Helper for the step-3 mint endpoints. Generates a raw `sk_agent_*` key
- * + its argon2id hash + the prefix used for indexed lookup. Returns the
- * raw key ONLY to the caller; never persists it in raw form.
+ * + its argon2id hash + its HMAC (null when the secret is unset) + the prefix
+ * used for indexed lookup. Returns the raw key ONLY to the caller; never
+ * persists it in raw form.
  */
 export async function generateAgentApiKeyMaterial(): Promise<{
   apiKey: string;
   apiKeyHash: string;
+  apiKeyHmac: Buffer | null;
   apiKeyPrefix: string;
 }> {
   const apiKey = `sk_agent_${randomBytes(RAW_KEY_BYTES).toString("hex")}`;
@@ -241,6 +508,7 @@ export async function generateAgentApiKeyMaterial(): Promise<{
   return {
     apiKey,
     apiKeyHash,
+    apiKeyHmac: computeAgentApiKeyHmac(apiKey),
     apiKeyPrefix: extractApiKeyPrefix(apiKey),
   };
 }
@@ -283,20 +551,35 @@ export interface MintAgentCredentialInput {
   // no user id; pass null and the audit lineage lives on the Computer
   // attachment record instead.
   createdByUserId: string | null;
+  /**
+   * Refuse (`agent_not_external`) unless the agent's runtime is external.
+   * Set by every human-facing mint path (web session, bootstrap exchange):
+   * a managed agent's credentials come only from its Computer
+   * (`/internal/computer/runners/:agentId/credentials`), because a key for a
+   * managed agent could drain and ack the daemon's delivery buffer.
+   */
+  requireExternalRuntime?: boolean;
+  /**
+   * Rotation: revoke this credential of the same agent in the same write
+   * (the login flow passes the credential its local profile held). Throws
+   * `replaces_credential_invalid` when it does not belong to the agent.
+   * Callers that need atomicity pass a transaction executor.
+   */
+  replacesCredentialId?: string | null;
 }
 
 /**
  * Mint a fresh `sk_agent_*` credential bound to `agentId`. Returns the raw
  * API key exactly once — callers MUST return it to the user in the same
- * response and then forget it. The argon2 hash is what persists.
+ * response and then forget it. The argon2 hash and HMAC are what persist.
  *
- * One row per credential. Existing credentials for the same agent are NOT
- * automatically revoked — that's a separate caller decision (e.g. CI may
- * rotate without disrupting an attached Computer runner). To force a
- * single-active-credential semantic, revoke the prior credential first.
+ * One row per credential. Other credentials for the same agent are NOT
+ * revoked (each device/profile holds its own); only `replacesCredentialId`,
+ * when given, is revoked in the same write.
  */
 export async function mintAgentCredential(
   input: MintAgentCredentialInput,
+  options: { executor?: DatabaseExecutor } = {},
 ): Promise<{
   credentialId: string;
   apiKey: string;
@@ -304,8 +587,9 @@ export async function mintAgentCredential(
   agentId: string;
   serverId: string;
   agentName: string;
+  replacedCredentialId: string | null;
 }> {
-  const db = getDb();
+  const db = options.executor ?? getDb();
 
   // Resolve agent + soft-delete check + server liveness in one go.
   const [agentRow] = await db
@@ -313,6 +597,7 @@ export async function mintAgentCredential(
       id: agents.id,
       name: agents.name,
       serverId: agents.serverId,
+      runtime: agents.runtime,
     })
     .from(agents)
     .innerJoin(servers, and(eq(servers.id, agents.serverId), isNull(servers.deletedAt)))
@@ -320,8 +605,37 @@ export async function mintAgentCredential(
   if (!agentRow) {
     throw new Error("agent_missing");
   }
+  if (input.requireExternalRuntime && !isExternalAgentRuntime(agentRow.runtime)) {
+    throw new Error("agent_not_external");
+  }
 
   const scopes = normalizeAgentCapabilities(input.scopes);
+  const [raftbenchService] = await db.select({ agentId: raftbenchServiceAgents.agentId })
+    .from(raftbenchServiceAgents).where(eq(raftbenchServiceAgents.agentId, input.agentId));
+  if (raftbenchService && !hasExactRaftbenchServiceScopes(scopes)) {
+    throw new Error("raftbench_service_credential_scope_invalid");
+  }
+
+  let replacedCredentialId: string | null = null;
+  if (input.replacesCredentialId) {
+    const [replaced] = await db
+      .select({ id: agentCredentials.id, revokedAt: agentCredentials.revokedAt })
+      .from(agentCredentials)
+      .where(and(eq(agentCredentials.id, input.replacesCredentialId), eq(agentCredentials.agentId, input.agentId)));
+    if (!replaced) throw new Error("replaces_credential_invalid");
+    if (!replaced.revokedAt) {
+      await db
+        .update(agentCredentials)
+        .set({
+          revokedAt: new Date(),
+          revokedReason: "rotated",
+          ...(input.createdByUserId ? { revokedByUserId: input.createdByUserId } : {}),
+        })
+        .where(and(eq(agentCredentials.id, replaced.id), isNull(agentCredentials.revokedAt)));
+      replacedCredentialId = replaced.id;
+    }
+  }
+
   const material = await generateAgentApiKeyMaterial();
 
   const [row] = await db
@@ -329,6 +643,7 @@ export async function mintAgentCredential(
     .values({
       agentId: input.agentId,
       apiKeyHash: material.apiKeyHash,
+      apiKeyHmac: material.apiKeyHmac,
       apiKeyPrefix: material.apiKeyPrefix,
       name: input.name ?? null,
       scopes,
@@ -343,6 +658,7 @@ export async function mintAgentCredential(
     agentId: agentRow.id,
     serverId: agentRow.serverId,
     agentName: agentRow.name,
+    replacedCredentialId,
   };
 }
 
@@ -371,8 +687,8 @@ export async function revokeAgentCredential(input: {
   serverId?: string;
   reason: string;
   revokedByUserId?: string;
-}): Promise<boolean> {
-  const db = getDb();
+}, options: { executor?: DatabaseExecutor } = {}): Promise<boolean> {
+  const db = options.executor ?? getDb();
   const [row] = await db
     .select({
       id: agentCredentials.id,
@@ -413,6 +729,7 @@ export interface IssueAgentBootstrapTokenInput {
 
 export async function issueAgentBootstrapToken(
   input: IssueAgentBootstrapTokenInput,
+  options: { executor?: DatabaseExecutor } = {},
 ): Promise<{
   tokenId: string;
   rawToken: string;
@@ -420,12 +737,12 @@ export async function issueAgentBootstrapToken(
   ttlExpiresAt: Date;
   scopes: AgentCapability[];
 }> {
-  const db = getDb();
+  const db = options.executor ?? getDb();
 
   // Resolve agent + check it belongs to the issuer's server (callers MUST
   // pre-verify this; we re-check here for defense-in-depth).
   const [agentRow] = await db
-    .select({ id: agents.id, serverId: agents.serverId })
+    .select({ id: agents.id, serverId: agents.serverId, runtime: agents.runtime })
     .from(agents)
     .where(and(eq(agents.id, input.agentId), isNull(agents.deletedAt)));
   if (!agentRow) {
@@ -433,6 +750,11 @@ export async function issueAgentBootstrapToken(
   }
   if (agentRow.serverId !== input.serverId) {
     throw new Error("agent_server_mismatch");
+  }
+  // The token exchanges for an `sk_agent_*`; same external-only rule as
+  // `mintAgentCredential({ requireExternalRuntime: true })`.
+  if (!isExternalAgentRuntime(agentRow.runtime)) {
+    throw new Error("agent_not_external");
   }
 
   const scopes = normalizeAgentCapabilities(input.scopes);
@@ -476,6 +798,7 @@ export type ConsumeAgentBootstrapTokenError =
   | "token_revoked"
   | "token_expired"
   | "agent_missing"
+  | "agent_not_external"
   | "server_missing";
 
 export type ConsumeAgentBootstrapTokenResult =
@@ -564,10 +887,14 @@ export async function consumeAgentBootstrapToken(
       scopes: row.scopes as AgentCapability[],
       createdByUserId: null, // bootstrap exchange: issuer is on the token row
       name: null,
+      requireExternalRuntime: true,
     });
   } catch (err) {
     if (err instanceof Error && err.message === "agent_missing") {
       return { ok: false, error: "agent_missing" };
+    }
+    if (err instanceof Error && err.message === "agent_not_external") {
+      return { ok: false, error: "agent_not_external" };
     }
     throw err;
   }

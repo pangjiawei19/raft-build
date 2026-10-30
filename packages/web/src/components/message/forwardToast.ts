@@ -1,5 +1,5 @@
 import type { ComponentPropsWithRef, ReactNode } from "react";
-import { createToastManager } from "raft-ui";
+import { createToastManager } from "@botiverse/raft-ui";
 
 export const forwardToastManager = createToastManager();
 

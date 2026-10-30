@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
+import { buildMessageImageGalleryRows } from "@botiverse/raft-ui";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import test from "node:test";
 import {
   buildImageInlineFallbackKey,
   getImageGalleryPreviewSrc,
@@ -34,6 +34,9 @@ function readSource(path: string): string {
 }
 
 const source = readSource("components/message/MessageItem.tsx");
+// The gallery tile (and its fit/reserve helpers) moved out of MessageItem into
+// its own file in task #709; its assertions read that file.
+const galleryItemSource = readSource("components/message/GalleryImageItem.tsx");
 const fallbackSource = readSource("components/message/urlImageFallback.ts");
 const inputSource = readSource("components/message/MessageInput.tsx");
 const messageStoreSource = readSource("store/messageStore.ts");
@@ -51,29 +54,67 @@ function imageAttachment(overrides: Partial<MessageAttachment> = {}): MessageAtt
   };
 }
 
-test("image gallery layout is ratio-aware instead of count-only", () => {
-  assert.match(source, /export function classifyImageAspect/);
-  assert.match(source, /ratio >= 2\.2/);
-  assert.match(source, /ratio <= 0\.55/);
-  assert.match(source, /export function buildImageGalleryRows/);
-  assert.match(source, /classifyImageAspect\(attachment\) === "wide"[\s\S]*?pushBufferedRows\(\)/);
-  assert.match(source, /getImageGalleryFitClass\(att\)/);
-  assert.match(source, /inline-block w-fit max-w-\[26rem\] justify-self-start/);
-  assert.doesNotMatch(source, /function getImageGalleryGridClass/);
+test("image gallery layout delegates to the shared raft-ui row builder", () => {
+  // The rowing rules (ratio thresholds, wide images taking their own row,
+  // rows of three with a lone four splitting two-and-two, the single-image
+  // reserve box) live in raft-ui's buildMessageImageGalleryRows and are
+  // covered by its own tests. slock keeps only the call and the item slot;
+  // the item slot itself lives in GalleryImageItem since task #709.
+  assert.match(source, /buildMessageImageGalleryRows/);
+  assert.match(source, /const imageRows = buildMessageImageGalleryRows\(renderedImages\)/);
+  assert.match(source, /<MessageImageGalleryRow/);
+  assert.match(source, /<GalleryImageItem[\s\S]{0,400}layout=\{item\}/);
+  assert.match(galleryItemSource, /<MessageImageGalleryItem[\s\S]{0,120}layout=\{layout\}/);
+  assert.match(source, /const att = renderedImages\[item\.index\]/);
+  // No local builder may creep back in.
+  for (const gallerySource of [source, galleryItemSource]) {
+    assert.doesNotMatch(gallerySource, /function classifyImageAspect|function buildImageGalleryRows/);
+    assert.doesNotMatch(gallerySource, /getImageGalleryRowClasses|getSingleImageReserveStyle|SINGLE_IMAGE_MAX_WIDTH/);
+  }
 });
 
-test("single image gallery reserves aspect-ratio space before the image loads", () => {
-  assert.match(source, /const SINGLE_IMAGE_MAX_WIDTH = 416;/);
-  assert.match(source, /const SINGLE_IMAGE_MAX_HEIGHT = 288;/);
-  assert.match(source, /function getSingleImageReserveStyle\(att: MessageImageAttachment\)/);
-  assert.match(source, /return \{ width: "min\(11rem, 100%\)", aspectRatio: "4 \/ 3" \};/);
-  assert.match(source, /const scale = Math\.min\(SINGLE_IMAGE_MAX_WIDTH \/ att\.width, SINGLE_IMAGE_MAX_HEIGHT \/ att\.height, 1\);/);
-  assert.match(source, /const imageReserveStyle = isSingleImage \? getSingleImageReserveStyle\(att\) : undefined;/);
-  assert.match(source, /style=\{imageReserveStyle\}/);
-  assert.match(source, /width=\{att\.width \?\? undefined\}/);
-  assert.match(source, /height=\{att\.height \?\? undefined\}/);
-  assert.match(source, /bg-brutal-cream\/60/);
+test("single-image reserve space comes from the shared layout contract", () => {
+  // The reserve box now flows through the builder's per-item layout (which
+  // raft-ui asserts), while the consumer surface and intrinsic size hints
+  // stay here, in the extracted gallery tile.
+  assert.match(source, /layout=\{item\}/);
+  assert.match(galleryItemSource, /layout=\{layout\}/);
+  assert.doesNotMatch(source, /getSingleImageReserveStyle|style=\{imageReserveStyle\}/);
+  assert.doesNotMatch(galleryItemSource, /getSingleImageReserveStyle|style=\{imageReserveStyle\}/);
+  assert.match(galleryItemSource, /width=\{att\.width \?\? undefined\}/);
+  assert.match(galleryItemSource, /height=\{att\.height \?\? undefined\}/);
+  // The tile surface (DS media frame: hairline + sunken fill) is the recipe's.
+  assert.doesNotMatch(galleryItemSource, /bg-palette-cream/);
   assert.doesNotMatch(source, /border-2 border-black bg-transparent/);
+  assert.doesNotMatch(galleryItemSource, /border-2 border-black bg-transparent/);
+});
+
+test("the migrated builder produces the same rows slock pinned before the port", () => {
+  // Same inputs as the pre-migration suite: the delegation must not change
+  // any rowing result.
+  const rows = buildMessageImageGalleryRows([
+    { width: 800, height: 600 },
+    { width: 300, height: 600 },
+    { width: 1000, height: 200 },
+    { width: 400, height: 400 },
+  ]);
+  assert.deepEqual(rows, [
+    {
+      items: [
+        { index: 0, fit: "cover" },
+        { index: 1, fit: "contain" },
+      ],
+    },
+    { items: [{ index: 2, fit: "contain" }] },
+    { items: [{ index: 3, fit: "cover" }] },
+  ]);
+  assert.deepEqual(buildMessageImageGalleryRows([{ width: 800, height: 600 }]), [
+    {
+      items: [
+        { index: 0, fit: "contain", reserved: { width: "min(384px, 100%)", aspectRatio: "800 / 600" } },
+      ],
+    },
+  ]);
 });
 
 test("optimistic image attachments carry local dimensions when available", () => {
@@ -95,7 +136,7 @@ test("sent image attachments keep local previews across optimistic handoff", () 
   assert.match(messageStoreSource, /width: attachment\.width \?\? local\.width \?\? null/);
   assert.match(messageStoreSource, /height: attachment\.height \?\? local\.height \?\? null/);
 
-  const submitStart = inputSource.indexOf("const handleSubmit = async");
+  const submitStart = inputSource.indexOf("const handleSubmit = useCallback(async");
   const catchStart = inputSource.indexOf("} catch (err) {", submitStart);
   assert.notEqual(submitStart, -1, "handleSubmit not found");
   assert.notEqual(catchStart, -1, "handleSubmit catch block not found");
@@ -109,16 +150,16 @@ test("sent image attachments with preserved local previews are no longer optimis
   assert.equal(isOptimisticAttachment(imageAttachment({ id: "optimistic-att-5" })), true);
   assert.equal(isOptimisticAttachment(imageAttachment({ id: "att-5", localPreviewUrl: "blob:local" })), false);
   assert.match(source, /from "\.\/urlImageFallback";/);
-  assert.match(source, /const lightboxImages = imageAttachments\.filter\(\(att\) => !isOptimisticAttachment\(att\)\)/);
+  assert.match(source, /imagePreviewAttachments\.filter\(\(att\) => !isOptimisticAttachment\(att\)\)/);
   assert.match(source, /const isOptimistic = isOptimisticAttachment\(att\);/);
   assert.doesNotMatch(source, /const isOptimistic = !!att\.localPreviewUrl/);
 });
 
 test("image attachments without thumbnails still open the lightbox fallback", () => {
-  assert.match(source, /const lightboxImages = imageAttachments\.filter\(\(att\) => !isOptimisticAttachment\(att\)\)/);
+  assert.match(source, /imagePreviewAttachments\.filter\(\(att\) => !isOptimisticAttachment\(att\)\)/);
   // open() gained a third arg (per-attachment comment contexts, task #10);
   // the contract is the index fallback, not the exact arity.
-  assert.match(source, /if \(isImage && !isOptimistic\) \{[\s\S]*?useImageLightboxStore\.getState\(\)\.open\([\s\S]{0,160}?imageIndex >= 0 \? imageIndex : 0/);
+  assert.match(source, /if \(isPreviewableImageAttachment\(att\) && !isOptimistic\) \{[\s\S]*?useImageLightboxStore\.getState\(\)\.open\([\s\S]{0,160}?imageIndex >= 0 \? imageIndex : 0/);
 });
 
 test("image attachments without thumbnails fetch an inline URL for direct gallery rendering", () => {
@@ -231,18 +272,20 @@ test("image attachments without thumbnails fetch an inline URL for direct galler
 });
 
 test("image gallery download affordance does not reuse the lightbox preview hit target", () => {
-  const galleryStart = source.indexOf("const handleDownloadImage");
-  const galleryEnd = source.indexOf("{videoAttachments.length > 0", galleryStart);
+  // The tile is its own component file since task #709; slice from its
+  // download handler to the end of that file (the tile is its last component).
+  const galleryStart = galleryItemSource.indexOf("const handleDownloadImage");
   assert.notEqual(galleryStart, -1, "thumbnail download handler not found");
-  assert.notEqual(galleryEnd, -1, "image gallery block end not found");
-  const gallerySource = source.slice(galleryStart, galleryEnd);
+  assert.match(source, /<GalleryImageItem\b/, "MessageItem must render the gallery tile");
+  const gallerySource = galleryItemSource.slice(galleryStart);
 
   assert.match(gallerySource, /event\.preventDefault\(\);/);
   assert.match(gallerySource, /event\.stopPropagation\(\);/);
-  assert.match(gallerySource, /void handleDownloadAttachment\(att\);/);
+  assert.match(gallerySource, /void onDownload\(att\);/);
   // aria labels migrated to react-intl (message.messageItem.previewFile/downloadFile).
   assert.match(gallerySource, /aria-label=\{formatMessage\(\{ id: "message\.messageItem\.previewFile" \}, \{ filename: att\.filename \}\)\}/);
   assert.match(gallerySource, /data-message-affordance="image-download"/);
   assert.match(gallerySource, /aria-label=\{formatMessage\(\{ id: "message\.messageItem\.downloadFile" \}, \{ filename: att\.filename \}\)\}/);
   assert.doesNotMatch(gallerySource, /<span[\s\S]{0,160}?data-message-affordance="image-download"/);
+  assert.doesNotMatch(source, /<span[\s\S]{0,160}?data-message-affordance="image-download"/);
 });

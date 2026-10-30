@@ -1,6 +1,4 @@
 import assert from "node:assert/strict";
-import { afterEach, describe, test } from "node:test";
-import type { TestContext } from "node:test";
 import { act } from "react";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -18,7 +16,7 @@ import { useMessageStore } from "../src/store/messageStore";
 import { useServerStore } from "../src/store/serverStore";
 import { useUIStore } from "../src/store/uiStore";
 
-describe("agent pinned DM profile behavior", { concurrency: false }, () => {
+describe("agent pinned DM profile behavior",  () => {
 
 test("sidebar sortable items clamp horizontal drag unless the pinned surface opts in", () => {
   const transform = { x: 24, y: 12, scaleX: 1, scaleY: 1 };
@@ -120,7 +118,6 @@ function renderAgentRow(props: {
   rowDm?: Channel;
   dmId?: string;
   selected?: boolean;
-  allowWrap?: boolean;
 }) {
   const longPress = () => ({});
   return render(
@@ -134,7 +131,6 @@ function renderAgentRow(props: {
         onSelect={noop}
         onContextMenu={noop}
         makeLongPress={longPress}
-        allowWrap={props.allowWrap}
       />
     </TestIntlProvider>,
   );
@@ -146,7 +142,7 @@ test("homepage agent DM keeps online presence static while busy presence still p
 
   const { container, rerender } = renderAgentRow({ rowAgent, rowDm: dm() });
   const onlineDot = container.querySelector(
-    '[data-sidebar-avatar-badge-shell="true"] span[title]',
+    '[data-sidebar-avatar-badge="true"]',
   );
   assert.ok(onlineDot, "agent DM should render its presence dot");
   assert.equal(
@@ -181,13 +177,14 @@ test("homepage agent DM keeps online presence static while busy presence still p
     </TestIntlProvider>,
   );
   const workingDot = container.querySelector(
-    '[data-sidebar-avatar-badge-shell="true"] span[title]',
+    '[data-sidebar-avatar-badge="true"]',
   );
   assert.ok(workingDot, "working agent DM should keep its presence dot");
+  assert.equal(workingDot.getAttribute("data-presence"), "busy", "working keeps the busy light (raft-ui Status presence)");
   assert.equal(
     workingDot.classList.contains("animate-pulse"),
-    true,
-    "thinking/working activity should retain the existing pulse",
+    false,
+    "working/thinking dots are static — an infinite pulse kept the page rendering every frame (task #136)",
   );
 });
 
@@ -274,8 +271,8 @@ function seedMember(userId: string, displayName: string) {
   }));
 }
 
-function mockSidebarOrderPatch(t: TestContext) {
-  t.mock.method(api, "patch", async (_url: string, body?: unknown) => {
+function mockSidebarOrderPatch() {
+  vi.spyOn(api, "patch").mockImplementation(async (_url: string, body?: unknown) => {
     return { data: body } as Awaited<ReturnType<typeof api.patch>>;
   });
 }
@@ -304,12 +301,10 @@ test("pinned agent row falls back to the agent profile and selected=false withou
 
   assert.ok(screen.getByText("agent-name"));
   assert.equal(screen.queryByText("agent fallback description"), null);
-  assert.equal(container.querySelector(".text-black\\/40"), null);
+  assert.equal(container.querySelector("[data-sidebar-row-description]"), null);
   assert.equal(container.querySelectorAll(".lucide-pencil").length, 0);
   assert.equal(container.querySelector("button")?.getAttribute("aria-current"), null);
-  const className = container.querySelector("button")?.className ?? "";
-  assert.doesNotMatch(className, /bg-brutal-pink/);
-  assert.doesNotMatch(className, /font-bold/);
+  assert.notEqual(container.querySelector("button")?.getAttribute("data-active"), "true");
 });
 
 test("pinned agent row shows draft state for its own DM id", () => {
@@ -323,8 +318,9 @@ test("pinned agent row bolds its name only when its DM has unread", () => {
   useMessageStore.setState({ unreadCounts: { "dm-1": 2 }, drafts: {} });
   const { container } = renderAgentRow({ rowDm: dm() });
 
+  // Unread is the row's raft-ui SidebarItem tone (it draws the 700 name).
   const name = screen.getByText("Agent fallback");
-  assert.match(name.className, /font-bold/);
+  assert.equal(name.closest('[data-slot="sidebar-item"]')?.getAttribute("data-tone"), "unread");
   assert.ok(container.textContent?.includes("2"));
 });
 
@@ -333,31 +329,26 @@ test("pinned agent row leaves its name unbolded when its DM has no unread", () =
   renderAgentRow({ rowDm: dm() });
 
   const name = screen.getByText("Agent fallback");
-  assert.doesNotMatch(name.className, /font-bold/);
+  assert.equal(name.closest('[data-slot="sidebar-item"]')?.hasAttribute("data-tone"), false, "no unread: no tone, a plain name");
+  assert.doesNotMatch(name.className, /(^|\s)font-bold(\s|$)/, "the name is never bolded by hand");
   assert.doesNotMatch(name.className, /Stryker was here/);
 });
 
 test("pinned agent row selected state follows the matching DM id", () => {
   const { container } = renderAgentRow({ rowDm: dm(), selected: true });
 
-  const className = container.querySelector("button")?.className ?? "";
-  assert.match(className, /bg-brutal-pink/);
-  assert.match(className, /font-bold/);
+  assert.equal(container.querySelector("button")?.getAttribute("data-active"), "true");
 });
 
-test("pinned agent row centers its trailing status independently of wrapped content", () => {
-  const { container } = renderAgentRow({ rowDm: dm(), allowWrap: true });
+test("a pinned agent row is the ordinary one-line row: name with an ellipsis, meta on the right", () => {
+  const { container } = renderAgentRow({ rowDm: dm() });
 
   const row = container.querySelector("button");
-  assert.match(row?.className ?? "", /items-start/, "wrapped pinned rows top-align their variable-height content");
-
-  const trailingIndicators = row?.lastElementChild;
-  assert.ok(trailingIndicators, "pinned agent row should render its trailing status group");
-  assert.match(
-    trailingIndicators.className,
-    /self-center/,
-    "the status group must center itself against the full pinned row instead of inheriting the content top edge",
-  );
+  assert.ok(row);
+  assert.equal(row.hasAttribute("data-wrap"), false, "pinned rows never wrap; every sidebar row truncates");
+  const title = row.querySelector('[data-slot="sidebar-item-title"]');
+  assert.ok(title, "the name is raft-ui's row title");
+  assert.match(title.className, /\btruncate\b/);
 });
 
 test("Sidebar renders a pinned agent row from live agent identity instead of the DM snapshot", async () => {
@@ -446,7 +437,8 @@ test("Sidebar renders a pinned agent row from live agent identity instead of the
 
   const name = await screen.findByText("Agent fallback");
   assert.equal(screen.queryByText("DM source description"), null);
-  assert.equal(screen.queryByText("agent fallback description"), null);
+  // Drawn like the Direct Messages row: the live agent's description shows.
+  assert.ok(screen.getByText("agent fallback description"));
   assert.equal(container.querySelector('img[alt="Agent avatar"]')?.getAttribute("src"), "https://example.com/agent.png");
   assert.match(name.className, /font-bold/);
   assert.ok(screen.getByText("3"));
@@ -536,10 +528,10 @@ test("Sidebar renders a typed pinned agent ref as an agent row when the DM exist
   );
 
   assert.ok(await screen.findByText("Cindy"));
-  assert.equal(screen.queryByText("Onboarding Assistant"), null);
-  assert.ok(container.querySelector("[data-cell-size]"), "agent DM with no custom avatar should render the pixel avatar");
+  assert.ok(screen.getByText("Onboarding Assistant"), "a pinned row shows the description its DM row shows");
+  assert.ok(container.querySelector("[data-agent-pixel-avatar]"), "agent DM with no custom avatar should render the pixel avatar");
   assert.equal(container.querySelector(".lucide-user"), null, "pinned agent DM must not render the human placeholder");
-  assert.ok(container.querySelector("span[title]"), "pinned agent DM should render the agent activity dot");
+  assert.ok(container.querySelector("span[data-base-ui-tooltip-trigger], span.rounded-full"), "pinned agent DM should render the agent activity dot");
 });
 
 test("Sidebar keeps regular agent DM descriptions sourced from the matching agent", async () => {
@@ -705,7 +697,7 @@ test("Sidebar keeps regular pinned channels on the channel row path", async () =
   );
 
   assert.ok(await screen.findByText("general"));
-  assert.equal(container.querySelector("[data-cell-size]"), null);
+  assert.equal(container.querySelector("[data-agent-pixel-avatar]"), null);
   assert.equal(container.querySelector(".lucide-user"), null);
 });
 
@@ -749,7 +741,7 @@ test("Sidebar keeps a pinned human DM on the human path when agent and human pee
   assert.ok(await screen.findByText("Human peer"));
   assert.equal(screen.queryByText("Colliding agent identity"), null);
   assert.ok(screen.getByText("Human source description"));
-  assert.equal(container.querySelector("[data-cell-size]"), null, "human DM must not render the agent pixel avatar");
+  assert.equal(container.querySelector("[data-agent-pixel-avatar]"), null, "human DM must not render the agent pixel avatar");
   assert.ok(container.querySelector(".lucide-user"), "human DM without avatar or gravatar should render the human placeholder");
   assert.equal(container.querySelector('img[src*="gravatar.com/avatar/"]'), null);
 });
@@ -860,9 +852,9 @@ test("Sidebar renders pinned agent DM channels in non-manual pinned sort mode", 
   );
 
   assert.ok(await screen.findByText("Cindy"));
-  assert.equal(screen.queryByText("Right agent description"), null);
+  assert.ok(screen.getByText("Right agent description"), "a pinned row shows the description its DM row shows");
   assert.equal(screen.queryByText("Wrong agent description"), null);
-  assert.ok(container.querySelector("[data-cell-size]"));
+  assert.ok(container.querySelector("[data-agent-pixel-avatar]"));
 });
 
 test("Sidebar tolerates a pinned agent DM channel before the agent list has the peer", async () => {
@@ -898,7 +890,7 @@ test("Sidebar tolerates a pinned agent DM channel before the agent list has the 
   );
 
   assert.ok(await screen.findByText("Cindy"));
-  assert.ok(container.querySelector("[data-cell-size]"));
+  assert.ok(container.querySelector("[data-agent-pixel-avatar]"));
 });
 
 test("Sidebar keeps live pinned identity when a stale DM snapshot arrives and reacts to store updates", async () => {
@@ -1008,8 +1000,8 @@ test("Sidebar does not offer Archive for joint channels", async () => {
   assert.equal(screen.queryByText("Archive"), null);
 });
 
-test("Sidebar channel Move to Pinned action updates pinned order", async (t) => {
-  mockSidebarOrderPatch(t);
+test("Sidebar channel Move to Pinned action updates pinned order", async () => {
+  mockSidebarOrderPatch();
   seedCurrentUser();
   seedServerOrder({});
   useChannelStore.setState({
@@ -1047,8 +1039,8 @@ test("Sidebar channel Move to Pinned action updates pinned order", async (t) => 
   assert.deepEqual(useServerStore.getState().sidebarOrder.pinned, [{ kind: "channel", id: "channel-1" }]);
 });
 
-test("Sidebar channel Unpin action removes the pinned channel", async (t) => {
-  mockSidebarOrderPatch(t);
+test("Sidebar channel Unpin action removes the pinned channel", async () => {
+  mockSidebarOrderPatch();
   seedCurrentUser();
   seedServerOrder({
     pinned: [{ kind: "channel", id: "channel-1" }],
@@ -1091,8 +1083,8 @@ test("Sidebar channel Unpin action removes the pinned channel", async (t) => {
   });
 });
 
-test("Sidebar agent Move to Pinned action updates agent pins", async (t) => {
-  mockSidebarOrderPatch(t);
+test("Sidebar agent Move to Pinned action updates agent pins", async () => {
+  mockSidebarOrderPatch();
   seedCurrentUser();
   seedServerOrder({});
   const rowAgent = agent({
@@ -1138,8 +1130,8 @@ test("Sidebar agent Move to Pinned action updates agent pins", async (t) => {
   assert.deepEqual(useServerStore.getState().sidebarOrder.pinned, [{ kind: "agent", id: "agent-1" }]);
 });
 
-test("Sidebar human DM Move to Pinned action updates typed human pins", async (t) => {
-  mockSidebarOrderPatch(t);
+test("Sidebar human DM Move to Pinned action updates typed human pins", async () => {
+  mockSidebarOrderPatch();
   seedCurrentUser();
   seedServerOrder({});
   seedMember("user-2", "Human peer");
@@ -1181,8 +1173,8 @@ test("Sidebar human DM Move to Pinned action updates typed human pins", async (t
   assert.deepEqual(useServerStore.getState().sidebarOrder.pinned, [{ kind: "human", id: "user-2" }]);
 });
 
-test("Sidebar fallback DM Move to Pinned action updates typed human pins", async (t) => {
-  mockSidebarOrderPatch(t);
+test("Sidebar fallback DM Move to Pinned action updates typed human pins", async () => {
+  mockSidebarOrderPatch();
   seedCurrentUser();
   seedServerOrder({});
   const rowDm = dm({
@@ -1223,7 +1215,7 @@ test("Sidebar fallback DM Move to Pinned action updates typed human pins", async
   assert.deepEqual(useServerStore.getState().sidebarOrder.pinned, [{ kind: "human", id: "user-without-member-row" }]);
 });
 
-test("Sidebar Pin for an unplaced DM survives an unrelated custom-section version advance", async (t) => {
+test("Sidebar Pin for an unplaced DM survives an unrelated custom-section version advance", async () => {
   seedCurrentUser();
   const unrelatedPlacement = {
     kind: "channel" as const,
@@ -1243,8 +1235,8 @@ test("Sidebar Pin for an unplaced DM survives an unrelated custom-section versio
   };
   const patchRequests: Array<Partial<typeof persistedOrder>> = [];
   let sectionConflicts = 0;
-  t.mock.method(api, "get", async () => ({ data: persistedOrder }) as Awaited<ReturnType<typeof api.get>>);
-  t.mock.method(api, "patch", async (_url: string, body?: unknown) => {
+  vi.spyOn(api, "get").mockImplementation(async () => ({ data: persistedOrder }) as Awaited<ReturnType<typeof api.get>>);
+  vi.spyOn(api, "patch").mockImplementation(async (_url: string, body?: unknown) => {
     const updates = body as Partial<typeof persistedOrder>;
     patchRequests.push(updates);
     if (
@@ -1389,7 +1381,7 @@ test("Sidebar pinned recent sort reacts to channel activity", async () => {
   assert.match(channelRows()[0], /older pinned channel/);
 });
 
-test("Pinned rows allow long labels to wrap instead of truncating", async () => {
+test("Pinned rows truncate long labels like every sidebar row", async () => {
   const longName = "very-long-project-channel-name-that-should-wrap-in-the-sidebar-pinned-section";
   seedCurrentUser();
   seedServerOrder({
@@ -1421,9 +1413,15 @@ test("Pinned rows allow long labels to wrap instead of truncating", async () => 
     </MemoryRouter>,
   );
 
+  // Every sidebar row is one line with an ellipsis (DS `rf-srow__name`), in
+  // Pinned as in its home section: the same row, the same rule.
   const label = await screen.findByText(longName);
-  assert.doesNotMatch(label.className, /truncate/);
-  assert.match(label.className, /break-words/);
+  assert.equal(label.getAttribute("data-slot"), "sidebar-item-title");
+  assert.match(label.className, /\btruncate\b/);
+  assert.doesNotMatch(label.className, /break-words|whitespace-normal/);
+  const row = label.closest("[data-slot='sidebar-item']");
+  assert.ok(row);
+  assert.equal(row.hasAttribute("data-wrap"), false);
 });
 
 test("Pinned empty placeholder wraps without icon or dashed frame", async () => {
@@ -1461,8 +1459,10 @@ test("Pinned empty placeholder wraps without icon or dashed frame", async () => 
   assert.doesNotMatch(hint.className, /border-dashed/);
   assert.doesNotMatch(hint.className, /ring-/);
   assert.equal(hint.hasAttribute("data-sidebar-section-description"), true);
-  assert.match(hint.className, /(?:^|\s)text-xs(?:\s|$)/);
-  assert.match(hint.className, /(?:^|\s)font-mono(?:\s|$)/);
+  // Raft Design System: human-readable section copy is Grotesk 13/18, one family.
+  assert.match(hint.className, /(?:^|\s)text-footnote(?:\s|$)/);
+  assert.match(hint.className, /(?:^|\s)font-sans(?:\s|$)/);
+  assert.doesNotMatch(hint.className, /theme-brutal:|font-mono/);
   assert.equal(hint.querySelector(".lucide-pin"), null);
 });
 
@@ -1520,7 +1520,7 @@ function renderPinnedAgentDmMatrix(pinned: boolean, agentStillCached: boolean) {
   );
 }
 
-describe("pinned agent DM row identity", { concurrency: false }, () => {
+describe("pinned agent DM row identity",  () => {
 
 for (const pinned of [true, false]) {
   for (const cached of [true, false]) {
@@ -1583,8 +1583,8 @@ test("a deleted agent's DM stays visible and its row actions stay reachable", as
  * the DM row still present. Reopening produced a working `dm/channelId` menu,
  * so the capability is not lost — only the open surface is destroyed.
  */
-test("an open human DM menu survives the peer being evicted from members", async (t) => {
-  mockSidebarOrderPatch(t);
+test("an open human DM menu survives the peer being evicted from members", async () => {
+  mockSidebarOrderPatch();
   const PEER = "peer-evicted";
   const DM_ID = "dm-peer-evicted";
   const peerDm = dm({

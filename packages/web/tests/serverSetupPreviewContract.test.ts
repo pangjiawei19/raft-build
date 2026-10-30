@@ -1,7 +1,6 @@
 import "./helpers/domSetup";
 
 import assert from "node:assert/strict";
-import { afterEach, test } from "node:test";
 import { createElement } from "react";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
@@ -55,9 +54,10 @@ test("production Screen B consumes the frozen projection contract without client
   ));
 
   const dimmer = Array.from(view.container.querySelectorAll<HTMLElement>("[aria-hidden='true']"))
-    .find((element) => element.getAttribute("class")?.includes("bg-black/55"));
+    .find((element) => element.getAttribute("class")?.includes("bg-layer-backdrop"));
   assert.ok(dimmer);
-  assert.match(dimmer.className, /bg-black\/55/);
+  // The preview's dimmer is the DS scrim token, not a hard-coded black wash.
+  assert.match(dimmer.className, /(?:^|\s)bg-layer-backdrop(?:\s|$)/);
   assert.ok(screen.getByTestId("onboarding-computer-connected"));
 
   const next = screen.getByRole("button", { name: "Next" });

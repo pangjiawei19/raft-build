@@ -1,15 +1,19 @@
-import { useState, useEffect } from "react";
-import type { FormEvent } from "react";
+import { useState, useEffect, useEffectEvent, useCallback } from "react";
+import { Input, Button } from "@botiverse/raft-ui";
+import type { ChangeEvent, FormEvent } from "react";
 import { useIntl } from "react-intl";
 import { useAuthStore } from "../../store/authStore";
 import { RefreshCw, LogOut, KeyRound } from "lucide-react";
 import Banner from "../ui/Banner";
-import Button from "../ui/Button";
 import CenteredCardFrame from "./CenteredCardFrame";
 import { AuthPageIntro } from "./AuthPageFrame";
 
 interface EmailVerificationPageProps {
   initialToken?: string | null;
+}
+
+function reloadPage() {
+  window.location.reload();
 }
 
 export default function EmailVerificationPage({ initialToken }: EmailVerificationPageProps) {
@@ -27,16 +31,7 @@ export default function EmailVerificationPage({ initialToken }: EmailVerificatio
   const [showManualInput, setShowManualInput] = useState(false);
   const [manualToken, setManualToken] = useState("");
 
-  // Auto-verify if token provided via URL
-  useEffect(() => {
-    // oxlint-disable-next-line react-doctor/no-event-handler -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
-    if (initialToken) {
-      handleVerify(initialToken);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [initialToken]);
-
-  const handleVerify = async (token: string) => {
+  const handleVerify = useCallback(async (token: string) => {
     setVerifying(true);
     setError("");
     try {
@@ -51,9 +46,23 @@ export default function EmailVerificationPage({ initialToken }: EmailVerificatio
     } finally {
       setVerifying(false);
     }
-  };
+  }, [verifyEmail, formatMessage]);
 
-  const handleResend = async () => {
+  // Auto-verify if token provided via URL. useEffectEvent: only a NEW
+  // initialToken may trigger verification — a locale switch (new formatMessage
+  // → new handleVerify identity) must not re-verify an already-consumed token
+  // (Josh, task #709).
+  const verifyOnLoad = useEffectEvent((token: string) => {
+    void handleVerify(token);
+  });
+  useEffect(() => {
+    // oxlint-disable-next-line react-doctor/no-event-handler -- YMNNE-family: pre-existing non-bug site grandfathered; rule now gates new code (see docs/frontend/render-cost-contract.md)
+    if (initialToken) {
+      verifyOnLoad(initialToken);
+    }
+  }, [initialToken]);
+
+  const handleResend = useCallback(async () => {
     setResending(true);
     setError("");
     setResendSuccess(false);
@@ -65,14 +74,22 @@ export default function EmailVerificationPage({ initialToken }: EmailVerificatio
     } finally {
       setResending(false);
     }
-  };
+  }, [resendVerification, formatMessage]);
 
-  const handleManualSubmit = (e: FormEvent) => {
+  const handleManualSubmit = useCallback((e: FormEvent) => {
     e.preventDefault();
     if (manualToken.trim()) {
-      handleVerify(manualToken.trim());
+      void handleVerify(manualToken.trim());
     }
-  };
+  }, [manualToken, handleVerify]);
+
+  const handleManualTokenChange = useCallback((e: ChangeEvent<HTMLInputElement>) => {
+    setManualToken(e.target.value);
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    void logout();
+  }, [logout]);
 
   if (verified) {
     return (
@@ -83,9 +100,9 @@ export default function EmailVerificationPage({ initialToken }: EmailVerificatio
             description={formatMessage({ id: "pages.emailVerification.verifiedDescription" })}
           />
           <Button
-            onClick={() => window.location.reload()}
-            size="lg"
-            tone="pink"
+            onClick={reloadPage}
+            size="xl"
+            variant="accent"
             className="w-full"
           >
             {formatMessage({ id: "pages.emailVerification.continueToRaft" })}
@@ -99,26 +116,26 @@ export default function EmailVerificationPage({ initialToken }: EmailVerificatio
     <CenteredCardFrame>
       <div className="w-full">
         <AuthPageIntro title={formatMessage({ id: "pages.emailVerification.checkEmailTitle" })}>
-          <p className="mt-2 text-sm text-black/60">
+          <p className="mt-2 text-callout text-foreground-muted">
             {formatMessage({ id: "pages.emailVerification.sentLinkTo" })}
           </p>
-          <p className="mt-1 font-mono text-sm font-bold">{user?.email}</p>
+          <p className="mt-1 font-mono text-mono-code font-bold text-foreground">{user?.email}</p>
         </AuthPageIntro>
 
         {error && (
-          <Banner intent="warning" className="mb-4 font-bold">
+          <Banner intent="warning" className="mb-4">
             {error}
           </Banner>
         )}
 
         {resendSuccess && (
-          <div className="mb-4 border-2 border-black bg-brutal-lime/30 p-3 text-sm font-bold">
+          <Banner intent="success" className="mb-4">
             {formatMessage({ id: "pages.emailVerification.resent" })}
-          </div>
+          </Banner>
         )}
 
         {verifying && (
-          <div className="mb-4 text-center text-sm text-black/60">
+          <div className="mb-4 text-center text-callout text-foreground-muted">
             {formatMessage({ id: "pages.emailVerification.verifying" })}
           </div>
         )}
@@ -127,9 +144,8 @@ export default function EmailVerificationPage({ initialToken }: EmailVerificatio
           <Button
             onClick={handleResend}
             disabled={resending}
-            size="lg"
-            shape="iconText"
-            tone="pink"
+            size="xl"
+            variant="accent"
             className="w-full"
           >
             <RefreshCw size={16} className={resending ? "animate-spin" : ""} />
@@ -143,9 +159,9 @@ export default function EmailVerificationPage({ initialToken }: EmailVerificatio
             <button
               type="button"
               onClick={() => setShowManualInput(!showManualInput)}
-              className="text-sm text-black/50 underline hover:text-black"
+              className="inline-flex items-center gap-1 rounded-control text-footnote font-semibold text-foreground underline decoration-[1.5px] underline-offset-[3px] outline-none focus-visible:shadow-focus"
             >
-              <KeyRound size={12} className="inline mr-1" />
+              <KeyRound size={14} className="shrink-0 text-foreground-muted" />
               {showManualInput
                 ? formatMessage({ id: "pages.emailVerification.hideManualEntry" })
                 : formatMessage({ id: "pages.emailVerification.enterCodeManually" })}
@@ -154,30 +170,32 @@ export default function EmailVerificationPage({ initialToken }: EmailVerificatio
 
           {showManualInput && (
             <form onSubmit={handleManualSubmit} className="flex gap-2">
-              <input
+              <Input
                 type="text"
+                className="flex-1"
                 value={manualToken}
-                onChange={(e) => setManualToken(e.target.value)}
+                onChange={handleManualTokenChange}
                 placeholder={formatMessage({ id: "pages.emailVerification.tokenPlaceholder" })}
-                className="flex-1 border-2 border-black p-2 text-base shadow-brutal-sm focus:shadow-brutal focus:outline-none"
               />
-              <button
+              <Button size="lg"
                 type="submit"
+                variant="outline"
                 disabled={verifying || !manualToken.trim()}
-                className="btn-brutal border-2 border-black bg-brutal-lime px-3 py-1.5 text-sm font-bold disabled:opacity-50"
               >
                 {verifying ? "…" : formatMessage({ id: "pages.emailVerification.verifyAction" })}
-              </button>
+              </Button>
             </form>
           )}
 
-          <button
-            onClick={() => logout()}
-            className="flex w-full items-center justify-center gap-2 border-2 border-black bg-white p-2 font-bold text-sm shadow-brutal-sm transition-all duration-100 hover:-translate-y-[1px] hover:shadow-brutal active:translate-x-[1px] active:translate-y-[1px] active:shadow-brutal-active"
+          <Button
+            variant="ghost"
+            size="lg"
+            className="w-full"
+            onClick={handleLogout}
           >
-            <LogOut size={14} />
+            <LogOut size={18} />
             {formatMessage({ id: "pages.emailVerification.logOut" })}
-          </button>
+          </Button>
         </div>
       </div>
     </CenteredCardFrame>

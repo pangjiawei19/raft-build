@@ -1,11 +1,11 @@
-import { useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import { createPortal } from "react-dom";
 import { ArrowLeft } from "lucide-react";
 import { useIntl } from "react-intl";
 import { useLocation } from "react-router-dom";
 import { useMobileBack } from "../../hooks/useAppNavigate";
 import { useLiveSearchParams } from "../../hooks/useLiveSearchParams";
-import Button from "../ui/Button";
+import { PanelAction, PanelHeader } from "@botiverse/raft-ui";
 import ForwardedBundleCard from "./ForwardedBundleCard";
 import type {
   ForwardedBundleAttachmentSnapshot,
@@ -40,7 +40,7 @@ export default function ForwardedBundleRouteCard({
   const onBack = useMobileBack(fallbackPath);
   const detailOpen = searchParams.get("forward") === messageId;
 
-  const openDetail = () => {
+  const openDetail = useCallback(() => {
     if (!window.matchMedia("(max-width: 767px)").matches) return false;
     setSearchParams((current) => {
       const next = new URLSearchParams(current);
@@ -48,7 +48,7 @@ export default function ForwardedBundleRouteCard({
       return next;
     });
     return true;
-  };
+  }, [messageId, setSearchParams]);
 
   return (
     <>
@@ -60,16 +60,18 @@ export default function ForwardedBundleRouteCard({
       />
       {detailOpen && createPortal(
         <section
-          className="fixed bottom-0 left-0 right-0 top-0 z-[70] flex flex-col bg-white md:hidden"
+          className="fixed bottom-0 left-0 right-0 top-0 z-[70] flex flex-col bg-layer-canvas md:hidden"
           data-testid="forwarded-bundle-detail-page"
           aria-label={formatMessage({ id: "message.forwardedBundle.detailTitle" })}
         >
-          <header className="flex h-12 shrink-0 items-center gap-2 border-b-2 border-black px-3">
-            <Button type="button" shape="icon" tone="white" onClick={onBack} aria-label={formatMessage({ id: "message.forwardedBundle.backToConversation" })}>
-              <ArrowLeft size={16} />
-            </Button>
-            <h1 className="text-sm font-bold">{formatMessage({ id: "message.forwardedBundle.detailTitle" })}</h1>
-          </header>
+          {/* The phone NavBar is raft-ui's panel head (Back 3px from the
+              edge, mirroring the last action). */}
+          <PanelHeader render={<header />}>
+            <PanelAction onClick={onBack} aria-label={formatMessage({ id: "message.forwardedBundle.backToConversation" })}>
+              <ArrowLeft />
+            </PanelAction>
+            <h1 className="min-w-0 truncate text-headline text-foreground">{formatMessage({ id: "message.forwardedBundle.detailTitle" })}</h1>
+          </PanelHeader>
           <main className="min-h-0 flex-1 overflow-y-auto p-3">
             <ForwardedBundleCard
               metadata={metadata}

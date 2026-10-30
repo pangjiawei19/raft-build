@@ -30,8 +30,12 @@ test.describe("search rail re-click — no flicker loop (#393)", () => {
     const login = await loginViaApi(request, seedState);
     await dismissOwnerOnboarding(request, seedState, login.accessToken);
 
+    // #393 is a FULL-PAGE search regression. Since task #143 a desktop-width rail
+    // click from a channel opens the ⌘K overlay instead (whose backdrop also
+    // covers the rail), so start on the full page the way a fresh /search link
+    // lands — nothing to float over → full page — and re-click from there.
     await page.setViewportSize({ width: 1280, height: 800 });
-    await page.goto(`/s/${seedState.server.slug}/channel/${seedState.channel.id}`);
+    await page.goto(`/s/${seedState.server.slug}/search`);
     await page.waitForLoadState("networkidle");
 
     // Patch history.{push,replace}State to count navigations from inside the
@@ -52,19 +56,20 @@ test.describe("search rail re-click — no flicker loop (#393)", () => {
       };
     });
 
-    // Step 1: open search via the rail.
-    await page.locator('[data-testid="left-rail-tab-search"]').click();
-    await page.waitForURL(/\/search$/, { timeout: 5_000 });
+    // Step 1: the full-page search is open (no overlay).
+    await expect(page.getByTestId("desktop-search-overlay")).toHaveCount(0);
 
     // Step 2: type a query and let it commit to the URL.
-    const input = page.locator('input[placeholder*="Search" i]').first();
+    const input = page.getByTestId("message-search-input");
     await input.fill("googl");
     await page.waitForURL(/\/search\?q=googl$/, { timeout: 5_000 });
 
-    // Step 3: snapshot nav count, then click rail Search a SECOND time.
+    // Step 3: snapshot nav count, then click the Search entry a SECOND time.
+    // The entry moved from the rail to the top bar (task #753); it runs the
+    // same code path the rail tab did.
     // Pre-fix: this kicks off the symmetric Effect-A ↔ Effect-B oscillation.
     const before = await page.evaluate(() => (window as unknown as { __navCount: number }).__navCount);
-    await page.locator('[data-testid="left-rail-tab-search"]').click();
+    await page.locator('[data-testid="app-top-bar-search"]').click();
 
     // Wait 1 full second of wall-clock — the pre-fix bug fires hundreds of
     // history mutations in this window. Post-fix, exactly 1 is expected

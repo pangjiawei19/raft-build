@@ -1,7 +1,8 @@
 import { Router, type NextFunction, type Request, type Response, type Router as RouterType } from "express";
+import { UUID_RE } from "../lib/messageId";
 import {
   createAttachmentPreviewBridgeTransform,
-} from "../services/attachmentPreviewBridge.js";
+} from "../services/attachmentPreviewBridge";
 import jwt from "jsonwebtoken";
 import multer from "multer";
 import fs from "node:fs";
@@ -11,42 +12,46 @@ import { eq, inArray, and, isNull, isNotNull } from "drizzle-orm";
 import {
   FREE_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
   PRO_SINGLE_FILE_UPLOAD_LIMIT_BYTES,
+  type AttachmentPreviewResponse,
 } from "@botiverse/raft-shared";
-import { getDb } from "../db/index.js";
-import { attachments, messages } from "../db/schema.js";
-import * as channelService from "../services/channelService.js";
-import * as userService from "../services/userService.js";
-import * as attachmentCommentService from "../services/attachmentCommentService.js";
-import { parseStructuredMentions } from "./messages.js";
-import { isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService.js";
-import type { AgentOrchestrator } from "../services/agentOrchestrator.js";
-import { buildAttachmentPreviewResponse } from "../services/attachmentPreviews/registry.js";
-import { getStorage, getCdnStorage, isStorageTimeoutError } from "../services/storageService.js";
+import { getDb } from "../db/index";
+import { attachments, messages } from "../db/schema";
+import * as channelService from "../services/channelService";
+import * as userService from "../services/userService";
+import * as attachmentCommentService from "../services/attachmentCommentService";
+import { parseStructuredMentions } from "./messages";
+import { isChannelReadOnlyByBillingFeature, isChannelReadOnlyByQuota } from "../services/planService";
+import type { AgentOrchestrator } from "../services/agentOrchestrator";
+import { getAttachmentPreviewProvider } from "../services/attachmentPreviews/registry";
+import { getAttachmentPreviewWithCache, type AttachmentPreviewCacheOutcome } from "../services/attachmentPreviews/previewCache";
+import { withTraceChildSpan } from "../tracing/semanticTrace";
+import { getStorage, getCdnStorage, isStorageNotFoundError, isStorageTimeoutError, resolvePublicAssetUrl } from "../services/storageService";
 import {
   streamStorageResponse,
   streamStorageResponseThrough,
-} from "../services/storageResponseStream.js";
+} from "../services/storageResponseStream";
 import {
   FileUploadQuotaExceededError,
   buildFileUploadQuotaExceededResponse,
   getFileUploadQuotaSummary,
-} from "../services/fileUploadQuotaService.js";
-import { getWebFrameAncestorOrigins } from "../config/appUrl.js";
+} from "../services/fileUploadQuotaService";
+import { getWebFrameAncestorOrigins } from "../config/appUrl";
 import {
   getAttachmentsForMessagesWithExecutor,
-} from "../services/attachmentLinkingService.js";
+} from "../services/attachmentLinkingService";
 import {
   getAttachmentFileSizeLimitBytes,
   getLegacyAttachmentFileSizeLimitBytes,
-} from "../services/attachmentUploadPolicy.js";
-import { resolveReadableAttachmentAuthorityContext } from "../services/attachmentAuthorityService.js";
-import { uploadAttachmentBuffers } from "../services/attachmentUploadWriterService.js";
-import { buildSvgRasterTransferKey } from "../services/attachmentTransferIntentService.js";
+} from "../services/attachmentUploadPolicy";
+import { resolveReadableAttachmentAuthorityContext } from "../services/attachmentAuthorityService";
+import { uploadAttachmentBuffers } from "../services/attachmentUploadWriterService";
+import { buildSvgRasterTransferKey } from "../services/attachmentTransferIntentService";
+import { sendJsonServerError } from "./errorResponse";
 
 export {
   getAttachmentFileSizeLimitBytes,
   getLegacyAttachmentFileSizeLimitBytes,
-} from "../services/attachmentUploadPolicy.js";
+} from "../services/attachmentUploadPolicy";
 
 const THUMBNAIL_MAX_WIDTH = 320;
 const THUMBNAIL_QUALITY = 75;
@@ -57,6 +62,13 @@ const SVG_RASTER_MAX_PIXELS = 4096 * 4096;
 const HEIC_DECODE_MAX_PIXELS = 64 * 1024 * 1024;
 const HTML_PREVIEW_TOKEN_TTL_SECONDS = 300;
 export const ATTACHMENT_PRESIGNED_URL_TTL_SECONDS = 300;
+// Inline video/audio previews use the presigned URL as a long-lived
+// <video>/<audio> src: the browser keeps sending range requests to it for as
+// long as the page is open, and an expired link surfaces as a broken preview
+// (bug-triage task #14). Only those get the longer window; downloads and every
+// other type keep the 5-minute TTL. Access is still checked when the link is
+// issued (`GET /:id/url`), so this widens the window, not who can view.
+export const ATTACHMENT_MEDIA_PREVIEW_PRESIGNED_URL_TTL_SECONDS = 3600;
 
 interface HtmlPreviewTokenClaims {
   sub: string;
@@ -73,12 +85,9 @@ function jwtSecret() {
   return secret;
 }
 
-/** Build a CDN URL for a thumbnail key, or null if CDN not configured */
+/** Build the public URL for a thumbnail key from its generation, or null if unavailable */
 export function getThumbnailUrl(thumbnailKey: string | null): string | null {
-  if (!thumbnailKey) return null;
-  const cdnBase = process.env.CDN_BASE_URL;
-  if (!cdnBase) return null;
-  return `${cdnBase.replace(/\/$/, "")}/${thumbnailKey}`;
+  return resolvePublicAssetUrl(thumbnailKey);
 }
 
 interface HeicDecodableImage {
@@ -148,6 +157,10 @@ export async function generateSvgRasterPreview(buffer: Buffer): Promise<Buffer> 
 }
 
 export const attachmentRouter: RouterType = Router();
+
+// NOTE: deliberately NOT covered by guardUuidPathParams — these routes keep
+// their deliberate 400 {code:"invalid_attachment_id"} contract
+// (rejectMalformedAttachmentId), not the generic 404 (task #12).
 
 // Public router — serves files by UUID (no auth required, UUIDs are unguessable)
 export const attachmentPublicRouter: RouterType = Router();
@@ -313,7 +326,7 @@ async function getRequestAttachmentTooLargeResponse(req: Request): Promise<Retur
 }
 
 
-function isPreviewableImageMimeType(mimeType: string | null | undefined): boolean {
+export function isPreviewableImageMimeType(mimeType: string | null | undefined): boolean {
   return !!mimeType && PREVIEWABLE_IMAGE_MIME_TYPES.has(mimeType);
 }
 
@@ -336,9 +349,7 @@ export function buildSvgRasterPreviewKey(thumbnailKey: string): string {
 
 function getSvgRasterPreviewUrl(thumbnailKey: string | null, mimeType: string | null | undefined): string | null {
   if (!thumbnailKey || !isSvgAttachmentMimeType(mimeType)) return null;
-  const cdnBase = process.env.CDN_BASE_URL;
-  if (!cdnBase) return null;
-  return `${cdnBase.replace(/\/$/, "")}/${buildSvgRasterPreviewKey(thumbnailKey)}`;
+  return resolvePublicAssetUrl(buildSvgRasterPreviewKey(thumbnailKey));
 }
 
 export function isHtmlAttachmentMimeType(mimeType: string | null | undefined): boolean {
@@ -520,6 +531,14 @@ function shouldUseDownloadDisposition(req: Request): boolean {
   return req.query.disposition === "attachment" || req.query.download === "1";
 }
 
+function attachmentUrlTtlSecondsForRequest(req: Request, filename: string, mimeType: string | null | undefined): number {
+  if (shouldUseDownloadDisposition(req) || req.query.disposition !== "inline") return ATTACHMENT_PRESIGNED_URL_TTL_SECONDS;
+  const resolvedMimeType = resolveAttachmentMimeType(filename, mimeType);
+  return isVideoPreviewAttachmentMimeType(resolvedMimeType) || isAudioPreviewAttachmentMimeType(resolvedMimeType)
+    ? ATTACHMENT_MEDIA_PREVIEW_PRESIGNED_URL_TTL_SECONDS
+    : ATTACHMENT_PRESIGNED_URL_TTL_SECONDS;
+}
+
 export function shouldStreamAttachmentThroughServerForRequest(
   req: Pick<Request, "query">,
 ): boolean {
@@ -581,19 +600,41 @@ export function parseAttachmentByteRange(rangeHeader: string | string[] | undefi
   return { start, end: Math.min(end, size - 1), size };
 }
 
-function getHtmlPreviewFrameAncestorOrigins(raw = process.env.CORS_ORIGIN): string[] {
-  return getWebFrameAncestorOrigins(raw);
+// The Raft Desktop shell embeds attachment previews from its custom-scheme page
+// origin (app://raft). getWebFrameAncestorOrigins keeps only http(s) web
+// origins, so that desktop origin is filtered out and a preview response's
+// `frame-ancestors` blocks the app://raft parent (ERR_BLOCKED_BY_RESPONSE)
+// even after the desktop page CSP allows the frame.
+const DESKTOP_APP_FRAME_ANCESTOR = "app://raft";
+
+// Frame ancestors for BOTH framed preview responses: the configured web origins
+// (CORS_ORIGIN + app URL, http(s)) plus the desktop shell. #7977 added the
+// desktop origin to the interactive HTML preview only; the API-served inline
+// preview (local-storage fallback / protected proxy, e.g. the PDF viewer frame)
+// kept a web-only list, which blocked the desktop shell (ERR_BLOCKED_BY_RESPONSE)
+// on self-hosted / local-storage deployments. The desktop shell is a supported
+// embedding origin for every attachment preview, so it is admitted here
+// explicitly. This widens the ancestor allowlist by exactly that one origin
+// (an origin identifier, not an application identity); attachment ACL / token
+// checks still run before the stream, and every other origin stays refused.
+// CORS and the web-side frame policy are untouched.
+function getPreviewFrameAncestorOrigins(raw = process.env.CORS_ORIGIN): string[] {
+  return [...getWebFrameAncestorOrigins(raw), DESKTOP_APP_FRAME_ANCESTOR];
 }
 
-export function buildAttachmentInlinePreviewContentSecurityPolicy(frameAncestorOrigins = getHtmlPreviewFrameAncestorOrigins()): string {
+export function buildAttachmentInlinePreviewContentSecurityPolicy(frameAncestorOrigins = getPreviewFrameAncestorOrigins()): string {
   const frameAncestors = ["'self'", ...frameAncestorOrigins].join(" ");
   return `frame-ancestors ${frameAncestors}`;
 }
 
-export function buildHtmlPreviewContentSecurityPolicy(frameAncestorOrigins = getHtmlPreviewFrameAncestorOrigins()): string {
+export function buildHtmlPreviewContentSecurityPolicy(frameAncestorOrigins = getPreviewFrameAncestorOrigins()): string {
   const frameAncestors = ["'self'", ...frameAncestorOrigins].join(" ");
   return [
     "default-src 'none'",
+    // Opaque origin even when the preview URL is opened directly (not only
+    // inside the web app's sandboxed iframe): hostile HTML must never run as
+    // the API origin, where same-origin deployments keep credentials.
+    "sandbox allow-scripts",
     // Treat every HTML attachment as hostile, whether it came from a human or
     // an agent. v0 intentionally allows HTTPS subresources for Mermaid/charts;
     // the security contract is that a leaked previewToken only replays this
@@ -739,6 +780,7 @@ async function resolveReadableAttachmentForRequest(
   if (!context) return null;
   return {
     ...context.projection,
+    channelId: context.localHostChannel.id,
     uploaderId: context.object.uploaderId,
     uploaderType: context.object.uploaderType,
     mimeType: context.object.mimeType,
@@ -881,7 +923,7 @@ attachmentRouter.post(
         return;
       }
       if (await isChannelReadOnlyByBillingFeature(channelId, req.serverId!)) {
-        res.status(403).json({ error: "Joint Channels require the Pro plan. Upgrade to continue." });
+        res.status(403).json({ error: "This joint channel is read-only because it has more than 2 free servers. It becomes writable again when a server upgrades or a free server leaves." });
         return;
       }
 
@@ -970,8 +1012,7 @@ attachmentRouter.get("/comments/counts", async (req, res) => {
     const counts = await attachmentCommentService.getAttachmentCommentCounts(accessible);
     res.json({ counts });
   } catch (err) {
-    console.error("Comment counts error:", err);
-    res.status(500).json({ error: "Failed to load comment counts" });
+    sendJsonServerError(req, res, { error: "Failed to load comment counts", logPrefix: "Comment counts error:", err });
   }
 });
 
@@ -1020,8 +1061,7 @@ attachmentRouter.get("/:id/comments", async (req, res) => {
             : { canComment: false, reason: "not_member" as const };
     res.json({ ...result, viewer });
   } catch (err) {
-    console.error("Comment list error:", err);
-    res.status(500).json({ error: "Failed to load comments" });
+    sendJsonServerError(req, res, { error: "Failed to load comments", logPrefix: "Comment list error:", err });
   }
 });
 
@@ -1094,15 +1134,14 @@ attachmentRouter.post("/:id/comments", async (req, res) => {
       res.status(err.status).json({ error: err.message, code: err.code });
       return;
     }
-    console.error("Comment create error:", err);
-    res.status(500).json({ error: "Failed to create comment" });
+    sendJsonServerError(req, res, { error: "Failed to create comment", logPrefix: "Comment create error:", err });
   }
 });
 
 // Return a short-lived presigned URL for an attachment (JSON, no redirect).
 // Used by the frontend to download attachments without putting JWTs in query strings.
 const MAX_ATTACHMENT_URL_BATCH = 50;
-const ATTACHMENT_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const ATTACHMENT_UUID_RE = UUID_RE;
 
 /**
  * Reject a malformed `:id` before it reaches a `uuid` column.
@@ -1188,14 +1227,12 @@ attachmentPublicRouter.post("/urls", async (req, res) => {
 
     res.json({ urls: results.filter((r): r is NonNullable<typeof r> => r !== null) });
   } catch (err) {
-    console.error("Batch attachment URL resolution failed:", err);
-    res.status(500).json({ error: "Failed to resolve attachment urls" });
+    sendJsonServerError(req, res, { error: "Failed to resolve attachment urls", logPrefix: "Batch attachment URL resolution failed:", err });
   }
 });
 
 attachmentPublicRouter.get("/:id/url", async (req, res) => {
   if (rejectMalformedAttachmentId(req, res)) return;
-  let attachmentForLog: typeof attachments.$inferSelect | null = null;
   try {
     const db = getDb();
     const [projection] = await db
@@ -1203,7 +1240,6 @@ attachmentPublicRouter.get("/:id/url", async (req, res) => {
       .from(attachments)
       .where(eq(attachments.id, req.params.id as string))
       .limit(1);
-    attachmentForLog = projection ?? null;
 
     if (!projection) {
       res.status(404).json({ error: "Attachment not found" });
@@ -1222,7 +1258,7 @@ attachmentPublicRouter.get("/:id/url", async (req, res) => {
     }
 
     if (storage.getPresignedUrl && !shouldStreamAttachmentThroughServerForRequest(req)) {
-      const expiresIn = ATTACHMENT_PRESIGNED_URL_TTL_SECONDS;
+      const expiresIn = attachmentUrlTtlSecondsForRequest(req, attachment.filename, attachment.mimeType);
       const url = await storage.getPresignedUrl(attachment.storageKey, {
         expiresIn,
         responseContentDisposition: buildAttachmentContentDispositionForRequest(req, attachment.filename, attachment.mimeType),
@@ -1262,14 +1298,26 @@ attachmentPublicRouter.get("/:id/url", async (req, res) => {
     }
     res.json({ url: url.toString(), expiresAt: null });
   } catch (err) {
-    logAttachmentAccessError("url", req.params.id, err, attachmentForLog);
-    res.status(500).json({ error: "Failed to get attachment URL" });
+    sendJsonServerError(req, res, { error: "Failed to get attachment URL", logPrefix: "[Attachments] Failed to url attachment", err });
   }
 });
 
+/** Coarse source-size class for preview traces: no ids, names or exact sizes. */
+function attachmentPreviewSizeBucket(sizeBytes: number): string {
+  if (sizeBytes < 100 * 1024) return "<100KB";
+  if (sizeBytes < 1024 * 1024) return "100KB-1MB";
+  if (sizeBytes <= 10 * 1024 * 1024) return "1-10MB";
+  return ">10MB";
+}
+
+/** generated / cache_hit / capped (over a size limit) / unsupported. */
+function attachmentPreviewTraceOutcome(response: AttachmentPreviewResponse, cache: AttachmentPreviewCacheOutcome): string {
+  if (response.status === "unsupported") return response.reason === "too_large" ? "capped" : "unsupported";
+  return cache === "hit" || cache === "shared" ? "cache_hit" : "generated";
+}
+
 attachmentPublicRouter.get("/:id/preview", async (req, res) => {
   if (rejectMalformedAttachmentId(req, res)) return;
-  let attachmentForLog: typeof attachments.$inferSelect | null = null;
   try {
     const db = getDb();
     const [projection] = await db
@@ -1277,7 +1325,6 @@ attachmentPublicRouter.get("/:id/preview", async (req, res) => {
       .from(attachments)
       .where(eq(attachments.id, req.params.id as string))
       .limit(1);
-    attachmentForLog = projection ?? null;
 
     if (!projection) {
       res.status(404).json({ error: "Attachment not found" });
@@ -1290,10 +1337,32 @@ attachmentPublicRouter.get("/:id/preview", async (req, res) => {
     }
 
     res.setHeader("Cache-Control", "private, no-store");
-    res.json(await buildAttachmentPreviewResponse(attachment));
+    // Access is checked above; the cache below only saves CPU (task #19).
+    const previewKind = getAttachmentPreviewProvider(attachment)?.kind ?? "unsupported";
+    const result = await withTraceChildSpan(
+      "server.attachment_preview.build",
+      { surface: "server", kind: "internal", attrs: { preview_kind: previewKind, size_bucket: attachmentPreviewSizeBucket(attachment.sizeBytes) } },
+      () => getAttachmentPreviewWithCache(attachment),
+      {
+        onSuccess: (built) => ({
+          outcome: attachmentPreviewTraceOutcome(built.response, built.cache),
+          cache: built.cache,
+          ...(built.computeMs === null ? {} : { compute_ms: built.computeMs }),
+          ...(built.fetchMs === undefined ? {} : { fetch_ms: built.fetchMs }),
+          ...(built.parseMs === undefined ? {} : { parse_ms: built.parseMs }),
+        }),
+      },
+    );
+    res.json(result.response);
   } catch (err) {
-    logAttachmentAccessError("preview", req.params.id, err, attachmentForLog);
-    res.status(500).json({ error: "Failed to build attachment preview" });
+    // A missing storage object is a 404, not a server fault: the attachment
+    // row outlived its object (lifecycle sweep, manual bucket edit, staging
+    // residue). Mirrors the "Attachment not found" branches above.
+    if (isStorageNotFoundError(err)) {
+      res.status(404).json({ error: "Attachment not found" });
+      return;
+    }
+    sendJsonServerError(req, res, { error: "Failed to build attachment preview", logPrefix: "[Attachments] Failed to preview attachment", err });
   }
 });
 
@@ -1305,7 +1374,6 @@ attachmentPublicRouter.get("/:id/preview", async (req, res) => {
 // endpoint keeps ACL checks and preview-only security headers server-side.
 attachmentPublicRouter.get("/:id/html-preview-url", async (req, res) => {
   if (rejectMalformedAttachmentId(req, res)) return;
-  let attachmentForLog: typeof attachments.$inferSelect | null = null;
   try {
     const db = getDb();
     const [projection] = await db
@@ -1313,7 +1381,6 @@ attachmentPublicRouter.get("/:id/html-preview-url", async (req, res) => {
       .from(attachments)
       .where(eq(attachments.id, req.params.id as string))
       .limit(1);
-    attachmentForLog = projection ?? null;
 
     if (!projection) {
       res.status(404).json({ error: "Attachment not found" });
@@ -1333,8 +1400,7 @@ attachmentPublicRouter.get("/:id/html-preview-url", async (req, res) => {
     const { url, expiresAt } = buildHtmlPreviewUrl(req, attachment);
     res.json({ url: url.toString(), expiresAt });
   } catch (err) {
-    logAttachmentAccessError("url", req.params.id, err, attachmentForLog);
-    res.status(500).json({ error: "Failed to get HTML preview URL" });
+    sendJsonServerError(req, res, { error: "Failed to get HTML preview URL", logPrefix: "[Attachments] Failed to url attachment", err });
   }
 });
 
@@ -1432,6 +1498,10 @@ attachmentPublicRouter.get("/:id/html-preview", async (req, res) => {
       logAttachmentAccessError("serve", req.params.id, err, attachmentForLog);
     }
     if (res.destroyed || res.headersSent) return;
+    if (isStorageNotFoundError(err)) {
+      res.status(404).json({ error: "Attachment not found" });
+      return;
+    }
     res.status(500).json({ error: "Failed to serve HTML preview" });
   }
 });
@@ -1523,6 +1593,10 @@ attachmentPublicRouter.get("/:id", async (req, res) => {
   } catch (err) {
     if (res.destroyed || res.headersSent) return;
     logAttachmentAccessError("serve", req.params.id, err, attachmentForLog);
+    if (isStorageNotFoundError(err)) {
+      res.status(404).json({ error: "Attachment not found" });
+      return;
+    }
     res.status(500).json({ error: "Failed to serve attachment" });
   }
 });

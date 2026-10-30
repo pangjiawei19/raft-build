@@ -1,15 +1,17 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Button, Card, PreviewCard, PreviewCardContent, PreviewCardTrigger, ListRow, ListRowGroup, ListRowIcon, ListRowMeta, ListRowTitle } from "@botiverse/raft-ui";
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { useIntl } from "react-intl";
 import { select } from "d3-selection";
 import { zoom, zoomIdentity } from "d3-zoom";
 import type { ZoomTransform } from "d3-zoom";
 import { GitBranch, Hash, RefreshCw } from "lucide-react";
-import { PreviewCard, PreviewCardContent, PreviewCardTrigger } from "raft-ui";
 import { useServerStore } from "../../store/serverStore";
 import api from "../../api/client";
 import AvatarSlot from "../ui/AvatarSlot";
 import Banner from "../ui/Banner";
+import EmptyState from "../ui/EmptyState";
+import SectionEyebrow from "../ui/SectionEyebrow";
 import SectionHeader from "../ui/SectionHeader";
 import ProfilePreviewCardContent from "../message/ProfilePreviewCardContent";
 
@@ -68,6 +70,8 @@ type GraphResponse = {
   edges: GraphEdge[];
 };
 
+const EMPTY_GRAPH: GraphResponse = { humans: [], agents: [], channels: [], edges: [] };
+
 type Point = { x: number; y: number };
 type GraphViewBox = { x: number; y: number; width: number; height: number };
 type GraphDimensions = { width: number; height: number };
@@ -79,7 +83,8 @@ const CENTER: Point = { x: VIEWBOX_WIDTH / 2, y: VIEWBOX_HEIGHT / 2 };
 const GRAPH_PADDING = 58;
 const DEFAULT_GRAPH_VIEWBOX: GraphViewBox = { x: 0, y: 0, width: VIEWBOX_WIDTH, height: VIEWBOX_HEIGHT };
 const MAX_GRAPH_ZOOM = 4;
-const GRAPH_NODE_SIZE = 36;
+// DS Avatar md (8n + 2×1.5px edge): the same square sticker every member list uses.
+const GRAPH_NODE_SIZE = 35;
 
 function displayName(member: GraphMember): string {
   return member.displayName || member.name;
@@ -112,7 +117,7 @@ function MemberAvatar({ member, compact = false }: { member: GraphMember; compac
   if (member.type === "agent") {
     return (
       <AvatarSlot
-        context={compact ? "compact-list" : "surface-list"}
+        context={compact ? "compact-row" : "list-row"}
         type="agent"
         agentAvatarUrl={member.avatarUrl}
       />
@@ -121,7 +126,7 @@ function MemberAvatar({ member, compact = false }: { member: GraphMember; compac
 
   return (
     <AvatarSlot
-      context={compact ? "compact-list" : "surface-list"}
+      context={compact ? "compact-row" : "list-row"}
       type="human"
       humanAvatarUrl={member.avatarUrl}
       gravatarHash={member.gravatarHash}
@@ -160,44 +165,28 @@ function GraphMemberNode({
             <button
               type="button"
               aria-label={label}
-              className="relative block cursor-default border-0 bg-transparent p-0 text-left"
+              className="relative block cursor-default rounded-sticker border-0 bg-transparent p-0 text-left outline-none focus-visible:shadow-focus"
             >
-              <div
-                className="relative overflow-hidden rounded-full border-black"
-                style={{
-                  width: GRAPH_NODE_SIZE,
-                  height: GRAPH_NODE_SIZE,
-                  borderWidth: 1,
-                  backgroundColor:
-                    member.type === "agent"
-                      ? "var(--color-brutal-cyan)"
-                      : "var(--color-brutal-lavender)",
-                  boxSizing: "border-box",
-                }}
-              >
-                <div className="absolute inset-0 overflow-hidden rounded-full">
-                  {member.type === "agent" ? (
-                    <AvatarSlot
-                      context="panel-header"
-                      type="agent"
-                      agentAvatarUrl={member.avatarUrl}
-                      className="!h-full !w-full !border-0 rounded-full"
-                    />
-                  ) : (
-                    <AvatarSlot
-                      context="panel-header"
-                      type="human"
-                      humanAvatarUrl={member.avatarUrl}
-                      gravatarHash={member.gravatarHash}
-                      humanPlaceholder={!member.avatarUrl && !member.gravatarHash}
-                      className="!h-full !w-full !border-0 rounded-full"
-                    />
-                  )}
-                </div>
-              </div>
+              <span className="relative block" style={{ width: GRAPH_NODE_SIZE, height: GRAPH_NODE_SIZE }}>
+                {member.type === "agent" ? (
+                  <AvatarSlot
+                    context="panel-header"
+                    type="agent"
+                    agentAvatarUrl={member.avatarUrl}
+                  />
+                ) : (
+                  <AvatarSlot
+                    context="panel-header"
+                    type="human"
+                    humanAvatarUrl={member.avatarUrl}
+                    gravatarHash={member.gravatarHash}
+                    humanPlaceholder={!member.avatarUrl && !member.gravatarHash}
+                  />
+                )}
+              </span>
               <div
                 className={[
-                  "pointer-events-none absolute whitespace-nowrap text-[12px] font-bold text-black",
+                  "pointer-events-none absolute whitespace-nowrap text-caption font-semibold text-foreground",
                   dense
                     ? member.type === "agent"
                       ? "right-full top-1/2 -translate-y-1/2 pr-2 text-right"
@@ -206,7 +195,7 @@ function GraphMemberNode({
                 ].join(" ")}
               >
                 <div>{shortLabel(label, dense ? 12 : 16)}</div>
-                {!dense && <div className="font-mono text-[10px] text-black/55">{formatMessage({ id: "settings.memberGraph.nodeLinks" }, { count: degree })}</div>}
+                {!dense && <div className="font-mono text-mono-meta font-normal text-foreground-hint">{formatMessage({ id: "settings.memberGraph.nodeLinks" }, { count: degree })}</div>}
               </div>
             </button>
           }
@@ -566,16 +555,22 @@ function MemberGraphCanvas({ data }: { data: GraphResponse }) {
     };
   }, [dimensions.height, dimensions.width, transform]);
 
-  const screenPosition = (point: Point) => ({
-    left: transform.x + (point.x / VIEWBOX_WIDTH) * dimensions.width * transform.k,
-    top: transform.y + (point.y / VIEWBOX_HEIGHT) * dimensions.height * transform.k,
-  });
+  const screenPosition = useCallback(
+    (point: Point) => ({
+      left: transform.x + (point.x / VIEWBOX_WIDTH) * dimensions.width * transform.k,
+      top: transform.y + (point.y / VIEWBOX_HEIGHT) * dimensions.height * transform.k,
+    }),
+    [dimensions.height, dimensions.width, transform],
+  );
 
   if (members.length === 0 && channels.length === 0) {
     return (
-      <div className="flex min-h-[320px] items-center justify-center border-2 border-dashed border-black/30 bg-white text-sm font-bold text-black/40">
-        {formatMessage({ id: "settings.memberGraph.emptyState" })}
-      </div>
+      <Card className="min-h-[320px] flex-row items-center justify-center">
+        <EmptyState
+          icon={<GitBranch size={36} />}
+          title={formatMessage({ id: "settings.memberGraph.emptyState" })}
+        />
+      </Card>
     );
   }
 
@@ -587,7 +582,7 @@ function MemberGraphCanvas({ data }: { data: GraphResponse }) {
         role="img"
         aria-label={formatMessage({ id: "settings.memberGraph.graphAriaLabel" })}
       >
-        <rect x="0" y="0" width={VIEWBOX_WIDTH} height={VIEWBOX_HEIGHT} fill="#f8f8f0" />
+        <rect x="0" y="0" width={VIEWBOX_WIDTH} height={VIEWBOX_HEIGHT} className="fill-layer-card" />
         <g opacity={dense ? "0.16" : "0.34"}>
           {memberLinks.map((link) => {
             const from = positions.get(link.source);
@@ -598,7 +593,7 @@ function MemberGraphCanvas({ data }: { data: GraphResponse }) {
                 key={`${link.source}:${link.target}`}
                 d={edgePath(from, to, dense)}
                 fill="none"
-                stroke="#111"
+                stroke="var(--line-strong)"
                 strokeWidth={dense ? Math.min(1.8, 0.55 + link.weight * 0.2) : Math.min(3, 1.1 + link.weight * 0.35)}
                 vectorEffect="non-scaling-stroke"
               />
@@ -610,9 +605,9 @@ function MemberGraphCanvas({ data }: { data: GraphResponse }) {
   };
 
   return (
-    <div
+    <Card
       ref={graphRef}
-      className="relative touch-none select-none overflow-hidden border-2 border-black bg-[#f8f8f0] shadow-brutal-sm cursor-grab active:cursor-grabbing"
+      className="relative cursor-grab touch-none select-none active:cursor-grabbing"
     >
       {renderGraphSvg()}
       <div className="pointer-events-none absolute inset-0">
@@ -633,15 +628,28 @@ function MemberGraphCanvas({ data }: { data: GraphResponse }) {
           );
         })}
       </div>
-    </div>
+    </Card>
   );
 }
 
+// DS ListRow inside an inset list (rf-section title + rf-list--inset): the top
+// members / channels as raft-ui display-only `plain` rows (the hairline from
+// the row's 16px edge) with a gray mono count (rf-count).
 function RankedList({ title, children }: { title: string; children: ReactNode }) {
   return (
-    <div className="border-2 border-black bg-white p-3 shadow-brutal-sm">
-      <div className="mb-2 text-xs font-black uppercase tracking-normal text-black">{title}</div>
-      {children}
+    <section className="space-y-2">
+      <SectionEyebrow as="div">{title}</SectionEyebrow>
+      <ListRowGroup>{children}</ListRowGroup>
+    </section>
+  );
+}
+
+
+function GraphStat({ value, label }: { value: number; label: string }) {
+  return (
+    <div className="min-w-0 px-2 py-3 text-center">
+      <div className="font-mono text-headline text-foreground">{value}</div>
+      <div className="mt-0.5 truncate text-caption text-foreground-hint">{label}</div>
     </div>
   );
 }
@@ -659,29 +667,30 @@ export default function MemberGraphSection({
   // omits it would silently render English in zh. Same shape as the
   // SelectionPopover primitive defaults (#5716).
   const resolvedSectionLabel = sectionLabel ?? formatMessage({ id: "settings.memberGraph.sectionLabel" });
-  const current = useServerStore((s) => s.current);
+  const currentServerId = useServerStore((s) => s.current?.id);
   const [data, setData] = useState<GraphResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const loadGraph = async () => {
-    if (!current) return;
+  const loadGraph = useCallback(async () => {
+    if (!currentServerId) return;
     setLoading(true);
     setError("");
     try {
-      const { data: next } = await api.get(`/servers/${current.id}/member-graph`);
+      const { data: next } = await api.get(`/servers/${currentServerId}/member-graph`);
       setData(next);
     } catch (err: any) {
       setError(err.response?.data?.error || formatMessage({ id: "settings.memberGraph.loadFailed" }));
     } finally {
       setLoading(false);
     }
-  };
+  }, [currentServerId, formatMessage]);
 
+  // Load once per active server; a locale switch only re-renders, it does not refetch.
+  const loadGraphForServer = useEffectEvent(loadGraph);
   useEffect(() => {
-    void loadGraph();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [current?.id]);
+    void loadGraphForServer();
+  }, [currentServerId]);
 
   const members = useMemo<GraphMember[]>(
     () => data ? [...data.humans, ...data.agents] : [],
@@ -710,73 +719,60 @@ export default function MemberGraphSection({
             count={data ? data.humans.length + data.agents.length : undefined}
           />
         )}
-        <button
+        <Button
+          variant="outline"
+          size="sm"
           type="button"
           onClick={loadGraph}
           disabled={loading}
-          className="btn-brutal-sm flex w-fit items-center gap-1.5 bg-white px-2.5 py-1.5 text-xs disabled:opacity-50"
+          className="w-fit"
         >
-          <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
+          <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
           {formatMessage({ id: "settings.memberGraph.refresh" })}
-        </button>
+        </Button>
       </div>
 
-      {error && <Banner intent="warning" density="sm" className="font-bold">{error}</Banner>}
+      {error && <Banner intent="warning" density="sm">{error}</Banner>}
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_280px]">
-        <MemberGraphCanvas data={data ?? { humans: [], agents: [], channels: [], edges: [] }} />
+        <MemberGraphCanvas data={data ?? EMPTY_GRAPH} />
 
         <div className="space-y-3">
-          <div className="grid grid-cols-3 gap-2">
-            <div className="border-2 border-black bg-white p-2 text-center shadow-brutal-sm">
-              <div className="text-lg font-black">{data?.humans.length ?? 0}</div>
-              <div className="text-[10px] font-bold uppercase text-black/55">{formatMessage({ id: "settings.memberGraph.humans" })}</div>
-            </div>
-            <div className="border-2 border-black bg-white p-2 text-center shadow-brutal-sm">
-              <div className="text-lg font-black">{data?.agents.length ?? 0}</div>
-              <div className="text-[10px] font-bold uppercase text-black/55">{formatMessage({ id: "settings.memberGraph.agents" })}</div>
-            </div>
-            <div className="border-2 border-black bg-white p-2 text-center shadow-brutal-sm">
-              <div className="text-lg font-black">{memberLinks.length}</div>
-              <div className="text-[10px] font-bold uppercase text-black/55">{formatMessage({ id: "settings.memberGraph.links" })}</div>
-            </div>
-          </div>
+          <Card className="grid grid-cols-3 divide-x divide-line-hairline">
+            <GraphStat value={data?.humans.length ?? 0} label={formatMessage({ id: "settings.memberGraph.humans" })} />
+            <GraphStat value={data?.agents.length ?? 0} label={formatMessage({ id: "settings.memberGraph.agents" })} />
+            <GraphStat value={memberLinks.length} label={formatMessage({ id: "settings.memberGraph.links" })} />
+          </Card>
 
           <RankedList title={formatMessage({ id: "settings.memberGraph.mostConnectedTitle" })}>
             {rankedMembers.length > 0 ? (
-              <div className="space-y-2">
-                {rankedMembers.map((member) => (
-                  <div key={memberKey(member)} className="flex items-center justify-between gap-2 text-xs">
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      <MemberAvatar member={member} compact />
-                      <span className="truncate font-bold">{displayName(member)}</span>
-                    </div>
-                    <span className="shrink-0 font-mono text-black/55">{memberLinkDegrees.get(memberKey(member)) ?? 0}</span>
-                  </div>
-                ))}
-              </div>
+              rankedMembers.map((member) => (
+                <ListRow key={memberKey(member)} variant="plain" interactive={false}>
+                  <MemberAvatar member={member} compact />
+                  <ListRowTitle>{displayName(member)}</ListRowTitle>
+                  <ListRowMeta>{memberLinkDegrees.get(memberKey(member)) ?? 0}</ListRowMeta>
+                </ListRow>
+              ))
             ) : (
-              <div className="text-xs italic text-black/40">{formatMessage({ id: "settings.memberGraph.noMemberships" })}</div>
+              <div className="px-4 py-3 text-footnote text-foreground-hint">{formatMessage({ id: "settings.memberGraph.noMemberships" })}</div>
             )}
           </RankedList>
 
           <RankedList title={formatMessage({ id: "settings.memberGraph.largestChannelsTitle" })}>
             {rankedChannels.length > 0 ? (
-              <div className="space-y-2">
-                {rankedChannels.map((channel) => (
-                  <div key={channel.id} className="flex items-center justify-between gap-2 text-xs">
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      <Hash size={13} />
-                      <span className="truncate font-bold">{channel.name}</span>
-                    </div>
-                    <span className="shrink-0 font-mono text-black/55">
-                      {channel.humanCount}H/{channel.agentCount}A
-                    </span>
-                  </div>
-                ))}
-              </div>
+              rankedChannels.map((channel) => (
+                <ListRow key={channel.id} variant="plain" interactive={false}>
+                  <ListRowIcon>
+                    <Hash />
+                  </ListRowIcon>
+                  <ListRowTitle>{channel.name}</ListRowTitle>
+                  <ListRowMeta>
+                    {channel.humanCount}H/{channel.agentCount}A
+                  </ListRowMeta>
+                </ListRow>
+              ))
             ) : (
-              <div className="text-xs italic text-black/40">{formatMessage({ id: "settings.memberGraph.noVisibleChannels" })}</div>
+              <div className="px-4 py-3 text-footnote text-foreground-hint">{formatMessage({ id: "settings.memberGraph.noVisibleChannels" })}</div>
             )}
           </RankedList>
         </div>

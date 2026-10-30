@@ -8,6 +8,11 @@ import {
 type WebSocketOptions = import("ws").ClientOptions;
 
 const fetchDispatcherCache = new Map<string, Dispatcher>();
+let directFetchDispatcher: Dispatcher | undefined;
+
+// undici 8 negotiates HTTP/2 by default; undici 7 did not. Daemon fetches stay
+// on HTTP/1.1 until h2 is rolled out on its own with tracing.
+const HTTP1_ONLY = { allowH2: false } as const;
 const isolatedFetchDispatcherCache = new Map<string, Dispatcher>();
 
 // Bounded PRE-RESPONSE timeout for the proxied fetch dispatcher.
@@ -177,6 +182,10 @@ function createProxyDispatcher(
 ): Dispatcher {
   return new ProxyAgent({
     uri: proxyUrl,
+    // undici 8 forwards plain-http requests to the proxy without CONNECT
+    // unless asked; keep 7.x's tunnel-everything behavior.
+    proxyTunnel: true,
+    ...HTTP1_ONLY,
     connect: { timeout: connectTimeoutMs },
     requestTls: { timeout: connectTimeoutMs },
     headersTimeout: headersTimeoutMs,
@@ -208,6 +217,12 @@ export function buildFetchDispatcher(
   const dispatcher = createProxyDispatcher(proxyUrl, timeoutMs, timeoutMs);
   fetchDispatcherCache.set(proxyUrl, dispatcher);
   return dispatcher;
+}
+
+/** Shared HTTP/1.1 dispatcher for daemon fetches that bypass the proxy. */
+export function buildDirectFetchDispatcher(): Dispatcher {
+  directFetchDispatcher ??= new Agent(HTTP1_ONLY);
+  return directFetchDispatcher;
 }
 
 function getIsolatedDispatcherCacheKey(
@@ -255,6 +270,7 @@ export function buildIsolatedFetchDispatcher(
   const dispatcher = proxyUrl
     ? createProxyDispatcher(proxyUrl, connectTimeoutMs, effectiveHeadersTimeoutMs, effectiveBodyTimeoutMs)
     : new Agent({
+        ...HTTP1_ONLY,
         connect: { timeout: connectTimeoutMs },
         headersTimeout: effectiveHeadersTimeoutMs,
         ...(effectiveBodyTimeoutMs === undefined ? {} : { bodyTimeout: effectiveBodyTimeoutMs }),
