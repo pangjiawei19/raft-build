@@ -46,6 +46,7 @@ import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseReaderStartedAtMs, runTraceCli, traceBannerLines } from "./raftdev-trace.js";
+import { persistentSchemaHash, readPersistentEnvironment, writePersistentEnvironment } from "./raftdev-persistent.js";
 
 export const PROJECT_DIR = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 
@@ -86,7 +87,8 @@ interface Env {
   CONTAINER: string; REDIS_CONTAINER: string; RUSTFS_CONTAINER: string; OTELCOL_CONTAINER: string;
   RISINGWAVE_CONTAINER: string;
   RISINGWAVE_NETWORK: string;
-  RUSTFS_VOLUME: string; TMUX_SESSION: string; SEED_FILE: string;
+  RUSTFS_VOLUME: string; PG_VOLUME: string; REDIS_VOLUME: string;
+  PERSISTENT_CONFIG: string; TMUX_SESSION: string; SEED_FILE: string;
   SLOCKDEV_DIR: string; SLOCK_HOME: string; ACTIVITY_FILE: string; IDLE_TTL_FILE: string;
   RISINGWAVE_DSN_FILE: string; RISINGWAVE_STATE_FILE: string;
   POSTGRES_PASSWORD: string; JWT_SECRET: string;
@@ -485,6 +487,9 @@ function setupEnv(name: string): Env {
     RISINGWAVE_CONTAINER: `slock-dev-${name}-risingwave`,
     RISINGWAVE_NETWORK: `slock-dev-${name}-risingwave-net`,
     RUSTFS_VOLUME: `slock-dev-${name}-rustfs-data`,
+    PG_VOLUME: `slock-dev-${name}-pg-data`,
+    REDIS_VOLUME: `slock-dev-${name}-redis-data`,
+    PERSISTENT_CONFIG: join(SLOCKDEV_DIR, "environment.json"),
     TMUX_SESSION: `slock-${name}`,
     SEED_FILE: join(PROJECT_DIR, `.dev-env-${name}.json`),
     SLOCKDEV_DIR,
@@ -853,6 +858,64 @@ function dockerNameRunning(name: string): boolean {
   const lines = sh("docker", ["ps", "--format", "{{.Names}}"], { quiet: true }).stdout.split("\n");
   return lines.includes(name);
 }
+
+function isPersistentEnvironment(e: Env): boolean {
+  // 即使配置丢失，命名数据卷仍阻止旧的清理路径删除数据。
+  return process.env.SLOCKDEV_PERSISTENT === "1" || existsSync(e.PERSISTENT_CONFIG) ||
+    dockerVolumeExists(e.PG_VOLUME) || dockerVolumeExists(e.REDIS_VOLUME);
+}
+
+function requireCommand(cmd: string, args: string[]): void {
+  const result = sh(cmd, args, { quiet: true });
+  if (result.code !== 0) throw new Error(`${cmd} ${args[0]} 执行失败：${result.stderr.trim()}`);
+}
+
+function requirePersistentMount(container: string, volume: string, destination: string): void {
+  if (!dockerNameExists(container)) return;
+  const result = sh("docker", ["inspect", "--format", "{{json .Mounts}}", container], { quiet: true });
+  const mounts = result.code === 0 ? JSON.parse(result.stdout) as { Name?: string; Destination?: string }[] : [];
+  if (!mounts.some((mount) => mount.Name === volume && mount.Destination === destination)) {
+    throw new Error(`容器 ${container} 未使用预期持久卷 ${volume}；请使用新环境名，或明确销毁旧环境后初始化。`);
+  }
+}
+
+function acquirePersistentLock(e: Env): (() => void) | null {
+  mkdirSync(e.SLOCKDEV_DIR, { recursive: true });
+  const path = join(e.SLOCKDEV_DIR, "lifecycle.lock");
+  if (existsSync(path)) {
+    const pid = Number(readFileSync(path, "utf8"));
+    if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error("启停锁正在建立或已损坏，请稍后重试。");
+    if (pid === process.pid) return () => {};
+    let alive = true;
+    try { process.kill(pid, 0); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") alive = false;
+    }
+    if (alive) {
+      out(`环境 '${e.name}' 正在执行启停操作，本次未重复执行。`);
+      return null;
+    }
+    rmSync(path, { force: true });
+  }
+  try {
+    writeFileSync(path, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    out(`环境 '${e.name}' 正在执行启停操作，本次未重复执行。`);
+    return null;
+  }
+  const release = (): void => {
+    if (existsSync(path) && readFileSync(path, "utf8").trim() === String(process.pid)) rmSync(path);
+    process.removeListener("exit", release);
+  };
+  process.once("exit", release);
+  return release;
+}
+
+function persistentHttpReady(e: Env): boolean {
+  return [e.SERVER_PORT, e.WEB_PORT].every(portInUse) &&
+    [`http://127.0.0.1:${e.SERVER_PORT}/health`, `http://127.0.0.1:${e.WEB_PORT}/`].every((url) =>
+      sh("curl", ["--fail", "--silent", "--output", "/dev/null", "--max-time", "2", url], { quiet: true }).code === 0);
+}
 function dockerNetworkExists(name: string): boolean {
   return sh("docker", ["network", "inspect", name], { quiet: true }).code === 0;
 }
@@ -978,9 +1041,15 @@ function usageAndExit(): never {
 Usage: ./raftdev <command> [name]
 
 Commands:
-  start [name] [--description <text>] [--replicas N] [--risingwave[=full|process-only]] [--with-onboarding]
+  init [name]     初始化持久本地环境，仅创建必要账号和基础频道
+  start [name] [--persistent] [--description <text>] [--replicas N] [--risingwave[=full|process-only]] [--with-onboarding]
                   Start an isolated dev environment
-  stop [name]     Stop and clean up an environment
+                  --persistent 首次启用持久模式，以后从环境配置自动识别
+  stop [name]     持久环境仅停止服务并保留数据；临时预览环境仍执行清理
+  restart [name]  停止并重新启动环境
+  migrate [name]  为持久数据库显式执行版本化迁移，服务保持停止
+  destroy <name> --yes
+                  永久删除指定环境的容器、数据卷和本地配置
   status          Show all running environments
   seed [name] [--with-onboarding]
                   Re-run seed script; default fixture skips onboarding
@@ -993,7 +1062,7 @@ Commands:
                   Find matching local spans and span events
   trace show <trace-id> [--env <name>] [--wait <duration>] [--raw]
                   Show one local web/server/daemon trace tree
-  nuke            Stop ALL environments and remove ALL containers
+  nuke            清理临时环境；存在持久环境时拒绝执行
 
 Name defaults to the directory basename (e.g., "slock").
 Different names get different ports, so multiple environments can coexist.
@@ -1059,6 +1128,8 @@ Optional:
   User API requests refresh the timer; health checks, CORS preflight, and
   /internal daemon/background traffic do not. Set SLOCKDEV_IDLE_TTL_SECONDS=0
   to disable auto-stop for an intentionally long debugging session.
+  持久环境默认关闭自动停止，重复 start 不重置数据或机器密钥。
+  日常 start 不执行 schema push 或开发 seed；初始化和版本化迁移独立执行。
 
   If 'cloudflared' is installed (e.g. \`brew install cloudflare/cloudflare/cloudflared\`),
   \`./raftdev start\` automatically opens a public preview tunnel to the
@@ -1142,7 +1213,8 @@ function cmdStatus(): void {
   for (const entry of (existsSync(environmentsRoot)
     ? readdirSync(environmentsRoot, { withFileTypes: true })
     : [])) {
-    if (entry.isDirectory() && existsSync(join(environmentsRoot, entry.name, "risingwave-state.json"))) {
+    if (entry.isDirectory() && (existsSync(join(environmentsRoot, entry.name, "risingwave-state.json")) ||
+        existsSync(join(environmentsRoot, entry.name, "environment.json")))) {
       environmentNames.add(entry.name);
     }
   }
@@ -1157,7 +1229,7 @@ function cmdStatus(): void {
     }
   }
   for (const volumeName of volumeNames) {
-    const match = volumeName.match(/^slock-dev-(.+)-rustfs-data$/);
+    const match = volumeName.match(/^slock-dev-(.+)-(?:rustfs|pg|redis)-data$/);
     if (!match || !dockerVolumeIsRaftdevManaged(volumeName)) continue;
     try {
       validateEnvironmentName(match[1]);
@@ -1188,6 +1260,7 @@ function cmdStatus(): void {
   for (const en of [...environmentNames].sort()) {
     const o = computeOffset(en);
     const e = setupEnv(en);
+    const persistent = existsSync(e.PERSISTENT_CONFIG) || volumeNames.includes(e.PG_VOLUME) || volumeNames.includes(e.REDIS_VOLUME);
     const risingWaveState = readRisingWaveState(e);
     const baseOwnershipProof = risingWaveState?.mode === "local" ||
       hasSeededEnvironmentOwnershipProof(e);
@@ -1200,7 +1273,7 @@ function cmdStatus(): void {
       e.RISINGWAVE_CONTAINER,
     ].filter((container) => containerNames.includes(container));
     const environmentVolumes = volumeNames.filter((volume) =>
-      volume === e.RUSTFS_VOLUME &&
+      [e.RUSTFS_VOLUME, e.PG_VOLUME, e.REDIS_VOLUME].includes(volume) &&
       (dockerVolumeIsRaftdevManaged(volume) || baseOwnershipProof)
     );
     const environmentNetworks = networkNames.filter((network) =>
@@ -1219,17 +1292,24 @@ function cmdStatus(): void {
       !managedRedisRunning && portInUse(e.REDIS_PORT);
     const readyServiceCount = Number(postgresRunning) + Number(rustfsRunning) +
       Number(managedRedisRunning || externalRedisListening);
+    const serverListening = portInUse(e.SERVER_PORT);
+    const webListening = portInUse(e.WEB_PORT);
     out(`Environment '${en}':`);
-    if (hasSession && readyServiceCount === 3) {
+    if (persistent) out("  Mode       : persistent（启停保留数据）");
+    if (hasSession && readyServiceCount === 3 && serverListening && webListening && (!persistent || persistentHttpReady(e))) {
       const redisState = externalRedisListening ? "; Redis external" : "";
       out(`  Runtime    : running (tmux session + required services ready${redisState})`);
+    } else if (persistent && !hasSession && readyServiceCount === 0 && !serverListening && !webListening) {
+      out("  Runtime    : stopped（服务已停止，持久数据保留）");
     } else if (hasSession || dockerResidueCount > 0) {
       const sessionState = hasSession ? "tmux session present" : "no tmux session";
       out(`  Runtime    : partial/orphan (${sessionState}; ${readyServiceCount}/3 required services ready; ${dockerResidueCount} Docker residue(s))`);
-      out(`  Recovery   : ./raftdev stop ${en}`);
+      out(persistent ? `  Recovery   : ./raftdev start ${en}（保留数据恢复服务）`
+        : `  Recovery   : ./raftdev stop ${en}（会删除本环境的容器和附件卷）`);
     } else {
       out("  Runtime    : stopped (state only; no tmux session or Docker resources)");
     }
+    out(`  HTTP       : API ${serverListening ? "监听中" : "未监听"}；Web ${webListening ? "监听中" : "未监听"}`);
     out(`  PostgreSQL : localhost:${15432 + o}`);
     out(`  Postgres   : postgresql://postgres:slock-dev-${en}@localhost:${15432 + o}/slock`);
     out(`  Redis      : localhost:${16379 + o}`);
@@ -1262,7 +1342,7 @@ function cmdStatus(): void {
     out(`  Trace worker: localhost:${18787 + o} (web + daemon traces, feedback reports; set SLOCKDEV_TRACE_WORKER=0 to disable)`);
     out(`  Trace observe: otelcol OTLP http://127.0.0.1:${17417 + o} (grpc ${17317 + o}); server direct + Worker-forwarded web/daemon`);
     const lastActivity = readIntegerFile(e.ACTIVITY_FILE);
-    const ttl = readIntegerFile(e.IDLE_TTL_FILE) ?? DEFAULT_IDLE_TTL_SECONDS;
+    const ttl = readIntegerFile(e.IDLE_TTL_FILE) ?? (persistent ? 0 : DEFAULT_IDLE_TTL_SECONDS);
     out(`  Last activity: ${formatTimestamp(lastActivity)}`);
     out(ttl > 0
       ? `  Auto-stop at : ${formatTimestamp(lastActivity ? lastActivity + ttl : null)} (idle TTL ${ttl}s)`
@@ -1538,6 +1618,9 @@ function cmdSeed(args: string[]): void {
   if (args.includes("-h") || args.includes("--help")) usageAndExit();
   const { name, withOnboarding } = parseSeedCommandArgs(args, basename(PROJECT_DIR));
   const e = setupEnv(name);
+  if (isPersistentEnvironment(e)) {
+    throw new Error("持久环境不允许导入开发测试数据；请在独立的临时环境中运行 seed。");
+  }
   // Reseed never needs the server's optional external dependency. Scrub an
   // exported credential before RustFS/Drizzle/seed children inherit it.
   delete process.env.RISINGWAVE_DATABASE_URL;
@@ -1636,8 +1719,9 @@ function cmdSeed(args: string[]): void {
   out(`Done. Credentials: ${e.SEED_FILE}`);
 }
 
-function cmdStop(name: string): void {
+function cmdStop(name: string, destroy = false): boolean {
   const e = setupEnv(name);
+  const persistent = isPersistentEnvironment(e);
   const risingWaveState = readRisingWaveState(e);
   const baseOwnershipProof = risingWaveState?.mode === "local" ||
     hasSeededEnvironmentOwnershipProof(e);
@@ -1657,6 +1741,26 @@ function cmdStop(name: string): void {
     }
   } else {
     out(`No tmux session '${e.TMUX_SESSION}' found.`);
+  }
+  if (persistent && !destroy) {
+    for (const container of [e.OTELCOL_CONTAINER, e.RISINGWAVE_CONTAINER, e.RUSTFS_CONTAINER, e.REDIS_CONTAINER, e.CONTAINER]) {
+      if (!dockerNameExists(container)) continue;
+      if (!dockerContainerIsRaftdevManaged(container) ||
+          (container === e.RISINGWAVE_CONTAINER && risingWaveState?.mode === "external")) {
+        out(`保留外部容器：${container}`);
+        continue;
+      }
+      const stopped = sh("docker", ["stop", "--time", "30", container], { quiet: true });
+      if (stopped.code !== 0) cleanupFailed = true;
+    }
+    markTraceReaderStoppedIfPresent(e);
+    if (cleanupFailed) {
+      out("ERROR: 部分服务停止失败；所有数据和凭据已保留。");
+      process.exitCode = 1;
+    } else {
+      out("服务已停止；数据库、附件、机器身份和配置已保留。");
+    }
+    return !cleanupFailed;
   }
   // The local source owns a replication slot in Postgres. Stop/remove
   // RisingWave before Postgres so the slot shuts down cleanly. Mention the
@@ -1706,20 +1810,22 @@ function cmdStop(name: string): void {
     out("ERROR: Failed to enumerate Docker volumes.");
   }
   const vols = volumeList.stdout.split("\n");
-  if (vols.includes(e.RUSTFS_VOLUME)) {
-    if (!dockerVolumeIsRaftdevManaged(e.RUSTFS_VOLUME) && !baseOwnershipProof) {
-      out(`Unowned volume '${e.RUSTFS_VOLUME}' preserved.`);
-    } else if (sh("docker", ["volume", "rm", e.RUSTFS_VOLUME], { quiet: true }).code === 0) {
-      out(`Volume '${e.RUSTFS_VOLUME}' removed.`);
+  for (const volume of [e.RUSTFS_VOLUME, ...(destroy ? [e.PG_VOLUME, e.REDIS_VOLUME] : [])]) {
+    if (!vols.includes(volume)) continue;
+    if (!dockerVolumeIsRaftdevManaged(volume) && !baseOwnershipProof) {
+      out(`Unowned volume '${volume}' preserved.`);
+      if (persistent) cleanupFailed = true;
+    } else if (sh("docker", ["volume", "rm", volume], { quiet: true }).code === 0) {
+      out(`Volume '${volume}' removed.`);
     } else {
       cleanupFailed = true;
-      out(`ERROR: Failed to remove volume '${e.RUSTFS_VOLUME}'.`);
+      out(`ERROR: Failed to remove volume '${volume}'.`);
     }
   }
   if (cleanupFailed) {
     out("ERROR: Cleanup was incomplete; seed, credential, and ownership state files were preserved for retry.");
     process.exitCode = 1;
-    return;
+    return false;
   }
   if (existsSync(e.SEED_FILE)) {
     rmSync(e.SEED_FILE, { force: true });
@@ -1736,10 +1842,25 @@ function cmdStop(name: string): void {
     rmSync(e.RISINGWAVE_STATE_FILE, { force: true });
   }
   markTraceReaderStoppedIfPresent(e);
+  if (destroy) {
+    rmSync(`${e.SEED_FILE}.bootstrap-key`, { force: true });
+    rmSync(e.SLOCKDEV_DIR, { recursive: true, force: true });
+    if (risingWaveState?.mode === "external") writeRisingWaveState(e, risingWaveState);
+  }
   out("Done.");
+  return true;
 }
 
 function cmdNuke(): void {
+  if (process.env.SLOCKDEV_PERSISTENT === "1") throw new Error("持久环境入口不支持 nuke；删除数据请指定 destroy <name> --yes。");
+  const stateRoot = join(PROJECT_DIR, ".slockdev");
+  const protectedNames = (existsSync(stateRoot) ? readdirSync(stateRoot) : [])
+    .filter((name) => existsSync(join(stateRoot, name, "environment.json")));
+  const persistentVolumes = sh("docker", ["volume", "ls", "--format", "{{.Name}}"], { quiet: true });
+  if (persistentVolumes.code !== 0) throw new Error("无法确认持久卷状态，拒绝执行 nuke。");
+  if (protectedNames.length || /^slock-dev-.+-(?:pg|redis)-data$/m.test(persistentVolumes.stdout)) {
+    throw new Error("存在持久环境，nuke 已禁用。删除数据必须明确执行：./raftdev destroy <name> --yes");
+  }
   out("=== Nuking ALL slock dev environments ===");
   out("");
   const environmentsRoot = join(PROJECT_DIR, ".slockdev");
@@ -2035,6 +2156,13 @@ function cleanupFailedStart(
   seedFileExistedBeforeStart: boolean,
   ownershipProof: StartFailureOwnershipProof,
 ): boolean {
+  if (isPersistentEnvironment(e)) {
+    if (tunnelPid !== undefined) {
+      try { process.kill(tunnelPid, "SIGTERM"); } catch { /* 隧道已经退出。 */ }
+    }
+    out("启动失败，停止本地服务并保留持久数据，修复后可重新 start。");
+    return cmdStop(e.name);
+  }
   let complete = true;
   out("");
   out(`Start failed; cleaning partial environment '${e.name}'...`);
@@ -2186,7 +2314,7 @@ function armStartFailureCleanup(
 
 // ──── start ────
 
-function cmdStart(args: string[]): void {
+function cmdStart(args: string[], initOnly = false): void {
   let name = basename(PROJECT_DIR);
   let nameSet = false;
   let previewDescription =
@@ -2205,6 +2333,7 @@ function cmdStart(args: string[]): void {
   // separate mode resolved below and intentionally cannot be combined.
   let risingWaveLocalRaw: string | undefined = process.env.RAFTDEV_RISINGWAVE;
   let withOnboarding = false;
+  let persistentRequested = initOnly || process.env.SLOCKDEV_PERSISTENT === "1";
   let i = 0;
   while (i < args.length) {
     const a = args[i];
@@ -2234,6 +2363,8 @@ function cmdStart(args: string[]): void {
       risingWaveLocalRaw = a.slice(a.indexOf("=") + 1); i += 1;
     } else if (a === "--with-onboarding") {
       withOnboarding = true; i += 1;
+    } else if (a === "--persistent") {
+      persistentRequested = true; i += 1;
     } else if (a === "-h" || a === "--help") {
       usageAndExit();
     } else if (a.startsWith("--")) {
@@ -2250,6 +2381,62 @@ function cmdStart(args: string[]): void {
     process.exit(1);
   }
   const e = setupEnv(name);
+  let persistentState = readPersistentEnvironment(e.PERSISTENT_CONFIG);
+  const persistent = persistentRequested || persistentState !== null;
+  let releaseLock: (() => void) | null = null;
+  if (!persistentState && (dockerVolumeExists(e.PG_VOLUME) || dockerVolumeExists(e.REDIS_VOLUME))) {
+    throw new Error("持久数据卷存在但环境配置缺失，请恢复配置；拒绝自动创建空环境。");
+  }
+  if (persistent) {
+    releaseLock = acquirePersistentLock(e);
+    if (!releaseLock) return;
+    persistentState = readPersistentEnvironment(e.PERSISTENT_CONFIG);
+    if (!commandExists("curl")) throw new Error("持久环境需要 curl 来检查 HTTP 服务状态。");
+    if (risingWaveLocalRaw && risingWaveLocalRaw !== "0") {
+      throw new Error("持久模式暂不支持会重建数据库的本地 RisingWave 预览配置。");
+    }
+    if (withOnboarding || (replicasRaw && replicasRaw !== "1")) {
+      throw new Error("持久模式使用单实例和最小初始化，不支持测试 onboarding 或多副本配置。");
+    }
+    process.env.SLOCKDEV_TUNNEL = "0";
+    if (persistentState?.initialized && initOnly) {
+      out(`持久环境 '${name}' 已初始化，数据和凭据保持不变。`);
+      return;
+    }
+    if (persistentState?.initialized) {
+      if (!existsSync(e.SEED_FILE)) throw new Error("持久环境凭据缺失，请恢复凭据；不会重新 seed 或重置机器身份。");
+      if (persistentState.schemaHash !== persistentSchemaHash(join(PROJECT_DIR, "packages/server/src/db/schema.ts"))) {
+        throw new Error("数据库定义已变化，请备份并执行 ./raftdev migrate <name>，日常 start 不会修改表结构。");
+      }
+      for (const volume of [e.PG_VOLUME, e.REDIS_VOLUME, e.RUSTFS_VOLUME]) {
+        if (!dockerVolumeExists(volume)) throw new Error(`持久卷 ${volume} 缺失，拒绝用空数据替代；请恢复备份。`);
+      }
+    }
+    if (tmuxHasSession(e.TMUX_SESSION)) {
+      if (persistentState?.initialized && persistentHttpReady(e) &&
+          [e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER].every(dockerNameRunning)) {
+        out(`持久环境 '${name}' 已在运行，无需重复启动。`);
+        return;
+      }
+      // 不能把残留的空 shell 当成健康服务，也不在这里删除任何数据。
+      if (!persistentState) throw new Error("存在同名临时会话，请使用新环境名或先明确销毁旧环境。");
+      cmdStop(name);
+      if (process.exitCode) return;
+    }
+    for (const [container, volume, destination] of [
+      [e.CONTAINER, e.PG_VOLUME, "/var/lib/postgresql/data"],
+      [e.REDIS_CONTAINER, e.REDIS_VOLUME, "/data"],
+      [e.RUSTFS_CONTAINER, e.RUSTFS_VOLUME, "/data"],
+    ]) requirePersistentMount(container, volume, destination);
+    if (!persistentState) {
+      if (existsSync(e.SEED_FILE) || [e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER].some(dockerNameExists) ||
+          dockerVolumeExists(e.RUSTFS_VOLUME)) {
+        throw new Error("同名临时环境仍有资源，本次不迁移；请使用新环境名或明确销毁旧环境后初始化。");
+      }
+      persistentState = { version: 1, mode: "persistent", initialized: false, schemaHash: "" };
+      writePersistentEnvironment(e.PERSISTENT_CONFIG, persistentState);
+    }
+  }
   let risingWave: RisingWaveDependencyConfig;
   try {
     risingWave = resolveRisingWaveDependency(
@@ -2309,7 +2496,7 @@ function cmdStart(args: string[]): void {
   // it empty rather than reading a dead SLOCKDEV_TRACE_WORKER_SECRET env (it
   // would never reach a process — cross-process auth is scope-attestation only).
   const traceWorkerSecret = traceWorker ? `trace-worker-dev-secret-${name}` : "";
-  const idleTtlSeconds = parseIdleTtlSeconds(process.env.SLOCKDEV_IDLE_TTL_SECONDS);
+  const idleTtlSeconds = parseIdleTtlSeconds(process.env.SLOCKDEV_IDLE_TTL_SECONDS?.trim() || (persistent ? "0" : undefined));
   // Cluster mode: number of server replicas to launch. Validated before we
   // touch docker/tmux. 1 → single-replica (unchanged behavior).
   let replicas: number;
@@ -2378,9 +2565,11 @@ function cmdStart(args: string[]): void {
     process.exit(1);
   }
 
-  checkPort(e.PG_PORT, "PostgreSQL");
-  checkPort(e.RUSTFS_PORT, "RustFS");
-  checkPort(e.RUSTFS_CONSOLE_PORT, "RustFS console");
+  if (!persistent || !dockerNameRunning(e.CONTAINER)) checkPort(e.PG_PORT, "PostgreSQL");
+  if (!persistent || !dockerNameRunning(e.RUSTFS_CONTAINER)) {
+    checkPort(e.RUSTFS_PORT, "RustFS");
+    checkPort(e.RUSTFS_CONSOLE_PORT, "RustFS console");
+  }
   checkPort(e.SERVER_PORT, "Server");
   // Cluster mode: each extra replica needs its own free server + metrics port.
   for (let k = 2; k <= replicas; k++) {
@@ -2495,6 +2684,15 @@ function cmdStart(args: string[]): void {
     risingWaveNetwork: previousRisingWaveState?.mode === "local" &&
       previousRisingWaveState.profile === "full",
   });
+  if (persistent) {
+    for (const volume of [e.PG_VOLUME, e.REDIS_VOLUME, e.RUSTFS_VOLUME]) {
+      if (dockerVolumeExists(volume)) {
+        if (!dockerVolumeIsRaftdevManaged(volume)) throw new Error(`拒绝接管外部数据卷：${volume}`);
+      } else {
+        requireCommand("docker", ["volume", "create", "--label", RAFTDEV_MANAGED_LABEL_ARG, volume]);
+      }
+    }
+  }
   const risingWaveFull = risingWaveNeedsBootstrap(risingWave);
   if (risingWaveFull) {
     // Full mode is intentionally ephemeral/destructive. Recreate both database
@@ -2554,10 +2752,12 @@ function cmdStart(args: string[]): void {
   // PostgreSQL container
   if (dockerNameExists(e.CONTAINER)) {
     out(`Starting existing container ${e.CONTAINER}...`);
-    sh("docker", ["start", e.CONTAINER], { quiet: true });
+    requireCommand("docker", ["start", e.CONTAINER]);
   } else {
     out(`Creating PostgreSQL container ${e.CONTAINER}...`);
-    const launch = sh("docker", postgresDockerRunArgs(e, risingWaveFull), { quiet: true });
+    const pgArgs = postgresDockerRunArgs(e, risingWaveFull);
+    if (persistent) pgArgs.splice(pgArgs.indexOf("postgres:16-alpine"), 0, "-v", `${e.PG_VOLUME}:/var/lib/postgresql/data`);
+    const launch = sh("docker", pgArgs, { quiet: true });
     if (launch.code !== 0) {
       updateRisingWaveStatus("failed");
       out(`ERROR: Failed to create PostgreSQL container '${e.CONTAINER}'.`);
@@ -2566,19 +2766,22 @@ function cmdStart(args: string[]): void {
   }
 
   // Redis container
-  if (portInUse(e.REDIS_PORT)) {
+  if (portInUse(e.REDIS_PORT) && (!persistent || !dockerNameExists(e.REDIS_CONTAINER))) {
+    if (persistent) throw new Error("持久 Redis 端口被外部进程占用，拒绝连接未知实例。");
     out(`Redis already listening on port ${e.REDIS_PORT} (external).`);
   } else if (dockerNameExists(e.REDIS_CONTAINER)) {
     out(`Starting existing container ${e.REDIS_CONTAINER}...`);
-    sh("docker", ["start", e.REDIS_CONTAINER], { quiet: true });
+    requireCommand("docker", ["start", e.REDIS_CONTAINER]);
   } else {
     out(`Creating Redis container ${e.REDIS_CONTAINER}...`);
-    sh("docker", [
+    requireCommand("docker", [
       "run", "-d", "--name", e.REDIS_CONTAINER,
       "--label", RAFTDEV_MANAGED_LABEL_ARG,
       "-p", `${e.REDIS_PORT}:6379`,
+      ...(persistent ? ["-v", `${e.REDIS_VOLUME}:/data`] : []),
       "redis:7-alpine",
-    ], { quiet: true });
+      ...(persistent ? ["redis-server", "--appendonly", "yes"] : []),
+    ]);
   }
 
   // Optional RisingWave standalone data plane. The documented Docker shape is
@@ -2643,7 +2846,7 @@ function cmdStart(args: string[]): void {
   ], { quiet: true });
   if (dockerNameExists(e.RUSTFS_CONTAINER)) {
     out(`Starting existing container ${e.RUSTFS_CONTAINER}...`);
-    sh("docker", ["start", e.RUSTFS_CONTAINER], { quiet: true });
+    requireCommand("docker", ["start", e.RUSTFS_CONTAINER]);
   } else {
     out(`Creating RustFS container ${e.RUSTFS_CONTAINER}...`);
     sh("docker", [
@@ -2712,42 +2915,74 @@ function cmdStart(args: string[]): void {
     process.exit(1);
   }
 
-  out("Pushing database schema...");
   const npxCommand = packageManagerCommand("npx");
-  let r = spawnSync(npxCommand, ["drizzle-kit", "push", "--force"], {
-    cwd: join(PROJECT_DIR, "packages/server"),
-    env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
-    stdio: "inherit",
-    shell: packageManagerSpawnShell(),
-  });
-  if ((r.status ?? 1) !== 0) {
-    updateRisingWaveStatus("failed");
-    process.exit(r.status ?? 1);
-  }
-  out("Schema is up to date.");
+  let r: ReturnType<typeof spawnSync>;
+  if (persistent) {
+    if (!persistentState!.initialized) {
+      out("首次初始化持久数据库，应用版本化迁移...");
+      r = spawnSync(npxCommand, ["drizzle-kit", "migrate"], {
+        cwd: join(PROJECT_DIR, "packages/server"),
+        env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
+        stdio: "inherit", shell: packageManagerSpawnShell(),
+      });
+      if ((r.status ?? 1) !== 0) process.exit(r.status ?? 1);
+      if (!existsSync(e.SEED_FILE)) {
+        r = spawnSync(npxCommand, ["tsx", "scripts/init-local.ts", "--output", e.SEED_FILE], {
+          cwd: join(PROJECT_DIR, "packages/server"),
+          env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
+          stdio: "inherit", shell: packageManagerSpawnShell(),
+        });
+        if ((r.status ?? 1) !== 0) process.exit(r.status ?? 1);
+      }
+      persistentState = { ...persistentState!, initialized: true,
+        schemaHash: persistentSchemaHash(join(PROJECT_DIR, "packages/server/src/db/schema.ts")) };
+      writePersistentEnvironment(e.PERSISTENT_CONFIG, persistentState);
+    } else {
+      out("使用已有数据库和机器身份，跳过建表与测试数据初始化。");
+    }
+    if (initOnly) {
+      cmdStop(name);
+      failureCleanup.disarm();
+      out(`持久环境 '${name}' 已初始化；执行 ./raftdev start ${name} 启动服务。`);
+      return;
+    }
+  } else {
+    out("Pushing database schema...");
+    r = spawnSync(npxCommand, ["drizzle-kit", "push", "--force"], {
+      cwd: join(PROJECT_DIR, "packages/server"),
+      env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
+      stdio: "inherit",
+      shell: packageManagerSpawnShell(),
+    });
+    if ((r.status ?? 1) !== 0) {
+      updateRisingWaveStatus("failed");
+      process.exit(r.status ?? 1);
+    }
+    out("Schema is up to date.");
 
-  out("Seeding test data...");
-  r = spawnSync(npxCommand, buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
-    cwd: join(PROJECT_DIR, "packages/server"),
-    env: {
-      ...process.env,
-      DATABASE_URL: e.DATABASE_URL,
-      S3_ENDPOINT: e.S3_ENDPOINT,
-      S3_REGION: "us-east-1",
-      S3_FORCE_PATH_STYLE: "true",
-      S3_ACCESS_KEY_ID: e.RUSTFS_ACCESS_KEY,
-      S3_SECRET_ACCESS_KEY: e.RUSTFS_SECRET_KEY,
-      S3_ATTACHMENTS_BUCKET: e.RUSTFS_BUCKET,
-      S3_CDN_BUCKET: e.RUSTFS_BUCKET,
-    },
-    stdio: "inherit",
-    shell: packageManagerSpawnShell(),
-  });
-  if ((r.status ?? 1) !== 0) {
-    updateRisingWaveStatus("failed");
-    process.exit(r.status ?? 1);
+    out("Seeding test data...");
+    r = spawnSync(npxCommand, buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
+      cwd: join(PROJECT_DIR, "packages/server"),
+      env: {
+        ...process.env,
+        DATABASE_URL: e.DATABASE_URL,
+        S3_ENDPOINT: e.S3_ENDPOINT,
+        S3_REGION: "us-east-1",
+        S3_FORCE_PATH_STYLE: "true",
+        S3_ACCESS_KEY_ID: e.RUSTFS_ACCESS_KEY,
+        S3_SECRET_ACCESS_KEY: e.RUSTFS_SECRET_KEY,
+        S3_ATTACHMENTS_BUCKET: e.RUSTFS_BUCKET,
+        S3_CDN_BUCKET: e.RUSTFS_BUCKET,
+      },
+      stdio: "inherit",
+      shell: packageManagerSpawnShell(),
+    });
+    if ((r.status ?? 1) !== 0) {
+      updateRisingWaveStatus("failed");
+      process.exit(r.status ?? 1);
+    }
+    out("Seed data ready.");
   }
-  out("Seed data ready.");
 
   if (risingWaveFull) {
     out("Bootstrapping managed RisingWave CDC and materialized-view graph...");
@@ -2788,6 +3023,7 @@ function cmdStart(args: string[]): void {
     const m = readFileSync(e.SEED_FILE, "utf8").match(/"apiKey":\s*"([^"]+)"/);
     if (m) machineApiKey = m[1];
   } catch {}
+  if (persistent && !machineApiKey) throw new Error("机器凭据为空或损坏，拒绝重置身份；请恢复凭据文件。");
 
   mkdirSync(e.SLOCKDEV_DIR, { recursive: true });
   mkdirSync(e.SLOCK_HOME, { recursive: true });
@@ -3066,6 +3302,19 @@ function cmdStart(args: string[]): void {
     );
   }
 
+
+  sh("tmux", ["select-window", "-t", `${e.TMUX_SESSION}:server`], { quiet: true });
+
+  if (persistent) {
+    out("等待 API 和 Web 就绪...");
+    const deadline = Date.now() + 60_000;
+    while (!persistentHttpReady(e)) {
+      if (Date.now() >= deadline) throw new Error("API 或 Web 未在 60 秒内就绪；数据已保留，请检查日志后重试。");
+      spawnSync("sleep", ["1"]);
+    }
+  }
+
+  if (persistent) writeFileSync(e.ACTIVITY_FILE, `${Math.floor(Date.now() / 1000)}\n`);
   if (idleTtlSeconds > 0) {
     const janitorCmd = `node --import tsx scripts/dev/raftdev.ts janitor ${shellQuote(name)} ${String(idleTtlSeconds)}`;
     runRequiredTmux(
@@ -3073,8 +3322,6 @@ function cmdStart(args: string[]): void {
       "janitor",
     );
   }
-
-  sh("tmux", ["select-window", "-t", `${e.TMUX_SESSION}:server`], { quiet: true });
 
   out("");
   out(`=== Environment '${name}' is running ===`);
@@ -3155,6 +3402,7 @@ function cmdStart(args: string[]): void {
   out(`  Stop:      ./raftdev stop ${name}`);
   out(`  Creds:     ${e.SEED_FILE}`);
   failureCleanup.disarm();
+  releaseLock?.();
 }
 
 function cmdJanitor(name: string, ttlSecondsArg: string | undefined): void {
@@ -3168,7 +3416,24 @@ function cmdJanitor(name: string, ttlSecondsArg: string | undefined): void {
     const idleSeconds = now - lastActivity;
     if (idleSeconds >= ttlSeconds) {
       out(`[raftdev] '${name}' idle for ${idleSeconds}s; auto-stopping environment.`);
-      cmdStop(name);
+      // stop 会中断并删除包含 janitor 的 tmux 会话，清理进程必须脱离该会话。
+      const logFd = openSync(join(e.SLOCKDEV_DIR, "idle-stop.log"), "a", 0o600);
+      try {
+        const child = spawn(process.execPath, [
+          "--import", "tsx", fileURLToPath(import.meta.url), "stop", name,
+        ], {
+          cwd: PROJECT_DIR,
+          detached: true,
+          stdio: ["ignore", logFd, logFd],
+        });
+        child.on("error", (error) => {
+          out(`ERROR: 无法启动空闲清理进程：${error.message}`);
+          process.exitCode = 1;
+        });
+        child.unref();
+      } finally {
+        closeSync(logFd);
+      }
       return;
     }
     const remaining = Math.max(1, ttlSeconds - idleSeconds);
@@ -3178,9 +3443,57 @@ function cmdJanitor(name: string, ttlSecondsArg: string | undefined): void {
 
 // ───────────────── dispatch ─────────────────
 
+function cmdMigrate(name: string): void {
+  const e = setupEnv(name);
+  const state = readPersistentEnvironment(e.PERSISTENT_CONFIG);
+  if (!state?.initialized) throw new Error("请先初始化持久环境。");
+  requirePersistentMount(e.CONTAINER, e.PG_VOLUME, "/var/lib/postgresql/data");
+  if (!dockerNameExists(e.CONTAINER)) throw new Error("数据库容器不存在，请先用当前兼容版本恢复容器。");
+  if (!cmdStop(name)) return;
+  requireCommand("docker", ["start", e.CONTAINER]);
+  try {
+    let ready = false;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      if (sh("docker", ["exec", e.CONTAINER, "pg_isready", "-U", "postgres"], { quiet: true }).code === 0) {
+        ready = true;
+        break;
+      }
+      spawnSync("sleep", ["1"]);
+    }
+    if (!ready) throw new Error("数据库未就绪，迁移未执行。");
+    const result = spawnSync(packageManagerCommand("npx"), ["drizzle-kit", "migrate"], {
+      cwd: join(PROJECT_DIR, "packages/server"), env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
+      stdio: "inherit", shell: packageManagerSpawnShell(),
+    });
+    if (result.status !== 0) throw new Error("迁移失败，数据已保留，请查看迁移日志。");
+    writePersistentEnvironment(e.PERSISTENT_CONFIG, { ...state,
+      schemaHash: persistentSchemaHash(join(PROJECT_DIR, "packages/server/src/db/schema.ts")) });
+    out("版本化迁移完成；服务保持停止，可执行 start 启动。");
+  } finally {
+    requireCommand("docker", ["stop", "--time", "30", e.CONTAINER]);
+  }
+}
+
 async function main(argv: string[]): Promise<number | void> {
   const command = argv[0] ?? "";
   const envName = argv[1] ?? basename(PROJECT_DIR);
+  if (["stop", "restart", "destroy", "migrate"].includes(command)) {
+    const e = setupEnv(envName);
+    if (command === "destroy" && (argv.length !== 3 || argv[2] !== "--yes")) {
+      throw new Error("destroy 会永久删除环境数据；确认后执行 ./raftdev destroy <name> --yes。");
+    }
+    if (command !== "destroy" && argv.length > 2) throw new Error(`未知参数：${argv.slice(2).join(" ")}`);
+    const release = isPersistentEnvironment(e) ? acquirePersistentLock(e) : () => {};
+    if (!release) return;
+    try {
+      if (command === "migrate") cmdMigrate(envName);
+      else if (command === "destroy") cmdStop(envName, true);
+      else if (cmdStop(envName) && command === "restart") cmdStart([envName]);
+    } finally {
+      release();
+    }
+    return;
+  }
   switch (command) {
     case "__cleanup-failed-start": {
       try {
@@ -3199,7 +3512,7 @@ async function main(argv: string[]): Promise<number | void> {
       }) ? 0 : 1;
     }
     case "start":  cmdStart(argv.slice(1)); break;
-    case "stop":   cmdStop(envName); break;
+    case "init":   cmdStart(argv.slice(1), true); break;
     case "status": cmdStatus(); break;
     case "seed":   cmdSeed(argv.slice(1)); break;
     case "script": cmdScript(argv.slice(1)); break;

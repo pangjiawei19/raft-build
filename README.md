@@ -43,6 +43,8 @@ the license.
 
 ## Getting started
 
+需要长期保留本地数据、日常只启停服务时，请使用[持久本地环境](docs/local-persistent-environment.md)。
+
 Prerequisites: Node.js 24.15 (see `.node-version`), pnpm 10.29 (see
 `packageManager` in `package.json`), and Docker for the local stack.
 

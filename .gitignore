@@ -10,7 +10,12 @@ release/
 .env
 .env.scopedb
 .dev-env-*.json
+.dev-env-*.json.*
 .slockdev/
+# 本地代码索引和 Kotlin 验收构建缓存。
+.codegraph/
+/packages/sync-core/contracts/activity-v1/canary-kotlin/.gradle/
+/packages/sync-core/contracts/activity-v1/canary-kotlin/build/
 # Local uploads when the server or tests run from the repository root.
 /uploads/
 **/.wrangler/

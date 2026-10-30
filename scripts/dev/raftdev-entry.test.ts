@@ -13,6 +13,7 @@ import { dirname, join } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
+import { computeOffset } from "./raftdev.js";
 
 const projectDir = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
 const raftdev = join(projectDir, "raftdev");
@@ -487,6 +488,118 @@ exit 1
       /Recovery\s+: \.\/raftdev stop status-tmuxonly-tooth/,
     );
     assert.doesNotMatch(child.stdout, /Runtime\s+: running/);
+  });
+});
+
+for (const listening of [[], ["api"], ["web"], ["api", "web"]]) {
+  test(`status 检查 API 和 Web 端口，当前监听：${listening.join("、") || "无"}`, () => {
+    withFakeBin((root, bin) => {
+      const name = "status-http-regression";
+      const offset = computeOffset(name);
+      const dockerState = join(root, "docker.state");
+      const tmuxState = join(root, "tmux.state");
+      writeFakeStartTools(bin);
+      writeFileSync(dockerState, ["pg", "redis", "rustfs"]
+        .map((service) => `C:slock-dev-${name}-${service}\n`).join(""));
+      writeFileSync(tmuxState, `slock-${name}\n`);
+      const ports = [
+        ...(listening.includes("api") ? [13001 + offset] : []),
+        ...(listening.includes("web") ? [15173 + offset] : []),
+      ];
+      writeExecutable(join(bin, "lsof"), `#!/bin/sh
+case "$1" in
+  ${ports.map((port) => `-iTCP:${port}`).join("|") || "unused"}) printf 'listener\\n'; exit 0 ;;
+esac
+exit 1
+`);
+      const child = spawnSync(process.execPath, ["--import", "tsx", raftdevScript, "status"], {
+        cwd: projectDir,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          RAFTDEV_FAKE_DOCKER_STATE: dockerState,
+          RAFTDEV_FAKE_TMUX_STATE: tmuxState,
+        },
+      });
+      assert.equal(child.status, 0, child.stderr);
+      const block = child.stdout.split(`Environment '${name}':`)[1]?.split("Environment '")[0];
+      assert.ok(block, "应显示测试环境");
+      assert.match(block, listening.length === 2 ? /Runtime\s+: running/ : /Runtime\s+: partial\/orphan/);
+    });
+  });
+}
+
+test("空闲清理脱离 janitor 进程组后，仍能完成容器和状态清理", {
+  skip: process.platform === "win32",
+  timeout: 15_000,
+}, async () => {
+  await withFakeBinAsync(async (root, bin) => {
+    const name = `idle-cleanup-${process.pid}`;
+    const stateDir = join(projectDir, ".slockdev", name);
+    const activityFile = join(stateDir, "last-activity");
+    const idleTtlFile = join(stateDir, "idle-ttl-seconds");
+    const seedFile = join(projectDir, `.dev-env-${name}.json`);
+    const dockerState = join(root, "docker.state");
+    const tmuxState = join(root, "tmux.state");
+    const janitorPidFile = join(root, "janitor.pid");
+    writeFakeStartTools(bin);
+    // 模拟 tmux 向原窗口进程组发送中断信号；测试进程不在该进程组中。
+    writeExecutable(join(bin, "tmux"), `#!${process.execPath}
+const fs = require("node:fs");
+const state = process.env.RAFTDEV_FAKE_TMUX_STATE;
+const command = process.argv[2];
+if (command === "has-session") process.exit(fs.readFileSync(state, "utf8").trim() ? 0 : 1);
+if (command === "list-windows") process.stdout.write("server\\njanitor\\n");
+if ((command === "send-keys" && process.argv.includes("slock-${name}:janitor")) || command === "kill-session") {
+  try {
+    process.kill(-Number(fs.readFileSync(process.env.RAFTDEV_FAKE_JANITOR_PID_FILE, "utf8")), "SIGINT");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
+}
+if (command === "kill-session") fs.writeFileSync(state, "");
+`);
+    mkdirSync(stateDir, { recursive: true });
+    writeFileSync(activityFile, `${Math.floor(Date.now() / 1000) - 10}\n`);
+    writeFileSync(idleTtlFile, "1\n");
+    writeFileSync(seedFile, '{"apiKey":"fake-machine-key"}\n');
+    writeFileSync(dockerState, ["pg", "redis", "rustfs"]
+      .map((service) => `C:slock-dev-${name}-${service}\n`).join("") + `V:slock-dev-${name}-rustfs-data\n`);
+    writeFileSync(tmuxState, `slock-${name}\n`);
+    const child = spawn(process.execPath, ["--import", "tsx", raftdevScript, "janitor", name, "1"], {
+      cwd: projectDir,
+      detached: true,
+      stdio: "ignore",
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH ?? ""}`,
+        RAFTDEV_FAKE_DOCKER_STATE: dockerState,
+        RAFTDEV_FAKE_TMUX_STATE: tmuxState,
+        RAFTDEV_FAKE_JANITOR_PID_FILE: janitorPidFile,
+      },
+    });
+    assert.ok(child.pid);
+    writeFileSync(janitorPidFile, String(child.pid));
+    try {
+      await new Promise<void>((resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", () => resolve());
+      });
+      const deadline = Date.now() + 6_000;
+      while (existsSync(activityFile) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      assert.equal(readFileSync(dockerState, "utf8"), "", "tmux 退出后仍应清理容器和卷");
+      assert.equal(readFileSync(tmuxState, "utf8"), "", "应清理 tmux 会话");
+      assert.equal(existsSync(seedFile), false);
+      assert.equal(existsSync(activityFile), false);
+      assert.equal(existsSync(idleTtlFile), false);
+    } finally {
+      try { process.kill(-child.pid, "SIGKILL"); } catch { /* 测试进程组已退出。 */ }
+      rmSync(seedFile, { force: true });
+      rmSync(stateDir, { recursive: true, force: true });
+    }
   });
 });
 
