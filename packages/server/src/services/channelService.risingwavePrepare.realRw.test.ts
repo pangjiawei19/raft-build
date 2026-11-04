@@ -52,21 +52,26 @@ test("real RisingWave prepares the inbox serving query with null and non-null ch
     __testRisingWaveInbox.set({
       query: (async (pool, queryText, values) => {
         const result = await queryRisingWave(pool, queryText, values);
-        prepared.push({
-          channelParam: values?.[4] ?? null,
-          rowCount: result.result.rowCount,
-        });
+        if (queryText.includes("WITH filtered AS")) {
+          prepared.push({
+            channelParam: values?.[4] ?? null,
+            rowCount: result.result.rowCount,
+          });
+        }
         return result;
       }) as typeof queryRisingWave,
     });
 
     for (const scopedChannelId of [undefined, channelId]) {
-      await getInboxItems(serverId, userId, {
-        filter: "all",
+      const options = {
+        filter: "all" as const,
         limit: 100,
         channelId: scopedChannelId,
         humanActivityMuteEnabled: false,
-      });
+      };
+      const actual = await getInboxItems(serverId, userId, options);
+      const expected = await getInboxItems(serverId, userId, { ...options, forceCanonicalPostgres: true });
+      assert.deepEqual(actual.items, expected.items, "真实 RisingWave 必须保留任务信息和首条提及位置");
     }
   } finally {
     __testRisingWaveInbox.reset();

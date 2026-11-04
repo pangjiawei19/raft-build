@@ -7,13 +7,15 @@ export interface PersistentEnvironment {
   mode: "persistent";
   initialized: boolean;
   schemaHash: string;
+  risingWave?: boolean;
 }
 
 export function readPersistentEnvironment(path: string): PersistentEnvironment | null {
   if (!existsSync(path)) return null;
   const value = JSON.parse(readFileSync(path, "utf8")) as PersistentEnvironment;
   if (value.version !== 1 || value.mode !== "persistent" ||
-      typeof value.initialized !== "boolean" || typeof value.schemaHash !== "string") {
+      typeof value.initialized !== "boolean" || typeof value.schemaHash !== "string" ||
+      (value.risingWave !== undefined && typeof value.risingWave !== "boolean")) {
     throw new Error(`持久环境配置无效，请修复配置，不能自动重新初始化：${path}`);
   }
   return value;

@@ -77,4 +77,24 @@
 
 持久模式默认关闭公网预览隧道和空闲自动停止。若显式设置 `SLOCKDEV_IDLE_TTL_SECONDS`，到期也只停止服务，保留数据。
 
-当前仍由 tmux 运行应用，电脑休眠期间服务不可用，电脑重启后需启动 Docker 并重新执行 `start`。本次改造不安装系统登录启动项，也不提供进程崩溃后的自动重启。持久模式暂不支持本地 RisingWave 预览重建流程、多副本和测试 onboarding 配置。
+当前仍由 tmux 运行应用，电脑休眠期间服务不可用，电脑重启后需启动 Docker 并重新执行 `start`。本次改造不安装系统登录启动项，也不提供进程崩溃后的自动重启。持久模式不支持多副本和测试 onboarding 配置。
+
+## 收件箱与新版附件
+
+持久收件箱（网页动态和 `raft inbox check`）需要 RisingWave。
+
+完整本地依赖使用仓库固定的 RisingWave 2.8.0 镜像，镜像压缩体积约 2.2 GiB。Docker Desktop 建议至少分配 8 GiB 内存，并为镜像解压、数据和构建缓存预留磁盘空间；4 GiB 配额会触发该版本 compactor 的最低内存断言。
+
+首次为已有环境启用：
+
+```sh
+./raftdev start <name> --persistent --risingwave
+```
+
+持久模式保留原 PostgreSQL 容器和数据卷，通过 `ALTER SYSTEM` 启用逻辑复制并重启数据库，然后初始化 CDC 与物化视图。RisingWave 使用独立命名卷 `slock-dev-<name>-risingwave-data` 保存状态。启用结果写入环境配置，后续普通 `start` 自动恢复，启动时只验证既有复制槽和视图，不重建数据库或重新 seed。
+
+日常 `stop` 保留四个数据卷。缺失已启用的 RisingWave 卷时拒绝创建空状态替代，需先恢复；只有显式 `destroy --yes` 才删除卷。
+
+附件启动配置包含旧桶和独立的 `<旧桶名>-direct` 桶。旧附件继续使用原存储，新版 `attachments/v2/` 原件和直传使用专用桶。两个桶都保存在原 RustFS 持久卷中；本地凭据由启动脚本注入，不写入文档或版本库。
+
+本地 RustFS 使用 HTTP，Agent CLI 只接受 HTTPS 下载重定向，因此本地启动显式设置 `S3_DOWNLOAD_PROXY_ENABLED=true`，由 Raft 的鉴权接口流式返回附件，用户与 Agent 下载都经过原有访问检查。该开关只影响 GET 下载，保留大文件直传能力；线上默认仍使用签名 URL。

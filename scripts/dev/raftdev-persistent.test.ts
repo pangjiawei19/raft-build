@@ -140,6 +140,32 @@ test("持久环境启动失败会停止服务，但不会删除既有数据和�
   assert.ok(!f.commands().some(c => c.tool === "docker" && c.args.includes("rm")));
 });
 
+test("持久启动向服务端注入新版附件专用桶及全部连接配置", (t) => {
+  const f = fixture(t);
+  f.ok(["start", f.name, "--persistent"]);
+  const launch = f.commands().find(c => c.tool === "tmux" && c.args.some(arg => arg.includes("@botiverse/raft-server")));
+  assert.ok(launch);
+  const command = launch.args.join(" ");
+  for (const key of ["ENDPOINT", "REGION", "FORCE_PATH_STYLE", "ACCESS_KEY_ID", "SECRET_ACCESS_KEY", "BUCKET"]) {
+    assert.ok(command.includes(`S3_DIRECT_UPLOAD_${key}=`), key);
+  }
+  assert.ok(command.includes("-direct"));
+  assert.match(command, /S3_DOWNLOAD_PROXY_ENABLED=\S*true/);
+});
+
+test("已启用的持久 RisingWave 卷丢失时拒绝用新 CDC 状态替代", (t) => {
+  const f = fixture(t);
+  f.ok(["init", f.name]);
+  const path = join(f.environment, "environment.json");
+  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), risingWave: true }));
+  const before = readFileSync(f.state, "utf8");
+  const result = f.run(["start", f.name]);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /RisingWave 持久卷缺失/);
+  assert.equal(readFileSync(f.state, "utf8"), before);
+  assert.ok(!f.commands().some(c => c.tool === "docker" && c.args[0] === "rm"));
+});
+
 test("持久环境拒绝 seed/nuke，destroy 必须显式确认", (t) => {
   const f = fixture(t);
   f.ok(["init", f.name]);

@@ -903,6 +903,12 @@ export function getStorage(): StorageBackend | null {
     _storage = null;
   }
 
+  // 本地 HTTP 对象存储无法通过 CLI 的 HTTPS 下载跳转检查。
+  // 显式启用时由原有鉴权接口流式返回文件；上传签名能力独立保留。
+  if (_storage && process.env.S3_DOWNLOAD_PROXY_ENABLED === "true") {
+    delete _storage.getPresignedUrl;
+  }
+
   return _storage;
 }
 

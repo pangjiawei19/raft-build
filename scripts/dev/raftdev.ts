@@ -87,7 +87,7 @@ interface Env {
   CONTAINER: string; REDIS_CONTAINER: string; RUSTFS_CONTAINER: string; OTELCOL_CONTAINER: string;
   RISINGWAVE_CONTAINER: string;
   RISINGWAVE_NETWORK: string;
-  RUSTFS_VOLUME: string; PG_VOLUME: string; REDIS_VOLUME: string;
+  RUSTFS_VOLUME: string; PG_VOLUME: string; REDIS_VOLUME: string; RISINGWAVE_VOLUME: string;
   PERSISTENT_CONFIG: string; TMUX_SESSION: string; SEED_FILE: string;
   SLOCKDEV_DIR: string; SLOCK_HOME: string; ACTIVITY_FILE: string; IDLE_TTL_FILE: string;
   RISINGWAVE_DSN_FILE: string; RISINGWAVE_STATE_FILE: string;
@@ -371,15 +371,18 @@ export function risingWaveDockerRunArgs(
   e: RisingWaveDockerEnv,
   image: string = DEFAULT_RISINGWAVE_IMAGE,
   network?: string,
+  volume?: string,
 ): string[] {
   return [
-    "run", "-d", "--pull=always", "--name", e.RISINGWAVE_CONTAINER,
+    "run", "-d", volume ? "--pull=missing" : "--pull=always", "--name", e.RISINGWAVE_CONTAINER,
     "--label", RAFTDEV_MANAGED_LABEL_ARG,
     ...(network ? ["--network", network] : []),
+    ...(volume ? ["-v", `${volume}:/var/lib/risingwave`] : []),
     "-p", `127.0.0.1:${e.RISINGWAVE_PORT}:4566`,
     "-p", `127.0.0.1:${e.RISINGWAVE_DASHBOARD_PORT}:5691`,
     image,
     "single_node",
+    ...(volume ? ["--store-directory", "/var/lib/risingwave"] : []),
   ];
 }
 
@@ -489,6 +492,7 @@ function setupEnv(name: string): Env {
     RUSTFS_VOLUME: `slock-dev-${name}-rustfs-data`,
     PG_VOLUME: `slock-dev-${name}-pg-data`,
     REDIS_VOLUME: `slock-dev-${name}-redis-data`,
+    RISINGWAVE_VOLUME: `slock-dev-${name}-risingwave-data`,
     PERSISTENT_CONFIG: join(SLOCKDEV_DIR, "environment.json"),
     TMUX_SESSION: `slock-${name}`,
     SEED_FILE: join(PROJECT_DIR, `.dev-env-${name}.json`),
@@ -1009,8 +1013,8 @@ function checkPort(port: number, service: string): void {
   }
 }
 
-function ensureRustfsBucket(e: Env): boolean {
-  out(`Waiting for RustFS and ensuring bucket '${e.RUSTFS_BUCKET}'...`);
+function ensureRustfsBucket(e: Env, bucket = e.RUSTFS_BUCKET): boolean {
+  out(`Waiting for RustFS and ensuring bucket '${bucket}'...`);
   const dir = mkdtempSync(join(tmpdir(), `slockdev-rustfs-init-${e.RUSTFS_BUCKET}-`));
   const initLog = join(dir, "init.log");
   // Script lives at packages/server/ensure-rustfs-bucket.mjs so that Node's
@@ -1033,7 +1037,7 @@ function ensureRustfsBucket(e: Env): boolean {
         S3_REGION: "us-east-1",
         S3_ACCESS_KEY_ID: e.RUSTFS_ACCESS_KEY,
         S3_SECRET_ACCESS_KEY: e.RUSTFS_SECRET_KEY,
-        S3_ATTACHMENTS_BUCKET: e.RUSTFS_BUCKET,
+        S3_ATTACHMENTS_BUCKET: bucket,
       },
       stdio: ["ignore", fdOut, fdErr],
       shell: packageManagerSpawnShell(),
@@ -1305,7 +1309,7 @@ function cmdStatus(): void {
       e.RISINGWAVE_CONTAINER,
     ].filter((container) => containerNames.includes(container));
     const environmentVolumes = volumeNames.filter((volume) =>
-      [e.RUSTFS_VOLUME, e.PG_VOLUME, e.REDIS_VOLUME].includes(volume) &&
+      [e.RUSTFS_VOLUME, e.PG_VOLUME, e.REDIS_VOLUME, e.RISINGWAVE_VOLUME].includes(volume) &&
       (dockerVolumeIsRaftdevManaged(volume) || baseOwnershipProof)
     );
     const environmentNetworks = networkNames.filter((network) =>
@@ -1329,7 +1333,9 @@ function cmdStatus(): void {
     out(`Environment '${en}':`);
     const listeners = hasSession ? applicationListeners(e) : [];
     if (persistent) out("  Mode       : persistent（启停保留数据）");
-    if (hasSession && readyServiceCount === 3 && listeners.every((entry) => entry.listening) && serverListening && webListening && (!persistent || persistentHttpReady(e))) {
+    const risingWaveReady = risingWaveState?.mode !== "local" || risingWaveState.profile !== "full" ||
+      (dockerNameRunning(e.RISINGWAVE_CONTAINER) && risingWaveState.status === "serving-ready");
+    if (hasSession && readyServiceCount === 3 && listeners.every((entry) => entry.listening) && serverListening && webListening && (!persistent || persistentHttpReady(e)) && risingWaveReady) {
       const redisState = externalRedisListening ? "; Redis external" : "";
       out(`  Runtime    : running (tmux session + required services ready; application ports listening${redisState})`);
     } else if (persistent && !hasSession && readyServiceCount === 0 && !serverListening && !webListening) {
@@ -1553,8 +1559,8 @@ function redactRisingWaveDiagnostic(e: Env, value: string): string {
   return redacted;
 }
 
-function runManagedRisingWaveBootstrap(e: Env): number {
-  const result = spawnSync(packageManagerCommand("pnpm"), tsScriptArgs("scripts/bootstrap-risingwave-local.ts"), {
+function runManagedRisingWaveBootstrap(e: Env, verifyOnly = false): number {
+  const result = spawnSync(packageManagerCommand("pnpm"), tsScriptArgs("scripts/bootstrap-risingwave-local.ts", verifyOnly ? ["--verify-only"] : []), {
     cwd: join(PROJECT_DIR, "packages/server"),
     env: {
       ...process.env,
@@ -1841,7 +1847,7 @@ function cmdStop(name: string, destroy = false): boolean {
     out("ERROR: Failed to enumerate Docker volumes.");
   }
   const vols = volumeList.stdout.split("\n");
-  for (const volume of [e.RUSTFS_VOLUME, ...(destroy ? [e.PG_VOLUME, e.REDIS_VOLUME] : [])]) {
+  for (const volume of [e.RUSTFS_VOLUME, ...(destroy ? [e.PG_VOLUME, e.REDIS_VOLUME, e.RISINGWAVE_VOLUME] : [])]) {
     if (!vols.includes(volume)) continue;
     if (!dockerVolumeIsRaftdevManaged(volume) && !baseOwnershipProof) {
       out(`Unowned volume '${volume}' preserved.`);
@@ -2414,6 +2420,8 @@ function cmdStart(args: string[], initOnly = false): void {
   const e = setupEnv(name);
   let persistentState = readPersistentEnvironment(e.PERSISTENT_CONFIG);
   const persistent = persistentRequested || persistentState !== null;
+  // 已启用的收件箱依赖随环境恢复，不要求每天重复传参。
+  if (persistentState?.risingWave && risingWaveLocalRaw === undefined) risingWaveLocalRaw = "full";
   let releaseLock: (() => void) | null = null;
   if (!persistentState && (dockerVolumeExists(e.PG_VOLUME) || dockerVolumeExists(e.REDIS_VOLUME))) {
     throw new Error("持久数据卷存在但环境配置缺失，请恢复配置；拒绝自动创建空环境。");
@@ -2423,8 +2431,14 @@ function cmdStart(args: string[], initOnly = false): void {
     if (!releaseLock) return;
     persistentState = readPersistentEnvironment(e.PERSISTENT_CONFIG);
     if (!commandExists("curl")) throw new Error("持久环境需要 curl 来检查 HTTP 服务状态。");
-    if (risingWaveLocalRaw && risingWaveLocalRaw !== "0") {
-      throw new Error("持久模式暂不支持会重建数据库的本地 RisingWave 预览配置。");
+    if (risingWaveLocalRaw && !["0", "1", "full"].includes(risingWaveLocalRaw)) {
+      throw new Error("持久模式的本地 RisingWave 必须使用 full 配置。");
+    }
+    if (persistentState?.risingWave && risingWaveLocalRaw === "0") {
+      throw new Error("持久环境已启用 RisingWave，不能静默禁用收件箱依赖。");
+    }
+    if (persistentState?.risingWave && !dockerVolumeExists(e.RISINGWAVE_VOLUME)) {
+      throw new Error("RisingWave 持久卷缺失，请恢复数据；拒绝重建已有 CDC 状态。");
     }
     if (withOnboarding || (replicasRaw && replicasRaw !== "1")) {
       throw new Error("持久模式使用单实例和最小初始化，不支持测试 onboarding 或多副本配置。");
@@ -2445,7 +2459,9 @@ function cmdStart(args: string[], initOnly = false): void {
     }
     if (tmuxHasSession(e.TMUX_SESSION)) {
       if (persistentState?.initialized && persistentHttpReady(e) &&
-          [e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER].every(dockerNameRunning)) {
+          [e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER].every(dockerNameRunning) &&
+          (!persistentState.risingWave || dockerNameRunning(e.RISINGWAVE_CONTAINER)) &&
+          (!risingWaveLocalRaw || risingWaveLocalRaw === "0" || persistentState.risingWave)) {
         out(`持久环境 '${name}' 已在运行，无需重复启动。`);
         return;
       }
@@ -2458,6 +2474,7 @@ function cmdStart(args: string[], initOnly = false): void {
       [e.CONTAINER, e.PG_VOLUME, "/var/lib/postgresql/data"],
       [e.REDIS_CONTAINER, e.REDIS_VOLUME, "/data"],
       [e.RUSTFS_CONTAINER, e.RUSTFS_VOLUME, "/data"],
+      ...(persistentState?.risingWave ? [[e.RISINGWAVE_CONTAINER, e.RISINGWAVE_VOLUME, "/var/lib/risingwave"]] : []),
     ]) requirePersistentMount(container, volume, destination);
     if (!persistentState) {
       if (existsSync(e.SEED_FILE) || [e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER].some(dockerNameExists) ||
@@ -2474,7 +2491,7 @@ function cmdStart(args: string[], initOnly = false): void {
       risingWaveLocalRaw,
       process.env.RISINGWAVE_DATABASE_URL,
       e.RISINGWAVE_DATABASE_URL,
-      process.env.RAFTDEV_RISINGWAVE_IMAGE,
+      process.env.RAFTDEV_RISINGWAVE_IMAGE ?? (persistentState?.risingWave ? readRisingWaveState(e)?.configuredImage : undefined),
     );
   } catch (err) {
     out(`ERROR: ${(err as Error).message}`);
@@ -2612,8 +2629,10 @@ function cmdStart(args: string[], initOnly = false): void {
   }
   checkPort(e.WEB_PORT, "Web");
   if (risingWave.mode === "local") {
-    checkPort(e.RISINGWAVE_PORT, "RisingWave pgwire");
-    checkPort(e.RISINGWAVE_DASHBOARD_PORT, "RisingWave dashboard");
+    if (!persistent || !dockerNameRunning(e.RISINGWAVE_CONTAINER)) {
+      checkPort(e.RISINGWAVE_PORT, "RisingWave pgwire");
+      checkPort(e.RISINGWAVE_DASHBOARD_PORT, "RisingWave dashboard");
+    }
   }
   if (traceWorker) checkPort(e.TRACE_WORKER_PORT, "Trace upload worker");
   if (traceObserve) {
@@ -2727,7 +2746,7 @@ function cmdStart(args: string[], initOnly = false): void {
     }
   }
   const risingWaveFull = risingWaveNeedsBootstrap(risingWave);
-  if (risingWaveFull) {
+  if (risingWaveFull && !persistent) {
     // Full mode is intentionally ephemeral/destructive. Recreate both database
     // containers and their bridge so a process-only residue cannot silently
     // retain non-logical WAL settings or a stale CDC catalog.
@@ -2782,10 +2801,44 @@ function cmdStart(args: string[], initOnly = false): void {
     }
   }
 
+  if (risingWaveFull && persistent) {
+    // 复用原 PostgreSQL 容器与数据卷；只增加 CDC 网络和逻辑复制配置。
+    if (dockerNetworkExists(e.RISINGWAVE_NETWORK)) {
+      if (!dockerNetworkIsRaftdevManaged(e.RISINGWAVE_NETWORK)) throw new Error("拒绝接管外部 RisingWave 网络。");
+    } else {
+      requireCommand("docker", ["network", "create", "--label", RAFTDEV_MANAGED_LABEL_ARG, e.RISINGWAVE_NETWORK]);
+    }
+    if (dockerVolumeExists(e.RISINGWAVE_VOLUME)) {
+      if (!dockerVolumeIsRaftdevManaged(e.RISINGWAVE_VOLUME)) throw new Error("拒绝接管外部 RisingWave 数据卷。");
+    } else {
+      requireCommand("docker", ["volume", "create", "--label", RAFTDEV_MANAGED_LABEL_ARG, e.RISINGWAVE_VOLUME]);
+    }
+    requirePersistentMount(e.RISINGWAVE_CONTAINER, e.RISINGWAVE_VOLUME, "/var/lib/risingwave");
+  }
+
   // PostgreSQL container
   if (dockerNameExists(e.CONTAINER)) {
     out(`Starting existing container ${e.CONTAINER}...`);
     requireCommand("docker", ["start", e.CONTAINER]);
+    if (risingWaveFull && persistent) {
+      const networks = sh("docker", ["inspect", "--format", "{{json .NetworkSettings.Networks}}", e.CONTAINER], { quiet: true });
+      if (networks.code !== 0) throw new Error("无法检查 PostgreSQL CDC 网络。");
+      if (!Object.hasOwn(JSON.parse(networks.stdout), e.RISINGWAVE_NETWORK)) {
+        requireCommand("docker", ["network", "connect", e.RISINGWAVE_NETWORK, e.CONTAINER]);
+      }
+      let sqlReady = false;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        if (sh("docker", ["exec", e.CONTAINER, "pg_isready", "-U", "postgres"], { quiet: true }).code === 0) { sqlReady = true; break; }
+        spawnSync("sleep", ["1"]);
+      }
+      if (!sqlReady) throw new Error("PostgreSQL 未就绪，保留原容器与数据，请检查日志。");
+      if (!postgresLogicalWalReady(e)) {
+        for (const sql of ["ALTER SYSTEM SET wal_level = 'logical'", "ALTER SYSTEM SET max_replication_slots = '10'", "ALTER SYSTEM SET max_wal_senders = '10'"]) {
+          requireCommand("docker", ["exec", e.CONTAINER, "psql", "-X", "-U", "postgres", "-d", "slock", "-v", "ON_ERROR_STOP=1", "-c", sql]);
+        }
+        requireCommand("docker", ["restart", e.CONTAINER]);
+      }
+    }
   } else {
     out(`Creating PostgreSQL container ${e.CONTAINER}...`);
     const pgArgs = postgresDockerRunArgs(e, risingWaveFull);
@@ -2823,7 +2876,11 @@ function cmdStart(args: string[], initOnly = false): void {
   // RISINGWAVE_DATABASE_URL selects it only when the developer opted in.
   if (risingWave.mode === "local") {
     let launchCode = 0;
-    if (dockerNameExists(e.RISINGWAVE_CONTAINER)) {
+    const reusePersistentRisingWave = persistent && dockerNameExists(e.RISINGWAVE_CONTAINER);
+    if (reusePersistentRisingWave) {
+      if (!dockerContainerIsRaftdevManaged(e.RISINGWAVE_CONTAINER)) throw new Error("拒绝接管外部 RisingWave 容器。");
+      requireCommand("docker", ["start", e.RISINGWAVE_CONTAINER]);
+    } else if (dockerNameExists(e.RISINGWAVE_CONTAINER)) {
       if (
         previousRisingWaveState?.mode === "external" ||
         (!dockerContainerIsRaftdevManaged(e.RISINGWAVE_CONTAINER) &&
@@ -2847,16 +2904,19 @@ function cmdStart(args: string[], initOnly = false): void {
         process.exit(1);
       }
     }
-    out(`Creating RisingWave standalone container ${e.RISINGWAVE_CONTAINER}...`);
-    launchCode = sh(
-      "docker",
-      risingWaveDockerRunArgs(
-        e,
-        risingWave.image ?? DEFAULT_RISINGWAVE_IMAGE,
-        risingWaveFull ? e.RISINGWAVE_NETWORK : undefined,
-      ),
-      { quiet: true },
-    ).code;
+    if (!reusePersistentRisingWave) {
+      out(`Creating RisingWave standalone container ${e.RISINGWAVE_CONTAINER}...`);
+      launchCode = sh(
+        "docker",
+        risingWaveDockerRunArgs(
+          e,
+          risingWave.image ?? DEFAULT_RISINGWAVE_IMAGE,
+          risingWaveFull ? e.RISINGWAVE_NETWORK : undefined,
+          persistent ? e.RISINGWAVE_VOLUME : undefined,
+        ),
+        { quiet: true },
+      ).code;
+    }
     if (launchCode !== 0) {
       updateRisingWaveStatus("failed");
       out(`ERROR: Failed to start RisingWave container '${e.RISINGWAVE_CONTAINER}'.`);
@@ -2943,7 +3003,7 @@ function cmdStart(args: string[], initOnly = false): void {
     }
   }
 
-  if (!ensureRustfsBucket(e)) {
+  if (!ensureRustfsBucket(e) || !ensureRustfsBucket(e, `${e.RUSTFS_BUCKET}-direct`)) {
     updateRisingWaveStatus("failed");
     process.exit(1);
   }
@@ -3019,7 +3079,7 @@ function cmdStart(args: string[], initOnly = false): void {
 
   if (risingWaveFull) {
     out("Bootstrapping managed RisingWave CDC and materialized-view graph...");
-    const bootstrapStatus = runManagedRisingWaveBootstrap(e);
+    const bootstrapStatus = runManagedRisingWaveBootstrap(e, persistent && persistentState?.risingWave === true);
     if (bootstrapStatus !== 0) {
       updateRisingWaveStatus("failed");
       out("ERROR: Managed RisingWave CDC/MV bootstrap failed; server processes were not started.");
@@ -3027,8 +3087,13 @@ function cmdStart(args: string[], initOnly = false): void {
       out(`  Recovery: ./raftdev stop ${name}`);
       process.exit(bootstrapStatus);
     }
+    if (persistent) {
+      // 图已完整建立。即使后续验收失败，重试也只能验证，不能重置已有复制槽。
+      persistentState = { ...persistentState!, risingWave: true };
+      writePersistentEnvironment(e.PERSISTENT_CONFIG, persistentState);
+    }
     out("RisingWave CDC/MV graph is ready; waiting for strict seeded parity...");
-    if (!runSeededRisingWaveParity(e, { bootstrapSeedBaseline: true })) {
+    if (!runSeededRisingWaveParity(e, { bootstrapSeedBaseline: !persistent })) {
       updateRisingWaveStatus("failed");
       out("ERROR: Managed RisingWave serving parity failed; server processes were not started.");
       out(`  Recovery: ./raftdev stop ${name}`);
@@ -3153,6 +3218,14 @@ function cmdStart(args: string[], initOnly = false): void {
     serverCmd += `${envAssign("S3_ACCESS_KEY_ID", e.RUSTFS_ACCESS_KEY)} `;
     serverCmd += `${envAssign("S3_SECRET_ACCESS_KEY", e.RUSTFS_SECRET_KEY)} `;
     serverCmd += `${envAssign("S3_ATTACHMENTS_BUCKET", e.RUSTFS_BUCKET)} `;
+    serverCmd += `${envAssign("S3_DOWNLOAD_PROXY_ENABLED", "true")} `;
+    // 新版附件原件和直传使用专用桶，旧附件仍走原桶。
+    serverCmd += `${envAssign("S3_DIRECT_UPLOAD_ENDPOINT", e.S3_ENDPOINT)} `;
+    serverCmd += `${envAssign("S3_DIRECT_UPLOAD_REGION", "us-east-1")} `;
+    serverCmd += `${envAssign("S3_DIRECT_UPLOAD_FORCE_PATH_STYLE", "true")} `;
+    serverCmd += `${envAssign("S3_DIRECT_UPLOAD_ACCESS_KEY_ID", e.RUSTFS_ACCESS_KEY)} `;
+    serverCmd += `${envAssign("S3_DIRECT_UPLOAD_SECRET_ACCESS_KEY", e.RUSTFS_SECRET_KEY)} `;
+    serverCmd += `${envAssign("S3_DIRECT_UPLOAD_BUCKET", `${e.RUSTFS_BUCKET}-direct`)} `;
     serverCmd += `${envAssign("S3_CDN_BUCKET", e.RUSTFS_BUCKET)} `;
     for (const v of [
       "TRANSLATION_PROVIDER",

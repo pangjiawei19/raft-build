@@ -40,6 +40,33 @@ const TRACE_EVENT_ROW_TEST_RESOURCE = {
   deploymentEnvironment: "test",
 };
 
+test("本地 S3 代理下载关闭 GET 重定向，并保留专用桶的直传能力", async () => {
+  const values = {
+    S3_ENDPOINT: "http://127.0.0.1:19042", S3_REGION: "us-east-1",
+    S3_ACCESS_KEY_ID: "test-key", S3_SECRET_ACCESS_KEY: "test-secret", S3_ATTACHMENTS_BUCKET: "legacy",
+    S3_DIRECT_UPLOAD_ENDPOINT: "http://127.0.0.1:19042", S3_DIRECT_UPLOAD_REGION: "us-east-1",
+    S3_DIRECT_UPLOAD_ACCESS_KEY_ID: "direct-key", S3_DIRECT_UPLOAD_SECRET_ACCESS_KEY: "direct-secret",
+    S3_DIRECT_UPLOAD_BUCKET: "direct", S3_DOWNLOAD_PROXY_ENABLED: "true",
+  };
+  const before = new Map(Object.keys(values).map(key => [key, process.env[key]]));
+  try {
+    Object.assign(process.env, values);
+    resetStorageForTests();
+    const storage = getStorage();
+    assert.ok(storage?.get);
+    assert.equal(storage.getPresignedUrl, undefined);
+    assert.ok(getDirectUploadStorage()?.getPresignedPutUrl, "代理下载不能关闭直传上传");
+    process.env.S3_DOWNLOAD_PROXY_ENABLED = "false";
+    resetStorageForTests();
+    assert.ok(getStorage()?.getPresignedUrl, "未启用代理时保留默认签名下载");
+  } finally {
+    for (const [key, value] of before) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+    resetStorageForTests();
+  }
+});
+
 test("S3 storage transport config falls back to production-safe defaults", () => {
   assert.equal(parseS3RequestTimeoutMs(undefined), 30_000);
   assert.equal(parseS3RequestTimeoutMs(""), 30_000);

@@ -11157,10 +11157,7 @@ function buildRisingWaveInboxItemsServingQuery(
         p."taskClaimedById",
         p."taskClaimedByName",
         (CASE WHEN p."mentionOnly" THEN p."hasAnyMention" ELSE p."hasMention" END) AS "hasMention",
-        -- TODO(firstMentionMessageId): materialize first_mention_message_id in
-        -- rw_inbox_items_v2 MV + parity; Postgres-path-first. Until then the RW
-        -- backend does not project this column, so the shared result mapper in
-        -- getInboxItems resolves row.firstMentionMessageId to null for RW rows.
+        -- 首条提及和旧任务字段由 enrichRisingWaveInboxPageMetadata 批量补齐。
         p."materializedLastReadSeq",
         p."maxReadSeq",
         p."readStateVersion",
@@ -11857,15 +11854,71 @@ async function getUnifiedActivityAllInboxItems(
   };
 }
 
+/** 补齐当前页的任务字段和提及锚点，候选集、计数及分页仍由 RisingWave 负责。 */
+async function enrichRisingWaveInboxPageMetadata(
+  rows: InboxPolicySqlRow[],
+  userId: string,
+  traceQuery: DbQueryTracer,
+): Promise<void> {
+  if (rows.length === 0) return;
+  const client = getRisingWaveInboxPool();
+  if (!client) throw new RisingWaveNotConfiguredError("Activity metadata");
+  const values: unknown[] = [userId];
+  const pageValues = rows.map((row) => {
+    const start = values.length + 1;
+    values.push(inboxScopeIdOfRow(row), row.parentMessageId ?? null, row.maxReadSeq ?? "0", row.mentionOnly === true);
+    return `($${start}::varchar, $${start + 1}::varchar, $${start + 2}::bigint, $${start + 3}::boolean)`;
+  }).join(", ");
+  const result = await traceQuery("channels.inbox_page_metadata", () => queryRisingWaveInbox(client, `
+    WITH page(scope_id, parent_message_id, last_read_seq, mention_only) AS (VALUES ${pageValues}),
+    anchors AS (
+      SELECT p.scope_id, MIN(mm.message_seq) AS first_mention_seq
+      FROM page p
+      LEFT JOIN rw_joint_channel_servers base_projection
+        ON base_projection.local_channel_id = p.scope_id AND base_projection.status = 'active'
+      LEFT JOIN rw_joint_channel_servers sibling_projection
+        ON sibling_projection.joint_channel_id = base_projection.joint_channel_id
+       AND sibling_projection.status = 'active'
+      JOIN rw_message_mentions_v2 mm
+        ON mm.channel_id = COALESCE(sibling_projection.local_channel_id, p.scope_id)
+       AND mm.target_type = 'user' AND mm.target_id = $1
+       AND (mm.notifiable_at_send OR mm.notified_at IS NOT NULL)
+      LEFT JOIN rw_inbox_suppression_states suppression
+        ON suppression.receiver_type = 'user' AND suppression.receiver_id = $1
+       AND suppression.target_channel_id = p.scope_id
+       AND suppression.target_kind = CASE WHEN p.parent_message_id IS NOT NULL
+         THEN 'public_thread_mention' ELSE 'public_channel_mention' END
+      WHERE mm.message_seq > CASE WHEN p.mention_only
+        THEN COALESCE(suppression.done_through_seq, 0) ELSE p.last_read_seq END
+      GROUP BY p.scope_id
+    )
+    SELECT p.scope_id AS "scopeId", task.task_number AS "taskNumber",
+      task.status AS "taskStatus", task.claimed_by_type AS "taskClaimedByType",
+      task.claimed_by_id AS "taskClaimedById", m.id AS "firstMentionMessageId"
+    FROM page p
+    LEFT JOIN rw_tasks task ON task.message_id = p.parent_message_id
+    LEFT JOIN anchors a ON a.scope_id = p.scope_id
+    LEFT JOIN rw_messages m ON m.seq = a.first_mention_seq
+  `, values));
+  const metadata = new Map(result.result.rows.map((row) => [row.scopeId, row]));
+  for (const row of rows) {
+    const fields = metadata.get(inboxScopeIdOfRow(row));
+    if (!fields) throw new Error("RisingWave inbox page metadata is missing");
+    Object.assign(row, fields);
+  }
+}
+
 async function buildRisingWaveInboxItemsResult(
   result: InboxQueryResult,
   limit: number,
+  userId: string,
   traceQuery: DbQueryTracer,
   db: DatabaseExecutor,
 ): Promise<InboxItemsResult> {
   const rawRows = result.rows as InboxPolicySqlRow[];
   const page = selectInboxPolicyPageRows(rawRows, limit);
   const pageRows = page.rows;
+  await enrichRisingWaveInboxPageMetadata(pageRows, userId, traceQuery);
   await enrichInboxRowsWithProfileNames(pageRows, traceQuery, db);
   const mappedItems = mapInboxPolicyRowsToItems(pageRows, logInboxScopeCorruption, "servingPair") as InboxItem[];
   return {
@@ -11970,7 +12023,7 @@ export async function getInboxItems(
       "none",
       risingWaveResult.contractVersion,
     );
-    return buildRisingWaveInboxItemsResult(risingWaveResult, limit, traceQuery, db);
+    return buildRisingWaveInboxItemsResult(risingWaveResult, limit, userId, traceQuery, db);
   }
 
   const legacyActivityChannelFilterPredicate = channelId

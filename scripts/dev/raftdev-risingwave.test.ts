@@ -52,6 +52,14 @@ function loadActualBootstrapArtifacts(): Record<string, string> {
   ]));
 }
 
+test("持久 RisingWave 将目录和状态存储绑定到命名卷", () => {
+  const args = risingWaveDockerRunArgs({ RISINGWAVE_CONTAINER: "rw", RISINGWAVE_PORT: 17666, RISINGWAVE_DASHBOARD_PORT: 17866 }, "image", "network", "rw-data");
+  assert.equal(args[args.indexOf("-v") + 1], "rw-data:/var/lib/risingwave");
+  assert.equal(args[args.indexOf("--store-directory") + 1], "/var/lib/risingwave");
+  assert.ok(!args.includes("--rm"));
+  assert.ok(args.includes("--pull=missing"));
+});
+
 test("RisingWave is default-off and parses full/process-only profiles explicitly", () => {
   assert.equal(parseRisingWaveLocalProfile(undefined), null);
   assert.equal(parseRisingWaveLocalProfile(""), null);

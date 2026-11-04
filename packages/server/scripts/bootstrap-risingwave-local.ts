@@ -250,6 +250,13 @@ async function main(): Promise<void> {
   await postgres.connect();
   await risingwave.connect();
   try {
+    if (process.argv.includes("--verify-only")) {
+      // 持久环境重启只验证既有图，不删除 publication、复制槽或物化视图。
+      await assertPublication(postgres);
+      await assertRequiredRelations(risingwave);
+      console.log("Existing RisingWave CDC and materialized views verified.");
+      return;
+    }
     const wal = await postgres.query<{ wal_level: string }>("SHOW wal_level");
     if (wal.rows[0]?.wal_level !== "logical") {
       throw new Error(`Postgres wal_level must be logical, got ${wal.rows[0]?.wal_level ?? "unknown"}`);
