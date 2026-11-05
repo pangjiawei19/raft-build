@@ -58,6 +58,7 @@ test("持久 RisingWave 将目录和状态存储绑定到命名卷", () => {
   assert.equal(args[args.indexOf("--store-directory") + 1], "/var/lib/risingwave");
   assert.ok(!args.includes("--rm"));
   assert.ok(args.includes("--pull=missing"));
+  assert.equal(args[args.indexOf("--restart") + 1], "unless-stopped");
 });
 
 test("RisingWave is default-off and parses full/process-only profiles explicitly", () => {

@@ -377,7 +377,7 @@ export function risingWaveDockerRunArgs(
     "run", "-d", volume ? "--pull=missing" : "--pull=always", "--name", e.RISINGWAVE_CONTAINER,
     "--label", RAFTDEV_MANAGED_LABEL_ARG,
     ...(network ? ["--network", network] : []),
-    ...(volume ? ["-v", `${volume}:/var/lib/risingwave`] : []),
+    ...(volume ? ["--restart", "unless-stopped", "-v", `${volume}:/var/lib/risingwave`] : []),
     "-p", `127.0.0.1:${e.RISINGWAVE_PORT}:4566`,
     "-p", `127.0.0.1:${e.RISINGWAVE_DASHBOARD_PORT}:5691`,
     image,
@@ -884,6 +884,17 @@ function requirePersistentMount(container: string, volume: string, destination: 
   const mounts = result.code === 0 ? JSON.parse(result.stdout) as { Name?: string; Destination?: string }[] : [];
   if (!mounts.some((mount) => mount.Name === volume && mount.Destination === destination)) {
     throw new Error(`容器 ${container} 未使用预期持久卷 ${volume}；请使用新环境名，或明确销毁旧环境后初始化。`);
+  }
+}
+
+function ensurePersistentRisingWaveRestartPolicy(e: Env): void {
+  if (!dockerContainerIsRaftdevManaged(e.RISINGWAVE_CONTAINER)) throw new Error("拒绝接管外部 RisingWave 容器。");
+  requirePersistentMount(e.RISINGWAVE_CONTAINER, e.RISINGWAVE_VOLUME, "/var/lib/risingwave");
+  const policy = sh("docker", ["inspect", "--format", "{{.HostConfig.RestartPolicy.Name}}", e.RISINGWAVE_CONTAINER], { quiet: true });
+  if (policy.code !== 0) throw new Error("无法检查 RisingWave 重启策略。");
+  // 休眠后单节点可能因心跳过期退出；原地补策略，不重建容器或打断 Agent。
+  if (policy.stdout.trim() !== "unless-stopped") {
+    requireCommand("docker", ["update", "--restart", "unless-stopped", e.RISINGWAVE_CONTAINER]);
   }
 }
 
@@ -2462,6 +2473,7 @@ function cmdStart(args: string[], initOnly = false): void {
           [e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER].every(dockerNameRunning) &&
           (!persistentState.risingWave || dockerNameRunning(e.RISINGWAVE_CONTAINER)) &&
           (!risingWaveLocalRaw || risingWaveLocalRaw === "0" || persistentState.risingWave)) {
+        if (persistentState.risingWave) ensurePersistentRisingWaveRestartPolicy(e);
         out(`持久环境 '${name}' 已在运行，无需重复启动。`);
         return;
       }
@@ -2878,7 +2890,7 @@ function cmdStart(args: string[], initOnly = false): void {
     let launchCode = 0;
     const reusePersistentRisingWave = persistent && dockerNameExists(e.RISINGWAVE_CONTAINER);
     if (reusePersistentRisingWave) {
-      if (!dockerContainerIsRaftdevManaged(e.RISINGWAVE_CONTAINER)) throw new Error("拒绝接管外部 RisingWave 容器。");
+      ensurePersistentRisingWaveRestartPolicy(e);
       requireCommand("docker", ["start", e.RISINGWAVE_CONTAINER]);
     } else if (dockerNameExists(e.RISINGWAVE_CONTAINER)) {
       if (

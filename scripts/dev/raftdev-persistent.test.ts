@@ -42,7 +42,7 @@ if (tool === 'docker') {
   } else if (cmd === 'inspect') {
     const container = state.containers[args.at(-1)];
     if (!container) process.exit(1);
-    out(args.join(' ').includes('Mounts') ? JSON.stringify(container.mounts) : 'true');
+    out(args.join(' ').includes('Mounts') ? JSON.stringify(container.mounts) : args.join(' ').includes('RestartPolicy.Name') ? (container.restartPolicy ?? 'no') : 'true');
   } else if (cmd === 'run' && args.includes('--name')) {
     const mounts = [];
     args.forEach((arg, i) => { if (arg === '-v') { const [Name, Destination] = args[i+1].split(':'); mounts.push({Name, Destination}); } });
@@ -50,6 +50,8 @@ if (tool === 'docker') {
   } else if (cmd === 'start' || cmd === 'stop') {
     if (!state.containers[args.at(-1)]) process.exit(1);
     state.containers[args.at(-1)].running = cmd === 'start'; save();
+  } else if (cmd === 'update' && args.includes('--restart')) {
+    state.containers[args.at(-1)].restartPolicy = args[args.indexOf('--restart')+1]; save();
   } else if (cmd === 'rm') {
     delete state.containers[args.at(-1)]; save();
   } else if (cmd === 'volume') {
@@ -125,6 +127,35 @@ test("持久环境默认常驻，重复 start 无副作用，stop/start 保留�
   assert.ok(!f.commands().some(c => c.args.includes("scripts/seed.ts") || c.args.includes("--force")));
   assert.ok(!f.commands().some(c => c.tool === "tmux" && c.args.includes("janitor")));
   assert.ok(f.commands().some(c => c.tool === "docker" && c.args.includes("--appendonly")));
+});
+
+test("重复 start 为旧持久 RisingWave 补重启策略，保持既有服务、数据和凭据", (t) => {
+  const f = fixture(t);
+  f.ok(["start", f.name, "--persistent"]);
+  const path = join(f.environment, "environment.json");
+  writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), risingWave: true }));
+  const name = `slock-dev-${f.name}-risingwave`;
+  const volume = `${name}-data`;
+  const resources = f.resources();
+  resources.volumes.push(volume);
+  resources.containers[name] = { running: true, mounts: [{ Name: volume, Destination: "/var/lib/risingwave" }], restartPolicy: "no" };
+  writeFileSync(f.state, JSON.stringify(resources));
+  const credentials = readFileSync(f.credentials, "utf8");
+  const commandCount = f.commands().length;
+
+  assert.match(f.ok(["start", f.name]), /已在运行/);
+  assert.equal(f.resources().containers[name].restartPolicy, "unless-stopped");
+  assert.equal(readFileSync(f.credentials, "utf8"), credentials);
+  const commands = f.commands().slice(commandCount);
+  assert.ok(commands.some(c => c.tool === "docker" && c.args.join(" ") === `update --restart unless-stopped ${name}`));
+  assert.ok(!commands.some(c => c.tool === "tmux" && c.args[0] === "kill-session"));
+  assert.ok(!commands.some(c => c.tool === "docker" && ["start", "stop", "rm", "run"].includes(c.args[0])));
+  resources.containers[name].restartPolicy = "unless-stopped";
+  assert.deepEqual(f.resources(), resources);
+
+  const count = f.commands().length;
+  f.ok(["start", f.name]);
+  assert.ok(!f.commands().slice(count).some(c => c.tool === "docker" && c.args[0] === "update"));
 });
 
 test("持久环境启动失败会停止服务，但不会删除既有数据和凭据", (t) => {
