@@ -61,6 +61,25 @@ test("持久 RisingWave 将目录和状态存储绑定到命名卷", () => {
   assert.equal(args[args.indexOf("--restart") + 1], "unless-stopped");
 });
 
+test("低内存模式限制容器资源并保留原持久卷，默认模式保持不变", () => {
+  const env = { RISINGWAVE_CONTAINER: "rw", RISINGWAVE_PORT: 17666, RISINGWAVE_DASHBOARD_PORT: 17866 };
+  const normal = risingWaveDockerRunArgs(env, "image", "network", "rw-data");
+  const low = risingWaveDockerRunArgs(env, "image", "network", "rw-data", true);
+  assert.ok(!normal.includes("--memory"));
+  const imageIndex = low.indexOf("image");
+  const dockerArgs = low.slice(0, imageIndex);
+  const nodeArgs = low.slice(imageIndex + 1);
+  assert.equal(dockerArgs[dockerArgs.indexOf("--memory") + 1], "2560m");
+  assert.equal(dockerArgs[dockerArgs.indexOf("--memory-swap") + 1], "2560m");
+  assert.equal(dockerArgs[dockerArgs.indexOf("--cpus") + 1], "2");
+  assert.equal(dockerArgs[dockerArgs.indexOf("-v") + 1], "rw-data:/var/lib/risingwave");
+  assert.ok(dockerArgs.includes("RW_COMPACTOR_META_CACHE_MEMORY_BYTES=16777216"));
+  assert.match(dockerArgs[dockerArgs.indexOf("--mount") + 1], /target=\/etc\/risingwave-low-memory\.toml,readonly$/);
+  assert.equal(nodeArgs[nodeArgs.indexOf("--store-directory") + 1], "/var/lib/risingwave");
+  assert.equal(nodeArgs[nodeArgs.indexOf("--total-memory-bytes") + 1], "2147483648");
+  assert.ok(!nodeArgs.includes("--in-memory"));
+});
+
 test("RisingWave is default-off and parses full/process-only profiles explicitly", () => {
   assert.equal(parseRisingWaveLocalProfile(undefined), null);
   assert.equal(parseRisingWaveLocalProfile(""), null);

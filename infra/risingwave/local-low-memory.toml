@@ -1,0 +1,13 @@
+# RisingWave 2.8.0 的本地低内存配置，保留持久存储与完整 CDC／收件箱视图。
+# 已存在集群的 SST 大小不变，因此为 compactor 保留足够的构建空间。
+[storage]
+shared_buffer_capacity_mb = 32
+prefetch_buffer_capacity_mb = 16
+compactor_memory_limit_mb = 640
+compactor_max_task_multiplier = 1.0
+share_buffer_upload_concurrency = 1
+share_buffers_sync_parallelism = 1
+
+[storage.cache]
+block_cache_capacity_mb = 32
+meta_cache_capacity_mb = 32

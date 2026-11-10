@@ -372,17 +372,29 @@ export function risingWaveDockerRunArgs(
   image: string = DEFAULT_RISINGWAVE_IMAGE,
   network?: string,
   volume?: string,
+  lowMemory = false,
 ): string[] {
   return [
     "run", "-d", volume ? "--pull=missing" : "--pull=always", "--name", e.RISINGWAVE_CONTAINER,
     "--label", RAFTDEV_MANAGED_LABEL_ARG,
     ...(network ? ["--network", network] : []),
     ...(volume ? ["--restart", "unless-stopped", "-v", `${volume}:/var/lib/risingwave`] : []),
+    ...(lowMemory ? [
+      // 计算预算为 2 GiB，额外 512 MiB 为已有图的启动恢复保留余量。
+      "--memory", "2560m", "--memory-swap", "2560m", "--cpus", "2",
+      "-e", "RW_COMPACTOR_META_CACHE_MEMORY_BYTES=16777216",
+      "--mount", `type=bind,source=${join(PROJECT_DIR, "infra/risingwave/local-low-memory.toml")},target=/etc/risingwave-low-memory.toml,readonly`,
+    ] : []),
     "-p", `127.0.0.1:${e.RISINGWAVE_PORT}:4566`,
     "-p", `127.0.0.1:${e.RISINGWAVE_DASHBOARD_PORT}:5691`,
     image,
     "single_node",
     ...(volume ? ["--store-directory", "/var/lib/risingwave"] : []),
+    ...(lowMemory ? [
+      "--config-path", "/etc/risingwave-low-memory.toml",
+      "--total-memory-bytes", "2147483648", "--parallelism", "1",
+      "--compaction-worker-threads-number", "1",
+    ] : []),
   ];
 }
 
@@ -2925,6 +2937,7 @@ function cmdStart(args: string[], initOnly = false): void {
           risingWave.image ?? DEFAULT_RISINGWAVE_IMAGE,
           risingWaveFull ? e.RISINGWAVE_NETWORK : undefined,
           persistent ? e.RISINGWAVE_VOLUME : undefined,
+          process.env.RAFTDEV_RISINGWAVE_LOW_MEMORY === "1",
         ),
         { quiet: true },
       ).code;
