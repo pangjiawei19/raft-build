@@ -126,7 +126,7 @@ RAFTDEV_RISINGWAVE_LOW_MEMORY=1 ./raftdev start <name> --persistent --risingwave
 
 日常 `stop` 保留四个数据卷。缺失已启用的 RisingWave 卷时拒绝创建空状态替代，需先恢复；只有显式 `destroy --yes` 才删除卷。
 
-持久 RisingWave 使用 Docker 的 `unless-stopped` 重启策略。电脑从休眠唤醒后，单节点服务可能因内部心跳过期退出；Docker 会重新启动原容器并从原卷恢复 CDC 与视图，恢复期间收件箱可能短暂返回 503。正常 `stop` 后保持停止。旧容器在下次 `start` 时原地补齐策略；环境健康运行时也会检查，无需重启应用或 Agent。临时预览环境不启用该策略。
+持久 RisingWave 与其他本地容器一致，使用 Docker 的 `no` 重启策略，不随 Docker 启动，也不在退出后自动重启。电脑从休眠唤醒后，单节点服务若因内部心跳过期退出，可再次执行 `start`，复用原容器和命名卷恢复 CDC 与视图。旧容器在下次 `start` 时原地关闭自动重启；环境健康运行时也会检查，无需重启应用或 Agent。临时预览环境同样不启用自动重启。
 
 附件启动配置包含旧桶和独立的 `<旧桶名>-direct` 桶。旧附件继续使用原存储，新版 `attachments/v2/` 原件和直传使用专用桶。两个桶都保存在原 RustFS 持久卷中；本地凭据由启动脚本注入，不写入文档或版本库。
 

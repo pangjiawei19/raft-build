@@ -378,7 +378,7 @@ export function risingWaveDockerRunArgs(
     "run", "-d", volume ? "--pull=missing" : "--pull=always", "--name", e.RISINGWAVE_CONTAINER,
     "--label", RAFTDEV_MANAGED_LABEL_ARG,
     ...(network ? ["--network", network] : []),
-    ...(volume ? ["--restart", "unless-stopped", "-v", `${volume}:/var/lib/risingwave`] : []),
+    ...(volume ? ["--restart", "no", "-v", `${volume}:/var/lib/risingwave`] : []),
     ...(lowMemory ? [
       // 计算预算为 2 GiB，额外 512 MiB 为已有图的启动恢复保留余量。
       "--memory", "2560m", "--memory-swap", "2560m", "--cpus", "2",
@@ -904,9 +904,9 @@ function ensurePersistentRisingWaveRestartPolicy(e: Env): void {
   requirePersistentMount(e.RISINGWAVE_CONTAINER, e.RISINGWAVE_VOLUME, "/var/lib/risingwave");
   const policy = sh("docker", ["inspect", "--format", "{{.HostConfig.RestartPolicy.Name}}", e.RISINGWAVE_CONTAINER], { quiet: true });
   if (policy.code !== 0) throw new Error("无法检查 RisingWave 重启策略。");
-  // 休眠后单节点可能因心跳过期退出；原地补策略，不重建容器或打断 Agent。
-  if (policy.stdout.trim() !== "unless-stopped") {
-    requireCommand("docker", ["update", "--restart", "unless-stopped", e.RISINGWAVE_CONTAINER]);
+  // 与其他本地容器一致，关闭自动重启；原地更新旧策略，不重建容器或打断 Agent。
+  if (policy.stdout.trim() !== "no") {
+    requireCommand("docker", ["update", "--restart", "no", e.RISINGWAVE_CONTAINER]);
   }
 }
 
