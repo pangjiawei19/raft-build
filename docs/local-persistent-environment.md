@@ -27,6 +27,28 @@
 
 已健康运行时，重复 `start` 返回成功，不重启服务、不刷新凭据、不重跑初始化。启停操作使用环境锁，避免并发操作重复创建资源。部分服务退出时，`start` 会停止残留服务后恢复，数据继续保留。
 
+### 本机环境变量配置
+
+本机 `./.slockdev/local-dev` 通过 `RAFTDEV_ENV_FILE` 加载 `.slockdev/local.env`，配置文件不进入 Git。其他机器可从 `scripts/dev/local.env.example` 复制，再在自己的启动入口设置 `RAFTDEV_ENV_FILE`，或直接指定：
+
+```bash
+RAFTDEV_ENV_FILE="$PWD/.slockdev/local.env" ./raftdev start raft-build
+```
+
+配置使用 dotenv 格式，支持注释、引号和 `变量名=值`，不执行 shell 命令，也不展开 `$变量`。调用时显式提供的同名环境变量优先。文件中的变量会传给 tmux 启动的服务；端口、数据库和存储等由启动器托管的连接参数仍按环境生成。
+
+```dotenv
+# 免费工作区的月上传额度：10 GiB，单位为字节。
+FILE_UPLOAD_MONTHLY_LIMIT_BYTES=10737418240
+
+# 其他已有配置项也可放在同一文件中。
+IMAGE_DECODE_CONCURRENCY=2
+```
+
+`FILE_UPLOAD_MONTHLY_LIMIT_BYTES` 必须为正的安全整数，删除或留空时沿用上游默认的 100 MiB。它调整当前部署内免费工作区的月上传上限，保留已用及预占字节的核算；其他套餐额度和单文件大小上限沿用原规则。以后添加已有环境变量支持的参数即可；没有环境变量入口的参数仍需先增加代码支持。
+
+本机已配置每月 10 GiB，并通过 12 MiB 文件上传、鉴权代理下载和字节一致性验收，原有用量与凭据保留。修改文件后执行 `./.slockdev/local-dev restart raft-build` 生效。对已经健康运行的环境再次执行 `start` 不会重新加载服务进程的配置。
+
 ## 首次创建的内容
 
 - 一个本地账号：`dev@slock.ai`，初始密码为 `password123`。
@@ -73,7 +95,15 @@
 
 已启用 RisingWave 的旧环境还需要根据 [RisingWave SQL 说明](../infra/risingwave/sql/README.md)单独升级 CDC 字段和物化视图，尤其是 078 的任务讨论区视图。普通 `start` 仅验证既有图，缺少新版关系时会拒绝启动，不会重建复制槽、清空命名卷或重新导入测试数据。代码合并与回归测试不自动执行这项业务环境升级。
 
-2026 年 11 月 17 日合并验收：开发脚本、Agent 协作规则及提示词、附件存储与收件箱、前端任务与重连回归共 358 项通过、13 项跳过；真实 RisingWave 集成因未配置隔离数据库而跳过，缺少私有 CI 依赖的快照清理测试未纳入。启动器、Shared、Server、Daemon、Web、CLI、Computer 以及本地初始化和 RisingWave 脚本的类型检查通过，CLI 与 Web 完整构建通过。未对现有业务数据库执行迁移或重新初始化。
+2026 年 11 月 17 日代码合并验收：开发脚本、Agent 协作规则及提示词、附件存储与收件箱、前端任务与重连回归共 358 项通过、13 项跳过；当时真实 RisingWave 集成尚未配置隔离数据库，缺少私有 CI 依赖的快照清理测试未纳入。启动器、Shared、Server、Daemon、Web、CLI、Computer 以及本地初始化和 RisingWave 脚本的类型检查通过，CLI 与 Web 完整构建通过。
+
+同日本机 `raft-build` 已完成业务环境迁移。先停止服务，离线复制并逐文件校验四个数据卷，同时备份 PostgreSQL、Agent home 和身份配置，再在隔离副本演练；演练通过后才升级正式环境。PostgreSQL 迁移记录从 374 条推进至 693 条，迁移后的 81 项索引步骤通过。RisingWave 原地补齐三个 CDC 字段、同步历史数据并升级任务讨论区和收件箱视图，保留原 source、publication、复制槽和数据卷；创建新图时仅临时放宽迁移会话的 actor 限额，退役旧派生关系后恢复限制，最终 actor 数为 370。
+
+迁移前的 1 个账号、1 个工作区、224 个频道、12 个 Agent、2,788 条消息、166 个任务、311 个附件及本机 Daemon 记录均保留，所核对核心字段与本地凭据摘要一致。真实 RisingWave 图验证、PostgreSQL／RisingWave 收件箱一致性、真实数据库查询测试、原账号登录、网页动态和任务页面、历史附件摘要、新附件上传下载及匿名访问限制均通过，使用日常 `restart` 完整重启后再次通过。验收消息仅发送到本人私密临时频道，完成后已删除频道；这些验收记录不计入上述原数据基线。
+
+备份与验收证据保存在本机 `.slockdev/raft-build/migration-v124-20261117-155341/`，四个离线备份卷以 `raft-build-pre-v124-155341-` 开头，均保留供恢复使用。日常仍通过 `./.slockdev/local-dev` 启停，四个容器均使用 `restart=no`，RisingWave 继续使用原低内存配置。本机入口已配置仓库要求的 pnpm 12.15.0。
+
+验收时原工作区本月 100 MiB 上传额度剩余约 1.1 MiB，12 MiB 新文件按既有配额返回 `FILE_UPLOAD_QUOTA_EXCEEDED`；历史 12 MiB 附件仍能正常下载。本机未启用附件会话直传，沿用兼容上传和鉴权下载代理。外部产品反馈集成未配置，反馈列表返回 `feedback_integration_unavailable`；这两项限制独立于已通过的核心工作区功能。
 
 只有明确删除环境时才执行以下命令，它会永久删除指定环境的托管容器、命名数据卷和本地配置：
 

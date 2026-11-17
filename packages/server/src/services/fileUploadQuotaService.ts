@@ -1,9 +1,10 @@
 import { and, eq, sql } from "drizzle-orm";
-import { APPSUMO_PLAN_LIMITS, FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES, canUseProBillingFeatures, currentDate, type BillingEntitlementProjection, type ServerPlan } from "@botiverse/raft-shared";
+import { APPSUMO_PLAN_LIMITS, canUseProBillingFeatures, currentDate, type BillingEntitlementProjection, type ServerPlan } from "@botiverse/raft-shared";
 import type { DatabaseExecutor, DatabaseTransaction } from "../db/index";
 import { getDb } from "../db/index";
 import { serverFileUploadUsageMonths, servers } from "../db/schema";
 import { getAppUrl } from "../config/appUrl";
+import { freeMonthlyUploadLimitBytes } from "../config/fileUploadQuota";
 import { refreshSubscriptionForServerIfStale } from "./billingService";
 import { getServerBillingEntitlement, lockServerResourceInTransaction, withServerResourceLock } from "./planService";
 
@@ -126,7 +127,7 @@ function summarize(entitlement: BillingEntitlementProjection, month: string, use
   const { plan, appsumo } = entitlement;
   const limited = plan === "free" || Boolean(appsumo);
   const enforced = Boolean(appsumo) || (limited && !canUseProBillingFeatures(plan, now));
-  const limitBytes = appsumo ? APPSUMO_PLAN_LIMITS[appsumo.tier].monthlyUploadBytes : limited ? FREE_MONTHLY_FILE_UPLOAD_LIMIT_BYTES : -1;
+  const limitBytes = appsumo ? APPSUMO_PLAN_LIMITS[appsumo.tier].monthlyUploadBytes : limited ? freeMonthlyUploadLimitBytes : -1;
   return {
     month,
     plan,

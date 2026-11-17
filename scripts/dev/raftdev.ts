@@ -48,6 +48,7 @@ import { homedir, hostname, tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseReaderStartedAtMs, runTraceCli, traceBannerLines } from "./raftdev-trace";
 import { persistentSchemaHash, readPersistentEnvironment, writePersistentEnvironment } from "./raftdev-persistent";
+import { loadLocalEnvironment } from "./raftdev-local-env";
 import {
   prepareDevEnvDir,
   recordDevEnvProcesses,
@@ -864,6 +865,7 @@ function formatTimestamp(seconds: number | null): string {
  * the caller's TMPDIR is kept (explicit, CI, non-Linux, no on-disk root).
  */
 let serviceEnvDir: DevEnvDir | null = null;
+let localServiceEnv: NodeJS.ProcessEnv = {};
 
 // Wraps a command so tmux window prints its exit status then drops into a
 // login shell — identical contract to bash slockdev's run_tmux_shell_command.
@@ -872,13 +874,12 @@ let serviceEnvDir: DevEnvDir | null = null;
 // environment's TMPDIR into them explicitly.
 export function tmuxShellCommand(
   cmd: string,
-  carry: { NODE_COMPILE_CACHE?: string; TMPDIR?: string },
+  carry: NodeJS.ProcessEnv,
   shell: string,
 ): string {
   let exports = "";
-  for (const name of ["NODE_COMPILE_CACHE", "TMPDIR"] as const) {
-    const value = carry[name];
-    if (value) exports += `export ${envAssign(name, value)}; `;
+  for (const [name, value] of Object.entries(carry)) {
+    if (value !== undefined) exports += `export ${envAssign(name, value)}; `;
   }
   const wrapped =
     `${exports}${cmd}; status=$?; echo; echo "[raftdev] command exited with status $status"; ` +
@@ -888,8 +889,9 @@ export function tmuxShellCommand(
 
 export function runTmuxShellCommand(cmd: string): string {
   return tmuxShellCommand(cmd, {
+    ...localServiceEnv,
     NODE_COMPILE_CACHE: process.env.NODE_COMPILE_CACHE,
-    TMPDIR: serviceEnvDir?.tmpdir ?? undefined,
+    TMPDIR: serviceEnvDir?.tmpdir ?? localServiceEnv.TMPDIR,
   }, process.env.SHELL || "/bin/zsh");
 }
 
@@ -5436,6 +5438,7 @@ function applyDevCacheEnv(command: string): void {
 }
 
 async function main(argv: string[]): Promise<number | void> {
+  localServiceEnv = loadLocalEnvironment(process.env.RAFTDEV_ENV_FILE);
   const command = argv[0] ?? "";
   const envName = argv[1] ?? basename(PROJECT_DIR);
   if (command === "cache") return runCacheCli(argv.slice(1), { out });
