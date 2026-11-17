@@ -17,7 +17,14 @@ function fixture(t: TestContext) {
   mkdirSync(bin);
   mkdirSync(join(repo, "packages/server/src/db"), { recursive: true });
   cpSync(join(sourceRoot, "scripts/dev"), join(repo, "scripts/dev"), { recursive: true });
-  for (const file of ["raftdev", "package.json", ".node-version", "packages/server/src/db/schema.ts"]) {
+  cpSync(join(sourceRoot, "scripts/vitest"), join(repo, "scripts/vitest"), { recursive: true });
+  for (const file of [
+    "raftdev", "package.json", ".node-version", "packages/server/package.json", "packages/server/src/db/schema.ts",
+    "packages/server/src/db/postMigrationIndexes.ts", "packages/server/src/db/notificationOutboxIndexContract.ts",
+    "packages/server/src/db/attestedSendEventsIndexContract.ts", "packages/server/src/services/slackVerifiedIngressIndexContract.ts",
+    "packages/server/src/services/slackBotWakeIndexContract.ts",
+  ]) {
+    mkdirSync(dirname(join(repo, file)), { recursive: true });
     cpSync(join(sourceRoot, file), join(repo, file));
   }
   symlinkSync(join(sourceRoot, "node_modules"), join(repo, "node_modules"), "dir");
@@ -47,6 +54,9 @@ if (tool === 'docker') {
     const mounts = [];
     args.forEach((arg, i) => { if (arg === '-v') { const [Name, Destination] = args[i+1].split(':'); mounts.push({Name, Destination}); } });
     state.containers[args[args.indexOf('--name')+1]] = {running: true, mounts}; save();
+  } else if (cmd === 'exec') {
+    if (args.join(' ').includes('pg_tables')) out('0,false');
+    else if (args.join(' ').includes('SHOW wal_level')) out('logical');
   } else if (cmd === 'start' || cmd === 'stop') {
     if (!state.containers[args.at(-1)]) process.exit(1);
     state.containers[args.at(-1)].running = cmd === 'start'; save();
@@ -74,6 +84,7 @@ if (tool === 'docker') {
   process.exit(99);
 } else if (tool === 'pnpm') {
   if (process.env.RAFTDEV_TEST_FAIL_BUILD === '1' && cmd === '--filter') process.exit(23);
+  if (process.env.RAFTDEV_TEST_FAIL_MIGRATE === '1' && args.includes('scripts/migrate-deploy.ts')) process.exit(17);
   if (args.includes('scripts/init-local.ts')) {
     fs.writeFileSync(args[args.indexOf('--output')+1], JSON.stringify({user: {id: 'user'}, server: {id: 'server'}, machine: {apiKey: 'key-' + Date.now()}}));
   }
@@ -123,7 +134,7 @@ test("持久环境默认常驻，重复 start 无副作用，stop/start 保留�
   f.ok(["start", f.name]);
   assert.equal(readFileSync(f.credentials, "utf8"), before);
   assert.equal(f.commands().filter(c => c.tool === "pnpm" && c.args.includes("scripts/init-local.ts")).length, 1);
-  assert.equal(f.commands().filter(c => c.tool === "npx" && c.args.includes("migrate")).length, 1);
+  assert.equal(f.commands().filter(c => c.tool === "pnpm" && c.args.includes("scripts/migrate-deploy.ts")).length, 1);
   assert.ok(!f.commands().some(c => c.args.includes("scripts/seed.ts") || c.args.includes("--force")));
   assert.ok(!f.commands().some(c => c.tool === "tmux" && c.args.includes("janitor")));
   assert.ok(f.commands().some(c => c.tool === "docker" && c.args.includes("--appendonly")));
@@ -170,6 +181,24 @@ test("持久环境启动失败会停止服务，但不会删除既有数据和�
   assert.equal(readFileSync(f.credentials, "utf8"), before);
   assert.ok(!f.commands().some(c => c.tool === "docker" && c.args.includes("rm")));
 });
+
+for (const fail of [false, true]) {
+  test(`持久迁移${fail ? "失败" : "成功"}后保留数据和身份，服务保持停止`, (t) => {
+    const f = fixture(t);
+    f.ok(["init", f.name]);
+    const credentials = readFileSync(f.credentials, "utf8");
+    const resources = f.resources();
+    const count = f.commands().length;
+    const result = f.run(["migrate", f.name], { RAFTDEV_TEST_FAIL_MIGRATE: fail ? "1" : "0" });
+    assert.equal(result.status, fail ? 1 : 0, result.stdout + result.stderr);
+    assert.equal(readFileSync(f.credentials, "utf8"), credentials);
+    assert.deepEqual(f.resources(), resources);
+    const commands = f.commands().slice(count);
+    assert.ok(commands.some(c => c.tool === "pnpm" && c.args.includes("scripts/migrate-deploy.ts")));
+    assert.ok(!commands.some(c => c.args.includes("scripts/init-local.ts") || c.args.includes("scripts/seed.ts") || c.args.includes("--force")));
+    assert.ok(!commands.some(c => c.tool === "docker" && ["run", "rm"].includes(c.args[0])));
+  });
+}
 
 test("持久启动向服务端注入新版附件专用桶及全部连接配置", (t) => {
   const f = fixture(t);

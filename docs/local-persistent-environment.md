@@ -4,7 +4,7 @@
 
 ## 使用方式
 
-运行前需要安装 Node.js 24（仓库基准为 24.21）、pnpm 12.11.2、Docker 和 `tmux`，并启动 Docker。启动器会检查缺失依赖；例如 macOS 使用 Homebrew 时可通过 `brew install tmux` 安装 `tmux`。在仓库内运行 `pnpm --version`，应与 `package.json` 的 `packageManager` 一致。
+运行前需要安装 Node.js 24（仓库基准为 24.22.1）、pnpm 12.15.0、Docker 和 `tmux`，并启动 Docker。启动器会检查缺失依赖；例如 macOS 使用 Homebrew 时可通过 `brew install tmux` 安装 `tmux`。在仓库内运行 `pnpm --version`，应与 `package.json` 的 `packageManager` 一致。
 
 本机已经配置的入口为 `./.slockdev/local-dev`，默认启用持久模式。该入口负责选择本机的 Node 和 tmux，实际功能由纳入版本控制的 `raftdev` 实现。
 
@@ -64,6 +64,16 @@
 `migrate` 会停止应用、执行迁移并保持服务停止。迁移失败时保留数据和日志，不重新建库。它不是自动回滚或备份工具。
 
 从 `v1.13.0-source.1` 升级到 `v1.21.23-source.1` 时，上游重排了历史迁移，已有数据库不能直接沿用常规 `migrate` 流程。需要保留数据时应单独制定迁移方案；明确不需要旧数据时，可销毁该环境后重新初始化。
+
+### 升级到 v1.24.0
+
+持久环境继续沿用既有依赖选择，已启用的 RisingWave 自动恢复；尚未启用时仍需显式传入 `--risingwave`。上游临时开发环境的普通 `start` 则默认启用 RisingWave，可用 `--no-risingwave` 关闭。持久模式不支持临时预览或演示 Agent 初始化。
+
+持久环境首次初始化与显式 `migrate` 使用上游部署迁移器及迁移后的索引步骤；日常 `start` 仍只检查数据库定义，不自动修改表结构。迁移失败后服务保持停止，已有数据、身份和附件继续保留。
+
+已启用 RisingWave 的旧环境还需要根据 [RisingWave SQL 说明](../infra/risingwave/sql/README.md)单独升级 CDC 字段和物化视图，尤其是 078 的任务讨论区视图。普通 `start` 仅验证既有图，缺少新版关系时会拒绝启动，不会重建复制槽、清空命名卷或重新导入测试数据。代码合并与回归测试不自动执行这项业务环境升级。
+
+2026 年 11 月 17 日合并验收：开发脚本、Agent 协作规则及提示词、附件存储与收件箱、前端任务与重连回归共 358 项通过、13 项跳过；真实 RisingWave 集成因未配置隔离数据库而跳过，缺少私有 CI 依赖的快照清理测试未纳入。启动器、Shared、Server、Daemon、Web、CLI、Computer 以及本地初始化和 RisingWave 脚本的类型检查通过，CLI 与 Web 完整构建通过。未对现有业务数据库执行迁移或重新初始化。
 
 只有明确删除环境时才执行以下命令，它会永久删除指定环境的托管容器、命名数据卷和本地配置：
 

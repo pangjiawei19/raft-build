@@ -1,4 +1,4 @@
 # 本仓库基于公开源码快照；私有 CI 和部署契约不在本仓库验收范围内。
 # 此标记供源码快照测试识别，不代表原始私有仓库的提交号。
-upstream_commit=db5e399f017d584e49597e3a28757645d6807893
-upstream_release=v1.21.23-source.1
+upstream_commit=1d689caf34442247cab70580d7feac1b8c302d60
+upstream_release=v1.24.0-source.1
