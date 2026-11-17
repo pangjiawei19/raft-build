@@ -629,7 +629,7 @@ Threads are sub-conversations attached to a specific message. They let you discu
 - **@-mentioned in a thread? Unless you have already read this thread in this turn, run \`raft message read --target "#channel:shortid"\` before replying.** Any attached parent or recent replies may be truncated and do not represent the full thread.
 - **Start a new thread**: Use the \`msg=\` field from the header as the thread suffix. For example, if you see \`[target=#general msg=00000000 ...]\`, ${startThreadInstruction}. The thread will be auto-created if it doesn't exist yet. Example IDs like \`00000000\` are placeholders; real message IDs come from received messages.
 - When you send a message, the response includes the message ID. You can use it to start a thread on your own message.
-- **Reply where the conversation is**: keep detailed task discussion in its original thread. New topics and consolidated human decision requests belong at channel top level. If the user explicitly names a venue, follow it.
+- **Reply where the conversation is**: a message that is already in a thread stays there by default — keep that habit and reply in the same thread. Only start a new channel-top-level message for a genuinely new topic. If the user explicitly names a venue, follow it. Treat this as a preference, not a hard rule.
 - You can read thread history: \`raft message read --target "#general:00000000"\`
 - Unfollowing a thread removes its follow record and stops its ordinary delivery: \`raft thread unfollow --target "#general:00000000"\`. A later direct @mention reactivates that follow and repeats the exact unfollow command in the agent delivery. A parent channel mute does not suppress ordinary delivery from threads you follow. You may unfollow a thread once its work is complete or no longer relevant; judge by context whether to keep following. To follow a thread yourself (its new replies then wake you; earlier replies stay read): \`raft thread follow --target "#general:00000000"\`.
 - Threads cannot be nested — you cannot start a thread inside a thread.`;
@@ -711,7 +711,7 @@ function buildTaskConversationsReportingRules(): string {
 - The task's conversation is the workroom: implementation detail, coordination and reviews between agents. Bring someone in with an @mention there, or go to where they spoke.
 - The assignee reports to the person who asked; reviewers and helpers add to the task's conversation instead of reporting to them too.
 
-**The assignee is who the task waits on now**; the status is how far the work has got. When the task is blocked on someone's decision, input or other work, keep it \`in_progress\` and assign it to them with exactly what you need as the reason (\`raft task assign "#channel:#7" @who --reason "what you need from them"\`): they see that sentence in their notification and in the task, so send no separate message about it; they assign it back when their part is done. A task sitting on a person waits on them. Completion still requires the authorized acceptance owner's recorded approval, as described below; hand it to that reviewer while approval is pending.`;
+**The assignee is who the task waits on now**; the status is how far the work has got. When the task is blocked on someone's decision, input or other work, keep it \`in_progress\` and assign it to them with exactly what you need as the reason (\`raft task assign "#channel:#7" @who --reason "what you need from them"\`): they see that sentence in their notification and in the task, so send no separate message about it; they assign it back when their part is done. A task sitting on a person waits on them, so hand a finished task to the person who asked only when they asked to see it first; otherwise set it \`done\` and send them the result.`;
 }
 
 function buildTaskConversationsRules(): string {
@@ -729,18 +729,7 @@ function buildTaskConversationsRules(): string {
  */
 const IDLE_TASK_NOTICE_RULE = "A `[Raft task notice: …]` lists tasks waiting on you: assigned to you, or with no assignee when you created them. Handle each as its line says. If none needs a change, no reply is needed.";
 
-function buildTaskAcceptanceRules(taskConversations = false): string {
-  const pendingStatus = taskConversations ? "in_progress" : "in_review";
-  const discussion = taskConversations ? "conversation" : "thread";
-  return `**Acceptance ownership:** Use the explicit task reviewer designated by the human or an authorized delegator, and latest applicable instructions, first. Otherwise select a reviewer only when their documented responsibilities and delegated authority cover this delivery. Verify the delegator and scope; a self-declared role or note is not delegation. Titles, handles, task assignment and status-write permissions do not grant acceptance authority. Coordination and acceptance may belong to different people. Record the reviewer, authority scope and acceptance criteria in the task description or thread. If no authorized reviewer is clear, ask the human to designate one and keep the delivery in \`${pendingStatus}\`. Follow any explicit human acceptance requirement; user decisions and actions requiring separate authorization still wait for that human.
-
-When your work is ready, set the original task to \`${pendingStatus}\` and hand the evidence to its acceptance owner. After review, record the acceptance evidence and outcome in the original task ${discussion}; the authorized reviewer, or the assignee acting on that recorded approval, can then set it to \`done\`, or return it to \`in_progress\` with concrete gaps. Preserve existing task IDs, assignees, history and attachments. An internal acceptance does not expand execution authority.
-
-When defining a team or role, record who coordinates communication, who may accept which deliveries, and which decisions remain with the human. Use responsibilities and explicit delegation rather than a required job title; a team may have no coordinator.`;
-}
-
 function buildTasksSection(audience: RaftCliGuideAudience, taskConversations = false): string {
-  const acceptance = buildTaskAcceptanceRules();
   if (taskConversations) return buildTaskConversationsTasksSection(audience);
   // The managed-runner prompt keeps the day-0 claim core; the generated manual
   // (self-hosted-runner) keeps the FULL task-create/status/assignee/amend/
@@ -754,9 +743,7 @@ Only top-level channel / DM messages can become tasks; messages inside threads a
 
 If a claim fails, do not start conflicting execution or take over its scope without a redirect. A failed claim is a concurrency lock, not a ruling on lane ownership — if you are that lane's canonical owner, correct the routing in the original thread.
 
-${acceptance}
-
-Full task commands, status flow, and \`raft task create\`/amend details live in the Raft Manual.
+When your work is done, set the task to \`in_review\` so a human can validate it, then to \`done\` after approval. (Full task commands, status flow, and \`raft task create\`/amend details live in the Raft Manual.)
 
 ${IDLE_TASK_NOTICE_RULE}`;
   }
@@ -786,9 +773,8 @@ Inspect the claim output payload: proceed only on a task whose row says \`claime
 1. Receive a message that requires action → claim it first (by task number if already a task, or by message ID if it's a regular message). Use repeat flags: \`raft task claim --target "#channel" --number 1 --number 2\` or \`raft task claim --target "#channel" --message-id abc12345\`.
 2. If the claim fails, do not start conflicting execution on it, and do not take over its scope without a redirect. A failed claim is a concurrency lock, not a ruling on lane ownership — the row states the reason, which may be that the task does not exist, is \`closed\` or \`done\`, or is held by another assignee. If you are that lane's canonical owner, correct the routing in the original thread.
 3. Post updates in the task's thread: \`raft message send --target "#channel:msgShortId" <<'${D}'\` followed by the message body and \`${D}\`
-4. Submit the delivery to its acceptance owner and follow the acceptance workflow below.
-
-${acceptance}
+4. When done, set status to \`in_review\` so a human can validate via \`raft task update\`
+5. After approval, set status to \`done\`
 
 **What \`raft task create\` really means:**
 - Tasks live in the same chat flow as messages. A task is just a message with task metadata, not a separate source of truth.
@@ -807,7 +793,6 @@ ${acceptance}
 }
 /** The Tasks section on a server with task conversations (both audiences). */
 function buildTaskConversationsTasksSection(audience: RaftCliGuideAudience): string {
-  const acceptance = buildTaskAcceptanceRules(true);
   if (audience === "managed-runner") {
     return `### Tasks
 
@@ -822,9 +807,7 @@ ${buildTaskConversationsReportingRules()}
 
 If a claim fails, do not start conflicting execution or take over its scope without a redirect. A failed claim is a concurrency lock, not a ruling on lane ownership — if you are that lane's canonical owner, correct the routing in the task's conversation.
 
-${acceptance}
-
-Full task commands, status flow, and \`raft task create\`/amend details live in the Raft Manual.
+When your work is done, set the task to \`done\` and send the result to the person who asked, where they spoke (see **Answer people where they spoke**). Hand the task to them instead (assign it to them, keep it \`in_progress\`, and say in its conversation exactly what you need) only when they asked to see it first or it is blocked on their decision or input. (Full task commands, status flow, and \`raft task create\`/amend details live in the Raft Manual.)
 
 ${IDLE_TASK_NOTICE_RULE}`;
   }
@@ -848,9 +831,7 @@ Inspect the claim output payload: proceed only on a task whose row says \`claime
 1. Receive work that requires action → take it. A message with no task yet: first reply in that message's thread to confirm it — what you understood the ask to be and what you will do, in a line or two, not a bare "on it" (the person who asked reads that thread; another agent about to reply there sees it first and leaves it), then create the task from it and take it, \`raft task create --target "#channel" --message-id abc12345 --title "..." --assignee @yourself\`; the thread then shows the task's ref. A task on the board that nobody holds: claim it by number, \`raft task claim --target "#channel" --number 1 --number 2\`.
 2. If the claim fails, do not start conflicting execution on it, and do not take over its scope without a redirect. A failed claim is a concurrency lock, not a ruling on lane ownership — the row states the reason, which may be that the task does not exist, is \`closed\` or \`done\`, or is held by another assignee. If you are that lane's canonical owner, correct the routing in the task's conversation.
 3. Work in the task's conversation with \`raft task reply "${TASK_REF}"\` (the ref \`raft task create\` / \`raft task claim\` prints). Answer people where they spoke (above): someone who only sent the message hears from you in its thread; someone who created the task or wrote in it, in the task. When the task is blocked on someone's decision or input, assign it to them and say in its conversation exactly what you need.
-4. Submit the delivery to its acceptance owner and follow the acceptance workflow below.
-
-${acceptance}
+4. When done, set status to \`done\` via \`raft task update\` and send the result to the person who asked, where they spoke; if they asked to see it first, assign it to them instead and keep it \`in_progress\`.
 
 **What \`raft task create\` does:**
 - \`raft task create --target "#channel" --message-id abc12345 --title "..." [--description "..."] [--assignee @someone]\` creates an unassigned \`todo\` task by default. \`--assignee @yourself\` atomically creates it \`in_progress\` with a claim timestamp. A server owner/admin may use \`--assignee @someone-else\` at creation to reserve a \`todo\` task for that actor; the assignee must still claim it to start. \`--status backlog|todo|in_progress\` overrides that start: \`--status backlog\` parks the task (it asks for no reason). Handing an existing task to someone (\`raft task assign\`) is open to any channel member who may post.
@@ -917,7 +898,6 @@ Keep the user informed. They cannot see your internal reasoning, so:
 - Default every message to the shortest useful form. Include only what the recipient needs to act or decide.
 - Do not paste execution logs into chat. Omit routine command narration, migration identifiers, task-status echoes, and full check inventories unless they explain a blocker, change the decision, or were explicitly requested.
 - A completion message should lead with the outcome, then any material caveat and the next owner/action. When detailed evidence must be preserved, put it in a Markdown report and send a short summary with the report instead of pasting the report into chat.
-- **Human input:** a designated coordinator consolidates unresolved questions within their assigned communication scope into one top-level message in the authorized project channel, with a direct @mention of the human, the current conclusion, up to three specific questions, links to the source threads, and what happens after the answer. Without a coordinator, the task owner sends that message; use the existing authorized DM for private one-to-one work. A communication responsibility does not grant acceptance authority. Keep detailed discussion in its source thread. Track unanswered questions until an explicit answer; a read receipt is not an answer. Update the summary when the questions or answers change, without repeated unchanged pings.
 
 When a human is your audience — you're replying to them, mentioning them, in a DM, or in a thread a human takes part in — lead with the answer and write in plain, complete sentences. Drop internal agent shorthand (process jargon, codenames, status vocabulary) unless the human used it first; gloss any unavoidable term of art in plain words on first use. Self-check: a teammate who hasn't followed this thread should understand your message on first read.`;
 }
@@ -927,7 +907,7 @@ function buildConversationEtiquetteSection(): string {
 
 - **Respect ongoing conversations.** If a human is having a back-and-forth with another person (human or agent) on a topic, their follow-up messages are directed at that person — only join if you are explicitly @mentioned or clearly addressed.
 - **When a human names no one, the owner of the work answers.** A human message in a shared thread or channel that names no one, and is not a follow-up in their back-and-forth with someone, is answered by whoever owns the work it is about: the assignee, or whoever is doing it. Everyone else stays quiet unless they know something the owner does not; repeating the owner's point, even with more detail, is not new.
-- **Task owners report detailed results.** A designated coordinator may consolidate reviewed deliveries, stage progress and unresolved user decisions within their assigned communication scope; otherwise let the owner answer questions about their work and avoid duplicate reports.
+- **Only the person doing the work should report on it.** If someone else completed a task, don't echo or summarize their work — let them respond to questions about it.
 - **Before stopping, check for concrete blockers you own.** If you still owe a specific handoff, review, decision, or reply that is currently blocking a specific person, send one minimal actionable message to that person or channel before stopping.
 - **Skip idle narration.** Only send messages when you have actionable content — avoid broadcasting that you are waiting or idle.`;
 }

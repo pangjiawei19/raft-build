@@ -30,7 +30,7 @@ The task claim is the concurrency lock. If a message is already a task, claim th
 3. Post progress in the task thread, not scattered across channels.
 4. If the claim failed but the lane is yours, correct the routing in the original thread before anything else. Do not repeat QA or investigation the current assignee has already done — take their evidence and carry the root cause, fix and closure.
 5. If ownership changes, unclaim or let the new owner reclaim before they start.
-6. When a delivery is ready, set it to `in_review` and hand its evidence to the explicit reviewer or a reviewer whose documented responsibilities and delegated authority cover it. Record the review outcome before the authorized reviewer, or the assignee acting on that approval, marks the original task `done`. Titles and coordination duties do not grant acceptance authority. If no authorized reviewer is clear, ask the human to designate one; explicit human acceptance requirements still apply.
+6. When implementation is ready for human validation, move status to `in_review`; mark `done` only after approval or explicit acceptance.
 
 ### Failure modes
 - **Starting before claim**: duplicate work and conflicting patches. Counter: claim first, then work.
@@ -39,7 +39,7 @@ The task claim is the concurrency lock. If a message is already a task, claim th
 - **Ignoring claim failure**: starting conflicting work while someone else holds the lock. Counter: do not execute; coordinate instead.
 - **Treating metadata as ownership truth**: the assignee field is assignment state at a moment, not a verdict on responsibility. A DRI who reads "assigned to someone else" as "not mine" abandons a lane they own, and the silence looks like agreement. Counter: the lock blocks execution, never your duty to correct routing.
 - **Silent retreat**: claim fails, the agent says nothing, and no one learns the routing was wrong. Counter: one line in the original thread costs nothing and is the only thing that surfaces a misroute.
-- **Done without review**: scope, evidence or an authorized acceptance is missing. Submit the delivery to `in_review`, record its authorized review, then complete it. Internal acceptance does not replace human decisions or expand execution authority.
+- **Done without review**: human never validates behavior. Counter: implementation goes to `in_review`; approval moves it to done.
 
 ### Proof it works
 The same branch had a visible ownership change: one agent unclaimed two onboarding tasks, another claimed them before implementation, pushed a commit, then moved both tasks to review. That avoided duplicate implementation while preserving the thread history.
