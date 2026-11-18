@@ -49,6 +49,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseReaderStartedAtMs, runTraceCli, traceBannerLines } from "./raftdev-trace";
 import { persistentSchemaHash, readPersistentEnvironment, writePersistentEnvironment } from "./raftdev-persistent";
 import { loadLocalEnvironment } from "./raftdev-local-env";
+import { assertComputerBuildCurrent, computerBuildEnvironment, computerBuildIsCurrent } from "./raftdev-computer-build";
 import {
   prepareDevEnvDir,
   recordDevEnvProcesses,
@@ -3328,6 +3329,16 @@ function cmdStart(args: string[], preview?: PreviewStartHooks, initOnly = false)
   const e = setupEnv(name);
   let persistentState = readPersistentEnvironment(e.PERSISTENT_CONFIG);
   const persistent = persistentRequested || persistentState !== null;
+  const agentHost = process.env.RAFTDEV_AGENT_HOST ?? "daemon";
+  if (agentHost !== "daemon" && agentHost !== "computer") {
+    throw new Error("RAFTDEV_AGENT_HOST 仅支持 daemon 或 computer。");
+  }
+  const sourceComputer = agentHost === "computer";
+  const computerEntry = join(PROJECT_DIR, "packages/computer/dist/raft-computer.js");
+  if (sourceComputer && (!persistentState?.initialized ||
+      !existsSync(join(e.SLOCK_HOME, "computer/servers")))) {
+    throw new Error("Computer 模式需要已初始化的持久环境和已迁移的本机 attachment；拒绝回退到旧 daemon 或新建机器。");
+  }
   // 已启用的收件箱依赖随环境恢复，不要求每天重复传参。
   if (persistentState?.risingWave && risingWaveLocalRaw === undefined) risingWaveLocalRaw = "full";
   // 已有持久环境沿用原依赖选择，避免升级后首次启动隐式建立 CDC。
@@ -3369,6 +3380,12 @@ function cmdStart(args: string[], preview?: PreviewStartHooks, initOnly = false)
       }
     }
     if (tmuxHasSession(e.TMUX_SESSION)) {
+      if (sourceComputer) {
+        out(computerBuildIsCurrent(PROJECT_DIR)
+          ? `持久环境 '${name}' 已在运行，无需重复启动；如需重启，请执行 restart ${name}。`
+          : `环境 '${name}' 正在运行，Computer 需要重新构建；请执行 restart ${name}，将先停止服务再自动构建。`);
+        return;
+      }
       if (persistentState?.initialized && persistentHttpReady(e) &&
           [e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER].every(dockerNameRunning) &&
           (!persistentState.risingWave || dockerNameRunning(e.RISINGWAVE_CONTAINER)) &&
@@ -3395,6 +3412,20 @@ function cmdStart(args: string[], preview?: PreviewStartHooks, initOnly = false)
       }
       persistentState = { version: 1, mode: "persistent", initialized: false, schemaHash: "" };
       writePersistentEnvironment(e.PERSISTENT_CONFIG, persistentState);
+    }
+    if (sourceComputer && !computerBuildIsCurrent(PROJECT_DIR)) {
+      out("Computer 构建已过期或缺少记录，准备自动构建（Node 堆上限 1536 MiB，线程最多 2，降低 CPU 优先级）。");
+      // 编译必须先释放本环境的服务资源，不在运行中的 Agent 上覆盖 dist。
+      if ([e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER, e.RISINGWAVE_CONTAINER, e.OTELCOL_CONTAINER].some(dockerNameRunning) && !cmdStop(name)) {
+        throw new Error("部分服务停止失败，取消 Computer 自动构建；现有数据已保留。");
+      }
+      const built = spawnSync(packageManagerCommand("pnpm"), ["--filter", "@botiverse/raft-computer", "build"], {
+        cwd: PROJECT_DIR, env: computerBuildEnvironment(process.env), stdio: "inherit", shell: packageManagerSpawnShell(),
+      });
+      if (built.error || built.status !== 0) {
+        throw new Error(`Computer 自动构建失败（${built.error?.message ?? built.status ?? built.signal}）；服务保持停止，Agent、数据库和附件已保留。修复上方错误后重试 start。`);
+      }
+      assertComputerBuildCurrent(PROJECT_DIR);
     }
   }
   let risingWave: RisingWaveDependencyConfig;
@@ -4047,17 +4078,21 @@ function cmdStart(args: string[], preview?: PreviewStartHooks, initOnly = false)
     out("Managed RisingWave is serving-ready.");
   }
 
-  out("Building @botiverse/raft (used by spawned agents for messaging)...");
-  const pnpmCommand = packageManagerCommand("pnpm");
-  r = spawnSync(pnpmCommand, ["--filter", "@botiverse/raft", "build"], {
-    cwd: PROJECT_DIR, env: process.env, stdio: ["inherit", "ignore", "inherit"],
-    shell: packageManagerSpawnShell(),
-  });
-  if ((r.status ?? 1) !== 0) {
-    updateRisingWaveStatus("failed");
-    process.exit(r.status ?? 1);
+  if (sourceComputer) {
+    out("使用 Computer 构建中已验证的随附 CLI，跳过重复编译。");
+  } else {
+    out("Building @botiverse/raft (used by spawned agents for messaging)...");
+    const pnpmCommand = packageManagerCommand("pnpm");
+    r = spawnSync(pnpmCommand, ["--filter", "@botiverse/raft", "build"], {
+      cwd: PROJECT_DIR, env: process.env, stdio: ["inherit", "ignore", "inherit"],
+      shell: packageManagerSpawnShell(),
+    });
+    if ((r.status ?? 1) !== 0) {
+      updateRisingWaveStatus("failed");
+      process.exit(r.status ?? 1);
+    }
+    out("CLI built.");
   }
-  out("CLI built.");
 
   // Extract machine API key from seed file (first "apiKey": "..." occurrence).
   let machineApiKey = "";
@@ -4153,7 +4188,7 @@ function cmdStart(args: string[], preview?: PreviewStartHooks, initOnly = false)
     if (process.env.RAFTDEV_ASSISTANT_WITHOUT_RUNTIME === "1") {
       serverCmd += `${envAssign("RAFTDEV_ASSISTANT_WITHOUT_RUNTIME", "1")} `;
     }
-    if (process.env.RAFTDEV_COMPUTER && process.env.RAFTDEV_COMPUTER !== "0") {
+    if (sourceComputer || (process.env.RAFTDEV_COMPUTER && process.env.RAFTDEV_COMPUTER !== "0")) {
       serverCmd += `${envAssign("SLOCK_DEVICE_LOGIN_ENABLED", "true")} `;
       serverCmd += `${envAssign("AGENT_BOOTSTRAP_TOKEN_PEPPER", `raftdev-computer-pepper-${name}-0123456789abcdef`)} `;
     }
@@ -4303,7 +4338,13 @@ function cmdStart(args: string[], preview?: PreviewStartHooks, initOnly = false)
     daemonCmd += `${envAssign("SLOCK_DAEMON_TRACE_UPLOAD_INTERVAL_MS", "5000")} `;
   }
   daemonCmd += `${envAssign("SLOCK_HOME", e.SLOCK_HOME)} `;
-  daemonCmd += `pnpm --filter @botiverse/raft-daemon dev -- --server-url ${shellQuote(`http://localhost:${e.SERVER_PORT}`)} --api-key-file ${shellQuote(machineApiKeyFile)}`;
+  if (sourceComputer) {
+    // 前台管理进程随 tmux 生命周期退出，避免 stop 后留下独立后台服务。
+    daemonCmd += `${envAssign("RAFT_HOME", e.SLOCK_HOME)} `;
+    daemonCmd += `node ${shellQuote(computerEntry)} start --foreground`;
+  } else {
+    daemonCmd += `pnpm --filter @botiverse/raft-daemon dev -- --server-url ${shellQuote(`http://localhost:${e.SERVER_PORT}`)} --api-key-file ${shellQuote(machineApiKeyFile)}`;
+  }
   if (startDaemon) {
     runRequiredTmux(
       ["new-window", "-t", e.TMUX_SESSION, "-n", "daemon", "-c", PROJECT_DIR, runTmuxShellCommand(daemonCmd)],

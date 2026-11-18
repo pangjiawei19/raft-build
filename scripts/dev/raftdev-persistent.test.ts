@@ -58,6 +58,7 @@ if (tool === 'docker') {
     if (args.join(' ').includes('pg_tables')) out('0,false');
     else if (args.join(' ').includes('SHOW wal_level')) out('logical');
   } else if (cmd === 'start' || cmd === 'stop') {
+    if (cmd === 'stop' && process.env.RAFTDEV_TEST_FAIL_STOP === '1') process.exit(19);
     if (!state.containers[args.at(-1)]) process.exit(1);
     state.containers[args.at(-1)].running = cmd === 'start'; save();
   } else if (cmd === 'update' && args.includes('--restart')) {
@@ -83,6 +84,19 @@ if (tool === 'docker') {
 } else if (tool === 'npx' && cmd === 'drizzle-kit' && rest[0] === 'push') {
   process.exit(99);
 } else if (tool === 'pnpm') {
+  if (args.join(' ') === '--filter @botiverse/raft-computer build') {
+    const result = require('node:child_process').spawnSync(process.execPath,
+      ['--import','@oxc-node/core/register',path.join(process.cwd(),'scripts/dev/raftdev-computer-build.ts')],
+      {env:{...process.env,npm_execpath:process.argv[1]},stdio:'inherit'});
+    process.exit(result.status ?? 1);
+  }
+  if (args.join(' ') === 'run build:dist') {
+    if (state.sessions.length || Object.values(state.containers).some(c => c.running)) process.exit(25);
+    if (process.env.RAFTDEV_TEST_FAIL_COMPUTER_BUILD === '1') process.exit(23);
+    for (const file of ['dist/raft-computer.js','../daemon/dist/core.js','../daemon/dist/cli/raft.js']) {
+      fs.mkdirSync(path.dirname(file),{recursive:true}); fs.writeFileSync(file,'// 构建产物\\n');
+    }
+  }
   if (process.env.RAFTDEV_TEST_FAIL_BUILD === '1' && cmd === '--filter') process.exit(23);
   if (process.env.RAFTDEV_TEST_FAIL_MIGRATE === '1' && args.includes('scripts/migrate-deploy.ts')) process.exit(17);
   if (args.includes('scripts/init-local.ts')) {
@@ -101,6 +115,7 @@ if (tool === 'docker') {
     ...process.env, PATH: `${bin}:${dirname(process.execPath)}:/usr/bin:/bin`,
     SLOCKDEV_PERSISTENT: "0", SLOCKDEV_TUNNEL: "0", SLOCKDEV_TRACE_WORKER: "0",
     SLOCKDEV_TRACE_OBSERVE: "0", SLOCKDEV_IDLE_TTL_SECONDS: "",
+    RAFTDEV_AGENT_HOST: "daemon",
     RAFTDEV_TEST_STATE: state, RAFTDEV_TEST_LOG: log,
   };
   const run = (args: string[], extra: NodeJS.ProcessEnv = {}) => spawnSync(process.execPath,
@@ -111,7 +126,16 @@ if (tool === 'docker') {
     assert.equal(result.status, 0, result.stdout + result.stderr);
     return result.stdout;
   };
-  return { name, environment, credentials, state, log, run, ok,
+  const prepareComputer = () => {
+    mkdirSync(join(repo, "packages/computer/src"), { recursive: true });
+    writeFileSync(join(repo, "packages/computer/package.json"), JSON.stringify({ name: "@botiverse/raft-computer" }));
+    writeFileSync(join(repo, "packages/computer/src/index.ts"), "// 版本一\n");
+    mkdirSync(join(environment, "home/computer/servers"), { recursive: true });
+    mkdirSync(join(environment, "home/agents/existing-agent"), { recursive: true });
+    writeFileSync(join(environment, "home/agents/existing-agent/MEMORY.md"), "现有 Agent 记忆和会话\n");
+    return repo;
+  };
+  return { name, environment, credentials, state, log, run, ok, prepareComputer,
     resources: () => JSON.parse(readFileSync(state, "utf8")),
     commands: () => readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as {tool: string; args: string[]}),
   };
@@ -138,6 +162,111 @@ test("持久环境默认常驻，重复 start 无副作用，stop/start 保留�
   assert.ok(!f.commands().some(c => c.args.includes("scripts/seed.ts") || c.args.includes("--force")));
   assert.ok(!f.commands().some(c => c.tool === "tmux" && c.args.includes("janitor")));
   assert.ok(f.commands().some(c => c.tool === "docker" && c.args.includes("--appendonly")));
+});
+
+test("Computer 首次自动构建，后续无变化跳过构建，保留现有身份和 Agent", (t) => {
+  const f = fixture(t);
+  f.ok(["start", f.name, "--persistent"]);
+  f.ok(["stop", f.name]);
+  const credentials = readFileSync(f.credentials, "utf8");
+  const resources = readFileSync(f.state, "utf8");
+  const extra = { RAFTDEV_AGENT_HOST: "computer" };
+  const refused = f.run(["start", f.name], extra);
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /已迁移的本机 attachment/);
+  assert.equal(readFileSync(f.state, "utf8"), resources);
+  f.prepareComputer();
+  const before = f.commands().length;
+  const started = f.run(["start", f.name], extra);
+  assert.equal(started.status, 0, started.stdout + started.stderr);
+  assert.match(started.stdout, /自动构建/);
+  const commands = f.commands().slice(before);
+  const daemonWindow = commands.find(c => c.tool === "tmux" && c.args.includes("daemon"));
+  assert.ok(daemonWindow);
+  assert.match(daemonWindow.args.at(-1)!, /raft-computer\.js.*start --foreground/);
+  assert.match(daemonWindow.args.at(-1)!, /RAFT_HOME=/);
+  assert.ok(!daemonWindow.args.at(-1)!.includes("raft-daemon dev"));
+  assert.ok(commands.some(c => c.tool === "tmux" && c.args.some(a => a.includes("SLOCK_DEVICE_LOGIN_ENABLED"))));
+  assert.equal(readFileSync(f.credentials, "utf8"), credentials);
+  f.ok(["stop", f.name]);
+  const restarted = f.run(["start", f.name], extra);
+  assert.equal(restarted.status, 0, restarted.stdout + restarted.stderr);
+  assert.equal(readFileSync(f.credentials, "utf8"), credentials);
+  assert.equal(readFileSync(join(f.environment, "home/agents/existing-agent/MEMORY.md"), "utf8"), "现有 Agent 记忆和会话\n");
+  assert.equal(f.commands().filter(c => c.tool === "pnpm" && c.args.join(" ") === "run build:dist").length, 1);
+  const buildIndex = commands.findIndex(c => c.tool === "pnpm" && c.args.join(" ") === "run build:dist");
+  const startIndex = commands.findIndex(c => c.tool === "docker" && c.args[0] === "start");
+  assert.ok(buildIndex >= 0 && buildIndex < startIndex);
+  assert.ok(!commands.some(c => c.tool === "pnpm" && c.args.join(" ") === "--filter @botiverse/raft build"));
+});
+
+test("运行中 start 只提示 restart，restart 先停服务再构建并恢复", (t) => {
+  const f = fixture(t);
+  f.ok(["start", f.name, "--persistent"]);
+  f.ok(["stop", f.name]);
+  const repo = f.prepareComputer();
+  const extra = { RAFTDEV_AGENT_HOST: "computer" };
+  assert.equal(f.run(["start", f.name], extra).status, 0);
+  const resources = readFileSync(f.state, "utf8");
+  const credentials = readFileSync(f.credentials, "utf8");
+  writeFileSync(join(repo, "packages/computer/src/index.ts"), "// 版本二\n");
+  let before = f.commands().length;
+  const existing = f.run(["start", f.name], extra);
+  assert.equal(existing.status, 0, existing.stdout + existing.stderr);
+  assert.match(existing.stdout, /请执行 restart/);
+  assert.equal(readFileSync(f.state, "utf8"), resources);
+  assert.ok(!f.commands().slice(before).some(c => c.args.includes("stop") || c.args.includes("kill-session") || c.args.join(" ") === "run build:dist"));
+  before = f.commands().length;
+  const restarted = f.run(["restart", f.name], extra);
+  assert.equal(restarted.status, 0, restarted.stdout + restarted.stderr);
+  const commands = f.commands().slice(before);
+  const built = commands.findIndex(c => c.args.join(" ") === "run build:dist");
+  assert.ok(built >= 0);
+  assert.ok(commands.slice(0, built).some(c => c.tool === "docker" && c.args[0] === "stop"));
+  assert.ok(commands.slice(built + 1).some(c => c.tool === "docker" && c.args[0] === "start"));
+  assert.equal(readFileSync(f.credentials, "utf8"), credentials);
+  assert.equal(f.resources().payload, "用户数据");
+});
+
+test("Computer 自动构建失败保持停止，重试保留 Agent、附件和凭据", (t) => {
+  const f = fixture(t);
+  f.ok(["start", f.name, "--persistent"]);
+  f.ok(["stop", f.name]);
+  f.prepareComputer();
+  const extra = { RAFTDEV_AGENT_HOST: "computer" };
+  // 模拟应用已退出但依赖容器仍运行：自动构建前也必须先释放这些资源。
+  const leftover = f.resources();
+  for (const container of Object.values(leftover.containers) as { running: boolean }[]) container.running = true;
+  writeFileSync(f.state, JSON.stringify(leftover));
+  const credentials = readFileSync(f.credentials, "utf8");
+  const volumes = f.resources().volumes;
+  const before = f.commands().length;
+  const failed = f.run(["start", f.name], { ...extra, RAFTDEV_TEST_FAIL_COMPUTER_BUILD: "1" });
+  assert.notEqual(failed.status, 0);
+  assert.match(failed.stderr, /自动构建失败.*Agent、数据库和附件已保留/);
+  assert.equal(f.resources().sessions.length, 0);
+  assert.ok(Object.values(f.resources().containers).every((c: any) => !c.running));
+  assert.equal(readFileSync(f.credentials, "utf8"), credentials);
+  assert.equal(readFileSync(join(f.environment, "home/agents/existing-agent/MEMORY.md"), "utf8"), "现有 Agent 记忆和会话\n");
+  assert.deepEqual(f.resources().volumes, volumes);
+  assert.equal(f.resources().payload, "用户数据");
+  assert.ok(!f.commands().slice(before).some(c => c.args.includes("scripts/init-local.ts") || c.args.includes("scripts/migrate-deploy.ts") || c.args[0] === "rm"));
+  const retry = f.run(["start", f.name], extra);
+  assert.equal(retry.status, 0, retry.stdout + retry.stderr);
+  assert.equal(readFileSync(f.credentials, "utf8"), credentials);
+});
+
+test("停止服务失败时取消自动构建，保留全部数据卷", (t) => {
+  const f = fixture(t);
+  f.ok(["start", f.name, "--persistent"]);
+  f.prepareComputer();
+  const before = f.commands().length;
+  const volumes = f.resources().volumes;
+  const failed = f.run(["restart", f.name], { RAFTDEV_AGENT_HOST: "computer", RAFTDEV_TEST_FAIL_STOP: "1" });
+  assert.notEqual(failed.status, 0);
+  assert.ok(!f.commands().slice(before).some(c => c.args.join(" ") === "run build:dist"));
+  assert.deepEqual(f.resources().volumes, volumes);
+  assert.equal(f.resources().payload, "用户数据");
 });
 
 test("重复 start 为旧持久 RisingWave 关闭自动重启，保持既有服务、数据和凭据", (t) => {
