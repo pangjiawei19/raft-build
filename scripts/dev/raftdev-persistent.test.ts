@@ -269,7 +269,7 @@ test("停止服务失败时取消自动构建，保留全部数据卷", (t) => {
   assert.equal(f.resources().payload, "用户数据");
 });
 
-test("重复 start 为旧持久 RisingWave 关闭自动重启，保持既有服务、数据和凭据", (t) => {
+test("重复 start 为旧持久 RisingWave 启用异常退出重启，保持既有服务、数据和凭据", (t) => {
   const f = fixture(t);
   f.ok(["start", f.name, "--persistent"]);
   const path = join(f.environment, "environment.json");
@@ -278,19 +278,19 @@ test("重复 start 为旧持久 RisingWave 关闭自动重启，保持既有服�
   const volume = `${name}-data`;
   const resources = f.resources();
   resources.volumes.push(volume);
-  resources.containers[name] = { running: true, mounts: [{ Name: volume, Destination: "/var/lib/risingwave" }], restartPolicy: "unless-stopped" };
+  resources.containers[name] = { running: true, mounts: [{ Name: volume, Destination: "/var/lib/risingwave" }], restartPolicy: "no" };
   writeFileSync(f.state, JSON.stringify(resources));
   const credentials = readFileSync(f.credentials, "utf8");
   const commandCount = f.commands().length;
 
   assert.match(f.ok(["start", f.name]), /已在运行/);
-  assert.equal(f.resources().containers[name].restartPolicy, "no");
+  assert.equal(f.resources().containers[name].restartPolicy, "on-failure");
   assert.equal(readFileSync(f.credentials, "utf8"), credentials);
   const commands = f.commands().slice(commandCount);
-  assert.ok(commands.some(c => c.tool === "docker" && c.args.join(" ") === `update --restart no ${name}`));
+  assert.ok(commands.some(c => c.tool === "docker" && c.args.join(" ") === `update --restart on-failure ${name}`));
   assert.ok(!commands.some(c => c.tool === "tmux" && c.args[0] === "kill-session"));
   assert.ok(!commands.some(c => c.tool === "docker" && ["start", "stop", "rm", "run"].includes(c.args[0])));
-  resources.containers[name].restartPolicy = "no";
+  resources.containers[name].restartPolicy = "on-failure";
   assert.deepEqual(f.resources(), resources);
 
   const count = f.commands().length;

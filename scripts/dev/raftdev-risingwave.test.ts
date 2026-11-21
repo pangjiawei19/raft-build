@@ -67,7 +67,7 @@ test("持久 RisingWave 将目录和状态存储绑定到命名卷", () => {
   assert.equal(args[args.indexOf("--store-directory") + 1], "/var/lib/risingwave");
   assert.ok(!args.includes("--rm"));
   assert.ok(args.includes("--pull=missing"));
-  assert.equal(args[args.indexOf("--restart") + 1], "no");
+  assert.equal(args[args.indexOf("--restart") + 1], "on-failure");
 });
 
 test("低内存模式限制容器资源并保留原持久卷，默认模式保持不变", () => {
